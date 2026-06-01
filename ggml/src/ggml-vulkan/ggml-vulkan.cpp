@@ -16608,6 +16608,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO2_0:    // added
+                    case GGML_TYPE_TURBO3_0:    // added
+                    case GGML_TYPE_TURBO4_0:    // added
+                    case GGML_TYPE_TQ4_1S:      // added
                         return true;
                     default:
                         return false;
