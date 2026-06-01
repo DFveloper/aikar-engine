@@ -66,6 +66,8 @@ else()
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     )
     set(LLAMA_UI_EMBED_EXE "$<TARGET_FILE:llama-ui-embed>")
+endif()
+
 if(LLAMA_BUILD_UI)
     set(PUBLIC_ASSETS
         index.html
