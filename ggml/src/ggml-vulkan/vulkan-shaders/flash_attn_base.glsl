@@ -87,22 +87,74 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
+#if defined(DATA_A_F32)
+layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
+layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
+#elif defined(DATA_A_TURBO2_0)
+layout (binding = 1) readonly buffer K_T2 {block_turbo2_0 data_k_t2[];};
+layout (binding = 2) readonly buffer V_T2 {block_turbo2_0 data_v_t2[];};
+#elif defined(DATA_A_TURBO3_0)
+layout (binding = 1) readonly buffer K_T3 {block_turbo3_0 data_k_t3[];};
+layout (binding = 2) readonly buffer V_T3 {block_turbo3_0 data_v_t3[];};
+#elif defined(DATA_A_TURBO4_0)
+layout (binding = 1) readonly buffer K_T4 {block_turbo4_0 data_k_t4[];};
+layout (binding = 2) readonly buffer V_T4 {block_turbo4_0 data_v_t4[];};
+#elif defined(A_TYPE_PACKED16)
+layout (binding = 1) readonly buffer K_PACKED16 {A_TYPE_PACKED16 k_data_packed16[];} k_packed;
+layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16[];} v_packed;
+#endif
 
-// FaTypeK / FaTypeV spec constant values. These mirror enum ggml_type so the
-// host can pass the type directly. Keep in sync with ggml.h.
-#define FA_TYPE_F32   0u
-#define FA_TYPE_F16   1u
-#define FA_TYPE_Q4_0  2u
-#define FA_TYPE_Q4_1  3u
-#define FA_TYPE_Q5_0  6u
-#define FA_TYPE_Q5_1  7u
-#define FA_TYPE_Q8_0  8u
-#define FA_TYPE_BF16 30u
-#define FA_TYPE_Q1_0 41u
+#if defined(A_TYPE_PACKED32)
+layout (binding = 1) readonly buffer K_PACKED32 {A_TYPE_PACKED32 k_data_packed32[];} k_packed32;
+layout (binding = 2) readonly buffer V_PACKED32 {A_TYPE_PACKED32 v_data_packed32[];} v_packed32;
+#endif
 
-#if defined(BFLOAT16)
-#define O_TYPE float
-#define O_TYPEV4 vec4
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 1
+#endif
+
+// turbo3: define BLOCK_BYTE_SIZE early (before first use in FA offset computation)
+#if defined(DATA_A_TURBO2_0) && !defined(BLOCK_BYTE_SIZE)
+#define BLOCK_BYTE_SIZE 34
+#elif defined(DATA_A_TURBO3_0) && !defined(BLOCK_BYTE_SIZE)
+#define BLOCK_BYTE_SIZE 50 // block_turbo3_0: 2 (norm) + 32 (qs) + 16 (signs) = 50 bytes
+#elif defined(DATA_A_TURBO4_0) && !defined(BLOCK_BYTE_SIZE)
+#define BLOCK_BYTE_SIZE 68
+#endif
+
+#if defined(DATA_A_F32)
+#undef BLOCK_SIZE
+#define BLOCK_SIZE 4
+#define BLOCK_BYTE_SIZE 16
+
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    // iqs is currently always zero in the flash attention shaders
+    if (binding_idx == BINDING_IDX_K) {
+        return FLOAT_TYPEV4(k_packed.k_data_packed[a_offset + ib]);
+    } else {
+        return FLOAT_TYPEV4(v_packed.v_data_packed[a_offset + ib]);
+    }
+}
+#endif
+
+#if defined(DATA_A_Q4_0)
+#define BLOCK_BYTE_SIZE 18
+#elif defined(DATA_A_Q4_1)
+#define BLOCK_BYTE_SIZE 20
+#endif
+
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+        uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+        uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+        uint shift = (iqs & 0x10) >> 2;
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+#ifdef DATA_A_Q4_1
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * nibbles + FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].m);
 #else
 #define O_TYPE FLOAT_TYPE
 #define O_TYPEV4 FLOAT_TYPEV4
@@ -139,16 +191,104 @@ uint fa_quant_r_mmq(uint ty) {
         default:           return 1u;
     }
 }
+#endif
+#if defined(DATA_A_Q8_0)
+#define BLOCK_BYTE_SIZE 34
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+        const i8vec2 v0 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2])).xy; // vec4 used due to #12147
+        const i8vec2 v1 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
 
-// These can't be `const` globals because GLSL forbids function calls in global
-// const initializers, even when the spec constants would let the driver fold
-// them. Macros expand at the use site and fold after specialization.
-#define BLOCK_SIZE_K fa_block_elems(FaTypeK)
-#define BLOCK_SIZE_V fa_block_elems(FaTypeV)
-// F16 reads f16 elements directly from the binding; everything else routes
-// through dequantize4 / the MMQ helpers to unpack from the packed block layout.
-#define USE_DECODE_K (FaTypeK != FA_TYPE_F16)
-#define USE_DECODE_V (FaTypeV != FA_TYPE_F16)
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+    } else {
+        const i8vec2 v0 = unpack8(int32_t(v_packed.v_data_packed16[a_offset + ib].qs[iqs / 2])).xy; // vec4 used due to #12147
+        const i8vec2 v1 = unpack8(int32_t(v_packed.v_data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
+
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+    }
+}
+#endif
+
+#if defined(DATA_A_TURBO2_0)
+const float T2C[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+// iqs is always a multiple of 4 (4 consecutive elements within the same qs byte group)
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float nm;
+    uint  qb;
+    if (binding_idx == BINDING_IDX_K) {
+        nm = float(data_k_t2[a_offset + ib].norm);
+        qb = uint(data_k_t2[a_offset + ib].qs[iqs / 4]);
+    } else {
+        nm = float(data_v_t2[a_offset + ib].norm);
+        qb = uint(data_v_t2[a_offset + ib].qs[iqs / 4]);
+    }
+    return FLOAT_TYPEV4(
+        T2C[(qb      ) & 0x3] * nm,
+        T2C[(qb >>  2) & 0x3] * nm,
+        T2C[(qb >>  4) & 0x3] * nm,
+        T2C[(qb >>  6) & 0x3] * nm
+    );
+}
+#endif
+
+#if defined(DATA_A_TURBO3_0)
+const float T3C[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+);
+// iqs is always a multiple of 4: all 4 elements share the same qs byte and same signs byte.
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float nm;
+    uint  qb;
+    uint  sb;
+    if (binding_idx == BINDING_IDX_K) {
+        nm = float(data_k_t3[a_offset + ib].norm);
+        qb = uint(data_k_t3[a_offset + ib].qs[iqs / 4]);
+        sb = uint(data_k_t3[a_offset + ib].signs[iqs / 8]);
+    } else {
+        nm = float(data_v_t3[a_offset + ib].norm);
+        qb = uint(data_v_t3[a_offset + ib].qs[iqs / 4]);
+        sb = uint(data_v_t3[a_offset + ib].signs[iqs / 8]);
+    }
+    // iqs is a multiple of 4; within the signs byte, the 4 elements start at bit (iqs%8).
+    uint sshift = iqs & 4u;  // 0 if iqs%8 < 4, else 4
+    return FLOAT_TYPEV4(
+        T3C[((qb      ) & 0x3) | (((sb >> (sshift + 0)) & 1u) << 2)] * nm,
+        T3C[((qb >>  2) & 0x3) | (((sb >> (sshift + 1)) & 1u) << 2)] * nm,
+        T3C[((qb >>  4) & 0x3) | (((sb >> (sshift + 2)) & 1u) << 2)] * nm,
+        T3C[((qb >>  6) & 0x3) | (((sb >> (sshift + 3)) & 1u) << 2)] * nm
+    );
+}
+#endif
+
+#if defined(DATA_A_TURBO4_0)
+const float T4C[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926
+);
+// iqs is always even: pairs of elements share a qs nibble byte.
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float nm;
+    uint  qb0, qb1;
+    if (binding_idx == BINDING_IDX_K) {
+        nm  = float(data_k_t4[a_offset + ib].norm);
+        qb0 = uint(data_k_t4[a_offset + ib].qs[iqs / 2    ]);
+        qb1 = uint(data_k_t4[a_offset + ib].qs[iqs / 2 + 1]);
+    } else {
+        nm  = float(data_v_t4[a_offset + ib].norm);
+        qb0 = uint(data_v_t4[a_offset + ib].qs[iqs / 2    ]);
+        qb1 = uint(data_v_t4[a_offset + ib].qs[iqs / 2 + 1]);
+    }
+    return FLOAT_TYPEV4(
+        T4C[ qb0       & 0xF] * nm,
+        T4C[(qb0 >> 4) & 0xF] * nm,
+        T4C[ qb1       & 0xF] * nm,
+        T4C[(qb1 >> 4) & 0xF] * nm
+    );
+}
+#endif
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
