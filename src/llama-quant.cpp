@@ -452,10 +452,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   ||
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_K  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_K) {
-                new_type = !qs.has_output ? GGML_TYPE_IQ4_K : GGML_TYPE_Q5_K;
+                new_type = GGML_TYPE_IQ4_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ4_K || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS) {
-                new_type = !qs.has_output ? GGML_TYPE_IQ5_K : GGML_TYPE_Q6_K;
+                new_type = GGML_TYPE_IQ5_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_AKQ_G2Q3) {
                 new_type = GGML_TYPE_Q6_K;
@@ -928,8 +928,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     llama_ftype ftype = params->ftype;
 
     int nthread = params->nthread;
-    bool has_output = false;
-
+    
     if (nthread <= 0) {
         nthread = std::thread::hardware_concurrency();
     }
