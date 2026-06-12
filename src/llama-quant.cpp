@@ -928,6 +928,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     llama_ftype ftype = params->ftype;
 
     int nthread = params->nthread;
+    bool has_output = false;
 
     if (nthread <= 0) {
         nthread = std::thread::hardware_concurrency();
@@ -1060,6 +1061,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         });
     }
 
+    
     // compute tensor metadata once and cache it
     std::vector<tensor_metadata> metadata(tensors.size());
     for (size_t i = 0; i < tensors.size(); ++i) {
