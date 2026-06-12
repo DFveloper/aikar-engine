@@ -427,9 +427,18 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
+        // IDs must match ik_llama.cpp for GGUF interoperability
+        // IDs 40-136 reserved
+        GGML_TYPE_IQ2_K   = 137, // 2.375 bpw
+        GGML_TYPE_IQ3_K   = 138, // 3.44 bpw
+        GGML_TYPE_IQ4_K   = 139, // 4.5 bpw
+        GGML_TYPE_IQ5_K   = 140, // 5.5 bpw
+        GGML_TYPE_IQ6_K   = 141, // 6.625 bpw
+        // IDs 142-156 reserved
+        
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_COUNT   = 142,
     };
 
     // precision

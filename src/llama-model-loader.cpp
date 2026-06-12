@@ -68,6 +68,11 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_S:    return "IQ3_S - 3.4375 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_M:    return "IQ3_S mix - 3.66 bpw";
+        case LLAMA_FTYPE_MOSTLY_IQ2_K:    return "IQ2_K - 2.375 bpw";
+        case LLAMA_FTYPE_MOSTLY_IQ3_K:    return "IQ3_K - 3.44 bpw";
+        case LLAMA_FTYPE_MOSTLY_IQ4_K:    return "IQ4_K - 4.5 bpw";
+        case LLAMA_FTYPE_MOSTLY_IQ5_K:    return "IQ5_K - 5.5 bpw";
+        case LLAMA_FTYPE_MOSTLY_IQ6_K:    return "IQ6_K - 6.625 bpw";
         case LLAMA_FTYPE_MOSTLY_AKQ_G2Q3: return "AIKAR Quant - 3.xbpw";
         case LLAMA_FTYPE_MOSTLY_AKQ_G2Q6: return "AIKAR Quant - 6.xbpw";
 
@@ -762,6 +767,11 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
+            case GGML_TYPE_IQ2_K:   ftype = LLAMA_FTYPE_MOSTLY_IQ2_K;   break;
+            case GGML_TYPE_IQ3_K:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_K;   break;
+            case GGML_TYPE_IQ4_K:   ftype = LLAMA_FTYPE_MOSTLY_IQ4_K;   break;
+            case GGML_TYPE_IQ5_K:   ftype = LLAMA_FTYPE_MOSTLY_IQ5_K;   break;
+            case GGML_TYPE_IQ6_K:   ftype = LLAMA_FTYPE_MOSTLY_IQ6_K;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             default:

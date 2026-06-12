@@ -377,8 +377,11 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XS:
             case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ2_K:
             case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_K:
             case GGML_TYPE_IQ3_S:   // types on the right: block size 32
+            case GGML_TYPE_IQ4_K:
             case GGML_TYPE_IQ4_XS:  return_type = GGML_TYPE_IQ4_NL; break;
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
@@ -451,8 +454,11 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   ||
-                     ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
-                new_type = GGML_TYPE_Q5_K;
+                     ftype == LLAMA_FTYPE_MOSTLY_IQ1_M   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_K  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_K) {
+                new_type = GGML_TYPE_IQ4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_IQ4_K || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS) {
+                new_type = GGML_TYPE_IQ5_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_AKQ_G2Q3) {
                 new_type = GGML_TYPE_Q6_K;
@@ -527,6 +533,15 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S && qs.model.hparams.n_gqa() >= 4) {
             new_type = GGML_TYPE_Q4_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_K) {
+            new_type = qs.model.hparams.n_gqa() >= 2 ? GGML_TYPE_IQ4_K : GGML_TYPE_IQ3_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_K && qs.model.hparams.n_gqa() >= 2) {
+            new_type = GGML_TYPE_IQ4_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ4_K && qs.model.hparams.n_gqa() >= 2) {
+            new_type = GGML_TYPE_IQ5_K;
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
             new_type = qs.model.hparams.n_gqa() >= 4 ? GGML_TYPE_Q4_K : !qs.has_imatrix ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ3_XXS;
@@ -657,6 +672,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS || ftype == LLAMA_FTYPE_MOSTLY_AKQ_G2Q3) new_type = GGML_TYPE_IQ3_S;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M ) new_type = GGML_TYPE_Q4_K;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L ) new_type = GGML_TYPE_Q5_K;
+                else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  ) new_type = GGML_TYPE_Q4_K;
+                else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_K) {
+                    new_type = GGML_TYPE_IQ3_K;
+                }
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_M) new_type = GGML_TYPE_IQ4_XS;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_AKQ_G2Q6) new_type = GGML_TYPE_Q8_K;
             }
@@ -875,8 +894,13 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ1_M:   return GGML_TYPE_IQ1_M;
         case LLAMA_FTYPE_MOSTLY_IQ4_NL:  return GGML_TYPE_IQ4_NL;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  return GGML_TYPE_IQ4_XS;
-        case LLAMA_FTYPE_MOSTLY_IQ3_S:
+        case LLAMA_FTYPE_MOSTLY_IQ3_S:   return GGML_TYPE_IQ3_S;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
+        case LLAMA_FTYPE_MOSTLY_IQ2_K:   return GGML_TYPE_IQ2_K;
+        case LLAMA_FTYPE_MOSTLY_IQ3_K:   return GGML_TYPE_IQ3_K;
+        case LLAMA_FTYPE_MOSTLY_IQ4_K:   return GGML_TYPE_IQ4_K;
+        case LLAMA_FTYPE_MOSTLY_IQ5_K:   return GGML_TYPE_IQ5_K;
+        case LLAMA_FTYPE_MOSTLY_IQ6_K:   return GGML_TYPE_IQ6_K;
 
         default: return GGML_TYPE_COUNT;
     }
@@ -1039,6 +1063,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         });
     }
 
+    
     // compute tensor metadata once and cache it
     std::vector<tensor_metadata> metadata(tensors.size());
     for (size_t i = 0; i < tensors.size(); ++i) {

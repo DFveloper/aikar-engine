@@ -176,7 +176,7 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
-    other = static_cast<llama_kv_cache *>(mem_src);
+    
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
