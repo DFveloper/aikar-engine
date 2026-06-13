@@ -16462,6 +16462,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
     auto* cmd_buf = compute_ctx->s->buffer; // retrieve pointer before it gets reset
 
+    
     if (vkev->has_event) {
         // Move existing event into submitted
         vkev->events_submitted.push_back(vkev->event);
@@ -16483,11 +16484,18 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
     ggml_vk_ctx_end(compute_ctx);
 
+    // Preserve D2H copies across context reset (drained by synchronize after fence).
+    auto preserved_out_memcpys = std::move(compute_ctx->out_memcpys);
+    const size_t preserved_count = preserved_out_memcpys.size();
+
+
     ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
     vkev->cmd_buffer = cmd_buf;
     vkev->cmd_buffer_use_counter = cmd_buf->use_counter;
     ctx->compute_ctx.reset();
+
+    
 
     // Restore D2H copies into fresh context for synchronize to drain.
     if (!preserved_out_memcpys.empty()) {
