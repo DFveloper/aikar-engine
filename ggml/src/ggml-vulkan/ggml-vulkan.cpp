@@ -16500,6 +16500,9 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
     ggml_vk_ctx_end(compute_ctx);
 
+    auto preserved_out_memcpys = std::move(compute_ctx->out_memcpys);
+    const size_t preserved_count = preserved_out_memcpys.size();
+
     ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
     vkev->cmd_buffer = cmd_buf;
