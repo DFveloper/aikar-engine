@@ -773,6 +773,8 @@ const char * common_reasoning_format_name(common_reasoning_format format) {
             return "none";
         case COMMON_REASONING_FORMAT_AUTO:
             return "auto";
+        case COMMON_REASONING_FORMAT_AIKAR3:
+            return "aikar3";
         case COMMON_REASONING_FORMAT_DEEPSEEK:
             return "deepseek";
         case COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY:
@@ -788,6 +790,9 @@ common_reasoning_format common_reasoning_format_from_name(const std::string & fo
     }
     if (format == "auto") {
         return COMMON_REASONING_FORMAT_AUTO;
+    }
+    if (format == "AIKAR3" || format == "aikar3") {
+        return COMMON_REASONING_FORMAT_AIKAR3;
     }
     if (format == "deepseek") {
         return COMMON_REASONING_FORMAT_DEEPSEEK;
@@ -2375,6 +2380,13 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         LOG_DBG("%s: using differential autoparser\n", __func__);
         struct autoparser::autoparser autoparser;
         autoparser.analyze_template(tmpl);
+        if (params.reasoning_format == COMMON_REASONING_FORMAT_AIKAR3) {
+            autoparser.reasoning.mode = autoparser::reasoning_mode::TAG_BASED;
+            autoparser.reasoning.start = "<|channel>thought";
+            autoparser.reasoning.end = "<channel|>";
+            autoparser.preserved_tokens.push_back("<|channel>");
+            autoparser.preserved_tokens.push_back("<channel|>");
+        }
         auto auto_params = autoparser::peg_generator::generate_parser(tmpl, params, autoparser);
 
         std::vector<common_chat_msg_delimiter> delimiters;

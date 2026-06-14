@@ -2962,6 +2962,11 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         auto tst = peg_tester("models/templates/google-gemma-2-2b-it.jinja", detailed_debug);
 
         tst.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
+
+        tst.test("<|channel>thought\nI'm\nthinking<channel|>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AIKAR3)
+            .expect(message_assist_thoughts)
+            .run();
     }
     {
         // IBM Granite (reasoning and tool calling model)
