@@ -100,7 +100,7 @@ static int32_t meta_i(llama_model * m, const char * key, int32_t def) {
 
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]); return 1; }
-    const int MAXTOK = atoi(getenv("MAXTOK") ? getenv("MAXTOK") : "8192");
+    int MAXTOK = atoi(getenv("MAXTOK") ? getenv("MAXTOK") : "8192");
     const int MAXTOK_ENV = atoi(getenv("MAXTOK") ? getenv("MAXTOK") : "0");
     llama_backend_init();
     llama_model_params mparams = llama_model_default_params();
