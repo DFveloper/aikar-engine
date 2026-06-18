@@ -101,7 +101,7 @@ static int32_t meta_i(llama_model * m, const char * key, int32_t def) {
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]); return 1; }
     const int MAXTOK = atoi(getenv("MAXTOK") ? getenv("MAXTOK") : "8192");
-
+    const int MAXTOK_ENV = atoi(getenv("MAXTOK") ? getenv("MAXTOK") : "0");
     llama_backend_init();
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = atoi(getenv("NGL") ? getenv("NGL") : "0");
@@ -206,7 +206,7 @@ int main(int argc, char ** argv) {
         return nullptr;
     };
 
-    int MAXTOK = 0;
+    MAXTOK = 0;
     llama_context * ctx = nullptr;
     const char * reason = "auto";
 
@@ -256,12 +256,12 @@ int main(int argc, char ** argv) {
 
     // Stage 1 + Stage 2 are single-device features (sc_dev / prompt-KV store are single-GPU). Auto-enable
     // them for one CUDA device, exactly like the CLI's --diffusion-* auto resolution.
-    int gpu_devs = 0;
+    gpu_devs = 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         const auto dt = ggml_backend_dev_type(ggml_backend_dev_get(i));
         if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) { gpu_devs++; }
     }
-    const bool one_gpu = (gpu_devs <= 1);
+    //const bool one_gpu = (gpu_devs <= 1);
     base.kv_cache          = one_gpu;
     base.gpu_sampling      = one_gpu;
     base.gpu_sample_reduce = one_gpu;
