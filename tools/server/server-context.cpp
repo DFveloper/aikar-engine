@@ -15,6 +15,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "ggml-cpp.h"
 
 #include <algorithm>
 #include <cstddef>
