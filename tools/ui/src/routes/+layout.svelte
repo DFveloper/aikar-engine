@@ -11,6 +11,7 @@
 	import { PwaMetaTags, PwaRefreshAlert } from '$lib/components/pwa';
 	import { pwaAssetsHead } from 'virtual:pwa-assets/head';
 
+	import { chatStore } from '$lib/stores/chat.svelte';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { isRouterMode, serverStore } from '$lib/stores/server.svelte';
@@ -33,8 +34,6 @@
 	import { SETTINGS_KEYS } from '$lib/constants';
 
 	let { children } = $props();
-	let alwaysShowSidebarOnDesktop = $derived(config().alwaysShowSidebarOnDesktop);
-	let isDesktop = $derived(!isMobile.current);
 	let innerHeight = $state<number | undefined>();
 	let innerWidth = $state(browser ? window.innerWidth : 0);
 
@@ -156,18 +155,22 @@
 
 	onMount(() => {
 		updateFavicon();
+		// snapshot of every backend running stream on first load, populates the sidebar spinners
+		// so the user sees each conv that has a live inference, even ones not opened yet
+		void chatStore.syncRemoteRunningStreams();
 	});
+
+	// refresh that snapshot when the tab returns to the foreground, a stream may have advanced
+	// or ended while it was hidden. snapshot only, no polling
+	function handleVisibilityChange() {
+		if (document.visibilityState !== 'visible') return;
+		void chatStore.syncRemoteRunningStreams();
+	}
 
 	$effect(() => {
 		void theme.isSystemDark;
 
 		updateFavicon();
-	});
-
-	$effect(() => {
-		if (alwaysShowSidebarOnDesktop && isDesktop) {
-			return;
-		}
 	});
 
 	// Initialize server properties on app load (run once)
@@ -288,6 +291,7 @@
 </svelte:head>
 
 <svelte:window onkeydown={handleKeydown} bind:innerHeight bind:innerWidth />
+<svelte:document onvisibilitychange={handleVisibilityChange} />
 
 <Tooltip.Provider delayDuration={TOOLTIP_DELAY_DURATION}>
 	<div class="flex flex-col md:flex-row">
