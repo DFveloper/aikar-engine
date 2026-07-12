@@ -1,15 +1,19 @@
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "gguf.h"
 
 #include "arg.h"
 #include "common.h"
+#include "llama.h"
 
+#include <algorithm>
 #include <clocale>
-#include <map>
-#include <vector>
-#include <string>
+#include <cstring>
 #include <fstream>
+#include <map>
+#include <string>
+#include <vector>
 
 static bool g_verbose = false;
 
@@ -19,7 +23,7 @@ struct tensor_transformation {
     bool is_copy;
 };
 
-static std::string get_kv_str(struct gguf_context * ctx_gguf, const std::string & key){
+static std::string get_kv_str(struct gguf_context * ctx_gguf, const std::string & key) {
     int id = gguf_find_key(ctx_gguf, key.c_str());
     return id < 0 ? "" : std::string(gguf_get_val_str(ctx_gguf, id));
 }
@@ -47,6 +51,97 @@ static std::string ggml_ne_string(const ggml_tensor * t) {
     return str;
 }
 
+// ------------------------------------------------------------------------
+// Generic ggml_type <-> string lookup, built from the live GGML_TYPE list
+// instead of a hand-maintained if/else chain. This means any type ggml
+// knows about (including ones added later) is automatically selectable
+// from the command line, as long as it passes is_valid_output_type().
+// ------------------------------------------------------------------------
+
+static bool ggml_type_from_name(const std::string & name, ggml_type & out_type) {
+    std::string needle = name;
+    std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+
+    for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+        const ggml_type   t         = (ggml_type) i;
+        const char *       type_name = ggml_type_name(t);
+        if (type_name == nullptr) {
+            continue; // removed / reserved enum slot
+        }
+        std::string haystack = type_name;
+        std::transform(haystack.begin(), haystack.end(), haystack.begin(), ::tolower);
+        if (haystack == needle) {
+            out_type = t;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Only types that can actually be produced from an F32 accumulator are
+// valid merge output types: plain floats, or quantized types that expose
+// a from_float converter.
+static bool is_valid_output_type(ggml_type type) {
+    if (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+        return true;
+    }
+    // ggml_type_traits (backend-agnostic) only exposes the reference
+    // converter as from_float_ref; the SIMD-optimized from_float lives in
+    // ggml_type_traits_cpu (ggml-cpu.h), which isn't what we need here —
+    // ggml_quantize_chunk() dispatches internally per-type regardless.
+    const auto * traits = ggml_get_type_traits(type);
+    return traits != nullptr && traits->from_float_ref != nullptr;
+}
+
+static std::vector<std::string> list_supported_type_names() {
+    std::vector<std::string> names;
+    for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+        const ggml_type t = (ggml_type) i;
+        if (!is_valid_output_type(t)) {
+            continue;
+        }
+        const char * n = ggml_type_name(t);
+        if (n == nullptr) {
+            continue;
+        }
+        std::string lower = n;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        names.push_back(lower);
+    }
+    return names;
+}
+
+// Best-effort mapping to the legacy LLAMA_FTYPE metadata value. Not every
+// ggml_type has a 1:1 llama_ftype counterpart; unmapped types fall back to
+// LLAMA_FTYPE_MOSTLY_F16 with a warning (this only affects the informational
+// general.file_type key, not the actual tensor data written to disk).
+static uint32_t ggml_type_to_llama_ftype(ggml_type type) {
+    static const std::map<ggml_type, uint32_t> k_map = {
+        { GGML_TYPE_F32,   LLAMA_FTYPE_ALL_F32          },
+        { GGML_TYPE_F16,   LLAMA_FTYPE_MOSTLY_F16       },
+        { GGML_TYPE_BF16,  LLAMA_FTYPE_MOSTLY_BF16      },
+        { GGML_TYPE_Q4_0,  LLAMA_FTYPE_MOSTLY_Q4_0      },
+        { GGML_TYPE_Q4_1,  LLAMA_FTYPE_MOSTLY_Q4_1      },
+        { GGML_TYPE_Q5_0,  LLAMA_FTYPE_MOSTLY_Q5_0      },
+        { GGML_TYPE_Q5_1,  LLAMA_FTYPE_MOSTLY_Q5_1      },
+        { GGML_TYPE_Q8_0,  LLAMA_FTYPE_MOSTLY_Q8_0      },
+        { GGML_TYPE_Q2_K,  LLAMA_FTYPE_MOSTLY_Q2_K      },
+        { GGML_TYPE_Q3_K,  LLAMA_FTYPE_MOSTLY_Q3_K_M    },
+        { GGML_TYPE_Q4_K,  LLAMA_FTYPE_MOSTLY_Q4_K_M    },
+        { GGML_TYPE_Q5_K,  LLAMA_FTYPE_MOSTLY_Q5_K_M    },
+        { GGML_TYPE_Q6_K,  LLAMA_FTYPE_MOSTLY_Q6_K      },
+        { GGML_TYPE_MXFP4, LLAMA_FTYPE_MOSTLY_MXFP4_MOE },
+    };
+    auto it = k_map.find(type);
+    if (it != k_map.end()) {
+        return it->second;
+    }
+    fprintf(stderr, "%s: warning: no direct LLAMA_FTYPE mapping for '%s', "
+                     "general.file_type metadata will be approximate\n",
+            __func__, ggml_type_name(type));
+    return LLAMA_FTYPE_MOSTLY_F16;
+}
+
 static struct gguf_context * load_gguf(std::string & fname, struct ggml_context ** ctx_ggml) {
     struct gguf_init_params params = {
         /*.no_alloc = */ true,
@@ -67,7 +162,7 @@ struct file_input {
     float alpha;
     float scale;
 
-    file_input(std::string & fname, float scale): f_in(fname, std::ios::binary), scale(scale) {
+    file_input(std::string & fname, float scale) : f_in(fname, std::ios::binary), scale(scale) {
         if (!f_in.is_open()) {
             throw std::runtime_error("failed to open input gguf from " + fname);
         }
@@ -100,10 +195,10 @@ struct file_input {
         if (buf.size() < len) {
             buf.resize(len);
         }
-        auto i_tensor_in = gguf_find_tensor(ctx_gguf, name.c_str()); // idx of tensor in the input file
+        auto i_tensor_in = gguf_find_tensor(ctx_gguf, name.c_str());
         auto offset = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, i_tensor_in);
         f_in.seekg(offset);
-        f_in.read((char* )buf.data(), len);
+        f_in.read((char *) buf.data(), len);
     }
 
     ~file_input() {
@@ -113,17 +208,15 @@ struct file_input {
 };
 
 struct lora_merge_ctx {
-    // input base model + adapters
     file_input base_model;
     std::vector<std::unique_ptr<file_input>> adapters;
 
-    // for computing merged tensor
     int n_threads;
+    ggml_type out_type; // requested output tensor type (e.g. Q4_0, F16, F32...)
     ggml_backend_t backend = nullptr;
     ggml_gallocr_t allocr = nullptr;
     std::vector<uint8_t> read_buf;
 
-    // output file
     struct gguf_context * ctx_out;
     struct ggml_context * ctx_out_ggml;
     std::ofstream fout;
@@ -132,8 +225,11 @@ struct lora_merge_ctx {
             std::string & base_fname,
             std::vector<common_adapter_lora_info> & lora_files,
             std::string & outfile,
-            int n_threads) : base_model(base_fname, 0), n_threads(n_threads), fout(outfile, std::ios::binary) {
-        fout.exceptions(std::ofstream::failbit); // fail fast on write errors
+            ggml_type target_out_type,
+            int n_threads) :
+            base_model(base_fname, 0), n_threads(n_threads), out_type(target_out_type), fout(outfile, std::ios::binary) {
+
+        fout.exceptions(std::ofstream::failbit);
 
         if (gguf_find_key(base_model.ctx_gguf, LLM_KV_SPLIT_COUNT) >= 0) {
             throw std::runtime_error("split model is not yet supported");
@@ -149,7 +245,7 @@ struct lora_merge_ctx {
 
         ctx_out = gguf_init_empty();
         struct ggml_init_params params = {
-            /*.mem_size   =*/ static_cast<size_t>(gguf_get_n_tensors(base_model.ctx_gguf)*ggml_tensor_overhead()),
+            /*.mem_size   =*/ static_cast<size_t>(gguf_get_n_tensors(base_model.ctx_gguf) * ggml_tensor_overhead()),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -163,50 +259,38 @@ struct lora_merge_ctx {
         if (general_type != "adapter") {
             throw std::runtime_error("expect general.type to be 'adapter', but got: " + general_type);
         }
-
         auto adapter_type = get_kv_str(adapter->ctx_gguf, "adapter.type");
         if (adapter_type != "lora") {
             throw std::runtime_error("expect adapter.type to be 'lora', but got: " + adapter_type);
         }
-
         auto general_arch_base = get_kv_str(base_model.ctx_gguf, "general.architecture");
-        auto general_arch_lora = get_kv_str(adapter->ctx_gguf,   "general.architecture");
+        auto general_arch_lora = get_kv_str(adapter->ctx_gguf, "general.architecture");
         if (general_arch_base != general_arch_lora) {
             throw std::runtime_error("model arch and LoRA arch mismatch");
         }
     }
 
+    // F32 base tensors are kept as F32 in the output (matches upstream
+    // behavior); everything else follows the user-requested output type.
     ggml_type get_out_tensor_type(struct ggml_tensor * t) {
         if (t->type == GGML_TYPE_F32) {
             return GGML_TYPE_F32;
-        } else {
-            return GGML_TYPE_F16;
         }
+        return out_type;
     }
 
     void run_merge() {
-        // prepare metadata
         gguf_set_kv(ctx_out, base_model.ctx_gguf);
-        // output is forced to f16 for now
-        gguf_set_val_u32(ctx_out, "general.file_type", LLAMA_FTYPE_MOSTLY_F16);
+        gguf_set_val_u32(ctx_out, "general.file_type", ggml_type_to_llama_ftype(out_type));
 
-        // check if all lora adapters have the same tensors
-        // TODO: remove this when we can support merging subset of adapters. Ref: https://github.com/ggml-org/llama.cpp/pull/8607#discussion_r1686027777
-        static const char * err_no_subset_adapter = "Input adapters do not have the same list of tensors. This is not yet supported. Please merge the adapter one-by-one instead of merging all at once.";
         if (adapters.size() > 1) {
             for (size_t i = 1; i < adapters.size(); ++i) {
                 if (adapters[0]->tensors.size() != adapters[i]->tensors.size()) {
-                    throw std::runtime_error(err_no_subset_adapter);
-                }
-                for (auto & it : adapters[i]->tensors) {
-                    if (adapters[0]->get_tensor(it.first) == nullptr) {
-                        throw std::runtime_error(err_no_subset_adapter);
-                    }
+                    throw std::runtime_error("Subset adapters merging not supported.");
                 }
             }
         }
 
-        // mapping base tensor to out tensor (same shape with base, but different type)
         std::vector<tensor_transformation> trans;
         for (auto & it : base_model.tensors) {
             bool t_a = true;
@@ -217,38 +301,26 @@ struct lora_merge_ctx {
             }
             auto base_tensor = it.second;
             if (!t_a && !t_b) {
-                // only copy
                 struct ggml_tensor * cpy_tensor = ggml_dup_tensor(ctx_out_ggml, base_tensor);
                 ggml_set_name(cpy_tensor, base_tensor->name);
-                trans.push_back({
-                    cpy_tensor,
-                    cpy_tensor,
-                    true,
-                });
+                trans.push_back({cpy_tensor, cpy_tensor, true});
                 gguf_add_tensor(ctx_out, cpy_tensor);
             } else if (t_a && t_b) {
-                // need merging
                 struct ggml_tensor * out_tensor = ggml_new_tensor(
                     ctx_out_ggml, get_out_tensor_type(base_tensor), GGML_MAX_DIMS, base_tensor->ne);
                 ggml_set_name(out_tensor, base_tensor->name);
-                trans.push_back({
-                    base_tensor,
-                    out_tensor,
-                    false,
-                });
+                trans.push_back({base_tensor, out_tensor, false});
                 gguf_add_tensor(ctx_out, out_tensor);
             } else {
-                throw std::runtime_error("tensor " + it.first + " missing either lora_a or lora_b");
+                throw std::runtime_error("tensor " + it.first + " missing lora_a or lora_b");
             }
         }
 
-        // placeholder for the meta data
         {
             size_t meta_size = gguf_get_meta_size(ctx_out);
             zeros(fout, meta_size);
         }
 
-        // process base model tensors
         size_t n_merged = 0;
         for (auto & it : trans) {
             if (!it.is_copy) {
@@ -259,23 +331,22 @@ struct lora_merge_ctx {
             }
         }
 
-        // write output metadata
         {
             std::vector<uint8_t> data(gguf_get_meta_size(ctx_out));
             gguf_get_meta_data(ctx_out, data.data());
             fout.seekp(0);
-            fout.write((const char *)data.data(), data.size());
+            fout.write((const char *) data.data(), data.size());
         }
 
-        printf("%s : merged %zu tensors with lora adapters\n", __func__, n_merged);
-        printf("%s : wrote %zu tensors to output file\n", __func__, trans.size());
+        printf("%s : merged %zu tensors with lora adapters (output type: %s)\n",
+               __func__, n_merged, ggml_type_name(out_type));
     }
 
     void copy_tensor(struct ggml_tensor * base) {
         printf("%s :  %s [%s]\n", __func__, base->name, ggml_ne_string(base).c_str());
         size_t len = ggml_nbytes(base);
         base_model.read_tensor_data(base->name, read_buf);
-        fout.write((char* )read_buf.data(), len);
+        fout.write((char *) read_buf.data(), len);
         zeros(fout, GGML_PAD(len, GGUF_DEFAULT_ALIGNMENT) - len);
     }
 
@@ -286,45 +357,35 @@ struct lora_merge_ctx {
 
         printf("%s : %s [%s]\n", __func__, base->name, ggml_ne_string(base).c_str());
 
-        // context for input tensor
         std::vector<struct ggml_tensor *> inp_a(adapters.size());
         std::vector<struct ggml_tensor *> inp_b(adapters.size());
         struct ggml_init_params params {
-            /*.mem_size   =*/ ggml_tensor_overhead()*(2+adapters.size()*2),
+            /*.mem_size   =*/ ggml_tensor_overhead() * (2 + adapters.size() * 2),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
         struct ggml_context * ctx = ggml_init(params);
 
-        // alloc tensors
         struct ggml_tensor * inp_base = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, base->ne);
         for (size_t i = 0; i < adapters.size(); ++i) {
             auto t_a = adapters[i]->get_tensor(name_lora_a);
             auto t_b = adapters[i]->get_tensor(name_lora_b);
-            // TODO: add support for quantized lora
-            if (ggml_is_quantized(t_a->type) || ggml_is_quantized(t_b->type)) {
-                throw std::runtime_error("quantized LoRA adapters is not supported, please retry with f16 or f32");
-            }
             inp_a[i] = ggml_dup_tensor(ctx, t_a);
             inp_b[i] = ggml_dup_tensor(ctx, t_b);
         }
         ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-        // load base tensor to backend buffer
         base_model.read_tensor_data(name_base, read_buf);
         if (base->type != GGML_TYPE_F32) {
-            // optionally dequantize it
-            printf("%s :   + dequantize base tensor from %s to F32\n", __func__, ggml_type_name(base->type));
             auto nels = ggml_nelements(inp_base);
-            const auto * qtype = ggml_get_type_traits(base->type);
+            const auto * base_traits = ggml_get_type_traits(base->type);
             std::vector<uint8_t> dequant_buf(nels * sizeof(float));
-            qtype->to_float(read_buf.data(), (float *)dequant_buf.data(), nels);
+            base_traits->to_float(read_buf.data(), (float *) dequant_buf.data(), nels);
             ggml_backend_tensor_set(inp_base, dequant_buf.data(), 0, dequant_buf.size());
         } else {
             ggml_backend_tensor_set(inp_base, read_buf.data(), 0, ggml_nbytes(inp_base));
         }
 
-        // load lora tensors to backend buffer
         for (size_t i = 0; i < adapters.size(); ++i) {
             adapters[i]->read_tensor_data(name_lora_a, read_buf);
             ggml_backend_tensor_set(inp_a[i], read_buf.data(), 0, ggml_nbytes(inp_a[i]));
@@ -332,10 +393,9 @@ struct lora_merge_ctx {
             ggml_backend_tensor_set(inp_b[i], read_buf.data(), 0, ggml_nbytes(inp_b[i]));
         }
 
-        // build graph
         struct ggml_cgraph * gf;
         {
-            static size_t buf_size = ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
+            static size_t buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
             static std::vector<uint8_t> buf(buf_size);
             struct ggml_init_params params0 = {
                 /*.mem_size   =*/ buf_size,
@@ -344,12 +404,16 @@ struct lora_merge_ctx {
             };
             struct ggml_context * ctx0 = ggml_init(params0);
             gf = ggml_new_graph(ctx0);
+
+            // The accumulation always happens in F32; ggml has no
+            // "quantized destination" op, so the graph itself only ever
+            // produces F32 or plain-float output. Quantized output types
+            // are handled after the graph is computed, see below.
             struct ggml_tensor * cur = inp_base;
             for (size_t i = 0; i < adapters.size(); ++i) {
                 struct ggml_tensor * delta;
                 bool is_tok_embd = string_starts_with(name_base, "token_embd");
                 if (is_tok_embd) {
-                    printf("%s :     detected token embeddings tensor\n", __func__);
                     delta = ggml_mul_mat(ctx0,
                         ggml_cast(ctx0, inp_b[i], GGML_TYPE_F32),
                         ggml_cast(ctx0, inp_a[i], GGML_TYPE_F32));
@@ -358,38 +422,66 @@ struct lora_merge_ctx {
                         ggml_cont(ctx0, ggml_transpose(ctx0, ggml_cast(ctx0, inp_a[i], GGML_TYPE_F32))),
                         ggml_cast(ctx0, inp_b[i], GGML_TYPE_F32));
                 }
-                // scale
                 const float alpha = adapters[i]->alpha;
                 const float rank  = (float) inp_b[i]->ne[0];
                 const float scale = alpha ? adapters[i]->scale * alpha / rank : adapters[i]->scale;
                 delta = ggml_scale(ctx0, delta, scale);
                 cur = ggml_add(ctx0, delta, cur);
-                printf("%s :   + merging from adapter[%zu] type=%s\n", __func__, i, ggml_type_name(inp_a[i]->type));
-                printf("%s :     input_scale=%f calculated_scale=%f rank=%d\n", __func__, adapters[i]->scale, scale, (int) inp_b[i]->ne[0]);
             }
-            cur = ggml_cast(ctx0, cur, out->type);
-            printf("%s :   + output type is %s\n", __func__, ggml_type_name(out->type));
+
+            // Only cast in-graph for plain float destination types.
+            // Quantized destinations are produced explicitly afterwards.
+            if (!ggml_is_quantized(out->type)) {
+                cur = ggml_cast(ctx0, cur, out->type);
+            }
+
             ggml_build_forward_expand(gf, cur);
             ggml_free(ctx0);
         }
 
-        // compute
         {
             ggml_gallocr_alloc_graph(allocr, gf);
             ggml_backend_cpu_set_n_threads(backend, n_threads);
             ggml_backend_graph_compute(backend, gf);
         }
 
-        // write data to output file
         {
             auto * result = ggml_graph_node(gf, -1);
-            size_t len = ggml_nbytes(result);
-            if (read_buf.size() < len) {
-                read_buf.resize(len);
+            size_t nels = ggml_nelements(result);
+
+            if (ggml_is_quantized(out->type)) {
+                printf("%s :   + quantizing result on-the-fly to %s\n", __func__, ggml_type_name(out->type));
+
+                // 1. pull the F32 result off the backend
+                std::vector<float> f32_buf(nels);
+                ggml_backend_tensor_get(result, f32_buf.data(), 0, nels * sizeof(float));
+
+                // 2. quantize row-by-row using the *output* tensor's shape,
+                //    not just the raw element count. ggml_quantize_chunk
+                //    quantizes block-aligned rows, so it needs to know how
+                //    many elements make up one row (out->ne[0]) and how
+                //    many such rows there are.
+                const int64_t n_per_row = out->ne[0];
+                const int64_t nrows     = nels / n_per_row;
+                GGML_ASSERT(nrows * n_per_row == (int64_t) nels);
+
+                size_t out_len = ggml_row_size(out->type, n_per_row) * nrows;
+                std::vector<uint8_t> q_buf(out_len);
+
+                ggml_quantize_chunk(out->type, f32_buf.data(), q_buf.data(), 0, nrows, n_per_row, nullptr);
+
+                // 3. write the quantized bytes to disk
+                fout.write((char *) q_buf.data(), out_len);
+                zeros(fout, GGML_PAD(out_len, GGUF_DEFAULT_ALIGNMENT) - out_len);
+            } else {
+                size_t len = ggml_nbytes(result);
+                if (read_buf.size() < len) {
+                    read_buf.resize(len);
+                }
+                ggml_backend_tensor_get(result, read_buf.data(), 0, len);
+                fout.write((char *) read_buf.data(), len);
+                zeros(fout, GGML_PAD(len, GGUF_DEFAULT_ALIGNMENT) - len);
             }
-            ggml_backend_tensor_get(result, read_buf.data(), 0, len);
-            fout.write((char* )read_buf.data(), len);
-            zeros(fout, GGML_PAD(len, GGUF_DEFAULT_ALIGNMENT) - len);
         }
 
         ggml_free(ctx);
@@ -406,34 +498,79 @@ struct lora_merge_ctx {
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n  %s -m base-model.gguf --lora lora-file.gguf -o merged-model-f16.gguf\n", argv[0]);
-    printf("\nNOTE: output model is F16\n");
+    printf("\n  %s -m base-model.gguf --lora lora-file.gguf -o merged-model.gguf --type q4_0\n", argv[0]);
+    printf("\n--type accepts any ggml tensor type that can be produced from F32, e.g.:\n  ");
+    auto names = list_supported_type_names();
+    for (size_t i = 0; i < names.size(); ++i) {
+        printf("%s%s", names[i].c_str(), (i + 1 < names.size()) ? ", " : "\n");
+    }
     printf("\n");
+}
+
+// Pulls "--type <value>" out of argv (if present) and returns argv/argc
+// with it stripped, so downstream common_params_parse() doesn't choke on
+// an option it doesn't know about. Returns the requested type via out_type.
+static std::vector<std::string> extract_type_arg(int argc, char ** argv, ggml_type & out_type) {
+    std::vector<std::string> filtered;
+    filtered.reserve(argc);
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
+            std::string type_str = argv[i + 1];
+            if (!ggml_type_from_name(type_str, out_type)) {
+                throw std::runtime_error("unknown --type '" + type_str + "', see --help for the supported list");
+            }
+            if (!is_valid_output_type(out_type)) {
+                throw std::runtime_error("--type '" + type_str + "' cannot be produced from F32 data "
+                                          "(no from_float converter), see --help for the supported list");
+            }
+            i++; // skip the value too
+            continue;
+        }
+        filtered.push_back(argv[i]);
+    }
+    return filtered;
 }
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
+    params.out_file = "ggml-lora-merged.gguf";
+    ggml_type target_out_type = GGML_TYPE_F16; // default kept for backward compatibility
 
-    params.out_file = "ggml-lora-merged-f16.gguf";
+    std::vector<std::string> filtered_args;
+    try {
+        filtered_args = extract_type_arg(argc, argv, target_out_type);
+    } catch (const std::exception & err) {
+        fprintf(stderr, "%s\n", err.what());
+        print_usage(argc, argv);
+        return 1;
+    }
+
+    std::vector<char *> filtered_argv;
+    filtered_argv.reserve(filtered_args.size());
+    for (auto & s : filtered_args) {
+        filtered_argv.push_back(s.data());
+    }
+    int filtered_argc = (int) filtered_argv.size();
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_EXPORT_LORA, print_usage)) {
+    if (!common_params_parse(filtered_argc, filtered_argv.data(), params, LLAMA_EXAMPLE_EXPORT_LORA, print_usage)) {
         return 1;
     }
 
     g_verbose = (params.verbosity > 1);
     try {
-        lora_merge_ctx ctx(params.model.path, params.lora_adapters, params.out_file, params.cpuparams.n_threads);
+        lora_merge_ctx ctx(params.model.path, params.lora_adapters, params.out_file, target_out_type, params.cpuparams.n_threads);
         ctx.run_merge();
     } catch (const std::exception & err) {
         fprintf(stderr, "%s\n", err.what());
         exit(EXIT_FAILURE);
     }
 
-    printf("done, output file is %s\n", params.out_file.c_str());
+    printf("done, output file is %s (type: %s)\n", params.out_file.c_str(), ggml_type_name(target_out_type));
 
     return 0;
 }
