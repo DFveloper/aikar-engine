@@ -2784,7 +2784,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<|calls|>"  // solar-open
                     || t.first == "<end_of_turn>"
                     || t.first == "<|endoftext|>"
-                    || t.first == "</s>"      // paddleocr
+                    || (t.first == "</s>" && tokenizer_model != "gemma4") // paddleocr
                     || t.first == "<|eom_id|>"
                     || t.first == "<EOT>"
                     || t.first == "_<EOT>"
@@ -2798,7 +2798,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
                ) {
                 special_eog_ids.insert(t.second);
-                if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                const bool is_gemma4_tool_response = tokenizer_model == "gemma4"
+                    && t.first == "<|tool_response>"
+                    && (attr & LLAMA_TOKEN_ATTR_USER_DEFINED);
+
+                if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0 && !is_gemma4_tool_response) {
                     LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                             __func__, t.second, t.first.c_str());
                     attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
