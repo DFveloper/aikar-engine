@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -142,7 +143,7 @@ static uint32_t ggml_type_to_llama_ftype(ggml_type type) {
     return LLAMA_FTYPE_MOSTLY_F16;
 }
 
-static struct gguf_context * load_gguf(std::string & fname, struct ggml_context ** ctx_ggml) {
+static struct gguf_context * load_gguf(const std::string & fname, struct ggml_context ** ctx_ggml) {
     struct gguf_init_params params = {
         /*.no_alloc = */ true,
         /*.ctx      = */ ctx_ggml,
@@ -154,26 +155,106 @@ static struct gguf_context * load_gguf(std::string & fname, struct ggml_context 
     return ctx_gguf;
 }
 
+static std::vector<std::string> list_split_paths(const std::string & fname, int split_no, int split_count) {
+    std::vector<std::string> paths;
+    std::vector<char> buf(4096, 0);
+    const int ret = llama_split_prefix(buf.data(), buf.size(), fname.c_str(), split_no, split_count);
+    if (!ret) {
+        throw std::runtime_error("invalid split file name: " + fname);
+    }
+
+    const std::string prefix(buf.data(), ret);
+    for (int idx = 0; idx < split_count; ++idx) {
+        const int written = llama_split_path(buf.data(), buf.size(), prefix.c_str(), idx, split_count);
+        if (!written) {
+            throw std::runtime_error("failed to build split file name for " + prefix);
+        }
+        paths.emplace_back(buf.data(), written);
+    }
+    return paths;
+}
+
 struct file_input {
+    struct tensor_ref {
+        struct ggml_tensor * tensor;
+        size_t file_idx;
+    };
+
     struct ggml_context * ctx_meta = nullptr;
     struct gguf_context * ctx_gguf = nullptr;
-    std::ifstream f_in;
-    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::unique_ptr<std::ifstream>> f_ins;
+    std::vector<struct ggml_context *> ctx_metas;
+    std::vector<struct gguf_context *> ctx_ggufs;
+    std::map<std::string, tensor_ref> tensors;
     float alpha;
     float scale;
 
-    file_input(std::string & fname, float scale) : f_in(fname, std::ios::binary), scale(scale) {
-        if (!f_in.is_open()) {
-            throw std::runtime_error("failed to open input gguf from " + fname);
-        }
+    file_input(std::string & fname, float scale) : scale(scale) {
+        load_file(fname, -1);
+        ctx_meta = ctx_metas.front();
+        ctx_gguf = ctx_ggufs.front();
 
-        ctx_gguf = load_gguf(fname, &ctx_meta);
         alpha = get_kv_f32(ctx_gguf, "adapter.lora.alpha");
         printf("%s: loaded gguf from %s\n", __func__, fname.c_str());
 
-        for (ggml_tensor * cur = ggml_get_first_tensor(ctx_meta); cur; cur = ggml_get_next_tensor(ctx_meta, cur)) {
+        const int split_count_key = gguf_find_key(ctx_gguf, LLM_KV_SPLIT_COUNT);
+        if (split_count_key >= 0) {
+            const int split_count = gguf_get_val_u16(ctx_gguf, split_count_key);
+            if (split_count > 1) {
+                const int split_no_key = gguf_find_key(ctx_gguf, LLM_KV_SPLIT_NO);
+                if (split_no_key < 0) {
+                    throw std::runtime_error("missing split.no in split model: " + fname);
+                }
+                const int split_no = gguf_get_val_u16(ctx_gguf, split_no_key);
+                if (split_no != 0) {
+                    throw std::runtime_error("split model must be loaded from the first split: " + fname);
+                }
+
+                const std::vector<std::string> split_paths = list_split_paths(fname, split_no, split_count);
+                for (int idx = 1; idx < split_count; ++idx) {
+                    load_file(split_paths[idx], idx);
+                }
+
+                const int split_tensors_key = gguf_find_key(ctx_gguf, LLM_KV_SPLIT_TENSORS_COUNT);
+                if (split_tensors_key >= 0) {
+                    const int expected_tensors = gguf_get_val_i32(ctx_gguf, split_tensors_key);
+                    if (expected_tensors != (int) tensors.size()) {
+                        throw std::runtime_error("corrupted split model: tensor count mismatch");
+                    }
+                }
+                printf("%s: loaded %d GGUF splits from %s\n", __func__, split_count, fname.c_str());
+            }
+        }
+    }
+
+    void load_file(const std::string & fname, int expected_split_no) {
+        std::unique_ptr<std::ifstream> f_in(new std::ifstream(fname, std::ios::binary));
+        if (!f_in->is_open()) {
+            throw std::runtime_error("failed to open input gguf from " + fname);
+        }
+
+        struct ggml_context * ctx = nullptr;
+        struct gguf_context * gguf = load_gguf(fname, &ctx);
+        if (expected_split_no >= 0) {
+            const int split_no_key = gguf_find_key(gguf, LLM_KV_SPLIT_NO);
+            if (split_no_key < 0 || gguf_get_val_u16(gguf, split_no_key) != expected_split_no) {
+                gguf_free(gguf);
+                ggml_free(ctx);
+                throw std::runtime_error("invalid split file index: " + fname);
+            }
+        }
+
+        const size_t file_idx = f_ins.size();
+        f_ins.push_back(std::move(f_in));
+        ctx_metas.push_back(ctx);
+        ctx_ggufs.push_back(gguf);
+
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string name(cur->name);
-            tensors[name] = cur;
+            if (tensors.find(name) != tensors.end()) {
+                throw std::runtime_error("duplicated tensor in input gguf: " + name);
+            }
+            tensors[name] = { cur, file_idx };
             if (g_verbose) {
                 printf("%s: %s\n", __func__, cur->name);
             }
@@ -184,26 +265,33 @@ struct file_input {
         if (tensors.find(name) == tensors.end()) {
             return nullptr;
         }
-        return tensors[name];
+        return tensors[name].tensor;
     }
 
     void read_tensor_data(std::string name, std::vector<uint8_t> & buf) {
-        if (tensors.find(name) == tensors.end()) {
+        auto it = tensors.find(name);
+        if (it == tensors.end()) {
             throw std::runtime_error("cannot find tensor with name: " + name);
         }
-        auto len = ggml_nbytes(tensors[name]);
+        auto * tensor = it->second.tensor;
+        const size_t file_idx = it->second.file_idx;
+        auto len = ggml_nbytes(tensor);
         if (buf.size() < len) {
             buf.resize(len);
         }
-        auto i_tensor_in = gguf_find_tensor(ctx_gguf, name.c_str());
-        auto offset = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, i_tensor_in);
-        f_in.seekg(offset);
-        f_in.read((char *) buf.data(), len);
+        auto i_tensor_in = gguf_find_tensor(ctx_ggufs[file_idx], name.c_str());
+        auto offset = gguf_get_data_offset(ctx_ggufs[file_idx]) + gguf_get_tensor_offset(ctx_ggufs[file_idx], i_tensor_in);
+        f_ins[file_idx]->seekg(offset);
+        f_ins[file_idx]->read((char *) buf.data(), len);
     }
 
     ~file_input() {
-        gguf_free(ctx_gguf);
-        ggml_free(ctx_meta);
+        for (auto * ctx : ctx_ggufs) {
+            gguf_free(ctx);
+        }
+        for (auto * ctx : ctx_metas) {
+            ggml_free(ctx);
+        }
     }
 };
 
@@ -231,10 +319,6 @@ struct lora_merge_ctx {
 
         fout.exceptions(std::ofstream::failbit);
 
-        if (gguf_find_key(base_model.ctx_gguf, LLM_KV_SPLIT_COUNT) >= 0) {
-            throw std::runtime_error("split model is not yet supported");
-        }
-
         for (auto & lora_inp : lora_files) {
             auto fname = lora_inp.path;
             auto scale = lora_inp.scale;
@@ -245,7 +329,7 @@ struct lora_merge_ctx {
 
         ctx_out = gguf_init_empty();
         struct ggml_init_params params = {
-            /*.mem_size   =*/ static_cast<size_t>(gguf_get_n_tensors(base_model.ctx_gguf) * ggml_tensor_overhead()),
+            /*.mem_size   =*/ base_model.tensors.size() * ggml_tensor_overhead(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -282,6 +366,9 @@ struct lora_merge_ctx {
     void run_merge() {
         gguf_set_kv(ctx_out, base_model.ctx_gguf);
         gguf_set_val_u32(ctx_out, "general.file_type", ggml_type_to_llama_ftype(out_type));
+        gguf_remove_key(ctx_out, LLM_KV_SPLIT_NO);
+        gguf_remove_key(ctx_out, LLM_KV_SPLIT_COUNT);
+        gguf_remove_key(ctx_out, LLM_KV_SPLIT_TENSORS_COUNT);
 
         if (adapters.size() > 1) {
             for (size_t i = 1; i < adapters.size(); ++i) {
@@ -299,7 +386,7 @@ struct lora_merge_ctx {
                 t_a &= nullptr != adapter->get_tensor(it.first + ".lora_a");
                 t_b &= nullptr != adapter->get_tensor(it.first + ".lora_b");
             }
-            auto base_tensor = it.second;
+            auto base_tensor = it.second.tensor;
             if (!t_a && !t_b) {
                 struct ggml_tensor * cpy_tensor = ggml_dup_tensor(ctx_out_ggml, base_tensor);
                 ggml_set_name(cpy_tensor, base_tensor->name);
