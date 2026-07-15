@@ -1404,6 +1404,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 case LLAMA_LORA_QAT_TYPE_Q3_K: type = GGML_TYPE_Q3_K; break;
                 case LLAMA_LORA_QAT_TYPE_Q4_K: type = GGML_TYPE_Q4_K; break;
                 case LLAMA_LORA_QAT_TYPE_Q4_0: type = GGML_TYPE_Q4_0; break;
+                case LLAMA_LORA_QAT_TYPE_MXFP4: type = GGML_TYPE_MXFP4; break;
                 default: return tensor;
             }
 

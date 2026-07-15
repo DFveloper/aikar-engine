@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 
 
 @ModelBase.register("GemmaForCausalLM")
@@ -618,6 +618,16 @@ class Gemma3NModel(Gemma3Model):
 class Gemma4Model(Gemma3Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4
 
+    def dequant_model(self):
+        if self._is_mxfp4:
+            return
+        return super().dequant_model()
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4_MOE:
+            return gguf.GGMLQuantizationType.BF16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
     def norm_shift(self, name: str) -> float:
         del name # unused
         return 0.0
@@ -700,6 +710,43 @@ class Gemma4Model(Gemma3Model):
         self.gguf_writer.add_rope_dimension_count_swa(n_rot_swa)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        if self._is_mxfp4:
+            n_experts = self.hparams["num_experts"]
+            n_ff = self.hparams["moe_intermediate_size"]
+            consumed: list[str] = []
+
+            for bid in range(self.block_count):
+                prefix = f"model.layers.{bid}.moe.experts"
+                w13_name = f"{prefix}.w13_weight"
+                w13_scale_name = f"{prefix}.w13_weight_scale"
+                w2_name = f"{prefix}.w2_weight"
+                w2_scale_name = f"{prefix}.w2_weight_scale"
+
+                for name in (w13_name, w13_scale_name, w2_name, w2_scale_name):
+                    if name not in self.model_tensors:
+                        raise KeyError(f"Missing MXFP4 expert tensor {name}")
+
+                w13 = LazyTorchTensor.to_eager(self.model_tensors[w13_name]())
+                w13_scale = LazyTorchTensor.to_eager(self.model_tensors[w13_scale_name]())
+                w2 = LazyTorchTensor.to_eager(self.model_tensors[w2_name]())
+                w2_scale = LazyTorchTensor.to_eager(self.model_tensors[w2_scale_name]())
+
+                padded_ffn = w13.shape[1] // 2
+                if w13.shape != (n_experts, padded_ffn * 2, self.hparams["hidden_size"] // 2):
+                    raise ValueError(f"Unexpected MXFP4 w13 shape {tuple(w13.shape)}")
+                if w2.shape != (n_experts, self.hparams["hidden_size"], padded_ffn // 2):
+                    raise ValueError(f"Unexpected MXFP4 w2 shape {tuple(w2.shape)}")
+                if n_ff > padded_ffn or n_ff % 32 != 0:
+                    raise ValueError(f"Invalid MXFP4 expert feed-forward length {n_ff}")
+
+                self._write_mxfp4_experts(gguf.MODEL_TENSOR.FFN_GATE_EXP, bid, w13[:, :n_ff], w13_scale[:, :n_ff])
+                self._write_mxfp4_experts(gguf.MODEL_TENSOR.FFN_UP_EXP, bid, w13[:, padded_ffn:padded_ffn + n_ff], w13_scale[:, padded_ffn:padded_ffn + n_ff])
+                self._write_mxfp4_experts(gguf.MODEL_TENSOR.FFN_DOWN_EXP, bid, w2[:, :, :n_ff // 2], w2_scale[:, :, :n_ff // 32])
+                consumed.extend((w13_name, w13_scale_name, w2_name, w2_scale_name))
+
+            for name in consumed:
+                del self.model_tensors[name]
+
         # full layer uses "proportional" rope with partial_rotary_factor=0.25
         # the expected ordering is cc000000ss000000 (c = cos, s = sin, 0 = unrotated),
         # but ggml neox only supports ccss000000000000, and we cannot rearrange the head because that will break use_alternative_attention
@@ -715,6 +762,24 @@ class Gemma4Model(Gemma3Model):
         values = [1.0] * n_rot_full + [1e30] * n_unrot_full
         rope_freqs_full = torch.tensor(values, dtype=torch.float32)
         yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), rope_freqs_full)
+
+    def _write_mxfp4_experts(self, tensor_key: gguf.MODEL_TENSOR, bid: int, weight: Tensor, scale: Tensor):
+        if weight.dtype != torch.uint8 or scale.dtype != torch.uint8:
+            raise ValueError("MXFP4 expert weights and scales must be stored as U8")
+        if weight.shape[-1] * 2 // 32 != scale.shape[-1]:
+            raise ValueError("MXFP4 expert weight and scale shapes do not match")
+
+        n_blocks = scale.shape[-1]
+        source = weight.reshape(*weight.shape[:-1], n_blocks, 16)
+        low = source & 0x0F
+        high = source >> 4
+        values = torch.stack((low, high), dim=-1).reshape(*weight.shape[:-1], n_blocks, 32)
+        blocks = values[..., :16] | (values[..., 16:] << 4)
+        data = torch.cat((scale.unsqueeze(-1), blocks), dim=-1).reshape(*weight.shape[:-1], n_blocks * 17).numpy()
+        name = self.format_tensor_name(tensor_key, bid)
+        shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
+        logger.info(f"{name}: repacked MXFP4 experts, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
+        self.gguf_writer.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
     def _generate_nvfp4_tensors(self):
         # Gemma-4 stores a per-layer router.per_expert_scale ([n_expert]) that scales
@@ -746,7 +811,10 @@ class Gemma4Model(Gemma3Model):
 
         if name.endswith("per_dim_scale") or name.endswith("layer_scalar"):
             name = name + ".weight"
-        if ".experts." in name and not name.endswith((".weight", ".weight_scale", ".weight_scale_2", ".input_scale")):
+        if ".experts." in name and not name.endswith((
+            ".weight", ".weight_scale", ".weight_scale_2", ".input_scale",
+            "w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale",
+        )):
             name += ".weight"
 
         return super().filter_tensors((name, gen))
