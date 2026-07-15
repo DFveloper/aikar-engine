@@ -882,6 +882,8 @@ class Gemma4VisionAudioModel(MmprojModel):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
         self.hparams_vision["image_size"] = 224 # unused, but set to avoid error
+        self.preprocessor_config.setdefault("image_mean", [0.0, 0.0, 0.0])
+        self.preprocessor_config.setdefault("image_std", [1.0, 1.0, 1.0])
 
         # remap audio hparams
         if self.hparams_audio:
