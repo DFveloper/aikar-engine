@@ -360,6 +360,9 @@ struct lora_merge_ctx {
         if (t->type == GGML_TYPE_F32) {
             return GGML_TYPE_F32;
         }
+        if (t->ne[0] % ggml_blck_size(out_type) != 0) {
+            return t->type;
+        }
         return out_type;
     }
 
