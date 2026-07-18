@@ -712,6 +712,8 @@ static enum llama_lora_qat_type lora_qat_type_from_string(const std::string & ty
     if (type == "q4_k") return LLAMA_LORA_QAT_TYPE_Q4_K;
     if (type == "q4_0") return LLAMA_LORA_QAT_TYPE_Q4_0;
     if (type == "mxfp4") return LLAMA_LORA_QAT_TYPE_MXFP4;
+    if (type == "q6_k") return LLAMA_LORA_QAT_TYPE_Q6_K;
+    if (type == "q8_0") return LLAMA_LORA_QAT_TYPE_Q8_0;
     return LLAMA_LORA_QAT_TYPE_NONE;
 }
 
