@@ -725,10 +725,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    bool managed = false;
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool managed = false) :
+        device(device), dev_ptr(dev_ptr), managed(managed),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
@@ -844,6 +845,10 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
+    if (ctx->managed) {
+        return;
+    }
+
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -955,6 +960,86 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_managed_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(buft);
+    GGML_UNUSED(size);
+    return nullptr;
+#else
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    ggml_cuda_set_device(buft_ctx->device);
+
+    void * dev_ptr;
+    const size_t alloc_size = std::max<size_t>(size, 1);
+    cudaError_t err = cudaMallocManaged(&dev_ptr, alloc_size, cudaMemAttachGlobal);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMallocManaged failed: %s\n",
+                __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    const int physical_device = ggml_cuda_get_physical_device(buft_ctx->device);
+    CUDA_CHECK(cudaMemAdvise(dev_ptr, alloc_size, cudaMemAdviseSetAccessedBy, physical_device));
+
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, true);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+#endif
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_managed_buffer_type(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return nullptr;
+#else
+    int device = -1;
+    for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+        if (ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i) == dev) {
+            device = i;
+            break;
+        }
+    }
+    if (device < 0) {
+        return nullptr;
+    }
+
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(device)));
+    if (ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_VOLTA ||
+        strstr(prop.name, "V100") == nullptr || !prop.concurrentManagedAccess) {
+        return nullptr;
+    }
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static ggml_backend_buffer_type managed_buffer_types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+            managed_buffer_types[i] = {
+                /* .iface    = */ {
+                    /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
+                    /* .alloc_buffer     = */ ggml_backend_cuda_managed_buffer_type_alloc_buffer,
+                    /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
+                    /* .get_max_size     = */ nullptr,
+                    /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+                    /* .is_host          = */ nullptr,
+                },
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_Managed"},
+            };
+        }
+        initialized = true;
+    }
+
+    return &managed_buffer_types[device];
+#endif
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -3151,6 +3236,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (disable_fusion) {
         return 0;
     }
+    static bool disable_volta_fusion = getenv("GGML_CUDA_DISABLE_VOLTA_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_VOLTA_FUSION"));
 
     ggml_tensor * node = cgraph->nodes[i];
 
@@ -3390,6 +3476,148 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         GGML_ASSERT(bias_node->src[0] == mul_node);
         return bias_node->src[1];
     };
+
+    // Fuse the packed Gemma 4 expert gate/up MMVQ with GEGLU on Volta.
+    {
+        constexpr int n_ops = 4;
+        const ggml_op ops[n_ops] = {
+            GGML_OP_MUL_MAT_ID,
+            GGML_OP_VIEW,
+            GGML_OP_VIEW,
+            GGML_OP_GLU,
+        };
+        const int out_nodes[] = { i + n_ops - 1 };
+
+        if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+            ggml_tensor * mm        = cgraph->nodes[i];
+            ggml_tensor * gate_view = cgraph->nodes[i + 1];
+            ggml_tensor * up_view   = cgraph->nodes[i + 2];
+            ggml_tensor * glu       = cgraph->nodes[i + 3];
+
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const bool sources_ok =
+                (gate_view->view_src == mm || gate_view->src[0] == mm) &&
+                (up_view->view_src   == mm || up_view->src[0]   == mm) &&
+                glu->src[0] == gate_view && glu->src[1] == up_view;
+            const bool layout_ok =
+                mm->src[0]->ne[1] == 2*glu->ne[0] &&
+                mm->ne[0] == 2*glu->ne[0] &&
+                gate_view->view_offs == 0 &&
+                up_view->view_offs == (size_t) glu->ne[0]*ggml_type_size(mm->type);
+            const bool op_ok =
+                ggml_get_glu_op(glu) == GGML_GLU_OP_GEGLU &&
+                !ggml_get_op_params_i32(glu, 1);
+
+            if (!disable_volta_fusion && cc == GGML_CUDA_CC_VOLTA && mm->src[0]->type == GGML_TYPE_Q4_0 &&
+                    sources_ok && layout_ok && op_ok && ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+                const ggml_tensor * packed = mm->src[0];
+                const int64_t n_ff = packed->ne[1] / 2;
+
+                ggml_tensor gate;
+                ggml_tensor up;
+                memcpy(&gate, packed, sizeof(ggml_tensor));
+                memcpy(&up,   packed, sizeof(ggml_tensor));
+
+                gate.ne[1] = n_ff;
+                up.ne[1]   = n_ff;
+                gate.view_src = const_cast<ggml_tensor *>(packed);
+                up.view_src   = const_cast<ggml_tensor *>(packed);
+                up.view_offs  = n_ff*packed->nb[1];
+                up.data       = (char *) packed->data + up.view_offs;
+
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate   = &gate;
+                fusion_data.glu_op = GGML_GLU_OP_GEGLU;
+
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, &up, mm->src[1], mm->src[2], glu, &fusion_data);
+                return n_ops - 1;
+            }
+        }
+    }
+
+    // Fuse the Gemma 4 down MMVQ, QAT scale, router weight, and expert reduction on Volta.
+    {
+        constexpr int n_expert_used = 8;
+        constexpr int n_ops = 21;
+        std::array<ggml_op, n_ops> ops = {
+            GGML_OP_MUL_MAT_ID,
+            GGML_OP_RESHAPE,
+            GGML_OP_REPEAT,
+            GGML_OP_GET_ROWS,
+            GGML_OP_MUL,
+            GGML_OP_MUL,
+        };
+        std::fill(ops.begin() + 6, ops.begin() + 14, GGML_OP_VIEW);
+        std::fill(ops.begin() + 14, ops.end(), GGML_OP_ADD);
+        const int out_nodes[] = { i + n_ops - 1 };
+
+        const bool subgraph_ok = ggml_can_fuse_subgraph(cgraph, i, n_ops, ops.data(), out_nodes, 1);
+        const bool memory_ok = subgraph_ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1);
+
+        if (subgraph_ok) {
+            ggml_tensor * mm                  = cgraph->nodes[i];
+            ggml_tensor * scale_reshape       = cgraph->nodes[i + 1];
+            ggml_tensor * scale_repeat        = cgraph->nodes[i + 2];
+            ggml_tensor * scale_get_rows      = cgraph->nodes[i + 3];
+            ggml_tensor * expert_scale_mul    = cgraph->nodes[i + 4];
+            ggml_tensor * expert_weight_mul   = cgraph->nodes[i + 5];
+            ggml_tensor * dst                 = cgraph->nodes[i + n_ops - 1];
+
+            const bool scale_mul_ok =
+                (expert_scale_mul->src[0] == mm && expert_scale_mul->src[1] == scale_get_rows) ||
+                (expert_scale_mul->src[1] == mm && expert_scale_mul->src[0] == scale_get_rows);
+            const bool weight_mul_ok =
+                expert_weight_mul->src[0] == expert_scale_mul || expert_weight_mul->src[1] == expert_scale_mul;
+            const ggml_tensor * expert_weights =
+                expert_weight_mul->src[0] == expert_scale_mul ? expert_weight_mul->src[1] : expert_weight_mul->src[0];
+            const ggml_tensor * expert_scale = scale_reshape->src[0];
+
+            bool views_ok = true;
+            for (int expert = 0; expert < n_expert_used; ++expert) {
+                const ggml_tensor * view = cgraph->nodes[i + 6 + expert];
+                views_ok = views_ok &&
+                    (view->view_src == expert_weight_mul || view->src[0] == expert_weight_mul) &&
+                    view->view_offs == (size_t) expert*mm->ne[0]*ggml_type_size(mm->type);
+            }
+
+            bool adds_ok =
+                cgraph->nodes[i + 14]->src[0] == cgraph->nodes[i + 6] &&
+                cgraph->nodes[i + 14]->src[1] == cgraph->nodes[i + 7];
+            for (int expert = 2; expert < n_expert_used; ++expert) {
+                adds_ok = adds_ok &&
+                    cgraph->nodes[i + 13 + expert]->src[0] == cgraph->nodes[i + 12 + expert] &&
+                    cgraph->nodes[i + 13 + expert]->src[1] == cgraph->nodes[i + 6 + expert];
+            }
+
+            const bool scale_graph_ok =
+                scale_repeat->src[0] == scale_reshape &&
+                scale_get_rows->src[0] == scale_repeat &&
+                scale_get_rows->src[1] == mm->src[2];
+            const bool shape_ok =
+                mm->ne[1] == n_expert_used && mm->ne[2] == 1 &&
+                mm->src[1]->ne[1] == n_expert_used &&
+                ggml_nelements(expert_scale) == mm->src[0]->ne[2] &&
+                ggml_nelements(expert_weights) == n_expert_used &&
+                dst->ne[0] == mm->ne[0] && dst->ne[1] == 1;
+            const bool type_ok =
+                mm->src[0]->type == GGML_TYPE_Q4_0 &&
+                expert_scale->type == GGML_TYPE_F32 &&
+                expert_weights->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(expert_scale) &&
+                ggml_is_contiguous(expert_weights) &&
+                ggml_is_contiguous(dst);
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+            if (!disable_volta_fusion && cc == GGML_CUDA_CC_VOLTA && scale_mul_ok && weight_mul_ok &&
+                    scale_graph_ok && views_ok && adds_ok && shape_ok && type_ok &&
+                    ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+                ggml_cuda_mul_mat_vec_q4_0_moe_reduce(
+                    *cuda_ctx, mm->src[0], mm->src[1], mm->src[2], expert_scale, expert_weights, dst, !memory_ok);
+                return n_ops - 1;
+            }
+        }
+    }
 
     // gate + glu + up, with optional scale/bias on both lanes.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
@@ -5342,6 +5570,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_managed_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_managed_buffer_type;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

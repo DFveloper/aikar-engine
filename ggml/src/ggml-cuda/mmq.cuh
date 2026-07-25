@@ -214,6 +214,7 @@ struct ggml_cuda_mmq_config {
 
 #include "mmq-config-pascal.cuh"
 #include "mmq-config-ampere.cuh"
+#include "mmq-config-volta.cuh"
 #include "mmq-config-blackwell.cuh"
 
 #include "mmq-config-cdna.cuh"
@@ -235,6 +236,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     if (blackwell_mma_available(cc)) {
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
+    if (cc == GGML_CUDA_CC_VOLTA) {
+        return ggml_cuda_mmq_get_config_volta(type, J, fallback);
+    }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
@@ -253,6 +257,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+#elif __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return ggml_cuda_mmq_get_config_volta(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #else

@@ -6,9 +6,10 @@
 
 #include <array>
 #include <cassert>
-#include <stdexcept>
 #include <cinttypes>
+#include <cstdlib>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,20 @@ enum common_layer_fraction_t {
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+bool common_use_v100_lazy_kv(const llama_context_params * cparams, ggml_backend_dev_t dev) {
+    if (getenv("GGML_CUDA_DISABLE_VOLTA_LAZY_KV") != nullptr ||
+        !cparams->offload_kqv || !cparams->kv_unified || cparams->n_ctx < 65536 ||
+        cparams->type_k != cparams->type_v ||
+        (cparams->type_k != GGML_TYPE_Q8_0 && cparams->type_k != GGML_TYPE_F16)) {
+        return false;
+    }
+
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    using managed_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+    auto * get_managed_buft = (managed_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_managed_buffer_type");
+    return get_managed_buft && get_managed_buft(dev);
+}
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
@@ -129,6 +144,16 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
         ret[i].free  = free;
         ret[i].total = total;
+
+        if (common_use_v100_lazy_kv(cparams, dev)) {
+            constexpr size_t MiB = 1024*1024;
+            const size_t resident_budget = 256*MiB;
+            if (ret[i].mb.context > resident_budget) {
+                LOG_TRC("%s: capping V100 lazy KV fit estimate from %zu to %zu MiB\n",
+                        __func__, ret[i].mb.context/MiB, resident_budget/MiB);
+                ret[i].mb.context = resident_budget;
+            }
+        }
     }
 
     devs.clear();
@@ -200,7 +225,11 @@ static void common_params_fit_impl(
         margins.push_back(margins_s[0]);
     } else {
         for (size_t id = 0; id < nd; id++) {
-            margins.push_back(margins_s[id]);
+            int64_t margin = margins_s[id];
+            if (common_use_v100_lazy_kv(cparams, devs[id]) && margin > 512*MiB) {
+                margin -= 512*MiB;
+            }
+            margins.push_back(margin);
         }
     }
 

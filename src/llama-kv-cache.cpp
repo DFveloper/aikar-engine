@@ -77,7 +77,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                     bool   lazy) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -214,6 +215,17 @@ llama_kv_cache::llama_kv_cache(
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
+
+            if (lazy && getenv("GGML_CUDA_DISABLE_VOLTA_LAZY_KV") == nullptr) {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                using managed_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+                auto * get_managed_buft = (managed_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_managed_buffer_type");
+                if (get_managed_buft) {
+                    if (auto * managed_buft = get_managed_buft(dev)) {
+                        buft = managed_buft;
+                    }
+                }
+            }
 
             dev_name = ggml_backend_dev_name(dev);
         }

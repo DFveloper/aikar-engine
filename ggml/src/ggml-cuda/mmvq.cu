@@ -63,6 +63,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
+    MMVQ_PARAMETERS_VOLTA,
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
@@ -79,6 +80,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return MMVQ_PARAMETERS_VOLTA;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
 #else
@@ -98,6 +101,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
+    }
+    if (cc == GGML_CUDA_CC_VOLTA) {
+        return MMVQ_PARAMETERS_VOLTA;
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
@@ -350,7 +356,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+    if (table_id == MMVQ_PARAMETERS_VOLTA && type == GGML_TYPE_Q4_0 && ncols_dst == 1) {
+        return 2;
+    }
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_VOLTA) {
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -456,7 +465,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_VOLTA ||
+            table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -765,6 +775,66 @@ static __global__ void mul_mat_vec_q_moe(
     // Write results
     if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
         dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = tmp[threadIdx.x];
+    }
+}
+
+template <int c_rows_per_block>
+__launch_bounds__(8*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q4_0_moe_reduce(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        const float * expert_scale_ptr, const float * expert_weights_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y) {
+    constexpr int n_expert_used = 8;
+    constexpr int qk            = ggml_cuda_type_traits<GGML_TYPE_Q4_0>::qk;
+    constexpr int qi            = ggml_cuda_type_traits<GGML_TYPE_Q4_0>::qi;
+    constexpr int vdr           = VDR_Q4_0_Q8_1_MMVQ;
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr*warp_size/qi;
+
+    const int expert_slot = threadIdx.y;
+    const int row0        = c_rows_per_block*blockIdx.x;
+    const int expert_id   = ids_ptr[expert_slot];
+    const int blocks_per_row_x = ncols_x/qk;
+
+    const block_q8_1 * y = (const block_q8_1 *) vy_ptr + expert_slot*stride_channel_y;
+    const int kbx_offset = expert_id*stride_channel_x + row0*stride_row_x;
+
+    float tmp[c_rows_per_block] = { 0.0f };
+
+    for (int kbx = threadIdx.x/(qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx*(qk/QK8_1);
+        const int kqs = vdr*(threadIdx.x % (qi/vdr));
+
+#pragma unroll
+        for (int row = 0; row < c_rows_per_block; ++row) {
+            if (uint32_t(row0 + row) < nrows_x) {
+                tmp[row] += vec_dot_q4_0_q8_1(vx_ptr, &y[kby], kbx_offset + row*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int row = 0; row < c_rows_per_block; ++row) {
+        tmp[row] = warp_reduce_sum<warp_size>(tmp[row]);
+    }
+
+    __shared__ float expert_sum[c_rows_per_block][n_expert_used];
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int row = 0; row < c_rows_per_block; ++row) {
+            expert_sum[row][expert_slot] = tmp[row]*expert_scale_ptr[expert_id]*expert_weights_ptr[expert_slot];
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.y == 0 && threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+        float sum = expert_sum[threadIdx.x][0];
+#pragma unroll
+        for (int expert = 1; expert < n_expert_used; ++expert) {
+            sum += expert_sum[threadIdx.x][expert];
+        }
+        dst_ptr[row0 + threadIdx.x] = sum;
     }
 }
 
@@ -1255,6 +1325,68 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+void ggml_cuda_mul_mat_vec_q4_0_moe_reduce(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * expert_scale, const ggml_tensor * expert_weights, ggml_tensor * dst, bool use_dst_tmp) {
+    constexpr int n_expert_used = 8;
+    constexpr int rows_per_block = 2;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(expert_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(expert_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[0] == src1->ne[0]);
+    GGML_ASSERT(src0->ne[1] == dst->ne[0]);
+    GGML_ASSERT(src1->ne[1] == n_expert_used);
+    GGML_ASSERT(ids->ne[0] == n_expert_used);
+    GGML_ASSERT(ggml_nelements(expert_scale) == src0->ne[2]);
+    GGML_ASSERT(ggml_nelements(expert_weights) == n_expert_used);
+    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(expert_scale));
+    GGML_ASSERT(ggml_is_contiguous(expert_weights));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
+        src1->ne[3]*src1->ne[2]*src1->ne[1]*ne10_padded*sizeof(block_q8_1)/QK8_1);
+
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const int64_t s11 = src1->nb[1]/ts_src1;
+    const int64_t s12 = src1->nb[2]/ts_src1;
+    const int64_t s13 = src1->nb[3]/ts_src1;
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), src0->type,
+        ne10, s11, s12, s13, ne10_padded, src1->ne[1], src1->ne[2], src1->ne[3], stream);
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const uint32_t stride_row_x     = src0->nb[1]/ts_src0;
+    const uint32_t stride_channel_x = src0->nb[2]/ts_src0;
+    const uint32_t stride_channel_y = ne10_padded/QK8_1;
+
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const dim3 block_nums((src0->ne[1] + rows_per_block - 1)/rows_per_block, 1, 1);
+    const dim3 block_dims(warp_size, n_expert_used, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_pool_alloc<float> dst_tmp(ctx.pool());
+    float * dst_d = use_dst_tmp ? dst_tmp.alloc(ggml_nelements(dst)) : (float *) dst->data;
+
+    ggml_cuda_kernel_launch(mul_mat_vec_q4_0_moe_reduce<rows_per_block>, launch_params,
+        src0->data, src1_q8_1.get(), (const int32_t *) ids->data,
+        (const float *) expert_scale->data, (const float *) expert_weights->data, dst_d,
+        (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], stride_row_x, stride_channel_x, stride_channel_y);
+
+    if (use_dst_tmp) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, dst_d, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
