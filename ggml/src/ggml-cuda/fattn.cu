@@ -324,6 +324,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+
     GGML_ABORT("fatal error");
 }
 
@@ -371,7 +373,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 
     float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -489,6 +493,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        static const char * disable_volta_d512_q8_vec_env = getenv("GGML_CUDA_DISABLE_VOLTA_FATTN_D512_Q8_VEC");
+        static const bool disable_volta_d512_q8_vec =
+            disable_volta_d512_q8_vec_env != nullptr && std::atoi(disable_volta_d512_q8_vec_env) != 0;
+        if (!disable_volta_d512_q8_vec && cc == GGML_CUDA_CC_VOLTA && Q->ne[0] == 512 && Q->ne[1] == 1 &&
+                gqa_ratio == 8 && K->ne[1] >= 4096 && logit_softcap == 0.0f &&
+                K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }

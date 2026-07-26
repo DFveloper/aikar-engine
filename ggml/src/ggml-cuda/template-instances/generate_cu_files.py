@@ -73,6 +73,8 @@ for type_k in TYPES_KV:
     for type_v in TYPES_KV:
         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
             f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
+            if type_k == "GGML_TYPE_Q8_0" and type_v == "GGML_TYPE_Q8_0":
+                f.write(f"DECL_FATTN_VEC_CASE(512, {type_k}, {type_v});\n")
 
 for ncols in [8, 16, 32, 64]:
     for ncols2 in [1, 2, 4, 8, 16, 32]:
