@@ -524,11 +524,32 @@ static ggml_opt_dataset_t build_dataset(
 
     const int64_t stride = n_ctx / 2;
     const int64_t n_tokens = (int64_t) flat_tokens.size();
-    int64_t ndata = 1;
+    int64_t ndata_candidate = 1;
     if (n_tokens > n_ctx) {
-        ndata += (n_tokens - n_ctx + stride - 1) / stride;
+        ndata_candidate += (n_tokens - n_ctx + stride - 1) / stride;
     }
 
+    std::vector<int64_t> window_offsets;
+    window_offsets.reserve(ndata_candidate);
+    for (int64_t i = 0; i < ndata_candidate; ++i) {
+        const int64_t off = i * stride;
+        bool has_label = false;
+        for (int32_t j = 0; j < n_ctx && off + j < n_tokens; ++j) {
+            if (flat_labels[off + j] >= 0) {
+                has_label = true;
+                break;
+            }
+        }
+        if (has_label) {
+            window_offsets.push_back(off);
+        }
+    }
+    if (window_offsets.empty()) {
+        LOG_ERR("%s: dataset has no supervised labels\n", __func__);
+        return nullptr;
+    }
+
+    const int64_t ndata = (int64_t) window_offsets.size();
     window_rewards.resize(ndata);
 
     ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
@@ -540,14 +561,14 @@ static ggml_opt_dataset_t build_dataset(
     int64_t n_padded = 0;
 
     for (int64_t i = 0; i < ndata; ++i) {
-        const int64_t off = i * stride;
+        const int64_t off = window_offsets[i];
         float reward_sum = 0.0f;
+        int64_t reward_count = 0;
         for (int32_t j = 0; j < n_ctx; ++j) {
             const int64_t idx = off + j;
             if (idx >= n_tokens) {
                 data  [i * n_ctx + j] = bos_token >= 0 ? bos_token : flat_tokens.back();
                 labels[i * n_ctx + j] = -1;
-                reward_sum += 1.0f;
                 ++n_padded;
                 continue;
             }
@@ -561,20 +582,23 @@ static ggml_opt_dataset_t build_dataset(
             labels[i * n_ctx + j] = flat_labels[idx];
             if (flat_labels[idx] >= 0) {
                 ++n_labels;
+                reward_sum += flat_rewards[idx];
+                ++reward_count;
             }
-            reward_sum += flat_rewards[idx];
         }
-        window_rewards[i] = reward_sum / n_ctx;
+        GGML_ASSERT(reward_count > 0);
+        window_rewards[i] = reward_sum / reward_count;
     }
-    LOG_INF("%s: packed %ld tokens into %ld windows (ctx=%d stride=%ld, supervised labels=%ld, padded=%ld)\n",
-            __func__, (long)n_tokens, (long)ndata, n_ctx, (long)stride, (long)n_labels, (long)n_padded);
+    LOG_INF("%s: packed %ld tokens into %ld windows (ctx=%d stride=%ld, supervised labels=%ld, padded=%ld, dropped no-label windows=%ld)\n",
+            __func__, (long)n_tokens, (long)ndata, n_ctx, (long)stride, (long)n_labels, (long)n_padded,
+            (long)(ndata_candidate - ndata));
 
     // Normalize window rewards to [0, 1].
     // Step 1: clip to [-1, 1] — outliers like 1.3/1.4 would otherwise compress the
     //         useful signal range after min-max scaling (a reward=1.0 would map to
     //         only 0.83 instead of 1.0 if the max is 1.4).
-    // Step 2: min-max scale clipped values → [0, 1].
-    //         min → 0.0 (window ignored), max → 1.0 (full weight).
+    // Step 2: min-max scale clipped values to [0, 1].
+    //         min becomes 0.0 (window ignored), max becomes 1.0 (full weight).
     // If all rewards are identical (pure SFT dataset) keep at 1.0.
     for (float & r : window_rewards) {
         r = std::max(-1.0f, std::min(1.0f, r));
@@ -1567,14 +1591,6 @@ int main(int argc, char ** argv) {
     auto dataset = build_dataset(samples, n_ctx, window_rewards, params.train_on_prompt, bos);
     if (!dataset) return 1;
 
-    // Check if any reward deviates from 1.0 — if so, enable reward-weighted SFT
-    const bool has_rewards = std::any_of(window_rewards.begin(), window_rewards.end(),
-                                         [](float r){ return std::abs(r - 1.0f) > 1e-4f; });
-    if (has_rewards) {
-        LOG_INF("%s: reward-weighted SFT enabled (found non-uniform rewards in dataset)\n", __func__);
-        llama_opt_set_reward_weights(window_rewards.data(), (int64_t)window_rewards.size());
-    }
-
     // Initialize optimizer — our custom param filter restricts training to lora_a/b
     struct llama_opt_params lopt_params {
         /*.n_ctx_train              =*/0,
@@ -1598,6 +1614,22 @@ int main(int argc, char ** argv) {
     if (params.val_split > 0.0f && idata_split == ndata) {
         LOG_WRN("%s: validation split skipped because dataset has only %ld training window(s)\n",
                 __func__, (long) ndata);
+    }
+
+    const auto train_reward_end = window_rewards.begin() + idata_split;
+    const bool all_train_rewards_zero = std::all_of(
+            window_rewards.begin(), train_reward_end, [](float r) { return std::abs(r) <= 1e-6f; });
+    if (all_train_rewards_zero) {
+        std::fill(window_rewards.begin(), train_reward_end, 1.0f);
+        LOG_WRN("%s: all training window rewards normalized to zero; using weight 1.0 for the small training split\n",
+                __func__);
+    }
+
+    const bool has_rewards = std::any_of(window_rewards.begin(), window_rewards.end(),
+                                         [](float r){ return std::abs(r - 1.0f) > 1e-4f; });
+    if (has_rewards) {
+        LOG_INF("%s: reward-weighted SFT enabled (found non-uniform rewards in dataset)\n", __func__);
+        llama_opt_set_reward_weights(window_rewards.data(), (int64_t)window_rewards.size());
     }
 
     unsigned epoch_start = 0;

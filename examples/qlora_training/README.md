@@ -102,7 +102,7 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--grad-checkpoint` | `0` | Mark every Nth forward node persistent to reduce activation VRAM; good values: 32–64 |
 | `--train-on-prompt` | off | Compute loss on prompt tokens too (default: response-only loss) |
 | `--shuffle-dataset` | off | Shuffle dataset windows at the start of each epoch |
-| `--val-split` | `0.0` | Fraction of data to hold out for validation (e.g. `0.1` = 10%); val loss logged per epoch |
+| `--val-split` | `0.05` | Fraction of data to hold out for validation (e.g. `0.1` = 10%); val loss logged per epoch |
 | `-epochs` / `--epochs` | `3` | Training epochs |
 | `-c` / `--ctx-size` | `512` | Training context window (tokens) |
 | `-b` / `--batch-size` | `2048` | Tokens per `llama_decode` call; set equal to `-c` |
@@ -179,7 +179,7 @@ llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 {"prompt": "...", "response": "...", "reward": 0.85}
 ```
 
-Rewards are normalized per epoch: clipped to `[-1, 1]`, then min-max scaled to `[0, 1]`. Reward 0 = sample ignored; reward 1 = full gradient.
+Rewards are averaged over supervised tokens in each window, clipped to `[-1, 1]`, then min-max scaled to `[0, 1]`. Reward 0 = window ignored; reward 1 = full gradient. Windows without supervised tokens are dropped. If a small validation split leaves only zero-weight training windows, their weights fall back to 1 so training does not become a no-op.
 
 ### Verify and use the adapter
 

@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3396,6 +3397,10 @@ void llama_context::opt_epoch_iter(
     const uint32_t n_ctx    = (uint32_t)tokens.size();
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
+    const int64_t n_labels = std::count_if(
+            labels_sparse.begin(), labels_sparse.end(), [](llama_token label) { return label >= 0; });
+    // Compensate for cross-entropy averaging over masked and padded rows.
+    const float label_scale = n_labels > 0 ? reward_scale * (float) n_ctx / (float) n_labels : 0.0f;
 
     memory->clear(true);
 
@@ -3493,7 +3498,7 @@ void llama_context::opt_epoch_iter(
                     // contribution.  Do NOT write anything — ggml_set_zero already handled it.
                     if (labels_sparse[ilabel] < 0) continue;
                     GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &reward_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    ggml_backend_tensor_set(labels, &label_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
 
