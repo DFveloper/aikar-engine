@@ -497,7 +497,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         static const bool disable_volta_d512_q8_vec =
             disable_volta_d512_q8_vec_env != nullptr && std::atoi(disable_volta_d512_q8_vec_env) != 0;
         if (!disable_volta_d512_q8_vec && cc == GGML_CUDA_CC_VOLTA && Q->ne[0] == 512 && Q->ne[1] == 1 &&
-                gqa_ratio == 8 && K->ne[1] >= 4096 && logit_softcap == 0.0f &&
+                gqa_ratio == 8 && K->ne[1] >= FATTN_KQ_STRIDE && logit_softcap == 0.0f &&
                 K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
             return BEST_FATTN_KERNEL_VEC;
         }
