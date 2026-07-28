@@ -16,5 +16,16 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q4_0, 256, 2, 64, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q4_0, 256, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
 
+    CASE(GGML_TYPE_Q8_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q8_0, 256, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+
+    CASE(GGML_TYPE_Q4_K, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q4_K, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q4_K, 256, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+
+    CASE(GGML_TYPE_Q6_K, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 }

@@ -216,7 +216,19 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    if (hp_nex > 0 && cparams->n_ubatch > 1024) {
+        for (auto * dev : devs) {
+            if (common_use_v100_lazy_kv(cparams, dev)) {
+                LOG_TRC("%s: capping V100 MoE ubatch from %" PRIu32 " to 1024\n", __func__, cparams->n_ubatch);
+                cparams->n_ubatch = 1024;
+                dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                break;
+            }
+        }
+    }
+
     const size_t nd = devs.size(); // number of devices
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits

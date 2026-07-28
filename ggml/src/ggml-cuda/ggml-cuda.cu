@@ -3239,7 +3239,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static bool disable_volta_fusion = getenv("GGML_CUDA_DISABLE_VOLTA_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_VOLTA_FUSION"));
 
     ggml_tensor * node = cgraph->nodes[i];
-
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -4109,6 +4108,83 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
+    using q8_fwht_map = std::unordered_map<const ggml_tensor *, ggml_tensor *>;
+    q8_fwht_map * q8_fwht_set_rows = nullptr;
+    q8_fwht_map * q8_set_rows_fwht = nullptr;
+#ifndef USE_CUDA_GRAPH
+    std::unique_ptr<q8_fwht_map> local_q8_fwht_set_rows;
+    std::unique_ptr<q8_fwht_map> local_q8_set_rows_fwht;
+#endif
+    static const bool disable_fusion =
+        getenv("GGML_CUDA_DISABLE_FUSION") != nullptr &&
+        std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    static const bool disable_volta_q8_fwht_fusion =
+        getenv("GGML_CUDA_DISABLE_VOLTA_Q8_FWHT_FUSION") != nullptr &&
+        std::atoi(getenv("GGML_CUDA_DISABLE_VOLTA_Q8_FWHT_FUSION"));
+    if (!disable_fusion && !disable_volta_q8_fwht_fusion &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VOLTA) {
+        bool analyze_q8_fwht = true;
+#ifdef USE_CUDA_GRAPH
+        ggml_cuda_graph * fusion_graph = cuda_ctx->cuda_graph(graph_key);
+        q8_fwht_set_rows = &fusion_graph->volta_q8_fwht_set_rows;
+        q8_set_rows_fwht = &fusion_graph->volta_q8_set_rows_fwht;
+        analyze_q8_fwht = fusion_graph->volta_q8_fwht_n_nodes != cgraph->n_nodes;
+#else
+        local_q8_fwht_set_rows = std::make_unique<q8_fwht_map>();
+        local_q8_set_rows_fwht = std::make_unique<q8_fwht_map>();
+        q8_fwht_set_rows = local_q8_fwht_set_rows.get();
+        q8_set_rows_fwht = local_q8_set_rows_fwht.get();
+#endif
+        if (analyze_q8_fwht) {
+            std::unordered_map<const ggml_tensor *, int> consumer_count;
+            consumer_count.reserve(cgraph->n_nodes);
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (cgraph->nodes[i]->src[j]) {
+                        ++consumer_count[cgraph->nodes[i]->src[j]];
+                    }
+                }
+            }
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_tensor * set_rows = cgraph->nodes[i];
+                if (set_rows->op != GGML_OP_SET_ROWS || set_rows->type != GGML_TYPE_Q8_0) {
+                    continue;
+                }
+                ggml_tensor * view = set_rows->src[0];
+                if (!view || view->op != GGML_OP_VIEW || !view->src[0]) {
+                    continue;
+                }
+                std::vector<ggml_tensor *> transparent;
+                ggml_tensor * fwht = view->src[0];
+                while (fwht && (fwht->op == GGML_OP_RESHAPE || fwht->op == GGML_OP_VIEW) && fwht->src[0]) {
+                    transparent.push_back(fwht);
+                    fwht = fwht->src[0];
+                }
+                if (!fwht || fwht->op != GGML_OP_MUL_MAT ||
+                        ggml_get_op_params_i32(fwht, 1) != GGML_HINT_SRC0_IS_HADAMARD ||
+                        !fwht->src[1] || fwht->src[1]->type != GGML_TYPE_F32 ||
+                        (fwht->ne[0] != 256 && fwht->ne[0] != 512) ||
+                        view->ne[0] != fwht->ne[0]*fwht->ne[1] ||
+                        set_rows->src[1]->type != GGML_TYPE_I64) {
+                    continue;
+                }
+                bool single_consumer_chain = consumer_count[fwht] == 1 && consumer_count[view] == 1;
+                for (const ggml_tensor * tensor : transparent) {
+                    single_consumer_chain = single_consumer_chain && consumer_count[tensor] == 1;
+                }
+                if (!single_consumer_chain) {
+                    continue;
+                }
+                (*q8_fwht_set_rows)[fwht] = set_rows;
+                (*q8_set_rows_fwht)[set_rows] = fwht;
+            }
+#ifdef USE_CUDA_GRAPH
+            fusion_graph->volta_q8_fwht_n_nodes = cgraph->n_nodes;
+#endif
+        }
+    }
+    const bool has_q8_fwht_fusions = q8_fwht_set_rows != nullptr && !q8_fwht_set_rows->empty();
+
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
@@ -4235,6 +4311,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (has_q8_fwht_fusions && node->op == GGML_OP_MUL_MAT) {
+                    const auto q8_fwht_it = q8_fwht_set_rows->find(node);
+                    if (q8_fwht_it != q8_fwht_set_rows->end()) {
+                        GGML_ASSERT(ggml_cuda_op_fwht_set_rows_q8_0(
+                            *cuda_ctx, node->src[1], node, q8_fwht_it->second));
+                        if (!is_concurrent_event_active) {
+                            try_launch_concurrent_event(node);
+                        }
+                        continue;
+                    }
+                }
+                if (has_q8_fwht_fusions && node->op == GGML_OP_SET_ROWS &&
+                        q8_set_rows_fwht->find(node) != q8_set_rows_fwht->end()) {
+                    if (!is_concurrent_event_active) {
+                        try_launch_concurrent_event(node);
+                    }
                     continue;
                 }
 

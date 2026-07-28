@@ -309,8 +309,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        if (cc == GGML_CUDA_CC_VOLTA && type == GGML_TYPE_Q4_0) {
-            return ne11 <= 96;
+        if (cc == GGML_CUDA_CC_VOLTA) {
+            if (n_experts > 0 && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 ||
+                    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)) {
+                return ne11 <= 2048;
+            }
+            if (type == GGML_TYPE_Q4_0) {
+                return ne11 <= 96;
+            }
         }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }

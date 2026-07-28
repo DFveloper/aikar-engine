@@ -1054,7 +1054,7 @@ private:
                 const auto cparams = common_context_params_to_llama(params_base);
                 for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                     if (common_use_v100_lazy_kv(&cparams, ggml_backend_dev_get(i))) {
-                        params_base.n_ubatch = std::min(params_base.n_ubatch, 1024);
+                        params_base.n_ubatch = std::min(params_base.n_ubatch, 2048);
                         if (mparams.use_gpu) {
                             mparams.use_gpu = false;
                             SRV_INF("%s", "[mtmd] using CPU projector to keep all V100 MoE weights on GPU\n");
