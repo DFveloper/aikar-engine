@@ -11,6 +11,7 @@
          --model model-q4_k_m.gguf \
          --train-file train.jsonl \
          --lora-rank 16 --lora-alpha 16 \
+         --lr-scheduler cosine --warmup-steps 10 \
          --lora-out adapter.gguf \
          --epochs 3 -c 4096 -b 4096 -ub 512
 */
@@ -130,6 +131,39 @@ static std::string preview_text(const std::string & s, size_t max_len = 240) {
         }
     }
     return out;
+}
+
+struct qlora_lr_schedule {
+    const lr_opt * lr;
+    std::string    type;
+    int64_t        warmup_steps;
+    int64_t        total_steps;
+    int64_t        step;
+    float          current_lr = 0.0f;
+
+    float get_lr() const {
+        const float lr_base = lr->lr0;
+        if (step < warmup_steps) {
+            return lr_base * (float) (step + 1) / (float) warmup_steps;
+        }
+        if (type != "cosine" || total_steps <= warmup_steps) {
+            return lr->get_lr();
+        }
+
+        const float lr_min = std::max(0.0f, lr->lr_min);
+        const double progress = (double) (step - warmup_steps) / (double) (total_steps - warmup_steps);
+        const double cosine = 0.5 * (1.0 + std::cos(std::acos(-1.0) * std::min(1.0, progress)));
+        return lr_min + (lr_base - lr_min) * (float) cosine;
+    }
+};
+
+static ggml_opt_optimizer_params qlora_opt_lr_pars(void * userdata) {
+    qlora_lr_schedule & schedule = *(qlora_lr_schedule *) userdata;
+    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
+    schedule.current_lr = schedule.get_lr();
+    result.adamw.alpha = result.sgd.alpha = schedule.current_lr;
+    result.sgd.wd = result.adamw.wd = schedule.lr->wd;
+    return result;
 }
 
 // Tensors whose names contain these substrings use MUL_MAT_ID (sparse MoE expert dispatch)
@@ -762,6 +796,7 @@ struct checkpoint_state {
     bool        has_metadata    = false;
     float       alpha           = 0.0f;
     bool        has_alpha       = false;
+    int64_t     schedule_step   = -1;
 };
 
 static bool parse_checkpoint_number(
@@ -843,6 +878,7 @@ static bool load_checkpoint_state(
         gguf_get_i64(gctx, "training.checkpoint.step", state.step);
         gguf_get_i64(gctx, "training.dataset.windows", state.dataset_windows);
         gguf_get_i64(gctx, "training.context_length", state.context_length);
+        gguf_get_i64(gctx, "training.scheduler.step", state.schedule_step);
 
         const int64_t shuffle_id = gguf_find_key(gctx, "training.dataset.shuffle");
         if (shuffle_id >= 0 && gguf_get_kv_type(gctx, shuffle_id) == GGUF_TYPE_BOOL) {
@@ -873,7 +909,7 @@ static bool load_checkpoint_state(
         LOG_ERR("%s: invalid checkpoint epoch %ld\n", __func__, (long) state.epoch);
         return false;
     }
-    if (state.window < 0 || state.step < 0) {
+    if (state.window < 0 || state.step < 0 || state.schedule_step < -1) {
         LOG_ERR("%s: checkpoint contains a negative training position\n", __func__);
         return false;
     }
@@ -907,6 +943,7 @@ static void save_adapter(
         gguf_set_val_i64(gctx, "training.dataset.windows", checkpoint->dataset_windows);
         gguf_set_val_i64(gctx, "training.context_length", checkpoint->context_length);
         gguf_set_val_bool(gctx, "training.dataset.shuffle", checkpoint->shuffle);
+        gguf_set_val_i64(gctx, "training.scheduler.step", checkpoint->schedule_step);
     }
 
     // Register tensors
@@ -1012,6 +1049,7 @@ struct save_ctx {
     int64_t              dataset_windows;
     int64_t              context_length;
     bool                 shuffle;
+    qlora_lr_schedule * schedule;
 };
 
 // TLS pointer set before each epoch so the static callback can access it.
@@ -1032,9 +1070,13 @@ static void save_every_callback(
         const int64_t window = g_save_ctx->window_offset + ibatch / g_save_ctx->ubatch_per_ctx;
         const int64_t ubatch_in_window = ibatch % g_save_ctx->ubatch_per_ctx;
         if (ibatch > 0 && ubatch_in_window == 0) {
+            ++g_save_ctx->schedule->step;
             double loss = 0.0, loss_unc = 0.0;
-            ggml_opt_result_loss(result, &loss, &loss_unc);
-            fprintf(stderr, "\n[window %4ld] loss=%.4f ± %.4f\n", (long)window, loss, loss_unc);
+            if (g_save_ctx->save_every > 0) {
+                ggml_opt_result_loss(result, &loss, &loss_unc);
+                fprintf(stderr, "\n[window %4ld] loss=%.4f +/- %.4f lr=%.6g\n",
+                        (long) window, loss, loss_unc, (double) g_save_ctx->schedule->current_lr);
+            }
         }
     }
 
@@ -1052,6 +1094,7 @@ static void save_every_callback(
         state.dataset_windows = g_save_ctx->dataset_windows;
         state.context_length  = g_save_ctx->context_length;
         state.shuffle         = g_save_ctx->shuffle;
+        state.schedule_step   = g_save_ctx->schedule->step;
         save_adapter(*g_save_ctx->lt, ckpt, *g_save_ctx->arch, g_save_ctx->lora_alpha,
                      *g_save_ctx->base_model_path, &state);
         fprintf(stderr, "\n");
@@ -1214,12 +1257,37 @@ static int run_grpo_mode(
     const int32_t n_steps  = params.grpo_n_steps;
     const float   temp     = params.grpo_temperature;
     const int32_t max_tok  = params.grpo_max_tokens;
+    int           step     = resume ? (int) resume->step : 0;
 
     if (resume && resume->context_length >= 0 && resume->context_length != n_ctx) {
         LOG_ERR("%s: checkpoint context length is %ld, current context length is %d\n",
                 __func__, (long) resume->context_length, n_ctx);
         return 1;
     }
+    if (n_steps <= 0 || step > n_steps) {
+        LOG_ERR("%s: invalid GRPO step range %d/%d\n", __func__, step, n_steps);
+        return 1;
+    }
+    if (params.warmup_steps > n_steps) {
+        LOG_ERR("%s: --warmup-steps %d exceeds total GRPO steps %d\n",
+                __func__, params.warmup_steps, n_steps);
+        return 1;
+    }
+    if (params.lr.lr0 <= 0.0f || (params.lr_scheduler == "cosine" && params.lr.lr_min > params.lr.lr0)) {
+        LOG_ERR("%s: learning-rate must be positive and cosine requires learning-rate-min <= learning-rate\n", __func__);
+        return 1;
+    }
+
+    const int64_t schedule_step = resume && resume->schedule_step >= 0
+        ? resume->schedule_step : step;
+    if (schedule_step != step) {
+        LOG_ERR("%s: checkpoint scheduler step %ld does not match GRPO step %d\n",
+                __func__, (long) schedule_step, step);
+        return 1;
+    }
+    qlora_lr_schedule schedule {
+        &params.lr, params.lr_scheduler, params.warmup_steps, n_steps, schedule_step
+    };
 
     std::mt19937 rng(params.sampling.seed != LLAMA_DEFAULT_SEED
                      ? params.sampling.seed : 42);
@@ -1229,8 +1297,8 @@ static int run_grpo_mode(
         /*.n_ctx_train              =*/0,
         /*.param_filter             =*/lora_param_filter,
         /*.param_filter_ud          =*/nullptr,
-        /*.get_opt_pars             =*/common_opt_lr_pars,
-        /*.get_opt_pars_ud          =*/&params.lr,
+        /*.get_opt_pars             =*/qlora_opt_lr_pars,
+        /*.get_opt_pars_ud          =*/&schedule,
         /*.optimizer_type           =*/params.optimizer,
         /*.lora_qat_type            =*/lora_qat_type_from_string(params.lora_qat),
         /*.grad_checkpoint_interval =*/params.grad_checkpoint_interval,
@@ -1245,14 +1313,17 @@ static int run_grpo_mode(
     ipc_emit("[QLORA:READY]");
 
     float last_loss = 0.0f;
-    int   step      = resume ? (int) resume->step : 0;
 
     if (resume) {
         LOG_INF("%s: resuming GRPO after step %d/%d; optimizer state starts fresh\n",
                 __func__, step, n_steps);
     }
+    LOG_INF("%s: lr scheduler=%s warmup_steps=%d total_steps=%d start_step=%ld lr=%.3g lr_min=%.3g\n",
+            __func__, params.lr_scheduler.c_str(), params.warmup_steps, n_steps,
+            (long) schedule.step, (double) params.lr.lr0, (double) std::max(0.0f, params.lr.lr_min));
 
     while (step < n_steps && !g_grpo_stop) {
+        params.lr.epoch = step;
 
         // ── Request prompt ────────────────────────────────────────────────
         {
@@ -1386,6 +1457,7 @@ static int run_grpo_mode(
         llama_opt_set_reward_weights(nullptr, 0);
 
         ++step;
+        ++schedule.step;
 
         // ── Emit progress ─────────────────────────────────────────────────
         {
@@ -1403,6 +1475,7 @@ static int run_grpo_mode(
             state.mode           = "grpo";
             state.step           = step;
             state.context_length = n_ctx;
+            state.schedule_step  = schedule.step;
             save_adapter(lt, ckpt, arch, lora_alpha, base_model_path, &state);
             char buf[512];
             snprintf(buf, sizeof(buf), "[QLORA:CHECKPOINT] %s", ckpt.c_str());
@@ -1591,13 +1664,17 @@ int main(int argc, char ** argv) {
     auto dataset = build_dataset(samples, n_ctx, window_rewards, params.train_on_prompt, bos);
     if (!dataset) return 1;
 
-    // Initialize optimizer — our custom param filter restricts training to lora_a/b
+    qlora_lr_schedule schedule {
+        &params.lr, params.lr_scheduler, params.warmup_steps, 0, 0
+    };
+
+    // Initialize optimizer - our custom param filter restricts training to lora_a/b.
     struct llama_opt_params lopt_params {
         /*.n_ctx_train              =*/0,
         /*.param_filter             =*/lora_param_filter,
         /*.param_filter_ud          =*/nullptr,
-        /*.get_opt_pars             =*/common_opt_lr_pars,
-        /*.get_opt_pars_ud          =*/&params.lr,
+        /*.get_opt_pars             =*/qlora_opt_lr_pars,
+        /*.get_opt_pars_ud          =*/&schedule,
         /*.optimizer_type           =*/params.optimizer,
         /*.lora_qat_type            =*/lora_qat_type_from_string(params.lora_qat),
         /*.grad_checkpoint_interval =*/params.grad_checkpoint_interval,
@@ -1615,7 +1692,24 @@ int main(int argc, char ** argv) {
         LOG_WRN("%s: validation split skipped because dataset has only %ld training window(s)\n",
                 __func__, (long) ndata);
     }
-
+    if (params.lr.epochs > 0 && idata_split > INT64_MAX / params.lr.epochs) {
+        LOG_ERR("%s: total training step count overflows int64\n", __func__);
+        return 1;
+    }
+    schedule.total_steps = idata_split * params.lr.epochs;
+    if (schedule.total_steps <= 0) {
+        LOG_ERR("%s: total training step count must be positive\n", __func__);
+        return 1;
+    }
+    if (params.warmup_steps > schedule.total_steps) {
+        LOG_ERR("%s: --warmup-steps %d exceeds total training steps %ld\n",
+                __func__, params.warmup_steps, (long) schedule.total_steps);
+        return 1;
+    }
+    if (params.lr.lr0 <= 0.0f || (params.lr_scheduler == "cosine" && params.lr.lr_min > params.lr.lr0)) {
+        LOG_ERR("%s: learning-rate must be positive and cosine requires learning-rate-min <= learning-rate\n", __func__);
+        return 1;
+    }
     const auto train_reward_end = window_rewards.begin() + idata_split;
     const bool all_train_rewards_zero = std::all_of(
             window_rewards.begin(), train_reward_end, [](float r) { return std::abs(r) <= 1e-6f; });
@@ -1669,6 +1763,23 @@ int main(int argc, char ** argv) {
                 __func__, epoch_start + 1, params.lr.epochs, (long) window_start,
                 (long) window_start + 1, (long) idata_split);
     }
+    if (epoch_start > params.lr.epochs) {
+        LOG_ERR("%s: checkpoint epoch %u exceeds target epochs %u\n",
+                __func__, epoch_start, params.lr.epochs);
+        return 1;
+    }
+    const int64_t schedule_step = (int64_t) epoch_start * idata_split + window_start;
+    if (schedule_step > schedule.total_steps) {
+        LOG_ERR("%s: checkpoint step %ld exceeds total training steps %ld\n",
+                __func__, (long) schedule_step, (long) schedule.total_steps);
+        return 1;
+    }
+    if (resume_requested && resume_state.schedule_step >= 0 && resume_state.schedule_step != schedule_step) {
+        LOG_ERR("%s: checkpoint scheduler step %ld does not match derived step %ld\n",
+                __func__, (long) resume_state.schedule_step, (long) schedule_step);
+        return 1;
+    }
+    schedule.step = schedule_step;
 
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
@@ -1678,7 +1789,7 @@ int main(int argc, char ** argv) {
 
     save_ctx sctx {
         &lt, &params.lora_out, &arch, &params.model.path, lora_alpha,
-        params.save_every, ubatch_per_ctx, 0, 0, 0, idata_split, n_ctx, params.shuffle_dataset
+        params.save_every, ubatch_per_ctx, 0, 0, 0, idata_split, n_ctx, params.shuffle_dataset, &schedule
     };
     g_save_ctx = &sctx;
 
@@ -1706,14 +1817,15 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: dataset: %ld windows × %d ubatches = %ld steps per epoch  (n_ctx=%d n_ubatch=%d stride=%d)\n",
             __func__, (long)total_windows, ubatch_per_ctx, (long)(idata_split * ubatch_per_ctx),
             n_ctx, n_ubatch, n_ctx / 2);
+    LOG_INF("%s: lr scheduler=%s warmup_steps=%d total_steps=%ld start_step=%ld lr=%.3g lr_min=%.3g\n",
+            __func__, params.lr_scheduler.c_str(), params.warmup_steps, (long) schedule.total_steps,
+            (long) schedule.step, (double) params.lr.lr0, (double) std::max(0.0f, params.lr.lr_min));
     if (params.save_every > 0) {
         LOG_INF("%s: will save checkpoint every %d windows → %s.ckptN.gguf\n",
                 __func__, params.save_every, params.lora_out.c_str());
     }
 
-    ggml_opt_epoch_callback cb_train = (params.save_every > 0)
-        ? save_every_callback
-        : ggml_opt_epoch_callback_progress_bar;
+    ggml_opt_epoch_callback cb_train = save_every_callback;
 
     for (params.lr.epoch = epoch_start; params.lr.epoch < params.lr.epochs; ++params.lr.epoch) {
         const int64_t idata_start = params.lr.epoch == epoch_start ? window_start : 0;
