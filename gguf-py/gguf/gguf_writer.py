@@ -971,6 +971,9 @@ class GGUFWriter:
     def add_norm_before_residual(self, value: bool) -> None:
         self.add_bool(Keys.LLM.NORM_BEFORE_RESIDUAL.format(arch=self.arch), value)
 
+    def add_norm_before_fc(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.NORM_BEFORE_FC.format(arch=self.arch), value)
+
     def add_attention_output_group_count(self, count: int) -> None:
         self.add_uint32(Keys.Attention.OUTPUT_GROUP_COUNT.format(arch=self.arch), count)
 
@@ -1223,6 +1226,9 @@ class GGUFWriter:
     def add_vision_head_count_kv(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.Attention.HEAD_COUNT_KV, value)
 
+    def add_vision_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.Attention.HEAD_DIM, value)
+
     def add_vision_attention_layernorm_eps(self, value: float) -> None:
         self.add_float32(Keys.ClipVision.Attention.LAYERNORM_EPS, value)
 
@@ -1370,6 +1376,9 @@ class GGUFWriter:
 
     def add_audio_stack_factor(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.Projector.STACK_FACTOR, value)
+
+    def add_audio_subsampling_factor(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.SUBSAMPLING_FACTOR, value)
 
     def add_audio_chunk_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.CHUNK_SIZE, value)
