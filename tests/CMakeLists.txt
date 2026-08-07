@@ -258,6 +258,10 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-moe-prune.cpp)
+target_sources(test-moe-prune PRIVATE ../tools/aikar-prune/dataset.cpp ../tools/aikar-prune/hard-prune.cpp)
+target_include_directories(test-moe-prune PRIVATE ../tools/aikar-prune ${CMAKE_SOURCE_DIR}/ggml/include)
+target_compile_definitions(test-moe-prune PRIVATE AIKAR_TEST_GEMMA_VOCAB="${CMAKE_SOURCE_DIR}/models/ggml-vocab-gemma-4.gguf")
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
