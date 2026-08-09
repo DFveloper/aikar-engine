@@ -818,6 +818,7 @@ struct vk_device_struct {
     bool shader_int64;
     bool buffer_device_address;
     bool vulkan_memory_model;
+    bool shader_atomic_float;
 
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
@@ -1031,6 +1032,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_back_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32;
     vk_pipeline pipeline_cross_entropy_loss_back_f32;
+    vk_pipeline pipeline_flash_attn_back_f32_f32;
+    vk_pipeline pipeline_flash_attn_back_f16_f32;
+    vk_pipeline pipeline_flash_attn_back_f32_f16;
+    vk_pipeline pipeline_flash_attn_back_f16_f16;
 
     vk_pipeline pipeline_soft_max_large1_f32, pipeline_soft_max_large1_f32_f16;
     vk_pipeline pipeline_soft_max_large2_f32, pipeline_soft_max_large2_f32_f16;
@@ -1402,6 +1407,19 @@ struct vk_op_cross_entropy_push_constants {
     uint32_t nclasses;
     uint32_t nrows;
 };
+
+struct vk_op_flash_attn_back_push_constants {
+    uint32_t DK, DV, N, M, HQ, HK;
+    uint32_t q_nb1, q_nb2, q_nb3;
+    uint32_t k_nb0, k_nb1, k_nb2, k_nb3;
+    uint32_t v_nb0, v_nb1, v_nb2, v_nb3;
+    uint32_t d_nb1, d_nb2, d_nb3;
+    uint32_t offs_k, offs_v, offs_s;
+    uint32_t MH, MB, causal, has_mask, has_sinks;
+    float scale, max_bias, logit_softcap;
+};
+
+static_assert(sizeof(vk_op_flash_attn_back_push_constants) <= 128, "flash attention backward push constants exceed Vulkan minimum");
 
 struct vk_op_fwht_push_constants {
     uint32_t n_rows;
@@ -5738,6 +5756,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_back_f32, "soft_max_back_f32", soft_max_back_f32_len, soft_max_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_cross_entropy_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_cross_entropy_push_constants), {256, 1, 1}, {}, 1);
+    if (device->shader_atomic_float) {
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_f32_f32, "flash_attn_back_f32_f32", flash_attn_back_f32_f32_len, flash_attn_back_f32_f32_data, "main", 7, sizeof(vk_op_flash_attn_back_push_constants), {128, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_f16_f32, "flash_attn_back_f16_f32", flash_attn_back_f16_f32_len, flash_attn_back_f16_f32_data, "main", 7, sizeof(vk_op_flash_attn_back_push_constants), {128, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_f32_f16, "flash_attn_back_f32_f16", flash_attn_back_f32_f16_len, flash_attn_back_f32_f16_data, "main", 7, sizeof(vk_op_flash_attn_back_push_constants), {128, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_f16_f16, "flash_attn_back_f16_f16", flash_attn_back_f16_f16_len, flash_attn_back_f16_f16_data, "main", 7, sizeof(vk_op_flash_attn_back_push_constants), {128, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large1_f32,     "soft_max_large1_f32",     soft_max_large1_f32_len,     soft_max_large1_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large2_f32,     "soft_max_large2_f32",     soft_max_large2_f32_len,     soft_max_large2_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
@@ -6244,6 +6268,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool dot2_f16_support = false;
         bool ocp_microscaling_extension = false;
         bool shader_float8_extension = false;
+        bool shader_atomic_float_extension = false;
 
         for (const auto& properties : ext_props) {
             if (strcmp("VK_KHR_maintenance4", properties.extensionName) == 0) {
@@ -6312,6 +6337,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 internally_sync_support = true;
             } else if (strcmp("VK_EXT_device_fault", properties.extensionName) == 0) {
                 device->device_fault = true;
+            } else if (strcmp("VK_EXT_shader_atomic_float", properties.extensionName) == 0) {
+                shader_atomic_float_extension = true;
             }
         }
 
@@ -6674,9 +6701,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_EXT_device_fault");
         }
 
+        VkPhysicalDeviceShaderAtomicFloatFeaturesEXT shader_atomic_float_features {};
+        shader_atomic_float_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+        if (shader_atomic_float_extension) {
+            last_struct->pNext = (VkBaseOutStructure *)&shader_atomic_float_features;
+            last_struct = (VkBaseOutStructure *)&shader_atomic_float_features;
+            device_extensions.push_back("VK_EXT_shader_atomic_float");
+        }
+
         vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
 
         device->device_fault = device->device_fault && fault_features.deviceFault;
+        device->shader_atomic_float = shader_atomic_float_extension && shader_atomic_float_features.shaderBufferFloat32AtomicAdd;
 
         device->has_internally_synchronized_queues = internally_synchronized_queues_features.internallySynchronizedQueues;
 
@@ -13622,6 +13658,60 @@ static void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_co
         pc, { 256, nrows, 1 });
 }
 
+static void ggml_vk_flash_attn_back(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * d = dst->src[3];
+    const ggml_tensor * mask = dst->src[4];
+    const ggml_tensor * sinks = dst->src[5];
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const size_t offs_k = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+
+    const vk_op_flash_attn_back_push_constants pc = {
+        (uint32_t) q->ne[0], (uint32_t) v->ne[0], (uint32_t) q->ne[1], (uint32_t) k->ne[1], (uint32_t) q->ne[2], (uint32_t) k->ne[2],
+        (uint32_t) (q->nb[1]/sizeof(float)), (uint32_t) (q->nb[2]/sizeof(float)), (uint32_t) (q->nb[3]/sizeof(float)),
+        (uint32_t) (k->nb[0]/ggml_type_size(k->type)), (uint32_t) (k->nb[1]/ggml_type_size(k->type)), (uint32_t) (k->nb[2]/ggml_type_size(k->type)), (uint32_t) (k->nb[3]/ggml_type_size(k->type)),
+        (uint32_t) (v->nb[0]/ggml_type_size(v->type)), (uint32_t) (v->nb[1]/ggml_type_size(v->type)), (uint32_t) (v->nb[2]/ggml_type_size(v->type)), (uint32_t) (v->nb[3]/ggml_type_size(v->type)),
+        (uint32_t) (d->nb[1]/sizeof(float)), (uint32_t) (d->nb[2]/sizeof(float)), (uint32_t) (d->nb[3]/sizeof(float)),
+        (uint32_t) (offs_k/sizeof(float)), (uint32_t) (offs_v/sizeof(float)), (uint32_t) (offs_s/sizeof(float)),
+        (uint32_t) (mask ? mask->ne[2] : 1), (uint32_t) (mask ? mask->ne[3] : 1),
+        ggml_flash_attn_ext_get_causal(dst) ? 1u : 0u, mask ? 1u : 0u, sinks ? 1u : 0u,
+        scale, max_bias, logit_softcap,
+    };
+
+    vk_pipeline pipeline;
+    if (k->type == GGML_TYPE_F16) {
+        pipeline = v->type == GGML_TYPE_F16 ? ctx->device->pipeline_flash_attn_back_f16_f16 : ctx->device->pipeline_flash_attn_back_f16_f32;
+    } else {
+        pipeline = v->type == GGML_TYPE_F16 ? ctx->device->pipeline_flash_attn_back_f32_f16 : ctx->device->pipeline_flash_attn_back_f32_f32;
+    }
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    const vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, d);
+    const vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+    const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, ggml_nbytes(dst));
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { q_buf, k_buf, v_buf, d_buf, mask_buf, sinks_buf, dst_buf }, pc,
+        { (uint32_t) (128*q->ne[1]*q->ne[2]*q->ne[3]), 1, 1 });
+}
+
 static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
     topk_moe_mode mode = ctx->fused_topk_moe_mode;
     const bool has_bias = mode == TOPK_MOE_SIGMOID_NORM_BIAS || mode == TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS;
@@ -15818,6 +15908,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+
+        break;
+
+    case GGML_OP_FLASH_ATTN_BACK:
+        ggml_vk_flash_attn_back(ctx, compute_ctx, node);
 
         break;
 
@@ -18323,6 +18418,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+        case GGML_OP_FLASH_ATTN_BACK: {
+            if (!device->shader_atomic_float || ggml_nbytes(op) > UINT32_MAX) {
+                return false;
+            }
+            for (int isrc = 0; isrc < 4; ++isrc) {
+                const ggml_tensor * src = op->src[isrc];
+                const size_t type_size = ggml_type_size(src->type);
+                for (int idim = 1; idim < GGML_MAX_DIMS; ++idim) {
+                    if (src->nb[idim]/type_size > UINT32_MAX) {
+                        return false;
+                    }
+                }
+            }
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) && op->src[3]->nb[0] == sizeof(float) &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                   (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) && op->src[2]->nb[0] == ggml_type_size(op->src[2]->type) &&
+                   (!op->src[4] || (op->src[4]->type == GGML_TYPE_F16 && ggml_is_contiguous(op->src[4])));
+        }
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {

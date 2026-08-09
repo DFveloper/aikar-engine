@@ -2464,9 +2464,21 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    GGML_API void ggml_flash_attn_ext_set_causal(
+            struct ggml_tensor * a,
+            bool                 causal);
+
+    GGML_API bool ggml_flash_attn_ext_get_causal(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * forward,
+            struct ggml_tensor  * grad);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

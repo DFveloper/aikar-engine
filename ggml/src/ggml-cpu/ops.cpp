@@ -9324,7 +9324,7 @@ void ggml_compute_forward_flash_attn_ext(
 
 // ggml_compute_forward_flash_attn_back
 
-static void ggml_compute_forward_flash_attn_back_f32(
+[[maybe_unused]] static void ggml_compute_forward_flash_attn_back_f32(
         const ggml_compute_params * params,
         const bool masked,
               ggml_tensor * dst) {
@@ -9639,23 +9639,185 @@ static void ggml_compute_forward_flash_attn_back_f32(
     }
 }
 
+static float ggml_flash_attn_back_load(const ggml_tensor * tensor, const char * ptr) {
+    switch (tensor->type) {
+        case GGML_TYPE_F32:  return *(const float *) ptr;
+        case GGML_TYPE_F16:  return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ptr);
+        case GGML_TYPE_BF16: return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) ptr);
+        default: GGML_ABORT("unsupported flash attention backward type: %s", ggml_type_name(tensor->type));
+    }
+}
+
+static void ggml_compute_forward_flash_attn_back_ext(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * d     = dst->src[3];
+    const ggml_tensor * mask  = dst->src[4];
+    const ggml_tensor * sinks = dst->src[5];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && d->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16);
+    GGML_ASSERT(v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_BF16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+
+    const int64_t DK  = q->ne[0];
+    const int64_t N   = q->ne[1];
+    const int64_t HQ  = q->ne[2];
+    const int64_t B   = q->ne[3];
+    const int64_t DV  = v->ne[0];
+    const int64_t M   = k->ne[1];
+    const int64_t HK  = k->ne[2];
+
+    GGML_ASSERT(k->ne[0] == DK && k->ne[3] == B);
+    GGML_ASSERT(v->ne[1] == M && v->ne[2] == HK && v->ne[3] == B);
+    GGML_ASSERT(d->ne[0] == DV && d->ne[1] == HQ && d->ne[2] == N && d->ne[3] == B);
+    GGML_ASSERT(HQ % HK == 0);
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const bool causal = ggml_flash_attn_ext_get_causal(dst);
+    GGML_ASSERT(!causal || M >= N);
+
+    if (params->ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
+
+    const size_t offs_k = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+    float * grad_q = (float *) dst->data;
+    float * grad_k = (float *) ((char *) dst->data + offs_k);
+    float * grad_v = (float *) ((char *) dst->data + offs_v);
+    float * grad_s = sinks ? (float *) ((char *) dst->data + offs_s) : NULL;
+
+    const size_t gq1 = DK;
+    const size_t gq2 = DK*N;
+    const size_t gq3 = DK*N*HQ;
+    const size_t gk1 = DK;
+    const size_t gk2 = DK*M;
+    const size_t gk3 = DK*M*HK;
+    const size_t gv1 = DV;
+    const size_t gv2 = DV*M;
+    const size_t gv3 = DV*M*HK;
+
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2((double) HQ));
+    const float m0 = powf(2.0f, -max_bias/n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias/2.0f)/n_head_log2);
+    const int64_t q_per_kv = HQ/HK;
+
+    const int64_t nr = HK*B;
+    const int64_t dr = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    float * logits = (float *) params->wdata + params->ith*(2*M + CACHE_LINE_SIZE_F32);
+    float * probs  = logits + M;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t ib = ir/HK;
+        const int64_t ikh = ir%HK;
+
+        for (int64_t irep = 0; irep < q_per_kv; ++irep) {
+            const int64_t iqh = ikh*q_per_kv + irep;
+            const float slope = max_bias > 0.0f ?
+                (iqh < n_head_log2 ? powf(m0, iqh + 1) : powf(m1, 2*(iqh - n_head_log2) + 1)) : 1.0f;
+
+            for (int64_t iq = 0; iq < N; ++iq) {
+                const int64_t key_end = causal ? MIN(M, M - N + iq + 1) : M;
+                const float * pq = (const float *) ((const char *) q->data + iq*q->nb[1] + iqh*q->nb[2] + ib*q->nb[3]);
+                const float * pd = (const float *) ((const char *) d->data + iqh*d->nb[1] + iq*d->nb[2] + ib*d->nb[3]);
+                const ggml_fp16_t * pm = mask ? (const ggml_fp16_t *) ((const char *) mask->data + iq*mask->nb[1] + (iqh%mask->ne[2])*mask->nb[2] + (ib%mask->ne[3])*mask->nb[3]) : NULL;
+
+                float max_score = sinks ? ((const float *) sinks->data)[iqh] : -INFINITY;
+                for (int64_t ik = 0; ik < key_end; ++ik) {
+                    const float mv = pm ? slope*GGML_CPU_FP16_TO_FP32(pm[ik]) : 0.0f;
+                    if (mv == -INFINITY) {
+                        logits[ik] = -INFINITY;
+                        continue;
+                    }
+                    const char * pk = (const char *) k->data + ik*k->nb[1] + ikh*k->nb[2] + ib*k->nb[3];
+                    float dot = 0.0f;
+                    for (int64_t id = 0; id < DK; ++id) {
+                        dot += pq[id]*ggml_flash_attn_back_load(k, pk + id*k->nb[0]);
+                    }
+                    float score = dot*scale;
+                    if (logit_softcap != 0.0f) {
+                        score = logit_softcap*tanhf(score/logit_softcap);
+                    }
+                    logits[ik] = score + mv;
+                    max_score = MAX(max_score, logits[ik]);
+                }
+
+                if (max_score == -INFINITY) {
+                    continue;
+                }
+
+                float sum = sinks ? expf(((const float *) sinks->data)[iqh] - max_score) : 0.0f;
+                for (int64_t ik = 0; ik < key_end; ++ik) {
+                    probs[ik] = logits[ik] == -INFINITY ? 0.0f : expf(logits[ik] - max_score);
+                    sum += probs[ik];
+                }
+                const float inv_sum = 1.0f/sum;
+                float mean = 0.0f;
+                for (int64_t ik = 0; ik < key_end; ++ik) {
+                    probs[ik] *= inv_sum;
+                    const char * pv = (const char *) v->data + ik*v->nb[1] + ikh*v->nb[2] + ib*v->nb[3];
+                    float dp = 0.0f;
+                    for (int64_t id = 0; id < DV; ++id) {
+                        dp += pd[id]*ggml_flash_attn_back_load(v, pv + id*v->nb[0]);
+                        grad_v[id + ik*gv1 + ikh*gv2 + ib*gv3] += probs[ik]*pd[id];
+                    }
+                    logits[ik] = dp;
+                    mean += probs[ik]*dp;
+                }
+
+                if (grad_s) {
+                    const float p_sink = expf(((const float *) sinks->data)[iqh] - max_score)*inv_sum;
+                    grad_s[iqh] += -p_sink*mean;
+                }
+
+                float * pgq = grad_q + iq*gq1 + iqh*gq2 + ib*gq3;
+                for (int64_t ik = 0; ik < key_end; ++ik) {
+                    if (probs[ik] == 0.0f) {
+                        continue;
+                    }
+                    const char * pk = (const char *) k->data + ik*k->nb[1] + ikh*k->nb[2] + ib*k->nb[3];
+                    float derivative = scale;
+                    if (logit_softcap != 0.0f) {
+                        float dot = 0.0f;
+                        for (int64_t id = 0; id < DK; ++id) {
+                            dot += pq[id]*ggml_flash_attn_back_load(k, pk + id*k->nb[0]);
+                        }
+                        const float t = tanhf(dot*scale/logit_softcap);
+                        derivative *= 1.0f - t*t;
+                    }
+                    const float ds = probs[ik]*(logits[ik] - mean)*derivative;
+                    float * pgk = grad_k + ik*gk1 + ikh*gk2 + ib*gk3;
+                    for (int64_t id = 0; id < DK; ++id) {
+                        const float kval = ggml_flash_attn_back_load(k, pk + id*k->nb[0]);
+                        pgq[id] += ds*kval;
+                        pgk[id] += ds*pq[id];
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_flash_attn_back(
         const ggml_compute_params * params,
         const bool masked,
         ggml_tensor * dst) {
-
-    const ggml_tensor * q = dst->src[0];
-
-    switch (q->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_flash_attn_back_f32(params, masked, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
+    GGML_UNUSED(masked);
+    ggml_compute_forward_flash_attn_back_ext(params, dst);
 }
 
 // ggml_compute_forward_ssm_conv

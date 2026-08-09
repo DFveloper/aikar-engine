@@ -5553,6 +5553,21 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_causal(
+        struct ggml_tensor * a,
+        bool                 causal) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(!causal || a->src[1]->ne[1] >= a->src[0]->ne[1]);
+    GGML_ASSERT(!causal || a->src[3]);
+    ggml_set_op_params_i32(a, 4, causal ? 1 : 0);
+}
+
+bool ggml_flash_attn_ext_get_causal(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_BACK);
+    return ggml_get_op_params_i32(a, 4) != 0;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -5567,6 +5582,38 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * forward,
+        struct ggml_tensor  * grad) {
+    GGML_ASSERT(forward->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(ggml_are_same_shape(forward, grad));
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * q = forward->src[0];
+    struct ggml_tensor * k = forward->src[1];
+    struct ggml_tensor * v = forward->src[2];
+    struct ggml_tensor * sinks = forward->src[4];
+
+    const size_t size_q = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t size_k = GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t size_v = GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t size_s = sinks ? GGML_PAD(ggml_nelements(sinks)*sizeof(float), GGML_MEM_ALIGN) : 0;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (size_q + size_k + size_v + size_s)/sizeof(float));
+    memcpy(result->op_params, forward->op_params, GGML_MAX_OP_PARAMS);
+
+    result->op     = GGML_OP_FLASH_ATTN_BACK;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = grad;
+    result->src[4] = forward->src[3];
+    result->src[5] = sinks;
+
+    return result;
 }
 
 // ggml_flash_attn_back
@@ -7401,6 +7448,49 @@ static void ggml_compute_backward(
                 } //break;
             }
         } break;
+        case GGML_OP_FLASH_ATTN_EXT: {
+            struct ggml_tensor * src4 = tensor->src[4];
+            const size_t isrc4 = src4 ? ggml_hash_find(hash_set, src4) : (size_t) -1;
+            const bool src4_needs_grads = src4 && isrc4 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc4) && grads_needed[isrc4];
+
+            GGML_ASSERT(!tensor->src[3] || tensor->src[3]->type == GGML_TYPE_F16);
+
+            if (src0_needs_grads || src1_needs_grads || src2_needs_grads || src4_needs_grads) {
+                struct ggml_tensor * back = ggml_flash_attn_ext_back(ctx, tensor, grad);
+
+                size_t offset = 0;
+                if (src0_needs_grads) {
+                    struct ggml_tensor * view = ggml_view_4d(ctx, back,
+                            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                            src0->ne[0]*sizeof(float), src0->ne[0]*src0->ne[1]*sizeof(float),
+                            src0->ne[0]*src0->ne[1]*src0->ne[2]*sizeof(float), offset);
+                    ggml_add_or_set(ctx, cgraph, isrc0, view);
+                }
+                offset += GGML_PAD(ggml_nelements(src0)*sizeof(float), GGML_MEM_ALIGN);
+
+                if (src1_needs_grads) {
+                    struct ggml_tensor * view = ggml_view_4d(ctx, back,
+                            src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                            src1->ne[0]*sizeof(float), src1->ne[0]*src1->ne[1]*sizeof(float),
+                            src1->ne[0]*src1->ne[1]*src1->ne[2]*sizeof(float), offset);
+                    ggml_add_or_set(ctx, cgraph, isrc1, view);
+                }
+                offset += GGML_PAD(ggml_nelements(src1)*sizeof(float), GGML_MEM_ALIGN);
+
+                if (src2_needs_grads) {
+                    struct ggml_tensor * view = ggml_view_4d(ctx, back,
+                            src2->ne[0], src2->ne[1], src2->ne[2], src2->ne[3],
+                            src2->ne[0]*sizeof(float), src2->ne[0]*src2->ne[1]*sizeof(float),
+                            src2->ne[0]*src2->ne[1]*src2->ne[2]*sizeof(float), offset);
+                    ggml_add_or_set(ctx, cgraph, isrc2, view);
+                }
+                offset += GGML_PAD(ggml_nelements(src2)*sizeof(float), GGML_MEM_ALIGN);
+
+                if (src4_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc4, ggml_view_1d(ctx, back, src4->ne[0], offset));
+                }
+            }
+        } break;
         case GGML_OP_NONE: {
             // noop
         } break;
@@ -7606,11 +7696,14 @@ void ggml_build_backward_expand(
             // backward graph builder never tries to propagate through them.
             case GGML_OP_SSM_CONV:       // Mamba causal conv1d
             case GGML_OP_SSM_SCAN:       // Mamba selective scan
-            case GGML_OP_FLASH_ATTN_EXT: // use standard attention for training
                 ignore_src[0] = true;
                 ignore_src[1] = true;
                 ignore_src[2] = true;
                 ignore_src[3] = true;
+                break;
+
+            case GGML_OP_FLASH_ATTN_EXT:
+                ignore_src[3] = true; // attention mask
                 break;
 
             default:

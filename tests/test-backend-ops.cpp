@@ -1160,6 +1160,11 @@ struct test_case {
         return 1e-4;
     }
 
+    virtual bool grad_check_supported(ggml_backend_t backend) {
+        GGML_UNUSED(backend);
+        return true;
+    }
+
     virtual double max_err() {
         return max_nmse_err();
     }
@@ -1713,6 +1718,12 @@ struct test_case {
             output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
                                                                 test_status_t::NOT_SUPPORTED,
                                                                 out->name + std::string("->type != FP32")));
+            return true;
+        }
+
+        if (!grad_check_supported(backend)) {
+            output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                                                                test_status_t::NOT_SUPPORTED, ggml_backend_name(backend)));
             return true;
         }
 
@@ -7116,6 +7127,169 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_ext_grad : public test_case {
+    const bool sinks;
+    const float max_bias;
+    const float logit_softcap;
+
+    test_flash_attn_ext_grad(bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f)
+        : sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(sinks, max_bias, logit_softcap);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t DK = sinks ? 128 : 64;
+        const int64_t DV = DK;
+        const int64_t N  = 1;
+        const int64_t M  = 256;
+        const int64_t HQ = 4;
+        const int64_t HK = 2;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, N, HQ, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, M, HK, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DV, M, HK, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, M, N, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(m, "m");
+        ggml_set_param(q);
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, HQ);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) DK), max_bias, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_set_causal(out, true);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> mask(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                const int64_t prefix = t->ne[0] - t->ne[1];
+                for (int64_t iq = 0; iq < t->ne[1]; ++iq) {
+                    for (int64_t ik = prefix + iq + 1; ik < t->ne[0]; ++ik) {
+                        mask[ik + t->ne[0]*iq] = ggml_fp32_to_fp16(-INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(mask[0]));
+            } else if (strcmp(t->name, "s") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (float) ((int) (i*13 % 17) - 8)/16.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (float) ((int) (i*17 % 33) - 16)/64.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            }
+        }
+    }
+
+    float grad_eps() override {
+        return 1.0f/8.0f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double max_maa_err() override {
+        return 5e-3;
+    }
+
+    bool grad_check_supported(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0;
+    }
+};
+
+struct test_flash_attn_back : public test_case {
+    const ggml_type type_kv;
+    const bool sinks;
+    const bool causal;
+
+    test_flash_attn_back(ggml_type type_kv = GGML_TYPE_F16, bool sinks = false, bool causal = true)
+        : type_kv(type_kv), sinks(sinks), causal(causal) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_kv, sinks, causal);
+    }
+
+    double max_nmse_err() override {
+        return 2e-5;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t DK = 64;
+        const int64_t DV = 64;
+        const int64_t N  = 4;
+        const int64_t M  = 8;
+        const int64_t HQ = 4;
+        const int64_t HK = 2;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, N, HQ, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_kv, DK, M, HK, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_kv, DV, M, HK, 1);
+        ggml_tensor * d = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DV, HQ, N, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, M, N, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(d, "d");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, HQ);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * forward = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) DK), sinks ? 2.0f : 0.0f, sinks ? 1.5f : 0.0f);
+        ggml_flash_attn_ext_add_sinks(forward, s);
+        ggml_flash_attn_ext_set_causal(forward, causal);
+        ggml_tensor * out = ggml_flash_attn_ext_back(ctx, forward, d);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> mask(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                if (causal) {
+                    const int64_t prefix = t->ne[0] - t->ne[1];
+                    for (int64_t iq = 0; iq < t->ne[1]; ++iq) {
+                        for (int64_t ik = prefix + iq + 1; ik < t->ne[0]; ++ik) {
+                            mask[ik + t->ne[0]*iq] = ggml_fp32_to_fp16(-INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(mask[0]));
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9881,6 +10055,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, tfrm, circular));
         }
     }
+
+    test_cases.emplace_back(new test_flash_attn_ext_grad());
+    test_cases.emplace_back(new test_flash_attn_ext_grad(true, 2.0f, 1.5f));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, false, false));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.

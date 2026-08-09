@@ -1073,6 +1073,10 @@ void process_shaders() {
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", {});
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", {});
+    string_to_spv("flash_attn_back_f32_f32", "flash_attn_back.comp", {});
+    string_to_spv("flash_attn_back_f16_f32", "flash_attn_back.comp", {{"K_F16", "1"}}, true);
+    string_to_spv("flash_attn_back_f32_f16", "flash_attn_back.comp", {{"V_F16", "1"}}, true);
+    string_to_spv("flash_attn_back_f16_f16", "flash_attn_back.comp", {{"K_F16", "1"}, {"V_F16", "1"}}, true);
 
     string_to_spv("solve_tri_f32", "solve_tri.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 
