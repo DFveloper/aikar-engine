@@ -3,6 +3,7 @@
 #include "gguf.h"
 
 #include "llama.h"
+#include "jsonl.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -686,7 +687,7 @@ static void write_evo_candidate(
     gguf_free(output_gguf);
 }
 
-static std::vector<std::string> load_calibration(const std::string & path) {
+static std::vector<std::string> load_calibration(const std::string & path, int32_t n_threads) {
     std::ifstream input(path);
     if (!input) {
         throw std::runtime_error("failed to open calibration file " + path);
@@ -699,18 +700,20 @@ static std::vector<std::string> load_calibration(const std::string & path) {
         return samples;
     }
 
-    std::string line;
-    int line_number = 0;
-    while (std::getline(input, line)) {
-        ++line_number;
-        if (trim(line).empty()) continue;
+    std::vector<common_jsonl_line> lines = common_jsonl_read_lines(path, COMMON_JSONL_EMPTY_LINE_SKIP);
+    std::vector<std::string> parsed(lines.size());
+    std::vector<std::string> errors(lines.size());
+    common_jsonl_worker_pool pool(common_jsonl_worker_count(n_threads, lines.size()));
+    pool.parallel_for(lines.size(), [&](size_t i, size_t) {
+        if (trim(lines[i].text).empty()) return;
         try {
-            const nlohmann::json item = nlohmann::json::parse(line);
+            const nlohmann::json item = nlohmann::json::parse(lines[i].text);
             std::string text;
             if (item.contains("messages") && item["messages"].is_array()) {
-                for (const auto & message : item["messages"]) {
-                    if (message.contains("content") && message["content"].is_string()) {
-                        text += message.value("role", "user") + ": " + message["content"].get<std::string>() + "\n";
+                for (const auto & data : item["messages"]) {
+                    const common_chat_msg message = common_jsonl_parse_chat_message(data, COMMON_JSONL_CHAT_PARSE_OPTIONAL_TEXT);
+                    if (!message.content_parts.empty()) {
+                        text += message.role + ": " + message.content_parts[0].text + "\n";
                     }
                 }
             } else if (item.contains("prompt") && item.contains("response")) {
@@ -718,10 +721,15 @@ static std::vector<std::string> load_calibration(const std::string & path) {
             } else if (item.contains("text")) {
                 text = item["text"].get<std::string>();
             }
-            if (!text.empty()) samples.push_back(std::move(text));
+            parsed[i] = std::move(text);
         } catch (const std::exception & error) {
-            throw std::runtime_error("invalid calibration JSONL line " + std::to_string(line_number) + ": " + error.what());
+            errors[i] = error.what();
         }
+    });
+    for (common_jsonl_line & line : lines) std::string().swap(line.text);
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!errors[i].empty()) throw std::runtime_error("invalid calibration JSONL line " + std::to_string(lines[i].number) + ": " + errors[i]);
+        if (!parsed[i].empty()) samples.push_back(std::move(parsed[i]));
     }
     if (samples.empty()) {
         throw std::runtime_error("calibration file contains no usable samples");
@@ -822,7 +830,7 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
     for (const auto & entry : inputs[0]->tensors) {
         tensor_names.push_back(entry.first);
     }
-    const std::vector<std::string> calibration = load_calibration(params.calibration);
+    const std::vector<std::string> calibration = load_calibration(params.calibration, params.n_threads);
     const uint32_t seed = params.seed ? params.seed : std::random_device{}();
     std::mt19937 rng(seed);
     const size_t gene_count = tensor_names.size() * inputs.size();
