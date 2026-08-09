@@ -455,33 +455,75 @@ if __name__ == '__main__':
                 return ()
 
             def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+                logger.info("### USING LORA get_tensors OVERRIDE ###")
                 tensor_map: dict[str, PartialLoraTensor] = {}
 
+                # ──────────────────────────────────────
+                # 1. 모든 LoRA tensor를 먼저 수집
+                # ──────────────────────────────────────
                 for name, tensor in lora_model.items():
                     if self.lazy:
                         tensor = LazyTorchTensor.from_eager(tensor)
+
                     base_name = get_base_tensor_name(name)
-                    # filter base name, ignore tensor transformations for now
-                    data_gen = lambda g=tensor: g  # noqa: E731
+
+                    # Gemma 4 MoE PEFT ParamWrapper mapping
+                    if (
+                        ".experts.base_layer.lora_A.weight" in name
+                        or ".experts.base_layer.lora_B.weight" in name
+                    ):
+                        base_name = base_name.replace(
+                            ".experts.base_layer.weight",
+                            ".experts.gate_up_proj.weight",
+                        )
+
+                    elif (
+                        ".experts.lora_A.weight" in name
+                        or ".experts.lora_B.weight" in name
+                    ):
+                        base_name = base_name.replace(
+                            ".experts.weight",
+                            ".experts.down_proj.weight",
+                        )
+
+                    data_gen = lambda g=tensor: g
+    
                     if (titem := self.filter_tensors((base_name, data_gen))) is None:
                         continue
+    
                     base_name, _ = titem
-                    # note: mergekit-extract-lora also adds token embeddings to the adapter
-                    is_lora_a = ".lora_A.weight" in name or ".lora_embedding_A" in name
-                    is_lora_b = ".lora_B.weight" in name or ".lora_embedding_B" in name
+    
+                    is_lora_a = (
+                        ".lora_A.weight" in name
+                        or ".lora_embedding_A" in name
+                    )
+                    is_lora_b = (
+                        ".lora_B.weight" in name
+                        or ".lora_embedding_B" in name
+                    )
+
+                    if ".experts" in name:
+                        logger.info(
+                            "EXPERT MAP: %s -> %s [%s]",
+                            name,
+                            base_name,
+                            "A" if is_lora_a else "B" if is_lora_b else "?",
+                        )
+
                     if not is_lora_a and not is_lora_b:
                         if ".base_layer.weight" in name:
                             continue
-                        # mergekit-extract-lora add these layernorm to the adapter, we need to keep them
+ 
                         if "_layernorm" in name or ".norm" in name:
                             yield (base_name, tensor)
                             continue
-                        logger.error(f"Unexpected name '{name}': Not a lora_A or lora_B tensor")
-                        if ".embed_tokens.weight" in name or ".lm_head.weight" in name:
-                            logger.error("Embeddings is present in the adapter. This can be due to new tokens added during fine tuning")
-                            logger.error("Please refer to https://github.com/ggml-org/llama.cpp/pull/9948")
-                        sys.exit(1)
-
+  
+                        logger.error(
+                            f"Unexpected name '{name}': "
+                            "Not a lora_A or lora_B tensor"
+                        )
+                        continue   
+  
                     if base_name in tensor_map:
                         if is_lora_a:
                             tensor_map[base_name].A = tensor
@@ -493,10 +535,85 @@ if __name__ == '__main__':
                         else:
                             tensor_map[base_name] = PartialLoraTensor(B=tensor)
 
-                for name, tensor in tensor_map.items():
+                # ──────────────────────────────────────
+                # ↑↑↑ 중요: lora_model 루프가 여기서 완전히 끝남
+                # ──────────────────────────────────────
+
+
+                # ──────────────────────────────────────
+                # 2. 그 다음에야 pairing 검증 + reshape
+                # ──────────────────────────────────────
+                bad = []
+    
+                for base_name, tensor in tensor_map.items():
+                    if tensor.A is None or tensor.B is None:
+                        bad.append(
+                            f"{base_name!r}: "
+                            f"A={'present' if tensor.A is not None else 'MISSING'}, "
+                            f"B={'present' if tensor.B is not None else 'MISSING'}"
+                        )
+    
+                if bad:
+                    raise RuntimeError(
+                        "Unpaired LoRA tensors:\n  " + "\n  ".join(bad)
+                    )
+
+                for base_name, tensor in tensor_map.items():
                     assert tensor.A is not None
                     assert tensor.B is not None
-                    yield (name, cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B)))
+    
+                    A = tensor.A
+                    B = tensor.B
+    
+                    # Gemma 4 MoE expert LoRA
+                    if (
+                        ".experts.gate_up_proj.weight" in base_name
+                        or ".experts.down_proj.weight" in base_name
+                    ):
+                        r = int(lparams["r"])
+    
+                        if A.shape[0] % r != 0:
+                            raise ValueError(
+                                f"Invalid Gemma4 expert LoRA A shape for {base_name}: "
+                                f"{tuple(A.shape)}, rank={r}"
+                            )
+    
+                        n_experts = A.shape[0] // r
+    
+                        if B.shape[1] != r * n_experts:
+                            raise ValueError(
+                                f"Invalid Gemma4 expert LoRA B shape for {base_name}: "
+                                f"{tuple(B.shape)}, expected second dim "
+                                f"{r * n_experts}"
+                            )
+    
+                        A = A.reshape(
+                            n_experts,
+                            r,
+                            A.shape[-1],
+                        )
+ 
+                        B = (
+                            B.reshape(
+                            B.shape[0],
+                            r,
+                            n_experts,
+                        )
+                        .permute(2, 0, 1)
+                        .contiguous()
+                    )
+
+                    logger.info(
+                        "Reshaped Gemma4 expert LoRA %s: A=%s B=%s",
+                        base_name,
+                        tuple(A.shape),
+                        tuple(B.shape),
+                    )
+
+                yield (
+                    base_name,
+                    cast(torch.Tensor, LoraTorchTensor(A, B)),
+                )
 
             def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
                 dest = list(super().modify_tensors(data_torch, name, bid))
@@ -527,6 +644,17 @@ if __name__ == '__main__':
 
         alpha: float = lparams["lora_alpha"]
 
+        logger.info("LoraModel methods: %s", list(LoraModel.__dict__.keys()))
+
+        assert "get_tensors" in LoraModel.__dict__, (
+            "BUG: get_tensors() is NOT defined inside LoraModel; "
+            "base model get_tensors() would export the full model"
+        )
+
+        assert "modify_tensors" in LoraModel.__dict__, (
+            "BUG: modify_tensors() is NOT defined inside LoraModel"
+        )
+
         model_instance = LoraModel(
             dir_base_model,
             ftype,
@@ -541,6 +669,6 @@ if __name__ == '__main__':
             remote_hf_model_id=base_model_id,
         )
 
-        logger.info("Exporting model...")
-        model_instance.write()
-        logger.info(f"Model successfully exported to {model_instance.fname_out}")
+    logger.info("Exporting model...")
+    model_instance.write()
+    logger.info(f"Model successfully exported to {model_instance.fname_out}")
