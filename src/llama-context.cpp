@@ -3360,6 +3360,21 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.critical_token_weight     = lopt_params.critical_token_weight;
     opt_params.critical_confidence_threshold = lopt_params.critical_confidence_threshold;
     opt_params.critical_weight_linear    = lopt_params.critical_weight_shape == LLAMA_OPT_CRITICAL_WEIGHT_SHAPE_LINEAR;
+    bool native_training_kernels_supported = true;
+    for (ggml_backend_t backend : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        const char * reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
+            native_training_kernels_supported = false;
+            break;
+        }
+    }
+    opt_params.sparse_labels = native_training_kernels_supported &&
+        lopt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
+    opt_params.fused_backward = native_training_kernels_supported;
     cparams.lora_qat_type                = lopt_params.lora_qat_type;
     opt_ctx = ggml_opt_init(opt_params);
 
@@ -3445,6 +3460,8 @@ void llama_context::opt_epoch_iter(
     std::vector<float> reward_weights_host(critical_metadata ? n_ubatch : 0);
     std::vector<float> stats_selected(critical_stats_due ? n_ubatch : 0);
     std::vector<float> stats_effective(critical_stats_due ? n_ubatch : 0);
+    std::vector<int32_t> sparse_targets_host(n_ubatch);
+    std::vector<float> sparse_weights_host(n_ubatch);
 
     memory->clear(true);
 
@@ -3542,8 +3559,13 @@ void llama_context::opt_epoch_iter(
             res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-                GGML_ASSERT(labels->ne[1] == n_ubatch);
-                ggml_set_zero(labels);
+                struct ggml_tensor * sparse_targets = ggml_opt_sparse_targets(opt_ctx);
+                struct ggml_tensor * sparse_weights = ggml_opt_sparse_weights(opt_ctx);
+                GGML_ASSERT(labels || (sparse_targets && sparse_weights));
+                if (labels) {
+                    GGML_ASSERT(labels->ne[1] == n_ubatch);
+                    ggml_set_zero(labels);
+                }
                 struct ggml_tensor * span_weights = critical_metadata ? ggml_opt_critical_span_weights(opt_ctx) : nullptr;
                 struct ggml_tensor * reward_weights = critical_metadata ? ggml_opt_critical_reward_weights(opt_ctx) : nullptr;
                 struct ggml_tensor * warmup_scale_tensor = critical_metadata ? ggml_opt_critical_warmup_scale(opt_ctx) : nullptr;
@@ -3553,19 +3575,31 @@ void llama_context::opt_epoch_iter(
                     std::fill(span_weights_host.begin(), span_weights_host.end(), 0.0f);
                     std::fill(reward_weights_host.begin(), reward_weights_host.end(), 0.0f);
                 }
+                if (sparse_targets) {
+                    std::fill(sparse_targets_host.begin(), sparse_targets_host.end(), 0);
+                    std::fill(sparse_weights_host.begin(), sparse_weights_host.end(), 0.0f);
+                }
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                     // -1 sentinel means "masked position" (prompt token, BOS separator, etc).
-                    // Leave the label tensor zeroed at this position → zero cross-entropy
-                    // contribution.  Do NOT write anything — ggml_set_zero already handled it.
+                    // Leave the dense label row or sparse weight at zero.
                     if (labels_sparse[ilabel] < 0) continue;
-                    GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
+                    GGML_ASSERT(labels_sparse[ilabel] < res->get_logits()->ne[0]);
                     const float active_label_scale = critical_metadata ? 1.0f : label_scale;
-                    ggml_backend_tensor_set(labels, &active_label_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    if (labels) {
+                        ggml_backend_tensor_set(labels, &active_label_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    } else {
+                        sparse_targets_host[pos_ubatch] = labels_sparse[ilabel];
+                        sparse_weights_host[pos_ubatch] = active_label_scale;
+                    }
                     if (critical_metadata) {
                         span_weights_host[pos_ubatch] = (*critical_metadata)[ilabel].span_weight;
                         reward_weights_host[pos_ubatch] = train ? (*critical_metadata)[ilabel].reward_weight : 1.0f;
                     }
+                }
+                if (sparse_targets) {
+                    ggml_backend_tensor_set(sparse_targets, sparse_targets_host.data(), 0, n_ubatch*sizeof(int32_t));
+                    ggml_backend_tensor_set(sparse_weights, sparse_weights_host.data(), 0, n_ubatch*sizeof(float));
                 }
                 if (critical_metadata) {
                     float warmup_scale = 1.0f;

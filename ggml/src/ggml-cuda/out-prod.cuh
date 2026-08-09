@@ -1,6 +1,6 @@
 #include "common.cuh"
 
-void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta = 0.0f);
 
 // Scattered outer-product for MUL_MAT_ID backward (gradient w.r.t. expert weight matrices).
 // src0: activations [cols, n_expert_used, n_tokens]  F32

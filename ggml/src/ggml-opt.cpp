@@ -49,6 +49,8 @@ struct ggml_opt_context {
     struct ggml_tensor * inputs  = nullptr;
     struct ggml_tensor * outputs = nullptr;
     struct ggml_tensor * labels  = nullptr;
+    struct ggml_tensor * sparse_targets = nullptr;
+    struct ggml_tensor * sparse_weights = nullptr;
     struct ggml_tensor * critical_span_weights   = nullptr;
     struct ggml_tensor * critical_reward_weights = nullptr;
     struct ggml_tensor * critical_warmup_scale   = nullptr;
@@ -91,6 +93,8 @@ struct ggml_opt_context {
     float   critical_token_weight = 1.0f;
     float   critical_confidence_threshold = 0.25f;
     bool    critical_weight_linear = false;
+    bool    sparse_labels = false;
+    bool    fused_backward = false;
     int32_t critical_max_tokens = -1;
 
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
@@ -409,6 +413,8 @@ struct ggml_opt_params ggml_opt_default_params(
         /*critical_token_weight    =*/ 1.0f,
         /*critical_confidence_threshold =*/ 0.25f,
         /*critical_weight_linear   =*/ false,
+        /*sparse_labels            =*/ false,
+        /*fused_backward           =*/ false,
         /*optimizer                =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
     };
 }
@@ -540,6 +546,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     struct ggml_context * ctx_results = opt_ctx->static_graphs ? opt_ctx->ctx_static : opt_ctx->ctx_compute;
+    ggml_set_fused_backward(ctx_results, opt_ctx->fused_backward);
 
     switch (opt_ctx->loss_type) {
         case GGML_OPT_LOSS_TYPE_MEAN: {
@@ -558,6 +565,24 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             break;
         }
         case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: {
+            if (opt_ctx->sparse_labels && !opt_ctx->critical_token_weighting) {
+                const int64_t nrows = ggml_nrows(opt_ctx->outputs);
+                opt_ctx->sparse_targets = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
+                opt_ctx->sparse_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+                ggml_set_input(opt_ctx->sparse_targets);
+                ggml_set_input(opt_ctx->sparse_weights);
+                ggml_set_name(opt_ctx->sparse_targets, "sparse_targets");
+                ggml_set_name(opt_ctx->sparse_weights, "sparse_weights");
+                opt_ctx->loss = ggml_cross_entropy_loss_sparse(
+                    ctx_results, opt_ctx->outputs, opt_ctx->sparse_targets, opt_ctx->sparse_weights);
+                ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse");
+                if (opt_ctx->opt_period > 1) {
+                    opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
+                    ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse_scaled");
+                }
+                opt_ctx->loss_per_datapoint = true;
+                break;
+            }
             opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
             ggml_set_name(opt_ctx->labels, "labels");
@@ -684,7 +709,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
 
-        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, ggml_argmax(ctx_results, opt_ctx->labels));
+        struct ggml_tensor * target_classes = opt_ctx->sparse_targets
+            ? opt_ctx->sparse_targets
+            : ggml_argmax(ctx_results, opt_ctx->labels);
+        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, target_classes);
         ggml_set_name(opt_ctx->ncorrect, "ncorrect");
         ggml_set_output(opt_ctx->ncorrect);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->ncorrect);
@@ -920,6 +948,8 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->critical_token_weight     = params.critical_token_weight;
     result->critical_confidence_threshold = params.critical_confidence_threshold;
     result->critical_weight_linear    = params.critical_weight_linear;
+    result->sparse_labels             = params.sparse_labels;
+    result->fused_backward            = params.fused_backward;
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -990,6 +1020,14 @@ struct ggml_tensor * ggml_opt_outputs(ggml_opt_context_t opt_ctx) {
 
 struct ggml_tensor * ggml_opt_labels(ggml_opt_context_t opt_ctx) {
     return opt_ctx->labels;
+}
+
+struct ggml_tensor * ggml_opt_sparse_targets(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->sparse_targets;
+}
+
+struct ggml_tensor * ggml_opt_sparse_weights(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->sparse_weights;
 }
 
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {

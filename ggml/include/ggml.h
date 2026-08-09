@@ -590,6 +590,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_GLU_BACK,
 
         GGML_OP_COUNT,
     };
@@ -816,6 +817,7 @@ extern "C" {
     GGML_API size_t  ggml_used_mem(const struct ggml_context * ctx);
 
     GGML_API bool    ggml_get_no_alloc(struct ggml_context * ctx);
+    GGML_API void    ggml_set_fused_backward(struct ggml_context * ctx, bool enabled);
     GGML_API void    ggml_set_no_alloc(struct ggml_context * ctx, bool no_alloc);
 
     GGML_API void *  ggml_get_mem_buffer     (const struct ggml_context * ctx);
@@ -1421,6 +1423,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_rms_norm_mul_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * scale,
             float                 eps);
 
     // A: k columns, n rows => [ne03, ne02, n, k]
@@ -2755,6 +2764,26 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * targets,
+            struct ggml_tensor  * weights);
+
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * targets,
+            struct ggml_tensor  * weights);
+
+    GGML_API struct ggml_tensor * ggml_glu_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            enum ggml_glu_op      op);
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

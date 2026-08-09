@@ -357,6 +357,60 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_op_unary_gated<op_gelu_quick>(ctx, dst);
 }
 
+static __global__ void glu_back_f32(
+        const float * grad,
+        const float * gate,
+        const float * up,
+        float * dst,
+        int64_t ne,
+        int64_t nc,
+        int op) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t row = i/nc;
+    const int64_t col = i%nc;
+    const int64_t out = row*2*nc + col;
+    const float x = gate[i];
+    const float dy = grad[i];
+    const float u = up[i];
+
+    if (op == GGML_GLU_OP_SWIGLU) {
+        const float sig = 1.0f/(1.0f + expf(-x));
+        const float silu = x*sig;
+        dst[out] = dy*u*sig*(1.0f + x*(1.0f - sig));
+        dst[out + nc] = dy*silu;
+    } else {
+        const float gelu_coef_a = 0.044715f;
+        const float sqrt_2_over_pi = 0.79788456080286535587989211986876f;
+        const float x2 = x*x;
+        const float t = tanhf(sqrt_2_over_pi*x*(1.0f + gelu_coef_a*x2));
+        const float dgelu = 0.5f*(1.0f + t) +
+            0.5f*x*sqrt_2_over_pi*(1.0f - t*t)*(1.0f + 3.0f*gelu_coef_a*x2);
+        dst[out] = dy*u*dgelu;
+        dst[out + nc] = dy*0.5f*x*(1.0f + t);
+    }
+}
+
+void ggml_cuda_op_glu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->src[2]->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    const int64_t ne = ggml_nelements(dst->src[1]);
+    const int64_t nc = dst->src[1]->ne[0];
+    const int op = ggml_get_op_params_i32(dst, 0);
+    const int64_t blocks = (ne + CUDA_GLU_BLOCK_SIZE - 1)/CUDA_GLU_BLOCK_SIZE;
+    glu_back_f32<<<blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) dst->src[0]->data,
+        (const float *) dst->src[1]->data,
+        (const float *) dst->src[2]->data,
+        (float *) dst->data, ne, nc, op);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // swiglu_oai
 
 template <typename T>

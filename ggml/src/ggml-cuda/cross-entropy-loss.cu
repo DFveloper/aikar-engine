@@ -120,12 +120,84 @@ static __global__ void cross_entropy_loss_back_f32(
     }
 }
 
+static __global__ void cross_entropy_loss_sparse_f32(
+        const float * __restrict__ logits,
+        const int32_t * __restrict__ targets,
+        const float * __restrict__ weights,
+        float * __restrict__ dst,
+        const int nclasses,
+        const int nrows) {
+    logits += int64_t(blockIdx.x)*nclasses;
+    const int32_t target = targets[blockIdx.x];
+    const float weight = weights[blockIdx.x];
+    if (target < 0 || weight == 0.0f) {
+        if (threadIdx.x == 0) {
+            dst[blockIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    float max_logit = -INFINITY;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        max_logit = fmaxf(max_logit, logits[i]);
+    }
+    max_logit = warp_reduce_max(max_logit);
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        sum += expf(logits[i] - max_logit);
+    }
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        dst[blockIdx.x] = weight*(logf(sum) + max_logit - logits[target])/(float) nrows;
+    }
+}
+
+static __global__ void cross_entropy_loss_sparse_back_f32(
+        const float * __restrict__ grad,
+        const float * __restrict__ logits,
+        const int32_t * __restrict__ targets,
+        const float * __restrict__ weights,
+        float * __restrict__ dst,
+        const int nclasses,
+        const int nrows) {
+    logits += int64_t(blockIdx.x)*nclasses;
+    dst += int64_t(blockIdx.x)*nclasses;
+    const int32_t target = targets[blockIdx.x];
+    const float weight = weights[blockIdx.x];
+    if (target < 0 || weight == 0.0f) {
+        for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+            dst[i] = 0.0f;
+        }
+        return;
+    }
+
+    float max_logit = -INFINITY;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        max_logit = fmaxf(max_logit, logits[i]);
+    }
+    max_logit = warp_reduce_max(max_logit);
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        sum += expf(logits[i] - max_logit);
+    }
+    sum = warp_reduce_sum(sum);
+    const float scale = weight*(*grad)/(sum*(float) nrows);
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        dst[i] = expf(logits[i] - max_logit)*scale;
+    }
+    __syncwarp();
+    if (threadIdx.x == 0) {
+        dst[target] -= weight*(*grad)/(float) nrows;
+    }
+}
+
 void ggml_cuda_cross_entropy_loss(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
     GGML_ASSERT(ggml_is_contiguous(src0));
@@ -136,7 +208,6 @@ void ggml_cuda_cross_entropy_loss(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int64_t nrows = ggml_nrows(src0);
 
     const float * src0_d = (const float *) src0->data;
-    const float * src1_d = (const float *) src1->data;
     float       * dst_d  = (float       *) dst->data;
 
     ggml_cuda_pool & pool = ctx.pool();
@@ -150,6 +221,20 @@ void ggml_cuda_cross_entropy_loss(ggml_backend_cuda_context & ctx, ggml_tensor *
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
     ggml_cuda_pool_alloc<float> dst_tmp(pool, blocks_num.x);
+
+    if (src1->type == GGML_TYPE_I32) {
+        const ggml_tensor * weights = dst->src[2];
+        GGML_ASSERT(weights->type == GGML_TYPE_F32);
+        cross_entropy_loss_sparse_f32<<<blocks_num, blocks_dim, 0, stream>>>(
+            src0_d, (const int32_t *) src1->data, (const float *) weights->data,
+            dst_tmp.ptr, ne00, nrows);
+        CUDA_CHECK(cudaGetLastError());
+        sum_f32_cuda(pool, dst_tmp.ptr, dst_d, blocks_num.x, stream);
+        return;
+    }
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    const float * src1_d = (const float *) src1->data;
 
     if (nbytes_shared <= smpbo) {
         CUDA_SET_SHARED_MEMORY_LIMIT((cross_entropy_loss_f32<true>), smpbo);
@@ -169,7 +254,6 @@ void ggml_cuda_cross_entropy_loss_back(ggml_backend_cuda_context & ctx, ggml_ten
     const ggml_tensor * src1f = dst->src[2];
 
     GGML_ASSERT(src0f->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1f->type == GGML_TYPE_F32);
     GGML_ASSERT( grad->type == GGML_TYPE_F32);
     GGML_ASSERT(  dst->type == GGML_TYPE_F32);
 
@@ -177,7 +261,6 @@ void ggml_cuda_cross_entropy_loss_back(ggml_backend_cuda_context & ctx, ggml_ten
     GGML_ASSERT(ggml_is_contiguous(src0f));
     GGML_ASSERT(ggml_is_contiguous(src1f));
     GGML_ASSERT(ggml_is_contiguous(dst));
-    GGML_ASSERT(ggml_are_same_shape(src0f, src1f));
     GGML_ASSERT(ggml_are_same_shape(src0f, dst));
 
     const int64_t ne00  = src0f->ne[0];
@@ -185,13 +268,26 @@ void ggml_cuda_cross_entropy_loss_back(ggml_backend_cuda_context & ctx, ggml_ten
 
     const float * grad_d  = (const float *) grad->data;
     const float * src0f_d = (const float *) src0f->data;
-    const float * src1f_d = (const float *) src1f->data;
     float       * dst_d   = (float       *) dst->data;
 
     cudaStream_t stream = ctx.stream();
 
     const dim3 blocks_dim(WARP_SIZE, 1, 1);
     const dim3 blocks_num(nrows, 1, 1);
+
+    if (src1f->type == GGML_TYPE_I32) {
+        const ggml_tensor * weights = dst->src[3];
+        GGML_ASSERT(weights->type == GGML_TYPE_F32);
+        cross_entropy_loss_sparse_back_f32<<<blocks_num, blocks_dim, 0, stream>>>(
+            grad_d, src0f_d, (const int32_t *) src1f->data, (const float *) weights->data,
+            dst_d, ne00, nrows);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    GGML_ASSERT(src1f->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0f, src1f));
+    const float * src1f_d = (const float *) src1f->data;
     const size_t nbytes_shared = ne00*sizeof(float);
 
     const int    id    = ggml_cuda_get_device();

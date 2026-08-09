@@ -2036,6 +2036,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_GLU_BACK:
+            {
+                ggml_compute_forward_glu_back(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2321,6 +2325,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 default:
                     GGML_ABORT("fatal error");
             }
+            break;
+        case GGML_OP_GLU_BACK:
+            n_tasks = n_threads;
             break;
         case GGML_OP_SILU_BACK:
         case GGML_OP_MUL:
@@ -2881,7 +2888,7 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         if (ggml_is_quantized(node->src[0]->type) ||
                             node->src[0]->type == GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                            cur = ggml_type_size(GGML_TYPE_F32) * (node->src[0]->ne[0] + CACHE_LINE_SIZE_F32) * n_tasks;
                         }
                     } break;
                 case GGML_OP_SET_ROWS:
@@ -3039,6 +3046,21 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_OUT_PROD) {
+        const enum ggml_op fuse_ops[] = { GGML_OP_OUT_PROD, GGML_OP_ADD };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+            struct ggml_tensor * add = cgraph->nodes[node_n + 1];
+            struct ggml_tensor * acc = add->src[0] == node ? add->src[1] : add->src[0];
+            if ((add->src[0] == node || add->src[1] == node) && acc &&
+                add->data == acc->data && ggml_are_same_shape(node, add) &&
+                ggml_are_same_shape(acc, add) && acc->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(acc) && ggml_is_contiguous(add)) {
+                ggml_compute_forward_out_prod_accumulate(params, node, add);
+                return 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion

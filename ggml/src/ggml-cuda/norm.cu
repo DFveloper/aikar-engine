@@ -156,7 +156,7 @@ static __global__ void rms_norm_f32(const float * x,
 
 template <int block_size>
 static __global__ void rms_norm_back_f32(
-        const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+        const float * grad, const float * xf, const float * weight, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
@@ -171,7 +171,8 @@ static __global__ void rms_norm_back_f32(
     for (int col = tid; col < ncols; col += block_size) {
         const float xfi = xf[col];
         sum_xx += xfi * xfi;
-        sum_xg += xfi * grad[col];
+        const float gi = weight ? grad[col]*weight[col] : grad[col];
+        sum_xg += xfi * gi;
     }
 
     // sum up partial sums
@@ -203,7 +204,8 @@ static __global__ void rms_norm_back_f32(
     const float scale_x    = -scale_grad * sum_xg/sum_eps;
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale_grad*grad[col] + scale_x*xf[col];
+        const float gi = weight ? grad[col]*weight[col] : grad[col];
+        dst[col] = scale_grad*gi + scale_x*xf[col];
     }
 }
 
@@ -407,13 +409,13 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     }
 }
 
-static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+static void rms_norm_back_f32_cuda(const float * grad, const float * xf, const float * weight, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        rms_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        rms_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, weight, dst, ncols, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        rms_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        rms_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, weight, dst, ncols, eps);
     }
 }
 
@@ -650,6 +652,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * grad  = dst->src[0]; // gradients
     const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
+    const ggml_tensor * weight = dst->src[2];
 
     const float * grad_d  = (const float *) grad->data;
     const float * src0f_d = (const float *) src0f->data;
@@ -670,7 +673,8 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     memcpy(&eps, dst->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
+    rms_norm_back_f32_cuda(grad_d, src0f_d, weight ? (const float *) weight->data : nullptr,
+        dst_d, ne00, nrows, eps, stream);
 }
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

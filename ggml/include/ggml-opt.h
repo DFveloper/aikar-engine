@@ -151,6 +151,8 @@ extern "C" {
         float   critical_token_weight;
         float   critical_confidence_threshold;
         bool    critical_weight_linear;
+        bool    sparse_labels;
+        bool    fused_backward;
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
@@ -175,6 +177,8 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_opt_inputs(  ggml_opt_context_t opt_ctx); // forward graph input tensor
     GGML_API struct ggml_tensor * ggml_opt_outputs( ggml_opt_context_t opt_ctx); // forward graph output tensor
     GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx); // labels to compare outputs against
+    GGML_API struct ggml_tensor * ggml_opt_sparse_targets(ggml_opt_context_t opt_ctx);
+    GGML_API struct ggml_tensor * ggml_opt_sparse_weights(ggml_opt_context_t opt_ctx);
     GGML_API struct ggml_tensor * ggml_opt_loss(    ggml_opt_context_t opt_ctx); // scalar tensor that contains the loss
     GGML_API struct ggml_tensor * ggml_opt_pred(    ggml_opt_context_t opt_ctx); // predictions made by outputs
     GGML_API struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx); // number of matching predictions between outputs and labels

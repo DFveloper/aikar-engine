@@ -2258,6 +2258,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     return false;
             }
             break;
+        case GGML_OP_GLU_BACK:
+            ggml_cuda_op_glu_back(ctx, dst);
+            break;
         case GGML_OP_NORM:
             ggml_cuda_op_norm(ctx, dst);
             break;
@@ -3330,6 +3333,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static bool disable_volta_fusion = getenv("GGML_CUDA_DISABLE_VOLTA_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_VOLTA_FUSION"));
 
     ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_OUT_PROD && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        const ggml_op ops[] = { GGML_OP_OUT_PROD, GGML_OP_ADD };
+        const int outputs[] = { i + 1 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 1) && ggml_are_same_shape(node, add)) {
+            ggml_tensor * acc = add->src[0] == node ? add->src[1] : add->src[0];
+            if ((add->src[0] == node || add->src[1] == node) && acc &&
+                    add->data == acc->data && ggml_are_same_shape(acc, add) &&
+                    acc->type == GGML_TYPE_F32 && ggml_is_contiguous(acc) && ggml_is_contiguous(add)) {
+                ggml_tensor fused = *node;
+                fused.data = add->data;
+                fused.buffer = add->buffer;
+                ggml_cuda_out_prod(*cuda_ctx, &fused, 1.0f);
+                return 1;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -5593,6 +5614,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_GLU_BACK:
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);

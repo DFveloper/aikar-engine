@@ -1004,7 +1004,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_OPT_STEP_ADAMW:
             case GGML_OP_OPT_STEP_SGD:
-            case GGML_OP_GLU: {
+            case GGML_OP_GLU:
+            case GGML_OP_GLU_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             default: {

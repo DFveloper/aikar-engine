@@ -49,6 +49,7 @@ void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * param
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_out_prod(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_out_prod_accumulate(const struct ggml_compute_params * params, struct ggml_tensor * out_prod, struct ggml_tensor * dst);
 void ggml_compute_forward_out_prod_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_scale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -99,6 +100,7 @@ void ggml_compute_forward_win_part(const struct ggml_compute_params * params, st
 void ggml_compute_forward_win_unpart(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_unary(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_glu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_glu_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rwkv_wkv6(const struct ggml_compute_params * params, struct ggml_tensor * dst);

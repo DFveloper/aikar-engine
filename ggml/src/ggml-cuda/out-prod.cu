@@ -27,7 +27,7 @@ static __global__ void k_compute_out_prod_ptrs(
     ptrs_c[idx] = dst_d  +  i3      *s3  +  i2      *s2;
 }
 
-void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -74,7 +74,6 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float       *  dst_d = (float       *)  dst->data;
 
     const float alpha = 1.0f;
-    const float beta = 0.0f;
 
     CUBLAS_CHECK(cublasSetStream(handle, stream));
 

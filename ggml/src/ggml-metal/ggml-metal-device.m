@@ -1511,7 +1511,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op);
         case GGML_OP_RMS_NORM_BACK:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return op->src[2] == nullptr &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) &&
