@@ -136,20 +136,24 @@ static __device__ void quantize_f32_q5_1_block(const float * __restrict__ x, blo
 
 static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, block_q8_0 * __restrict__ y) {
     float amax = 0.0f; // absolute max
+    float vmax = 0.0f;
 
     for (int j = 0; j < QK8_0; j++) {
         const float v = x[j];
-        amax = fmaxf(amax, fabsf(v));
+        if (amax < fabsf(v)) {
+            amax = fabsf(v);
+            vmax = v;
+        }
     }
 
-    const float d = amax / ((1 << 7) - 1);
+    const float d = vmax / -128.0f;
     const float id = d ? 1.0f/d : 0.0f;
 
     y->d = d;
 
     for (int j = 0; j < QK8_0; ++j) {
         const float x0 = x[j]*id;
-        y->qs[j] = roundf(x0);
+        y->qs[j] = min(127, max(-128, (int) roundf(x0)));
     }
 }
 

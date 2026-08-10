@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
@@ -63,14 +64,11 @@ void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GG
 
     for (int i = 0; i < nb; i++) {
         for (int row_iter = 0; row_iter < 4; row_iter++) {
-            float amax = 0.0f; // absolute max
-
             for (int j = 0; j < QK8_0; j++) {
                 srcv[row_iter][j] = x[row_iter * k + i * QK8_0 + j];
-                amax = MAX(amax, fabsf(srcv[row_iter][j]));
             }
 
-            const float d = amax / ((1 << 7) - 1);
+            const float d = ggml_q8_0_scale(srcv[row_iter]);
             id[row_iter] = d ? 1.0f / d : 0.0f;
 
             y[i].d[row_iter] = GGML_CPU_FP32_TO_FP16(d);
@@ -82,7 +80,7 @@ void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GG
             src_offset += (j % blck_size_interleave);
 
             float x0 = srcv[src_id][src_offset] * id[src_id];
-            y[i].qs[j] = roundf(x0);
+            y[i].qs[j] = MIN(127, MAX(-128, (int) roundf(x0)));
         }
     }
 }
@@ -146,14 +144,11 @@ void ggml_quantize_mat_q8_0_4x4_generic(const float * GGML_RESTRICT x, void * GG
 
     for (int i = 0; i < nb; i++) {
         for (int row_iter = 0; row_iter < 4; row_iter++) {
-            float amax = 0.0f; // absolute max
-
             for (int j = 0; j < QK8_0; j++) {
                 srcv[row_iter][j] = x[row_iter * k + i * QK8_0 + j];
-                amax = MAX(amax, fabsf(srcv[row_iter][j]));
             }
 
-            const float d = amax / ((1 << 7) - 1);
+            const float d = ggml_q8_0_scale(srcv[row_iter]);
             id[row_iter] = d ? 1.0f / d : 0.0f;
 
             y[i].d[row_iter] = GGML_CPU_FP32_TO_FP16(d);
@@ -165,7 +160,7 @@ void ggml_quantize_mat_q8_0_4x4_generic(const float * GGML_RESTRICT x, void * GG
             src_offset += (j % blck_size_interleave);
 
             float x0 = srcv[src_id][src_offset] * id[src_id];
-            y[i].qs[j] = roundf(x0);
+            y[i].qs[j] = MIN(127, MAX(-128, (int) roundf(x0)));
         }
     }
 }
@@ -184,14 +179,11 @@ void ggml_quantize_mat_q8_0_4x8_generic(const float * GGML_RESTRICT x, void * GG
 
     for (int i = 0; i < nb; i++) {
         for (int row_iter = 0; row_iter < 4; row_iter++) {
-            float amax = 0.0f; // absolute max
-
             for (int j = 0; j < QK8_0; j++) {
                 srcv[row_iter][j] = x[row_iter * k + i * QK8_0 + j];
-                amax = MAX(amax, fabsf(srcv[row_iter][j]));
             }
 
-            const float d = amax / ((1 << 7) - 1);
+            const float d = ggml_q8_0_scale(srcv[row_iter]);
             id[row_iter] = d ? 1.0f / d : 0.0f;
 
             y[i].d[row_iter] = GGML_CPU_FP32_TO_FP16(d);
@@ -203,7 +195,7 @@ void ggml_quantize_mat_q8_0_4x8_generic(const float * GGML_RESTRICT x, void * GG
             src_offset += (j % blck_size_interleave);
 
             float x0 = srcv[src_id][src_offset] * id[src_id];
-            y[i].qs[j] = roundf(x0);
+            y[i].qs[j] = MIN(127, MAX(-128, (int) roundf(x0)));
         }
     }
 }

@@ -152,6 +152,38 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.cpuparams.n_threads == 1234);
 
+    {
+        common_params kv_params;
+        argv = {"binary_name", "-m", "model.gguf", "-ctlk", "q8_0", "-ctlv", "q8_0", "-ctgk", "f16", "-ctgv", "f16"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        const llama_context_params cparams = common_context_params_to_llama(kv_params);
+        assert(cparams.type_k == GGML_TYPE_F16);
+        assert(cparams.type_v == GGML_TYPE_F16);
+        assert(cparams.type_k_swa == GGML_TYPE_Q8_0);
+        assert(cparams.type_v_swa == GGML_TYPE_Q8_0);
+    }
+
+    {
+        common_params kv_params;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "q8_0", "-ctv", "q8_0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        const llama_context_params cparams = common_context_params_to_llama(kv_params);
+        assert(cparams.type_k == GGML_TYPE_Q8_0);
+        assert(cparams.type_v == GGML_TYPE_Q8_0);
+        assert(cparams.type_k_swa == GGML_TYPE_Q8_0);
+        assert(cparams.type_v_swa == GGML_TYPE_Q8_0);
+    }
+
+    for (const std::vector<std::string> & args : {
+            std::vector<std::string>{"binary_name", "-ctk", "q8_0", "-ctlk", "q4_0"},
+            std::vector<std::string>{"binary_name", "-ctgk", "q4_0", "-ctk", "q8_0"},
+            std::vector<std::string>{"binary_name", "-ctv", "q8_0", "-ctlv", "q4_0"},
+            std::vector<std::string>{"binary_name", "-ctgv", "q4_0", "-ctv", "q8_0"}}) {
+        common_params kv_params;
+        argv = args;
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+    }
+
     argv = {"binary_name", "--verbose"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.verbosity > 1);

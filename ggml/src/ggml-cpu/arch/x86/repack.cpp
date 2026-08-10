@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
@@ -195,21 +196,8 @@ void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTR
             __m256 v2 = _mm256_loadu_ps( x + row_iter * k + i * 32 + 16 );
             __m256 v3 = _mm256_loadu_ps( x + row_iter * k + i * 32 + 24 );
 
-            // Compute max(abs(e)) for the block
-            const __m256 signBit = _mm256_set1_ps( -0.0f );
-            __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v1 ) );
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v2 ) );
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v3 ) );
-
-            __m128 max4 = _mm_max_ps( _mm256_extractf128_ps( maxAbs, 1 ), _mm256_castps256_ps128( maxAbs ) );
-            max4 = _mm_max_ps( max4, _mm_movehl_ps( max4, max4 ) );
-            max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
-            const float maxScalar = _mm_cvtss_f32( max4 );
-
-            // Divided by 127.f to mirror results in quantize_row_q8_0
-            const float d = maxScalar  / 127.f;
-            id[row_iter] = ( maxScalar != 0.0f ) ? 127.f / maxScalar : 0.0f; //d ? 1.0f / d : 0.0f;
+            const float d = ggml_q8_0_scale(x + row_iter*k + i*QK8_0);
+            id[row_iter] = d ? 1.0f / d : 0.0f;
 
             // Store the scale for the individual block
             y[i].d[row_iter] = GGML_CPU_FP32_TO_FP16(d);

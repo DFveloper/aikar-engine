@@ -34,6 +34,16 @@ fn cluster_max_8(v: f32) -> f32 {
     return r;
 }
 
+fn cluster_vmax_8(v: f32) -> f32 {
+    var r = v;
+    var s = subgroupShuffleXor(r, 1u);
+    r = select(r, s, abs(r) < abs(s));
+    s = subgroupShuffleXor(r, 2u);
+    r = select(r, s, abs(r) < abs(s));
+    s = subgroupShuffleXor(r, 4u);
+    return select(r, s, abs(r) < abs(s));
+}
+
 #if defined(MUL_ACC_Q4_0) || defined(MUL_ACC_Q4_1) || defined(MUL_ACC_Q4_K)
 fn cluster_add_i4x8(v: i32) -> i32 {
     var r= v;
@@ -49,6 +59,7 @@ fn cluster_add_i4x8(v: i32) -> i32 {
 #define CLUSTER_SIZE 8
 
 var<workgroup> partial_amaxs: array<array<f32, CLUSTER_SIZE>, WG_SIZE / CLUSTER_SIZE>;
+var<workgroup> partial_vmaxs: array<array<f32, CLUSTER_SIZE>, WG_SIZE / CLUSTER_SIZE>;
 var<workgroup> partial_sums:  array<array<i32, CLUSTER_SIZE>, WG_SIZE / CLUSTER_SIZE>;
 #endif
 
@@ -88,6 +99,7 @@ fn main(
     var q4 = vec4<f32>(0.0);
     var q4_quants = 0u;
     var thread_amax = 0.0;
+    var thread_vmax = 0.0;
 
     let src11_vec4_idx = src11_wg_idx * WG_SIZE + thread_id;
     let is_valid = src11_vec4_idx < ne0_vec4;
@@ -100,13 +112,19 @@ fn main(
         q4 = src1[src1_idx_vec4_base + src11_vec4_idx];
         let abs_q4 = abs(q4);
         thread_amax = max(max(abs_q4[0u], abs_q4[1u]), max(abs_q4[2], abs_q4[3]));
+        for (var j = 0u; j < 4u; j++) {
+            if (abs(q4[j]) == thread_amax) {
+                thread_vmax = q4[j];
+                break;
+            }
+        }
     }
 
-    d = cluster_max_8(thread_amax) / 127.0;
+    d = cluster_vmax_8(thread_vmax) / -128.0;
 
     if (is_valid) {
-        let id = select(0.0, 1.0 / d, d > 0.0);
-        q4_quants = pack4xI8(vec4<i32>(round(q4 * id)));
+        let id = select(0.0, 1.0 / d, d != 0.0);
+        q4_quants = pack4xI8(vec4<i32>(clamp(round(q4 * id), vec4<f32>(-128.0), vec4<f32>(127.0))));
         if (qs_idx == 0u) {
             src1q[src1q_idx].d = f16(d);
         }
@@ -134,7 +152,14 @@ fn main(
         q4 = src1[src1_idx_vec4_base + src11_vec4_idx];
         let abs_q4 = abs(q4);
         thread_amax = max(max(abs_q4[0], abs_q4[1]), max(abs_q4[2], abs_q4[3]));
+        for (var j = 0u; j < 4u; j++) {
+            if (abs(q4[j]) == thread_amax) {
+                thread_vmax = q4[j];
+                break;
+            }
+        }
         partial_amaxs[cluster_id][qs_idx] = thread_amax;
+        partial_vmaxs[cluster_id][qs_idx] = thread_vmax;
     }
 
     workgroupBarrier();
@@ -147,10 +172,17 @@ fn main(
                         max(partial_amaxs[cluster_id][4], partial_amaxs[cluster_id][5]), max(partial_amaxs[cluster_id][6], partial_amaxs[cluster_id][7]))
                 );
 
-        d = amax / 127.0;
-        let id = select(0.0f, 1.0f / d, d > 0.0f);
+        var vmax = 0.0;
+        for (var j = 0u; j < 8u; j++) {
+            if (partial_amaxs[cluster_id][j] == amax) {
+                vmax = partial_vmaxs[cluster_id][j];
+                break;
+            }
+        }
+        d = vmax / -128.0;
+        let id = select(0.0f, 1.0f / d, d != 0.0f);
 
-        q4_quants = pack4xI8(vec4<i32>(round(q4 * id)));
+        q4_quants = pack4xI8(vec4<i32>(clamp(round(q4 * id), vec4<f32>(-128.0), vec4<f32>(127.0))));
         src1q[src1q_idx].qs[qs_idx] = q4_quants;
 
         if (qs_idx == 0u) {

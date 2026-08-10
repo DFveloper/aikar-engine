@@ -333,6 +333,10 @@ struct cmd_params {
     std::vector<int>                 n_ubatch;
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
+    std::vector<ggml_type>           type_k_local;
+    std::vector<ggml_type>           type_v_local;
+    std::vector<ggml_type>           type_k_global;
+    std::vector<ggml_type>           type_v_global;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -377,6 +381,10 @@ static const cmd_params cmd_params_defaults = {
     /* n_ubatch             */ { 512 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
+    /* type_k_local         */ {},
+    /* type_v_local         */ {},
+    /* type_k_global        */ {},
+    /* type_v_global        */ {},
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -448,6 +456,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  -ctlk, --cache-type-k-local <t>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
+    printf("  -ctlv, --cache-type-v-local <t>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  -ctgk, --cache-type-k-global <t>                  (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
+    printf("  -ctgv, --cache-type-v-global <t>                  (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -612,6 +624,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 auto p = parse_int_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
+                if (!params.type_k_local.empty() || !params.type_k_global.empty()) {
+                    fprintf(stderr, "error: -ctk cannot be used with -ctlk or -ctgk\n");
+                    invalid_param = true;
+                    break;
+                }
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
@@ -632,6 +649,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 params.type_k.insert(params.type_k.end(), types.begin(), types.end());
             } else if (arg == "-ctv" || arg == "--cache-type-v") {
+                if (!params.type_v_local.empty() || !params.type_v_global.empty()) {
+                    fprintf(stderr, "error: -ctv cannot be used with -ctlv or -ctgv\n");
+                    invalid_param = true;
+                    break;
+                }
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
@@ -651,6 +673,90 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+            } else if (arg == "-ctlk" || arg == "--cache-type-k-local") {
+                if (!params.type_k.empty()) {
+                    fprintf(stderr, "error: -ctlk cannot be used with -ctk\n");
+                    invalid_param = true;
+                    break;
+                }
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & t : string_split<std::string>(argv[i], split_delim)) {
+                    const ggml_type type = ggml_type_from_name(t);
+                    if (type == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    params.type_k_local.push_back(type);
+                }
+                if (invalid_param) {
+                    break;
+                }
+            } else if (arg == "-ctlv" || arg == "--cache-type-v-local") {
+                if (!params.type_v.empty()) {
+                    fprintf(stderr, "error: -ctlv cannot be used with -ctv\n");
+                    invalid_param = true;
+                    break;
+                }
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & t : string_split<std::string>(argv[i], split_delim)) {
+                    const ggml_type type = ggml_type_from_name(t);
+                    if (type == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    params.type_v_local.push_back(type);
+                }
+                if (invalid_param) {
+                    break;
+                }
+            } else if (arg == "-ctgk" || arg == "--cache-type-k-global") {
+                if (!params.type_k.empty()) {
+                    fprintf(stderr, "error: -ctgk cannot be used with -ctk\n");
+                    invalid_param = true;
+                    break;
+                }
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & t : string_split<std::string>(argv[i], split_delim)) {
+                    const ggml_type type = ggml_type_from_name(t);
+                    if (type == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    params.type_k_global.push_back(type);
+                }
+                if (invalid_param) {
+                    break;
+                }
+            } else if (arg == "-ctgv" || arg == "--cache-type-v-global") {
+                if (!params.type_v.empty()) {
+                    fprintf(stderr, "error: -ctgv cannot be used with -ctv\n");
+                    invalid_param = true;
+                    break;
+                }
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & t : string_split<std::string>(argv[i], split_delim)) {
+                    const ggml_type type = ggml_type_from_name(t);
+                    if (type == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    params.type_v_global.push_back(type);
+                }
+                if (invalid_param) {
+                    break;
+                }
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1193,6 +1299,8 @@ struct cmd_params_instance {
     int                n_ubatch;
     ggml_type          type_k;
     ggml_type          type_v;
+    ggml_type          type_k_swa;
+    ggml_type          type_v_swa;
     int                n_threads;
     std::string        cpu_mask;
     bool               cpu_strict;
@@ -1281,6 +1389,8 @@ struct cmd_params_instance {
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
+        cparams.type_k_swa      = type_k_swa;
+        cparams.type_v_swa      = type_v_swa;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
@@ -1291,8 +1401,32 @@ struct cmd_params_instance {
     }
 };
 
+static std::vector<std::pair<ggml_type, ggml_type>> get_cache_type_pairs(
+        const std::vector<ggml_type> & whole,
+        const std::vector<ggml_type> & local,
+        const std::vector<ggml_type> & global) {
+    std::vector<std::pair<ggml_type, ggml_type>> result;
+    if (local.empty() && global.empty()) {
+        for (const ggml_type type : whole) {
+            result.push_back({ type, type });
+        }
+        return result;
+    }
+
+    const std::vector<ggml_type> & local_types  = local.empty()  ? whole : local;
+    const std::vector<ggml_type> & global_types = global.empty() ? whole : global;
+    for (const ggml_type global_type : global_types) {
+        for (const ggml_type local_type : local_types) {
+            result.push_back({ global_type, local_type });
+        }
+    }
+    return result;
+}
+
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
+    const auto type_k_pairs = get_cache_type_pairs(params.type_k, params.type_k_local, params.type_k_global);
+    const auto type_v_pairs = get_cache_type_pairs(params.type_v, params.type_v_local, params.type_v_global);
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
@@ -1312,8 +1446,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nopo : params.no_op_offload)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
-    for (const auto & tk : params.type_k)
-    for (const auto & tv : params.type_v)
+    for (const auto & tk : type_k_pairs)
+    for (const auto & tv : type_v_pairs)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
@@ -1332,8 +1466,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ tk.first,
+                /* .type_v                = */ tv.first,
+                /* .type_k_swa            = */ tk.second,
+                /* .type_v_swa            = */ tv.second,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1368,8 +1504,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ tk.first,
+                /* .type_v                = */ tv.first,
+                /* .type_k_swa            = */ tk.second,
+                /* .type_v_swa            = */ tv.second,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1404,8 +1542,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ tk.first,
+                /* .type_v                = */ tv.first,
+                /* .type_k_swa            = */ tk.second,
+                /* .type_v_swa            = */ tv.second,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1451,6 +1591,8 @@ struct test {
     int                      poll;
     ggml_type                type_k;
     ggml_type                type_v;
+    ggml_type                type_k_swa;
+    ggml_type                type_v_swa;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1490,6 +1632,8 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
+        type_k_swa     = inst.type_k_swa;
+        type_v_swa     = inst.type_v_swa;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1559,7 +1703,8 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "type_k_swa",    "type_v_swa",     "n_gpu_layers",
+            "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
@@ -1646,6 +1791,8 @@ struct test {
                                             std::to_string(poll),
                                             ggml_type_name(type_k),
                                             ggml_type_name(type_v),
+                                            ggml_type_name(type_k_swa),
+                                            ggml_type_name(type_v_swa),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
@@ -1828,7 +1975,7 @@ struct markdown_printer : public printer {
         if (field == "n_ubatch") {
             return 8;
         }
-        if (field == "type_k" || field == "type_v") {
+        if (field == "type_k" || field == "type_v" || field == "type_k_swa" || field == "type_v_swa") {
             return 6;
         }
         if (field == "split_mode") {
@@ -1940,11 +2087,19 @@ struct markdown_printer : public printer {
         if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
             fields.emplace_back("n_ubatch");
         }
-        if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
+        const bool has_k_policy = !params.type_k_local.empty() || !params.type_k_global.empty();
+        const bool has_v_policy = !params.type_v_local.empty() || !params.type_v_global.empty();
+        if (has_k_policy || params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
             fields.emplace_back("type_k");
         }
-        if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
+        if (has_v_policy || params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
             fields.emplace_back("type_v");
+        }
+        if (has_k_policy) {
+            fields.emplace_back("type_k_swa");
+        }
+        if (has_v_policy) {
+            fields.emplace_back("type_v_swa");
         }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");

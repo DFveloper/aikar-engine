@@ -29,14 +29,19 @@ inline void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
     const float * xi   = (const float *) cxi;
     block_q8_0 *  dsti = (block_q8_0 *) cdsti;
 
-    float amax = 0.0f;  // absolute max
+    float amax = 0.0f;
+    float vmax = 0.0f;
 
     for (int j = 0; j < QK8_0; j++) {
         const float v = xi[j];
-        amax          = sycl::fmax(amax, sycl::fabs((float) v));
+        const float av = sycl::fabs(v);
+        if (amax < av) {
+            amax = av;
+            vmax = v;
+        }
     }
 
-    const float d  = amax / ((1 << 7) - 1);
+    const float d  = vmax / -128.0f;
     const float id = d ? 1.0f / d : 0.0f;
 
     dsti->d = d;
@@ -44,7 +49,7 @@ inline void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
     for (int j = 0; j < QK8_0; ++j) {
         const float x0 = xi[j] * id;
 
-        dsti->qs[j] = sycl::round((float) x0);
+        dsti->qs[j] = sycl::clamp((int) sycl::round(x0), -128, 127);
     }
 }
 

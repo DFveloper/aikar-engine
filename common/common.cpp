@@ -1679,8 +1679,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
-    cparams.type_k = params.cache_type_k;
-    cparams.type_v = params.cache_type_v;
+    const bool has_k_policy = params.cache_type_k_local != GGML_TYPE_COUNT || params.cache_type_k_global != GGML_TYPE_COUNT;
+    const bool has_v_policy = params.cache_type_v_local != GGML_TYPE_COUNT || params.cache_type_v_global != GGML_TYPE_COUNT;
+
+    cparams.type_k     = has_k_policy && params.cache_type_k_global != GGML_TYPE_COUNT ? params.cache_type_k_global : params.cache_type_k;
+    cparams.type_v     = has_v_policy && params.cache_type_v_global != GGML_TYPE_COUNT ? params.cache_type_v_global : params.cache_type_v;
+    cparams.type_k_swa = has_k_policy && params.cache_type_k_local  != GGML_TYPE_COUNT ? params.cache_type_k_local  : params.cache_type_k;
+    cparams.type_v_swa = has_v_policy && params.cache_type_v_local  != GGML_TYPE_COUNT ? params.cache_type_v_local  : params.cache_type_v;
 
     return cparams;
 }

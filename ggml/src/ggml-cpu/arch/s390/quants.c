@@ -54,21 +54,10 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #if defined(__VXE__) || defined(__VXE2__)
     for (int i = 0; i < nb; i++) {
         float32x4_t srcv [8];
-        float32x4_t asrcv[8];
-        float32x4_t amaxv[8];
 
         for (int j = 0; j < 8; j++) srcv[j] = vec_xl(0, x + i*32 + 4*j);
-        for (int j = 0; j < 8; j++) asrcv[j] = vec_abs(srcv[j]);
-        for (int j = 0; j < 4; j++) amaxv[2*j] = vec_max(asrcv[2*j], asrcv[2*j+1]);
-        for (int j = 0; j < 2; j++) amaxv[4*j] = vec_max(amaxv[4*j], amaxv[4*j+2]);
-        for (int j = 0; j < 1; j++) amaxv[8*j] = vec_max(amaxv[8*j], amaxv[8*j+4]);
 
-        const float amax = MAX(MAX(vec_extract(amaxv[0], 0),
-                                   vec_extract(amaxv[0], 1)),
-                               MAX(vec_extract(amaxv[0], 2),
-                                   vec_extract(amaxv[0], 3)));
-
-        const float d = amax / ((1 << 7) - 1);
+        const float d = ggml_q8_0_scale(x + i*QK8_0);
         const float id = d ? 1.0f / d : 0.0f;
 
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
@@ -78,10 +67,10 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
             /* Uses non-default rounding for vec_signed or vec_round */
             const int32x4_t vi = vec_signed(__builtin_s390_vfisb(v, 4, 1));
 
-            y[i].qs[4*j + 0] = vec_extract(vi, 0);
-            y[i].qs[4*j + 1] = vec_extract(vi, 1);
-            y[i].qs[4*j + 2] = vec_extract(vi, 2);
-            y[i].qs[4*j + 3] = vec_extract(vi, 3);
+            y[i].qs[4*j + 0] = MIN(127, MAX(-128, vec_extract(vi, 0)));
+            y[i].qs[4*j + 1] = MIN(127, MAX(-128, vec_extract(vi, 1)));
+            y[i].qs[4*j + 2] = MIN(127, MAX(-128, vec_extract(vi, 2)));
+            y[i].qs[4*j + 3] = MIN(127, MAX(-128, vec_extract(vi, 3)));
         }
     }
 #else

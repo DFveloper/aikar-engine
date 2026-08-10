@@ -163,17 +163,21 @@ kernel void kernel_set_rows_f32_i32(
 
 inline void quantize_q8_0_block(global float * x, global char * qs, global half * d_out) {
     float amax = 0.0f;
+    float vmax = 0.0f;
     for (int j = 0; j < QK8_0; j++) {
-        amax = fmax(amax, fabs(x[j]));
+        if (amax < fabs(x[j])) {
+            amax = fabs(x[j]);
+            vmax = x[j];
+        }
     }
 
-    float d  = amax / 127.0f;
-    float id = (d != 0.0f) ? 127.0f / amax : 0.0f;
+    float d  = vmax / -128.0f;
+    float id = (d != 0.0f) ? 1.0f / d : 0.0f;
 
     vstore_half(d, 0, d_out);
 
     for (int j = 0; j < QK8_0; j++) {
-        qs[j] = (char)((int)round(x[j] * id));
+        qs[j] = (char)clamp((int)round(x[j] * id), -128, 127);
     }
 }
 

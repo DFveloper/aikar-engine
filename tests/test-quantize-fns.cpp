@@ -200,6 +200,50 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+static int test_q8_0_full_byte(bool verbose) {
+    constexpr int qk = 32;
+    struct q8_0_block {
+        ggml_fp16_t d;
+        int8_t qs[qk];
+    };
+
+    static_assert(sizeof(q8_0_block) == 34);
+
+    float data[qk] = {};
+    data[0] = 4.0f;
+    data[1] = -4.0f;
+
+    q8_0_block ref = {};
+    q8_0_block fast = {};
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    traits->from_float_ref(data, &ref, qk);
+    ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(data, &fast, qk);
+
+    float out[qk];
+    traits->to_float(&ref, out, qk);
+
+    int num_failed = 0;
+    const bool failed = ref.qs[0] != -128 || ref.qs[1] != 127 || fast.qs[0] != -128 || fast.qs[1] != 127 || out[0] <= 0.0f || out[1] >= 0.0f;
+    num_failed += failed;
+    if (failed || verbose) {
+        printf(" q8_0 full-byte range:               %s (ref=[%d,%d] fast=[%d,%d])\n",
+                RESULT_STR[failed], ref.qs[0], ref.qs[1], fast.qs[0], fast.qs[1]);
+    }
+
+    q8_0_block legacy = {};
+    legacy.d = ggml_fp32_to_fp16(0.25f);
+    legacy.qs[0] = -128;
+    legacy.qs[1] = 127;
+    traits->to_float(&legacy, out, qk);
+    const bool legacy_failed = out[0] != -32.0f || out[1] != 31.75f;
+    num_failed += legacy_failed;
+    if (legacy_failed || verbose) {
+        printf(" q8_0 legacy block decode:           %s (out=[%f,%f])\n", RESULT_STR[legacy_failed], out[0], out[1]);
+    }
+
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -220,6 +264,7 @@ int main(int argc, char * argv[]) {
     int num_failed = 0;
 
     num_failed += test_vec_dot_f32(verbose);
+    num_failed += test_q8_0_full_byte(verbose);
     num_failed += test_vec_dot_q(verbose);
 
     if (num_failed || verbose) {

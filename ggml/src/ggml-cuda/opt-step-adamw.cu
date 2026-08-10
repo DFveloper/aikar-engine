@@ -78,14 +78,18 @@ static __global__ void opt_step_adamw_q8_0(
         }
     }
 
-    const float m_d = warp_reduce_max(fabsf(m_new))/127.0f;
-    const float v_d = warp_reduce_max(fabsf(v_new))/127.0f;
+    const float m_amax = warp_reduce_max(fabsf(m_new));
+    const float v_amax = warp_reduce_max(fabsf(v_new));
+    const int m_lane = __ffs(__ballot_sync(0xFFFFFFFF, fabsf(m_new) == m_amax)) - 1;
+    const int v_lane = __ffs(__ballot_sync(0xFFFFFFFF, fabsf(v_new) == v_amax)) - 1;
+    const float m_d = __shfl_sync(0xFFFFFFFF, m_new, m_lane) / -128.0f;
+    const float v_d = __shfl_sync(0xFFFFFFFF, v_new, v_lane) / -128.0f;
     g_m[ib].d = __float2half(m_d);
     g_v[ib].d = __float2half(v_d);
     const int m_q = m_d ? (int) roundf(m_new/m_d) : 0;
     const int v_q = v_d ? (int) roundf(v_new/v_d) : 0;
-    g_m[ib].qs[iq] = (int8_t) fmaxf(-127.0f, fminf(127.0f, (float) m_q));
-    g_v[ib].qs[iq] = (int8_t) fmaxf(-127.0f, fminf(127.0f, (float) v_q));
+    g_m[ib].qs[iq] = (int8_t) max(-128, min(127, m_q));
+    g_v[ib].qs[iq] = (int8_t) max(-128, min(127, v_q));
 }
 
 static void opt_step_adamw_q8_0_cuda(

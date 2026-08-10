@@ -382,11 +382,13 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k     =*/ params.type_k,
+            /*.type_v     =*/ params.type_v,
+            /*.type_k_swa =*/ params.type_k_swa,
+            /*.type_v_swa =*/ params.type_v_swa,
+            /*.swa_full   =*/ params.swa_full,
+            /*.ctx_type   =*/ cparams.ctx_type,
+            /*.mem_other  =*/ llama_get_memory(cparams.ctx_other),
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -458,7 +460,7 @@ llama_context::llama_context(
         sched_reserve();
 
         if (!cparams.flash_attn) {
-            if (ggml_is_quantized(params.type_v)) {
+            if (ggml_is_quantized(params.type_v) || ggml_is_quantized(params.type_v_swa)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
@@ -3786,6 +3788,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_k_swa                  =*/ GGML_TYPE_COUNT,
+        /*.type_v_swa                  =*/ GGML_TYPE_COUNT,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -3820,6 +3824,13 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (params.type_k_swa == GGML_TYPE_COUNT) {
+        params.type_k_swa = params.type_k;
+    }
+    if (params.type_v_swa == GGML_TYPE_COUNT) {
+        params.type_v_swa = params.type_v;
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
@@ -3836,12 +3847,14 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) &&
+            (params.type_k != params.type_v || params.type_k_swa != params.type_v_swa)) {
+        LLAMA_LOG_ERROR("%s: model does not support different K and V cache types\n", __func__);
         return nullptr;
     }
 
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+    if ((ggml_is_quantized(params.type_v) || ggml_is_quantized(params.type_v_swa)) &&
+            params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -3852,23 +3865,31 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_k);
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            const ggml_type type_k = model->hparams.is_swa(il) ? params.type_k_swa : params.type_k;
+            if (!ggml_is_quantized(type_k)) {
+                continue;
+            }
+            const uint32_t blck_size = ggml_blck_size(type_k);
             if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                    __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
+                    __func__, ggml_type_name(type_k), blck_size, model->hparams.n_embd_head_k(il));
                 return nullptr;
             }
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_v);
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            const ggml_type type_v = model->hparams.is_swa(il) ? params.type_v_swa : params.type_v;
+            if (!ggml_is_quantized(type_v)) {
+                continue;
+            }
+            const uint32_t blck_size = ggml_blck_size(type_v);
             if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
-                    __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
+                    __func__, ggml_type_name(type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
             }
         }

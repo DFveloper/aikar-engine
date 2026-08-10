@@ -28,14 +28,13 @@
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
 // multiply int8_t, add results pairwise twice
 static inline __m128i mul_sum_i8_pairs(const __m128i x, const __m128i y) {
-    // Get absolute values of x vectors
     const __m128i ax = _mm_sign_epi8(x, x);
-    // Sign the values of the y vectors
     const __m128i sy = _mm_sign_epi8(y, x);
-    // Perform multiplication and create 16-bit values
     const __m128i dot = _mm_maddubs_epi16(ax, sy);
     const __m128i ones = _mm_set1_epi16(1);
-    return _mm_madd_epi16(ones, dot);
+    const __m128i correction_mask = _mm_and_si128(_mm_cmpgt_epi8(_mm_setzero_si128(), x), _mm_cmpeq_epi8(y, _mm_set1_epi8(-128)));
+    const __m128i correction = _mm_maddubs_epi16(ax, _mm_and_si128(correction_mask, _mm_set1_epi8(1)));
+    return _mm_add_epi32(_mm_madd_epi16(ones, dot), _mm_slli_epi32(_mm_madd_epi16(ones, correction), 8));
 }
 
 #if __AVX__ || __AVX2__ || __AVX512F__
@@ -69,7 +68,9 @@ static inline int hsum_i32_4(const __m128i a) {
 static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
-    return _mm256_maddubs_epi16(ax, sy);
+    const __m256i correction_mask = _mm256_and_si256(_mm256_cmpgt_epi8(_mm256_setzero_si256(), x), _mm256_cmpeq_epi8(y, _mm256_set1_epi8(-128)));
+    const __m256i correction = _mm256_maddubs_epi16(ax, _mm256_and_si256(correction_mask, _mm256_set1_epi8(1)));
+    return _mm256_add_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_slli_epi16(correction, 8));
 }
 
 // spread 32 bits to 32 bytes { 0x00, 0xFF }
@@ -125,11 +126,9 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m256i summed_pairs = _mm256_dpbssd_epi32(zero, x, y);
     return _mm256_cvtepi32_ps(summed_pairs);
 #else
-    // Get absolute values of x vectors
-    const __m256i ax = _mm256_sign_epi8(x, x);
-    // Sign the values of the y vectors
-    const __m256i sy = _mm256_sign_epi8(y, x);
-    return mul_sum_us8_pairs_float(ax, sy);
+    const __m128i dotl = mul_sum_i8_pairs(_mm256_castsi256_si128(x), _mm256_castsi256_si128(y));
+    const __m128i doth = mul_sum_i8_pairs(_mm256_extractf128_si256(x, 1), _mm256_extractf128_si256(y, 1));
+    return _mm256_cvtepi32_ps(MM256_SET_M128I(doth, dotl));
 #endif
 }
 
@@ -173,7 +172,9 @@ static inline __m128i packNibbles( __m128i bytes1, __m128i bytes2 )
 static inline __m128i mul_add_epi8_sse(const __m128i x, const __m128i y) {
     const __m128i ax = _mm_sign_epi8(x, x);
     const __m128i sy = _mm_sign_epi8(y, x);
-    return _mm_maddubs_epi16(ax, sy);
+    const __m128i correction_mask = _mm_and_si128(_mm_cmpgt_epi8(_mm_setzero_si128(), x), _mm_cmpeq_epi8(y, _mm_set1_epi8(-128)));
+    const __m128i correction = _mm_maddubs_epi16(ax, _mm_and_si128(correction_mask, _mm_set1_epi8(1)));
+    return _mm_add_epi16(_mm_maddubs_epi16(ax, sy), _mm_slli_epi16(correction, 8));
 }
 
 // spread 32 bits to 32 bytes { 0x00, 0xFF }
@@ -231,16 +232,7 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m128i xh = _mm256_extractf128_si256(x, 1);
     const __m128i yl = _mm256_castsi256_si128(y);
     const __m128i yh = _mm256_extractf128_si256(y, 1);
-    // Get absolute values of x vectors
-    const __m128i axl = _mm_sign_epi8(xl, xl);
-    const __m128i axh = _mm_sign_epi8(xh, xh);
-    // Sign the values of the y vectors
-    const __m128i syl = _mm_sign_epi8(yl, xl);
-    const __m128i syh = _mm_sign_epi8(yh, xh);
-    // Perform multiplication and create 16-bit values
-    const __m128i dotl = _mm_maddubs_epi16(axl, syl);
-    const __m128i doth = _mm_maddubs_epi16(axh, syh);
-    return sum_i16_pairs_float(doth, dotl);
+    return _mm256_cvtepi32_ps(MM256_SET_M128I(mul_sum_i8_pairs(xh, yh), mul_sum_i8_pairs(xl, yl)));
 }
 
 // larger version of mul_sum_i8_pairs_float where x and y are each represented by four 128-bit vectors
@@ -315,22 +307,10 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         __m256 v3 = _mm256_loadu_ps( x + 24 );
         x += 32;
 
-        // Compute max(abs(e)) for the block
-        const __m256 signBit = _mm256_set1_ps( -0.0f );
-        __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v1 ) );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v2 ) );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v3 ) );
-
-        __m128 max4 = _mm_max_ps( _mm256_extractf128_ps( maxAbs, 1 ), _mm256_castps256_ps128( maxAbs ) );
-        max4 = _mm_max_ps( max4, _mm_movehl_ps( max4, max4 ) );
-        max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
-        const float maxScalar = _mm_cvtss_f32( max4 );
-
         // Quantize these floats
-        const float d = maxScalar / 127.f;
+        const float d = ggml_q8_0_scale(x - QK8_0);
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
-        const float id = ( maxScalar != 0.0f ) ? 127.f / maxScalar : 0.0f;
+        const float id = d ? 1.0f / d : 0.0f;
         const __m256 mul = _mm256_set1_ps( id );
 
         // Apply the multiplier

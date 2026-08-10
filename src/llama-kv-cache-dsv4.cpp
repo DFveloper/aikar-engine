@@ -1201,7 +1201,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     dsv4_make_k_only(hparams_raw);
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
-            model, hparams_raw, type_k, type_v,
+            model, hparams_raw, type_k, type_v, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
             nullptr, filter_raw, reuse, nullptr);
 

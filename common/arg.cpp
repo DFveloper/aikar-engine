@@ -2375,7 +2375,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
+            if (params.cache_type_k_local != GGML_TYPE_COUNT || params.cache_type_k_global != GGML_TYPE_COUNT) {
+                throw std::invalid_argument("-ctk cannot be used with -ctlk or -ctgk");
+            }
             params.cache_type_k = kv_cache_type_from_str(value);
+            params.cache_type_k_set = true;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2388,9 +2392,77 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
+            if (params.cache_type_v_local != GGML_TYPE_COUNT || params.cache_type_v_global != GGML_TYPE_COUNT) {
+                throw std::invalid_argument("-ctv cannot be used with -ctlv or -ctgv");
+            }
             params.cache_type_v = kv_cache_type_from_str(value);
+            params.cache_type_v_set = true;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"-ctlk", "--cache-type-k-local"}, "TYPE",
+        string_format(
+            "KV cache data type for K in local attention\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_k)
+        ),
+        [](common_params & params, const std::string & value) {
+            if (params.cache_type_k_set) {
+                throw std::invalid_argument("-ctlk cannot be used with -ctk");
+            }
+            params.cache_type_k_local = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_LOCAL"));
+    add_opt(common_arg(
+        {"-ctlv", "--cache-type-v-local"}, "TYPE",
+        string_format(
+            "KV cache data type for V in local attention\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_v)
+        ),
+        [](common_params & params, const std::string & value) {
+            if (params.cache_type_v_set) {
+                throw std::invalid_argument("-ctlv cannot be used with -ctv");
+            }
+            params.cache_type_v_local = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V_LOCAL"));
+    add_opt(common_arg(
+        {"-ctgk", "--cache-type-k-global"}, "TYPE",
+        string_format(
+            "KV cache data type for K in global attention\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_k)
+        ),
+        [](common_params & params, const std::string & value) {
+            if (params.cache_type_k_set) {
+                throw std::invalid_argument("-ctgk cannot be used with -ctk");
+            }
+            params.cache_type_k_global = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_GLOBAL"));
+    add_opt(common_arg(
+        {"-ctgv", "--cache-type-v-global"}, "TYPE",
+        string_format(
+            "KV cache data type for V in global attention\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_v)
+        ),
+        [](common_params & params, const std::string & value) {
+            if (params.cache_type_v_set) {
+                throw std::invalid_argument("-ctgv cannot be used with -ctv");
+            }
+            params.cache_type_v_global = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V_GLOBAL"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

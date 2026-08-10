@@ -44,17 +44,14 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         // load elements
         vfloat32m8_t v_x   = __riscv_vle32_v_f32m8(x+i*QK8_0, vl);
 
-        vfloat32m8_t vfabs = __riscv_vfabs_v_f32m8(v_x, vl);
-        vfloat32m1_t tmp   = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-        vfloat32m1_t vmax  = __riscv_vfredmax_vs_f32m8_f32m1(vfabs, tmp, vl);
-        float amax = __riscv_vfmv_f_s_f32m1_f32(vmax);
-
-        const float d = amax / ((1 << 7) - 1);
+        const float d = ggml_q8_0_scale(x + i*QK8_0);
         const float id = d ? 1.0f/d : 0.0f;
 
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
 
         vfloat32m8_t x0 = __riscv_vfmul_vf_f32m8(v_x, id, vl);
+        x0 = __riscv_vfmax_vf_f32m8(x0, -128.0f, vl);
+        x0 = __riscv_vfmin_vf_f32m8(x0,  127.0f, vl);
 
         // convert to integer
         vint16m4_t   vi = __riscv_vfncvt_x_f_w_i16m4(x0, vl);

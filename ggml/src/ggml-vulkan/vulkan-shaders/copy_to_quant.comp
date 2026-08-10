@@ -163,14 +163,19 @@ void quantize(uint dst_idx, uint src_idx)
 #if defined(DATA_A_Q8_0)
 void quantize(uint dst_idx, uint src_idx)
 {
-    float amax = 0.0; // absolute max
+    float amax = 0.0;
+    float vmax = 0.0;
 
     [[unroll]] for (int j = 0; j < QUANT_K_Q8_0; j++) {
         const float v = float(data_s[src_idx + j]);
-        amax = max(amax, abs(v));
+        const float av = abs(v);
+        if (amax < av) {
+            amax = av;
+            vmax = v;
+        }
     }
 
-    const float d = amax / ((1 << 7) - 1);
+    const float d = vmax / -128.0;
     const float id = (d != 0.0) ? 1.0/d : 0.0;
 
     data_q[dst_idx].d = float16_t(d);
@@ -178,7 +183,7 @@ void quantize(uint dst_idx, uint src_idx)
     [[unroll]] for (int j = 0; j < QUANT_K_Q8_0; ++j) {
         const float x0 = float(data_s[src_idx + j])*id;
 
-        data_q[dst_idx].qs[j] = int8_t(round(x0));
+        data_q[dst_idx].qs[j] = int8_t(clamp(round(x0), -128.0, 127.0));
     }
 }
 #endif

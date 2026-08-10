@@ -5,6 +5,8 @@
 
 #include "ggml.h"
 
+#include <math.h>
+
 // GGML internal header
 
 #ifdef __cplusplus
@@ -14,6 +16,21 @@ extern "C" {
 // NOTE: these functions are defined as GGML_API because they used by the CPU backend
 
 // Quantization
+static inline float ggml_q8_0_scale(const float * x) {
+    float amax = 0.0f;
+    float vmax = 0.0f;
+
+    for (int i = 0; i < QK8_0; ++i) {
+        const float ax = fabsf(x[i]);
+        if (amax < ax) {
+            amax = ax;
+            vmax = x[i];
+        }
+    }
+
+    return vmax / -128.0f;
+}
+
 GGML_API void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k);

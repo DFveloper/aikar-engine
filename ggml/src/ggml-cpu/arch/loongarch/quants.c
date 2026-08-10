@@ -460,23 +460,10 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         __m256 v3 = (__m256)__lasx_xvld( x , 96);
         x += 32;
 
-        // Compute max(abs(e)) for the block
-        const __m256 sign_bit = __lasx_xvreplfr2vr_s( -0.0f );
-        __m256 max_abs = (__m256)__lasx_xvandn_v( (__m256i)sign_bit, (__m256i)v0 );
-        max_abs = __lasx_xvfmax_s( max_abs, (__m256)__lasx_xvandn_v( (__m256i)sign_bit, (__m256i)v1 ) );
-        max_abs = __lasx_xvfmax_s( max_abs, (__m256)__lasx_xvandn_v( (__m256i)sign_bit, (__m256i)v2 ) );
-        max_abs = __lasx_xvfmax_s( max_abs, (__m256)__lasx_xvandn_v( (__m256i)sign_bit, (__m256i)v3 ) );
-
-        __m128 max4 = __lsx_vfmax_s( lasx_extractf128( max_abs, 1 ), lasx_extractf128( max_abs , 0) );
-        max4 = __lsx_vfmax_s( max4, (__m128)__lsx_vpickod_d((__m128i) max4, (__m128i)max4 ) );
-        __m128 tmp = max4;
-        max4 = __lsx_vfmax_s( max4, (__m128)__lsx_vinsgr2vr_w(tmp, __lsx_vpickve2gr_w( max4, 1 ), 0 ));
-        const float max_scalar = ((v4f32)max4)[0];
-
         // Quantize these floats
-        const float d = max_scalar / 127.f;
+        const float d = ggml_q8_0_scale(x - QK8_0);
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
-        const float id = ( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f;
+        const float id = d ? 1.0f / d : 0.0f;
         const __m256 mul = (__m256)__lasx_xvreplfr2vr_s( id );
 
         // Apply the multiplier

@@ -48,22 +48,10 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #if defined __wasm_simd128__
     for (int i = 0; i < nb; i++) {
         v128_t srcv [8];
-        v128_t asrcv[8];
-        v128_t amaxv[8];
 
         for (int j = 0; j < 8; j++) srcv[j]  = wasm_v128_load(x + i*32 + 4*j);
-        for (int j = 0; j < 8; j++) asrcv[j] = wasm_f32x4_abs(srcv[j]);
 
-        for (int j = 0; j < 4; j++) amaxv[2*j] = wasm_f32x4_max(asrcv[2*j], asrcv[2*j+1]);
-        for (int j = 0; j < 2; j++) amaxv[4*j] = wasm_f32x4_max(amaxv[4*j], amaxv[4*j+2]);
-        for (int j = 0; j < 1; j++) amaxv[8*j] = wasm_f32x4_max(amaxv[8*j], amaxv[8*j+4]);
-
-        const float amax = MAX(MAX(wasm_f32x4_extract_lane(amaxv[0], 0),
-                                   wasm_f32x4_extract_lane(amaxv[0], 1)),
-                               MAX(wasm_f32x4_extract_lane(amaxv[0], 2),
-                                   wasm_f32x4_extract_lane(amaxv[0], 3)));
-
-        const float d = amax / ((1 << 7) - 1);
+        const float d = ggml_q8_0_scale(x + i*QK8_0);
         const float id = d ? 1.0f/d : 0.0f;
 
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
@@ -72,10 +60,10 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
             const v128_t v  = wasm_f32x4_mul(srcv[j], wasm_f32x4_splat(id));
             const v128_t vi = wasm_i32x4_trunc_sat_f32x4(v);
 
-            y[i].qs[4*j + 0] = wasm_i32x4_extract_lane(vi, 0);
-            y[i].qs[4*j + 1] = wasm_i32x4_extract_lane(vi, 1);
-            y[i].qs[4*j + 2] = wasm_i32x4_extract_lane(vi, 2);
-            y[i].qs[4*j + 3] = wasm_i32x4_extract_lane(vi, 3);
+            y[i].qs[4*j + 0] = MIN(127, MAX(-128, wasm_i32x4_extract_lane(vi, 0)));
+            y[i].qs[4*j + 1] = MIN(127, MAX(-128, wasm_i32x4_extract_lane(vi, 1)));
+            y[i].qs[4*j + 2] = MIN(127, MAX(-128, wasm_i32x4_extract_lane(vi, 2)));
+            y[i].qs[4*j + 3] = MIN(127, MAX(-128, wasm_i32x4_extract_lane(vi, 3)));
         }
     }
 #else

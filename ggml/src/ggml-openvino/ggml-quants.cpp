@@ -951,17 +951,22 @@ void quantize_q8_0(const float * x,
         auto * zp = static_cast<uint8_t *>(zp_arr.data());
         for (int i = 0; i < nb; i++) {
             float amax = 0.0f;
+            float vmax = 0.0f;
             for (int j = 0; j < qk; j++) {
                 const float v = x[i * qk + j];
-                amax = std::max(amax, fabsf(v));
+                const float av = fabsf(v);
+                if (amax < av) {
+                    amax = av;
+                    vmax = v;
+                }
             }
-            const float d = amax / 127.0f;
+            const float d = vmax / -128.0f;
             const float id = d ? 1.0f / d : 0.0f;
             scales[i] = ov::float16(d);
             zp[i] = 128;
             for (int j = 0; j < qk; ++j) {
                 const float x0 = x[i * qk + j] * id;
-                const int8_t xi0 = roundf(x0);
+                const int xi0 = std::max(-128, std::min(127, (int) roundf(x0)));
                 weights[i * qk + j] = (uint8_t) (xi0 + 128);
             }
         }
@@ -970,16 +975,21 @@ void quantize_q8_0(const float * x,
         auto * signed_weights = reinterpret_cast<int8_t *>(weights);
         for (int i = 0; i < nb; i++) {
             float amax = 0.0f;
+            float vmax = 0.0f;
             for (int j = 0; j < qk; j++) {
                 const float v = x[i * qk + j];
-                amax = std::max(amax, fabsf(v));
+                const float av = fabsf(v);
+                if (amax < av) {
+                    amax = av;
+                    vmax = v;
+                }
             }
-            const float d = amax / 127.0f;
+            const float d = vmax / -128.0f;
             const float id = d ? 1.0f / d : 0.0f;
             scales[i] = ov::float16(d);
             for (int j = 0; j < qk; ++j) {
                 const float x0 = x[i * qk + j] * id;
-                signed_weights[i * qk + j] = (int8_t) roundf(x0);
+                signed_weights[i * qk + j] = (int8_t) std::max(-128, std::min(127, (int) roundf(x0)));
             }
         }
     }

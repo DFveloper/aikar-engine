@@ -592,6 +592,13 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k_local  = GGML_TYPE_COUNT;
+    ggml_type cache_type_v_local  = GGML_TYPE_COUNT;
+    ggml_type cache_type_k_global = GGML_TYPE_COUNT;
+    ggml_type cache_type_v_global = GGML_TYPE_COUNT;
+
+    bool cache_type_k_set = false;
+    bool cache_type_v_set = false;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

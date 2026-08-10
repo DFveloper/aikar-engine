@@ -13,8 +13,10 @@
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
-                ggml_type   type_k,
-                ggml_type   type_v,
+                ggml_type   type_k_base,
+                ggml_type   type_v_base,
+                ggml_type   type_k_swa,
+                ggml_type   type_v_swa,
                      bool   v_trans,
                      bool   offload,
                      bool   swa_full,
@@ -27,15 +29,17 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share) :
-    llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
+    llama_kv_cache_iswa(model, model.hparams, type_k_base, type_v_base, type_k_swa, type_v_swa, v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
         const llama_hparams & hparams,
-                ggml_type   type_k,
-                ggml_type   type_v,
+                ggml_type   type_k_base,
+                ggml_type   type_v_base,
+                ggml_type   type_k_swa,
+                ggml_type   type_v_swa,
                      bool   v_trans,
                      bool   offload,
                      bool   swa_full,
@@ -92,20 +96,23 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
-    const bool lazy = unified && kv_size >= 65536 &&
-        type_k == type_v && (type_k == GGML_TYPE_Q8_0 || type_k == GGML_TYPE_F16);
+    const bool lazy_base = unified && kv_size >= 65536 &&
+        type_k_base == type_v_base && (type_k_base == GGML_TYPE_Q8_0 || type_k_base == GGML_TYPE_F16);
 
     kv_base = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k, type_v,
+            model, hparams, type_k_base, type_v_base,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, lazy);
+            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, lazy_base);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
+    const bool lazy_swa = unified && kv_size >= 65536 &&
+        type_k_swa == type_v_swa && (type_k_swa == GGML_TYPE_Q8_0 || type_k_swa == GGML_TYPE_F16);
+
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k, type_v,
+            model, hparams, type_k_swa, type_v_swa,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, lazy);
+            hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, lazy_swa);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

@@ -412,13 +412,17 @@ void quantize_q5_1(device const float * src, device block_q5_1 & dst) {
 void quantize_q8_0(device const float * src, device block_q8_0 & dst) {
 #pragma METAL fp math_mode(safe)
     float amax = 0.0f; // absolute max
+    float vmax = 0.0f;
 
     for (int j = 0; j < QK8_0; j++) {
         const float v = src[j];
-        amax = MAX(amax, fabs(v));
+        if (amax < fabs(v)) {
+            amax = fabs(v);
+            vmax = v;
+        }
     }
 
-    const float d = amax / ((1 << 7) - 1);
+    const float d = vmax / -128.0f;
     const float id = d ? 1.0f/d : 0.0f;
 
     dst.d = d;
@@ -426,7 +430,7 @@ void quantize_q8_0(device const float * src, device block_q8_0 & dst) {
     for (int j = 0; j < QK8_0; ++j) {
         const float x0 = src[j]*id;
 
-        dst.qs[j] = round(x0);
+        dst.qs[j] = clamp((int) round(x0), -128, 127);
     }
 }
 

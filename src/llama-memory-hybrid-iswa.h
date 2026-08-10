@@ -21,8 +21,10 @@ public:
     llama_memory_hybrid_iswa(
         const llama_model & model,
                             /* attn */
-                ggml_type   type_k,
-                ggml_type   type_v,
+                ggml_type   type_k_base,
+                ggml_type   type_v_base,
+                ggml_type   type_k_swa,
+                ggml_type   type_v_swa,
                      bool   v_trans,
                      bool   swa_full,
                  uint32_t   kv_size,
