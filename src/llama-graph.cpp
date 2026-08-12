@@ -1312,6 +1312,9 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_sparse_targets = nullptr;
+    t_sparse_weights = nullptr;
+    t_sparse_loss    = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1387,6 +1390,33 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
+}
+
+void llm_graph_result::add_sparse_loss() {
+    GGML_ASSERT(t_logits != nullptr);
+    GGML_ASSERT(t_logits->ne[1] > 0);
+
+    t_sparse_targets = ggml_new_tensor_1d(ctx_compute.get(), GGML_TYPE_I32, t_logits->ne[1]);
+    t_sparse_weights = ggml_new_tensor_1d(ctx_compute.get(), GGML_TYPE_F32, t_logits->ne[1]);
+    ggml_set_input(t_sparse_targets);
+    ggml_set_input(t_sparse_weights);
+
+    t_sparse_loss = ggml_cross_entropy_loss_sparse(ctx_compute.get(), t_logits, t_sparse_targets, t_sparse_weights);
+    ggml_set_name(t_sparse_loss, "sparse_cross_entropy_loss");
+    ggml_set_output(t_sparse_loss);
+    ggml_build_forward_expand(gf, t_sparse_loss);
+}
+
+void llm_graph_result::set_sparse_loss_inputs(const llama_token * targets, size_t n_targets) {
+    GGML_ASSERT(t_sparse_targets != nullptr);
+    GGML_ASSERT(t_sparse_weights != nullptr);
+    GGML_ASSERT(n_targets == (size_t) ggml_nelements(t_sparse_targets));
+
+    ggml_backend_tensor_set(t_sparse_targets, targets, 0, n_targets*sizeof(llama_token));
+    if (sparse_weights_data.size() != n_targets) {
+        sparse_weights_data.assign(n_targets, 1.0f);
+    }
+    ggml_backend_tensor_set(t_sparse_weights, sparse_weights_data.data(), 0, n_targets*sizeof(float));
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {

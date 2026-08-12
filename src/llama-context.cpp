@@ -1364,6 +1364,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (sparse_loss.active) {
+            res->add_sparse_loss();
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1377,6 +1381,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        if (sparse_loss.active) {
+            GGML_ASSERT(sparse_loss.n_consumed + n_outputs <= sparse_loss.n_targets);
+            res->set_sparse_loss_inputs(sparse_loss.targets + sparse_loss.n_consumed, n_outputs);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1386,6 +1394,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (sparse_loss.active) {
+        ggml_tensor * t_loss = res->get_sparse_loss();
+        GGML_ASSERT(t_loss != nullptr);
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), t_loss) != nullptr);
+        ggml_backend_sched_synchronize(sched.get());
+        float ubatch_loss = 0.0f;
+        ggml_backend_tensor_get(t_loss, &ubatch_loss, 0, sizeof(ubatch_loss));
+        sparse_loss.sum += (double) ubatch_loss*n_outputs;
+        sparse_loss.n_consumed += n_outputs;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2085,6 +2104,38 @@ int llama_context::decode(const llama_batch & batch_inp) {
     return 0;
 }
 
+int llama_context::decode_sparse_cross_entropy(
+        const llama_batch & batch,
+        const llama_token * targets,
+        size_t n_targets,
+        float * loss) {
+    if (!targets || !loss || sparse_loss.active) {
+        return -1;
+    }
+
+    size_t expected = batch.logits ? 0 : batch.n_tokens;
+    if (batch.logits) {
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            expected += batch.logits[i] != 0;
+        }
+    }
+    if (expected != n_targets || n_targets == 0) {
+        return -1;
+    }
+
+    sparse_loss = { true, targets, n_targets, 0, 0.0 };
+    const int result = decode(batch);
+    if (result == 0 && sparse_loss.n_consumed == n_targets) {
+        *loss = (float) (sparse_loss.sum/n_targets);
+    }
+    const bool complete = sparse_loss.n_consumed == n_targets;
+    sparse_loss = {};
+    if (result != 0) {
+        return result;
+    }
+    return complete ? 0 : -1;
+}
+
 //
 // output
 //
@@ -2100,7 +2151,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = !sparse_loss.active;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -2451,6 +2502,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.sparse_loss =*/ sparse_loss.active,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -4407,6 +4459,15 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_sparse_cross_entropy(
+        llama_context * ctx,
+        llama_batch batch,
+        const llama_token * targets,
+        size_t n_targets,
+        float * loss) {
+    return ctx->decode_sparse_cross_entropy(batch, targets, n_targets, loss);
 }
 
 //

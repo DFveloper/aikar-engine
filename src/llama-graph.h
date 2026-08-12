@@ -785,6 +785,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    bool sparse_loss;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -857,6 +859,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            sparse_loss == other.sparse_loss &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -880,6 +883,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_sparse_loss() const { return t_sparse_loss; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -892,6 +896,8 @@ public:
 
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
+    void add_sparse_loss();
+    void set_sparse_loss_inputs(const llama_token * targets, size_t n_targets);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
@@ -915,8 +921,12 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_sparse_targets = nullptr;
+    ggml_tensor * t_sparse_weights = nullptr;
+    ggml_tensor * t_sparse_loss    = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
+    std::vector<float> sparse_weights_data;
 
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;

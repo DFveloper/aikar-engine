@@ -3,6 +3,8 @@
 #include "gguf.h"
 
 #include "llama.h"
+#include "llama-ext.h"
+#include "chat.h"
 #include "jsonl.h"
 #include <nlohmann/json.hpp>
 
@@ -15,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -38,12 +41,15 @@ struct merge_params {
     int population = 8;
     int generations = 10;
     int elite_count = 2;
-    int gpu_layers = 0;
+    int gpu_layers = -1;
     std::string device;
+    std::vector<std::string> devices;
     bool merge_gpu = false;
     int context_size = 512;
     float mutation = 0.10f;
     uint32_t seed = 0;
+    bool seed_set = false;
+    std::string temp_dir;
 };
 
 static void usage(const char * executable) {
@@ -63,10 +69,12 @@ static void usage(const char * executable) {
     printf("  --elite-count N               Evo elites retained per generation (default: 2)\n");
     printf("  --sigma0 N                    Evo CMA-ES initial sigma (default: 0.10)\n");
     printf("  --seed N                      Evo random seed (default: random)\n");
-    printf("  --gpu-layers N                layers offloaded for fitness; -1 means all (default: 0)\n");
+    printf("  --gpu-layers N                layers offloaded for fitness; -1 means all (default: -1)\n");
     printf("  --device NAME                 fitness backend device, e.g. CUDA0 or Vulkan0\n");
+    printf("  --devices LIST                evaluate candidates concurrently, one per comma-separated device\n");
     printf("  --merge-gpu                  run Evo weighted merge math on the selected GPU\n");
     printf("  --ctx-size N                  fitness context size (default: 512)\n");
+    printf("  --temp-dir DIR                local directory for Evo candidate files (default: system temp)\n");
     printf("  --config FILE                 INI file: base=, models=comma,separated, output=, method=, density=, threads=, memory_budget=\n");
 }
 
@@ -178,14 +186,19 @@ static void load_config(const std::string & path, merge_params & params) {
             params.mutation = std::stof(value);
         } else if (key == "seed") {
             params.seed = std::stoul(value);
+            params.seed_set = true;
         } else if (key == "gpu_layers") {
             params.gpu_layers = std::stoi(value);
         } else if (key == "device") {
             params.device = value;
+        } else if (key == "devices") {
+            params.devices = split(value, ',');
         } else if (key == "merge_gpu") {
             params.merge_gpu = parse_bool(value);
         } else if (key == "ctx_size") {
             params.context_size = std::stoi(value);
+        } else if (key == "temp_dir") {
+            params.temp_dir = value;
         } else {
             throw std::runtime_error("unknown config key '" + key + "'");
         }
@@ -232,14 +245,19 @@ static merge_params parse_args(int argc, char ** argv) {
             params.mutation = std::stof(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             params.seed = std::stoul(argv[++i]);
+            params.seed_set = true;
         } else if (arg == "--gpu-layers" && i + 1 < argc) {
             params.gpu_layers = std::stoi(argv[++i]);
         } else if (arg == "--device" && i + 1 < argc) {
             params.device = argv[++i];
+        } else if (arg == "--devices" && i + 1 < argc) {
+            params.devices = split(argv[++i], ',');
         } else if (arg == "--merge-gpu") {
             params.merge_gpu = true;
         } else if (arg == "--ctx-size" && i + 1 < argc) {
             params.context_size = std::stoi(argv[++i]);
+        } else if (arg == "--temp-dir" && i + 1 < argc) {
+            params.temp_dir = argv[++i];
         } else {
             throw std::runtime_error("unknown or incomplete option '" + arg + "'");
         }
@@ -268,6 +286,9 @@ static merge_params parse_args(int argc, char ** argv) {
     if (params.merge_gpu && params.method != "evo") {
         throw std::runtime_error("--merge-gpu currently requires --method evo");
     }
+    if (!params.device.empty() && !params.devices.empty()) {
+        throw std::runtime_error("use either --device or --devices, not both");
+    }
     return params;
 }
 
@@ -282,6 +303,65 @@ static std::string get_kv_string(const gguf_context * gguf, const char * key) {
     const int64_t idx = gguf_find_key(gguf, key);
     return idx < 0 ? "" : gguf_get_val_str(gguf, idx);
 }
+
+static size_t gguf_scalar_size(gguf_type type) {
+    switch (type) {
+        case GGUF_TYPE_UINT8:
+        case GGUF_TYPE_INT8:
+        case GGUF_TYPE_BOOL:    return 1;
+        case GGUF_TYPE_UINT16:
+        case GGUF_TYPE_INT16:   return 2;
+        case GGUF_TYPE_UINT32:
+        case GGUF_TYPE_INT32:
+        case GGUF_TYPE_FLOAT32: return 4;
+        case GGUF_TYPE_UINT64:
+        case GGUF_TYPE_INT64:
+        case GGUF_TYPE_FLOAT64: return 8;
+        default:                return 0;
+    }
+}
+
+static bool same_kv_value(const gguf_context * a, int64_t ia, const gguf_context * b, int64_t ib) {
+    const gguf_type type = gguf_get_kv_type(a, ia);
+    if (type != gguf_get_kv_type(b, ib)) {
+        return false;
+    }
+    if (type == GGUF_TYPE_STRING) {
+        return std::string(gguf_get_val_str(a, ia)) == gguf_get_val_str(b, ib);
+    }
+    if (type == GGUF_TYPE_ARRAY) {
+        const gguf_type element_type = gguf_get_arr_type(a, ia);
+        const size_t count = gguf_get_arr_n(a, ia);
+        if (element_type != gguf_get_arr_type(b, ib) || count != gguf_get_arr_n(b, ib)) {
+            return false;
+        }
+        if (element_type == GGUF_TYPE_STRING) {
+            for (size_t i = 0; i < count; ++i) {
+                if (std::string(gguf_get_arr_str(a, ia, i)) != gguf_get_arr_str(b, ib, i)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        const size_t element_size = gguf_scalar_size(element_type);
+        if (element_size == 0 || count > SIZE_MAX / element_size) {
+            throw std::runtime_error("unsupported or oversized GGUF metadata array");
+        }
+        return memcmp(gguf_get_arr_data(a, ia), gguf_get_arr_data(b, ib), count * element_size) == 0;
+    }
+    const size_t size = gguf_scalar_size(type);
+    if (size == 0) {
+        throw std::runtime_error("unsupported GGUF metadata type " + std::string(gguf_type_name(type)));
+    }
+    return memcmp(gguf_get_val_data(a, ia), gguf_get_val_data(b, ib), size) == 0;
+}
+
+static bool is_compatibility_key(const std::string & key, const std::string & architecture) {
+    return key.rfind("tokenizer.", 0) == 0 || key.rfind(architecture + ".", 0) == 0 || key == "general.architecture";
+}
+
+struct gguf_input;
+static void validate_metadata_compatibility(const gguf_input & base, const gguf_input & input);
 
 static uint32_t get_file_type(const gguf_context * gguf) {
     const int64_t idx = gguf_find_key(gguf, "general.file_type");
@@ -348,6 +428,24 @@ struct gguf_input {
     }
 };
 
+static void validate_metadata_compatibility(const gguf_input & base, const gguf_input & input) {
+    const std::string architecture = get_kv_string(base.gguf, "general.architecture");
+    for (int pass = 0; pass < 2; ++pass) {
+        const gguf_context * source = pass == 0 ? base.gguf : input.gguf;
+        const gguf_context * other = pass == 0 ? input.gguf : base.gguf;
+        for (int64_t i = 0; i < gguf_get_n_kv(source); ++i) {
+            const std::string key = gguf_get_key(source, i);
+            if (!is_compatibility_key(key, architecture)) {
+                continue;
+            }
+            const int64_t other_index = gguf_find_key(other, key.c_str());
+            if (other_index < 0 || !same_kv_value(source, i, other, other_index)) {
+                throw std::runtime_error("incompatible model metadata '" + key + "' in " + input.path);
+            }
+        }
+    }
+}
+
 static bool same_shape(const ggml_tensor * a, const ggml_tensor * b) {
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         if (a->ne[i] != b->ne[i]) {
@@ -392,12 +490,12 @@ static uint32_t type_to_ftype(ggml_type type) {
     }
 }
 
-static ggml_type parse_target_type(std::string value) {
+static llama_ftype parse_target_ftype(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-    if (value == "q4_0")  return GGML_TYPE_Q4_0;
-    if (value == "q3_k")  return GGML_TYPE_Q3_K;
-    if (value == "q4_k")  return GGML_TYPE_Q4_K;
-    if (value == "mxfp4") return GGML_TYPE_MXFP4;
+    if (value == "q4_0")  return LLAMA_FTYPE_MOSTLY_Q4_0;
+    if (value == "q3_k")  return LLAMA_FTYPE_MOSTLY_Q3_K_M;
+    if (value == "q4_k")  return LLAMA_FTYPE_MOSTLY_Q4_K_M;
+    if (value == "mxfp4") return LLAMA_FTYPE_MOSTLY_MXFP4_MOE;
     throw std::runtime_error("Evo target type must be q4_0, q3_k, q4_k, or mxfp4");
 }
 
@@ -482,27 +580,26 @@ static void ties_merge(const std::vector<float> & base, std::vector<std::vector<
     }
 }
 
-static void write_tensor(
-        std::ofstream & output,
+static std::vector<uint8_t> encode_tensor(
         ggml_type type,
         const ggml_tensor * shape,
-        const std::vector<float> & values,
-        size_t alignment) {
+        const std::vector<float> & values) {
     if (type == GGML_TYPE_F32) {
         const size_t size = values.size() * sizeof(float);
-        output.write((const char *) values.data(), size);
-        write_zeros(output, GGML_PAD(size, alignment) - size);
-        return;
+        std::vector<uint8_t> encoded(size);
+        memcpy(encoded.data(), values.data(), size);
+        return encoded;
     }
     if (ggml_is_quantized(type)) {
         const int64_t n_per_row = shape->ne[0];
+        if (n_per_row <= 0 || values.size() % n_per_row != 0 || n_per_row % ggml_blck_size(type) != 0) {
+            throw std::runtime_error("tensor '" + std::string(shape->name) + "' is incompatible with " + ggml_type_name(type));
+        }
         const int64_t n_rows = values.size() / n_per_row;
         const size_t size = ggml_row_size(type, n_per_row) * n_rows;
         std::vector<uint8_t> quantized(size);
         ggml_quantize_chunk(type, values.data(), quantized.data(), 0, n_rows, n_per_row, nullptr);
-        output.write((const char *) quantized.data(), size);
-        write_zeros(output, GGML_PAD(size, alignment) - size);
-        return;
+        return quantized;
     }
     const ggml_type_traits * traits = ggml_get_type_traits(type);
     if (!traits || !traits->from_float_ref) {
@@ -511,8 +608,67 @@ static void write_tensor(
     const size_t size = ggml_row_size(type, shape->ne[0]) * (values.size() / shape->ne[0]);
     std::vector<uint8_t> encoded(size);
     traits->from_float_ref(values.data(), encoded.data(), values.size());
-    output.write((const char *) encoded.data(), size);
-    write_zeros(output, GGML_PAD(size, alignment) - size);
+    return encoded;
+}
+
+static void write_encoded_tensor(std::ofstream & output, const std::vector<uint8_t> & encoded, size_t alignment) {
+    output.write((const char *) encoded.data(), encoded.size());
+    write_zeros(output, GGML_PAD(encoded.size(), alignment) - encoded.size());
+}
+
+static void write_tensor(
+        std::ofstream & output,
+        ggml_type type,
+        const ggml_tensor * shape,
+        const std::vector<float> & values,
+        size_t alignment) {
+    write_encoded_tensor(output, encode_tensor(type, shape, values), alignment);
+}
+
+static bool tensor_can_decode(const ggml_tensor * tensor) {
+    if (tensor->type == GGML_TYPE_F32) {
+        return true;
+    }
+    const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+    return traits && traits->to_float;
+}
+
+static std::vector<ggml_type> plan_evo_types(
+        const merge_params & params,
+        const gguf_input & base,
+        const std::vector<std::string> & tensor_names,
+        llama_model * metadata_model,
+        llama_ftype target_ftype) {
+    llama_model_quantize_params quant_params = llama_model_quantize_default_params();
+    quant_params.nthread = params.n_threads;
+    quant_params.ftype = target_ftype;
+    quant_params.allow_requantize = true;
+    std::unique_ptr<quantize_state_impl, decltype(&llama_quant_free)> quant_state(
+            llama_quant_init(metadata_model, &quant_params), llama_quant_free);
+    if (!quant_state) {
+        throw std::runtime_error("failed to initialize Evo quantization planner");
+    }
+
+    std::vector<ggml_type> result(tensor_names.size());
+    std::vector<ggml_tensor *> quantizable;
+    std::vector<size_t> quantizable_indices;
+    for (size_t i = 0; i < tensor_names.size(); ++i) {
+        ggml_tensor * tensor = base.tensors.at(tensor_names[i]).tensor;
+        result[i] = tensor->type;
+        if (tensor_can_decode(tensor) && llama_quant_tensor_allows_quantization(quant_state.get(), tensor)) {
+            quantizable.push_back(tensor);
+            quantizable_indices.push_back(i);
+        }
+    }
+
+    std::vector<ggml_type> planned(quantizable.size());
+    if (!quantizable.empty()) {
+        llama_quant_compute_types(quant_state.get(), target_ftype, quantizable.data(), planned.data(), planned.size());
+    }
+    for (size_t i = 0; i < planned.size(); ++i) {
+        result[quantizable_indices[i]] = planned[i];
+    }
+    return result;
 }
 
 struct evo_candidate {
@@ -542,11 +698,10 @@ static void normalize_genes(evo_candidate & candidate, size_t n_tensors, size_t 
 
 static void merge_weighted_gpu(
         ggml_backend_t backend,
-        const std::vector<std::unique_ptr<gguf_input>> & inputs,
-        const std::string & name,
+        const ggml_tensor * shape,
+        const std::vector<std::vector<float>> & inputs,
         const float * weights,
         std::vector<float> & result) {
-    const ggml_tensor * shape = inputs[0]->tensors.at(name).tensor;
     const size_t tensor_count = inputs.size() * 2 + inputs.size();
     ggml_init_params init_params = {
         /*.mem_size   = */ tensor_count * ggml_tensor_overhead() + ggml_graph_overhead(),
@@ -573,14 +728,11 @@ static void merge_weighted_gpu(
     }
 
     try {
-        std::vector<uint8_t> bytes;
-        std::vector<float> values;
         for (size_t input = 0; input < inputs.size(); ++input) {
-            decode_tensor(*inputs[input], name, bytes, values);
-            ggml_backend_tensor_set(source[input], values.data(), 0, values.size() * sizeof(float));
+            ggml_backend_tensor_set(source[input], inputs[input].data(), 0, inputs[input].size() * sizeof(float));
         }
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("GPU merge graph computation failed for tensor '" + name + "'");
+            throw std::runtime_error("GPU merge graph computation failed for tensor '" + std::string(shape->name) + "'");
         }
         result.resize(ggml_nelements(merged));
         ggml_backend_tensor_get(merged, result.data(), 0, result.size() * sizeof(float));
@@ -593,156 +745,189 @@ static void merge_weighted_gpu(
     ggml_free(ctx);
 }
 
-static void write_evo_candidate(
-        const std::string & path,
+struct evo_output {
+    gguf_context * gguf = nullptr;
+    ggml_context * ctx = nullptr;
+    std::ofstream file;
+    size_t metadata_size = 0;
+
+    evo_output(
+            const std::string & path,
+            const gguf_input & base,
+            const std::vector<std::string> & tensor_names,
+            const std::vector<ggml_type> & output_types,
+            llama_ftype target_ftype) {
+        gguf = gguf_init_empty();
+        gguf_set_kv(gguf, base.gguf);
+        gguf_remove_key(gguf, GGUF_KEY_GENERAL_ALIGNMENT);
+        gguf_set_val_u32(gguf, "general.file_type", target_ftype);
+        gguf_remove_key(gguf, "split.no");
+        gguf_remove_key(gguf, "split.count");
+        gguf_remove_key(gguf, "split.tensors.count");
+
+        ggml_init_params init_params = {
+            /*.mem_size   = */ base.tensors.size() * ggml_tensor_overhead(),
+            /*.mem_buffer = */ nullptr,
+            /*.no_alloc   = */ true,
+        };
+        ctx = ggml_init(init_params);
+        if (!ctx) {
+            throw std::runtime_error("failed to create Evo output tensor context");
+        }
+        for (size_t i = 0; i < tensor_names.size(); ++i) {
+            const ggml_tensor * source = base.tensors.at(tensor_names[i]).tensor;
+            ggml_tensor * tensor = ggml_new_tensor(ctx, output_types[i], GGML_MAX_DIMS, source->ne);
+            ggml_set_name(tensor, source->name);
+            gguf_add_tensor(gguf, tensor);
+        }
+
+        metadata_size = gguf_get_meta_size(gguf);
+        file.open(path, std::ios::binary);
+        file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+        write_zeros(file, metadata_size);
+    }
+
+    evo_output(const evo_output &) = delete;
+    evo_output & operator=(const evo_output &) = delete;
+
+    ~evo_output() {
+        file.exceptions(std::ios::goodbit);
+        file.close();
+        if (ctx) ggml_free(ctx);
+        if (gguf) gguf_free(gguf);
+    }
+
+    void append(const std::vector<uint8_t> & encoded) {
+        write_encoded_tensor(file, encoded, GGUF_DEFAULT_ALIGNMENT);
+    }
+
+    void finish() {
+        std::vector<uint8_t> metadata(metadata_size);
+        gguf_get_meta_data(gguf, metadata.data());
+        file.seekp(0);
+        file.write((const char *) metadata.data(), metadata.size());
+        file.close();
+    }
+};
+
+static int select_evo_worker_count(
+        const merge_params & params,
+        const ggml_tensor * tensor,
+        size_t n_candidates) {
+    const size_t elements = ggml_nelements(tensor);
+    const size_t bytes_per_worker = elements > SIZE_MAX / (2 * sizeof(float))
+        ? SIZE_MAX
+        : elements * 2 * sizeof(float);
+    const size_t memory_workers = bytes_per_worker == 0
+        ? 1
+        : std::max<size_t>(1, params.memory_budget / bytes_per_worker);
+    return std::max(1, std::min<int>(params.n_threads, std::min(n_candidates, memory_workers)));
+}
+
+static void write_evo_candidates(
+        const std::vector<std::string> & paths,
         const merge_params & params,
         const std::vector<std::unique_ptr<gguf_input>> & inputs,
         const std::vector<std::string> & tensor_names,
-        const evo_candidate & candidate,
-        ggml_type target_type,
+        const std::vector<evo_candidate> & candidates,
+        const std::vector<size_t> & gene_offsets,
+        const std::vector<ggml_type> & output_types,
+        llama_ftype target_ftype,
         ggml_backend_t merge_backend) {
+    if (paths.size() != candidates.size() || output_types.size() != tensor_names.size() ||
+            gene_offsets.size() != tensor_names.size()) {
+        throw std::runtime_error("internal Evo output size mismatch");
+    }
     const gguf_input & base = *inputs[0];
-    gguf_context * output_gguf = gguf_init_empty();
-    gguf_set_kv(output_gguf, base.gguf);
-    gguf_remove_key(output_gguf, GGUF_KEY_GENERAL_ALIGNMENT);
-    gguf_set_val_u32(output_gguf, "general.file_type", type_to_ftype(target_type));
-    gguf_remove_key(output_gguf, "split.no");
-    gguf_remove_key(output_gguf, "split.count");
-    gguf_remove_key(output_gguf, "split.tensors.count");
+    std::vector<std::unique_ptr<evo_output>> outputs;
+    outputs.reserve(paths.size());
+    for (const std::string & path : paths) {
+        outputs.emplace_back(new evo_output(path, base, tensor_names, output_types, target_ftype));
+    }
 
-    ggml_init_params init_params = {
-        /*.mem_size   = */ base.tensors.size() * ggml_tensor_overhead(),
-        /*.mem_buffer = */ nullptr,
-        /*.no_alloc   = */ true,
-    };
-    ggml_context * output_ctx = ggml_init(init_params);
-    std::map<std::string, ggml_type> output_types;
+    const ggml_tensor * largest_tensor = nullptr;
     for (const std::string & name : tensor_names) {
-        const ggml_tensor * source = base.tensors.at(name).tensor;
-        const ggml_type output_type = ggml_is_quantized(source->type) ? target_type : source->type;
-        ggml_tensor * tensor = ggml_new_tensor(output_ctx, output_type, GGML_MAX_DIMS, source->ne);
-        ggml_set_name(tensor, source->name);
-        gguf_add_tensor(output_gguf, tensor);
-        output_types[name] = output_type;
-    }
-
-    std::ofstream output(path, std::ios::binary);
-    output.exceptions(std::ofstream::failbit | std::ofstream::badbit);
-    write_zeros(output, gguf_get_meta_size(output_gguf));
-    std::atomic<size_t> next_job { 0 };
-    size_t next_to_write = 0;
-    bool stop = false;
-    std::exception_ptr worker_error;
-    std::mutex write_mutex;
-    std::condition_variable write_condition;
-    const int n_workers = merge_backend ? 1 : select_worker_count(params, base, inputs.size());
-    std::vector<std::thread> workers;
-    workers.reserve(n_workers);
-    for (int worker = 0; worker < n_workers; ++worker) {
-        workers.emplace_back([&] {
-            try {
-                std::vector<uint8_t> bytes;
-                std::vector<float> values;
-                std::vector<float> merged;
-                for (;;) {
-                    const size_t tensor_index = next_job.fetch_add(1);
-                    if (tensor_index >= tensor_names.size()) return;
-                    const std::string & name = tensor_names[tensor_index];
-                    const float * weights = candidate.genes.data() + tensor_index*inputs.size();
-                    if (merge_backend) {
-                        merge_weighted_gpu(merge_backend, inputs, name, weights, merged);
-                    } else {
-                        merged.assign(ggml_nelements(base.tensors.at(name).tensor), 0.0f);
-                        for (size_t input = 0; input < inputs.size(); ++input) {
-                            decode_tensor(*inputs[input], name, bytes, values);
-                            for (size_t element = 0; element < merged.size(); ++element) {
-                                merged[element] += weights[input] * values[element];
-                            }
-                        }
-                    }
-                    std::unique_lock<std::mutex> lock(write_mutex);
-                    write_condition.wait(lock, [&] { return stop || tensor_index == next_to_write; });
-                    if (stop) return;
-                    write_tensor(output, output_types.at(name), base.tensors.at(name).tensor, merged, GGUF_DEFAULT_ALIGNMENT);
-                    ++next_to_write;
-                    lock.unlock();
-                    write_condition.notify_all();
-                }
-            } catch (...) {
-                std::lock_guard<std::mutex> lock(write_mutex);
-                if (!worker_error) worker_error = std::current_exception();
-                stop = true;
-                write_condition.notify_all();
-            }
-        });
-    }
-    for (std::thread & worker : workers) worker.join();
-    if (worker_error) std::rethrow_exception(worker_error);
-    std::vector<uint8_t> metadata(gguf_get_meta_size(output_gguf));
-    gguf_get_meta_data(output_gguf, metadata.data());
-    output.seekp(0);
-    output.write((const char *) metadata.data(), metadata.size());
-    output.close();
-    ggml_free(output_ctx);
-    gguf_free(output_gguf);
-}
-
-static std::vector<std::string> load_calibration(const std::string & path, int32_t n_threads) {
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("failed to open calibration file " + path);
-    }
-    std::vector<std::string> samples;
-    const bool jsonl = path.size() >= 6 && path.substr(path.size() - 6) == ".jsonl";
-    if (!jsonl) {
-        std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        if (!text.empty()) samples.push_back(std::move(text));
-        return samples;
-    }
-
-    std::vector<common_jsonl_line> lines = common_jsonl_read_lines(path, COMMON_JSONL_EMPTY_LINE_SKIP);
-    std::vector<std::string> parsed(lines.size());
-    std::vector<std::string> errors(lines.size());
-    common_jsonl_worker_pool pool(common_jsonl_worker_count(n_threads, lines.size()));
-    pool.parallel_for(lines.size(), [&](size_t i, size_t) {
-        if (trim(lines[i].text).empty()) return;
-        try {
-            const nlohmann::json item = nlohmann::json::parse(lines[i].text);
-            std::string text;
-            if (item.contains("messages") && item["messages"].is_array()) {
-                for (const auto & data : item["messages"]) {
-                    const common_chat_msg message = common_jsonl_parse_chat_message(data, COMMON_JSONL_CHAT_PARSE_OPTIONAL_TEXT);
-                    if (!message.content_parts.empty()) {
-                        text += message.role + ": " + message.content_parts[0].text + "\n";
-                    }
-                }
-            } else if (item.contains("prompt") && item.contains("response")) {
-                text = item["prompt"].get<std::string>() + item["response"].get<std::string>();
-            } else if (item.contains("text")) {
-                text = item["text"].get<std::string>();
-            }
-            parsed[i] = std::move(text);
-        } catch (const std::exception & error) {
-            errors[i] = error.what();
+        const ggml_tensor * tensor = base.tensors.at(name).tensor;
+        if (!largest_tensor || ggml_nelements(tensor) > ggml_nelements(largest_tensor)) {
+            largest_tensor = tensor;
         }
-    });
-    for (common_jsonl_line & line : lines) std::string().swap(line.text);
-    for (size_t i = 0; i < lines.size(); ++i) {
-        if (!errors[i].empty()) throw std::runtime_error("invalid calibration JSONL line " + std::to_string(lines[i].number) + ": " + errors[i]);
-        if (!parsed[i].empty()) samples.push_back(std::move(parsed[i]));
     }
-    if (samples.empty()) {
-        throw std::runtime_error("calibration file contains no usable samples");
+    const int n_workers = merge_backend ? 1 : select_evo_worker_count(params, largest_tensor, candidates.size());
+    std::unique_ptr<common_jsonl_worker_pool> worker_pool;
+    if (!merge_backend) {
+        worker_pool.reset(new common_jsonl_worker_pool(n_workers));
+        printf("evo merge: %d CPU candidate workers\n", n_workers);
     }
-    return samples;
+    for (size_t tensor_index = 0; tensor_index < tensor_names.size(); ++tensor_index) {
+        const std::string & name = tensor_names[tensor_index];
+        const ggml_tensor * shape = base.tensors.at(name).tensor;
+        if (!tensor_can_decode(shape)) {
+            std::vector<uint8_t> base_bytes;
+            base.read_tensor(name, base_bytes);
+            for (size_t input = 1; input < inputs.size(); ++input) {
+                const ggml_tensor * other_shape = inputs[input]->tensors.at(name).tensor;
+                if (other_shape->type != shape->type) {
+                    throw std::runtime_error("non-floating tensor type differs for '" + name + "'");
+                }
+                std::vector<uint8_t> other_bytes;
+                inputs[input]->read_tensor(name, other_bytes);
+                if (base_bytes != other_bytes) {
+                    throw std::runtime_error("non-floating tensor data differs for '" + name + "'");
+                }
+            }
+            for (auto & output : outputs) output->append(base_bytes);
+            continue;
+        }
+
+        std::vector<std::vector<float>> decoded(inputs.size());
+        std::vector<uint8_t> bytes;
+        for (size_t input = 0; input < inputs.size(); ++input) {
+            if (!tensor_can_decode(inputs[input]->tensors.at(name).tensor)) {
+                throw std::runtime_error("floating tensor type differs for '" + name + "'");
+            }
+            decode_tensor(*inputs[input], name, bytes, decoded[input]);
+        }
+
+        if (merge_backend) {
+            std::vector<float> merged;
+            for (size_t candidate = 0; candidate < candidates.size(); ++candidate) {
+                const float * weights = candidates[candidate].genes.data() + gene_offsets[tensor_index];
+                merge_weighted_gpu(merge_backend, shape, decoded, weights, merged);
+                outputs[candidate]->append(encode_tensor(output_types[tensor_index], shape, merged));
+            }
+        } else {
+            worker_pool->parallel_for(candidates.size(), [&](size_t candidate, size_t) {
+                const float * weights = candidates[candidate].genes.data() + gene_offsets[tensor_index];
+                std::vector<float> merged(ggml_nelements(shape), 0.0f);
+                for (size_t input = 0; input < inputs.size(); ++input) {
+                    for (size_t element = 0; element < merged.size(); ++element) {
+                        merged[element] += weights[input] * decoded[input][element];
+                    }
+                }
+                outputs[candidate]->append(encode_tensor(output_types[tensor_index], shape, merged));
+            });
+        }
+        if ((tensor_index + 1) % 32 == 0 || tensor_index + 1 == tensor_names.size()) {
+            printf("evo merge: tensors %zu/%zu\n", tensor_index + 1, tensor_names.size());
+        }
+    }
+    for (auto & output : outputs) output->finish();
 }
 
-static std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text) {
+struct calibration_sample {
+    std::vector<llama_token> tokens;
+    size_t loss_begin = 1;
+};
+
+static std::vector<llama_token> tokenize_text(
+        const llama_vocab * vocab,
+        const std::string & text,
+        bool add_special) {
     std::vector<llama_token> tokens(text.size() + 8);
-    int32_t count = llama_tokenize(vocab, text.data(), text.size(), tokens.data(), tokens.size(), true, true);
+    int32_t count = llama_tokenize(vocab, text.data(), text.size(), tokens.data(), tokens.size(), add_special, true);
     if (count < 0) {
         tokens.resize(-count);
-        count = llama_tokenize(vocab, text.data(), text.size(), tokens.data(), tokens.size(), true, true);
+        count = llama_tokenize(vocab, text.data(), text.size(), tokens.data(), tokens.size(), add_special, true);
     }
     if (count < 0) {
         throw std::runtime_error("failed to tokenize calibration text");
@@ -751,19 +936,110 @@ static std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const s
     return tokens;
 }
 
-static double evaluate_candidate(const std::string & path, const merge_params & params, const std::vector<std::string> & samples) {
+static calibration_sample make_calibration_sample(
+        const llama_vocab * vocab,
+        const std::string & prompt,
+        const std::string & response) {
+    calibration_sample sample;
+    sample.tokens = tokenize_text(vocab, prompt, true);
+    sample.loss_begin = sample.tokens.size();
+    std::vector<llama_token> response_tokens = tokenize_text(vocab, response, false);
+    sample.tokens.insert(sample.tokens.end(), response_tokens.begin(), response_tokens.end());
+    return sample;
+}
+
+static std::vector<calibration_sample> load_calibration(
+        const std::string & path,
+        int32_t n_threads,
+        const llama_model * metadata_model) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open calibration file " + path);
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(metadata_model);
+    std::vector<calibration_sample> samples;
+    const bool jsonl = path.size() >= 6 && path.substr(path.size() - 6) == ".jsonl";
+    if (!jsonl) {
+        std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if (!text.empty()) samples.push_back(make_calibration_sample(vocab, "", text));
+        return samples;
+    }
+
+    std::vector<common_jsonl_line> lines = common_jsonl_read_lines(path, COMMON_JSONL_EMPTY_LINE_SKIP);
+    std::vector<nlohmann::json> parsed(lines.size());
+    std::vector<std::string> errors(lines.size());
+    common_jsonl_worker_pool pool(common_jsonl_worker_count(n_threads, lines.size()));
+    pool.parallel_for(lines.size(), [&](size_t i, size_t) {
+        if (trim(lines[i].text).empty()) return;
+        try {
+            parsed[i] = nlohmann::json::parse(lines[i].text);
+        } catch (const std::exception & error) {
+            errors[i] = error.what();
+        }
+    });
+    for (common_jsonl_line & line : lines) std::string().swap(line.text);
+    common_chat_templates_ptr templates = common_chat_templates_init(metadata_model, "");
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!errors[i].empty()) throw std::runtime_error("invalid calibration JSONL line " + std::to_string(lines[i].number) + ": " + errors[i]);
+        const nlohmann::json & item = parsed[i];
+        if (item.is_null()) continue;
+        if (item.contains("messages") && item["messages"].is_array()) {
+            std::vector<common_chat_msg> messages;
+            for (const auto & data : item["messages"]) {
+                messages.push_back(common_jsonl_parse_chat_message(data, COMMON_JSONL_CHAT_PARSE_OPTIONAL_TEXT));
+            }
+            size_t assistant_index = messages.size();
+            for (size_t index = messages.size(); index-- > 0;) {
+                if (messages[index].role == "assistant") {
+                    assistant_index = index;
+                    break;
+                }
+            }
+            if (assistant_index == messages.size()) {
+                throw std::runtime_error("calibration JSONL line " + std::to_string(lines[i].number) + " has no assistant response");
+            }
+            common_chat_templates_inputs chat_inputs;
+            chat_inputs.messages.assign(messages.begin(), messages.begin() + assistant_index);
+            chat_inputs.add_generation_prompt = true;
+            const std::string prompt = common_chat_templates_apply(templates.get(), chat_inputs).prompt;
+            chat_inputs.messages.assign(messages.begin(), messages.begin() + assistant_index + 1);
+            chat_inputs.add_generation_prompt = false;
+            const std::string full = common_chat_templates_apply(templates.get(), chat_inputs).prompt;
+            if (full.rfind(prompt, 0) != 0) {
+                throw std::runtime_error("chat template output is not prefixed by its generation prompt on calibration JSONL line " +
+                        std::to_string(lines[i].number));
+            }
+            samples.push_back(make_calibration_sample(vocab, prompt, full.substr(prompt.size())));
+        } else if (item.contains("prompt") && item.contains("response")) {
+            samples.push_back(make_calibration_sample(
+                    vocab, item.at("prompt").get<std::string>(), item.at("response").get<std::string>()));
+        } else if (item.contains("text")) {
+            samples.push_back(make_calibration_sample(vocab, "", item.at("text").get<std::string>()));
+        } else {
+            throw std::runtime_error("calibration JSONL line " + std::to_string(lines[i].number) + " has no supported text field");
+        }
+    }
+    if (samples.empty()) {
+        throw std::runtime_error("calibration file contains no usable samples");
+    }
+    return samples;
+}
+
+static double evaluate_candidate(
+        const std::string & path,
+        const merge_params & params,
+        const std::vector<calibration_sample> & samples,
+        ggml_backend_dev_t fitness_device,
+        int fitness_threads) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = params.gpu_layers;
     std::vector<ggml_backend_dev_t> devices;
-    if (!params.device.empty()) {
-        ggml_backend_dev_t device = ggml_backend_dev_by_name(params.device.c_str());
-        if (!device) {
-            throw std::runtime_error("backend device not found: " + params.device);
-        }
-        devices = { device, nullptr };
+    if (fitness_device) {
+        devices = { fitness_device, nullptr };
         model_params.devices = devices.data();
     }
-    llama_model * model = llama_model_load_from_file(path.c_str(), model_params);
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+            llama_model_load_from_file(path.c_str(), model_params), llama_model_free);
     if (!model) {
         throw std::runtime_error("failed to load Evo candidate " + path);
     }
@@ -771,20 +1047,28 @@ static double evaluate_candidate(const std::string & path, const merge_params & 
     context_params.n_ctx = params.context_size;
     context_params.n_batch = params.context_size;
     context_params.n_ubatch = params.context_size;
-    llama_context * context = llama_init_from_model(model, context_params);
+    context_params.n_threads = fitness_threads;
+    context_params.n_threads_batch = fitness_threads;
+    std::unique_ptr<llama_context, decltype(&llama_free)> context(
+            llama_init_from_model(model.get(), context_params), llama_free);
     if (!context) {
-        llama_model_free(model);
         throw std::runtime_error("failed to create Evo fitness context");
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     double total_nll = 0.0;
     size_t total_tokens = 0;
-    for (const std::string & sample : samples) {
-        const std::vector<llama_token> tokens = tokenize_text(vocab, sample);
+    for (const calibration_sample & sample : samples) {
+        const std::vector<llama_token> & tokens = sample.tokens;
         for (size_t begin = 0; begin + 1 < tokens.size();) {
             const size_t count = std::min<size_t>(params.context_size, tokens.size() - begin);
+            std::vector<llama_token> targets;
+            for (size_t i = 0; i + 1 < count; ++i) {
+                if (begin + i + 1 >= sample.loss_begin) targets.push_back(tokens[begin + i + 1]);
+            }
+            if (targets.empty()) {
+                begin += count > 1 ? count - 1 : count;
+                continue;
+            }
             llama_batch batch = llama_batch_init(count, 0, 1);
             batch.n_tokens = count;
             for (size_t i = 0; i < count; ++i) {
@@ -792,31 +1076,20 @@ static double evaluate_candidate(const std::string & path, const merge_params & 
                 batch.pos[i] = i;
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
-                batch.logits[i] = i + 1 < count;
+                batch.logits[i] = i + 1 < count && begin + i + 1 >= sample.loss_begin;
             }
-            llama_memory_clear(llama_get_memory(context), true);
-            if (llama_decode(context, batch) != 0) {
+            llama_memory_clear(llama_get_memory(context.get()), true);
+            float batch_nll = 0.0f;
+            if (llama_decode_sparse_cross_entropy(context.get(), batch, targets.data(), targets.size(), &batch_nll) != 0) {
                 llama_batch_free(batch);
-                llama_free(context);
-                llama_model_free(model);
-                throw std::runtime_error("llama_decode failed during Evo fitness evaluation");
+                throw std::runtime_error("sparse cross-entropy decode failed during Evo fitness evaluation");
             }
-            for (size_t i = 0; i + 1 < count; ++i) {
-                const float * logits = llama_get_logits_ith(context, i);
-                const float max_logit = *std::max_element(logits, logits + n_vocab);
-                double sum = 0.0;
-                for (int32_t token = 0; token < n_vocab; ++token) {
-                    sum += std::exp(logits[token] - max_logit);
-                }
-                total_nll += max_logit + std::log(sum) - logits[tokens[begin + i + 1]];
-                ++total_tokens;
-            }
+            total_nll += (double) batch_nll*targets.size();
+            total_tokens += targets.size();
             llama_batch_free(batch);
             begin += count > 1 ? count - 1 : count;
         }
     }
-    llama_free(context);
-    llama_model_free(model);
     if (total_tokens == 0) {
         throw std::runtime_error("calibration data produced fewer than two tokens");
     }
@@ -824,16 +1097,22 @@ static double evaluate_candidate(const std::string & path, const merge_params & 
 }
 
 static void run_evo(const merge_params & params, const std::vector<std::unique_ptr<gguf_input>> & inputs) {
-    const ggml_type target_type = parse_target_type(params.target_type);
+    const llama_ftype target_ftype = parse_target_ftype(params.target_type);
     std::vector<std::string> tensor_names;
     tensor_names.reserve(inputs[0]->tensors.size());
     for (const auto & entry : inputs[0]->tensors) {
         tensor_names.push_back(entry.first);
     }
-    const std::vector<std::string> calibration = load_calibration(params.calibration, params.n_threads);
-    const uint32_t seed = params.seed ? params.seed : std::random_device{}();
+    std::vector<size_t> gene_offsets(tensor_names.size(), SIZE_MAX);
+    size_t n_gene_tensors = 0;
+    for (size_t i = 0; i < tensor_names.size(); ++i) {
+        if (tensor_can_decode(inputs[0]->tensors.at(tensor_names[i]).tensor)) {
+            gene_offsets[i] = n_gene_tensors++ * inputs.size();
+        }
+    }
+    const uint32_t seed = params.seed_set ? params.seed : std::random_device{}();
     std::mt19937 rng(seed);
-    const size_t gene_count = tensor_names.size() * inputs.size();
+    const size_t gene_count = n_gene_tensors * inputs.size();
     if (gene_count == 0) {
         throw std::runtime_error("input model has no tensors");
     }
@@ -851,17 +1130,53 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
     std::normal_distribution<float> normal(0.0f, 1.0f);
 
     evo_candidate best;
-    const std::string temporary = params.output + ".evo-candidate.tmp.gguf";
     llama_backend_init();
     ggml_backend_t merge_backend = nullptr;
+    std::vector<std::string> temporary_paths;
     try {
-        if (!params.device.empty() && !ggml_backend_dev_by_name(params.device.c_str())) {
-            throw std::runtime_error("backend device not found: " + params.device);
+        llama_model_params metadata_params = llama_model_default_params();
+        metadata_params.n_gpu_layers = 0;
+        metadata_params.vocab_only = true;
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> metadata_model(
+                llama_model_load_from_file(inputs[0]->path.c_str(), metadata_params), llama_model_free);
+        if (!metadata_model) {
+            throw std::runtime_error("failed to load base model metadata for Evo");
         }
+
+        const std::vector<ggml_type> output_types = plan_evo_types(
+                params, *inputs[0], tensor_names, metadata_model.get(), target_ftype);
+        if (get_kv_string(inputs[0]->gguf, "tokenizer.ggml.model") == "no_vocab") {
+            throw std::runtime_error("Evo fitness requires a model with an initialized tokenizer");
+        }
+        const std::vector<calibration_sample> calibration = load_calibration(
+                params.calibration, params.n_threads, metadata_model.get());
+        metadata_model.reset();
+
+        std::vector<ggml_backend_dev_t> fitness_devices;
+        std::vector<std::string> fitness_device_names = params.devices;
+        if (!params.device.empty()) fitness_device_names.push_back(params.device);
+        for (const std::string & name : fitness_device_names) {
+            ggml_backend_dev_t device = ggml_backend_dev_by_name(name.c_str());
+            if (!device) {
+                throw std::runtime_error("backend device not found: " + name);
+            }
+            if (std::find(fitness_devices.begin(), fitness_devices.end(), device) != fitness_devices.end()) {
+                throw std::runtime_error("duplicate fitness device: " + name);
+            }
+            fitness_devices.push_back(device);
+        }
+        const size_t n_eval_workers = fitness_devices.empty()
+            ? 1
+            : std::min<size_t>(fitness_devices.size(), params.population);
+        const int fitness_threads = std::max(1, params.n_threads / (int) n_eval_workers);
+        if (fitness_devices.size() > 1) {
+            printf("evo: %zu concurrent fitness devices, %d host threads each\n", n_eval_workers, fitness_threads);
+        }
+
         if (params.merge_gpu) {
-            ggml_backend_dev_t device = params.device.empty()
-                ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)
-                : ggml_backend_dev_by_name(params.device.c_str());
+            ggml_backend_dev_t device = !fitness_devices.empty()
+                ? fitness_devices[0]
+                : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
             if (!device || (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU &&
                             ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_IGPU &&
                             ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_ACCEL)) {
@@ -873,6 +1188,12 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
             }
             printf("evo: GPU merge device %s (%s)\n", ggml_backend_dev_name(device), ggml_backend_dev_description(device));
         }
+
+        const std::filesystem::path temp_dir = params.temp_dir.empty()
+            ? std::filesystem::temp_directory_path()
+            : std::filesystem::path(params.temp_dir);
+        std::filesystem::create_directories(temp_dir);
+        const uint32_t run_id = std::random_device{}();
         for (int generation = 0; generation < params.generations; ++generation) {
             std::vector<evo_candidate> population(params.population);
             for (int candidate = 0; candidate < params.population; ++candidate) {
@@ -881,18 +1202,37 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
                     const float sample = candidate == 0 ? 0.0f : normal(rng);
                     population[candidate].genes[gene] = mean[gene] + sigma * std::sqrt(variance[gene]) * sample;
                 }
-                normalize_genes(population[candidate], tensor_names.size(), inputs.size());
-                printf("evo generation %d/%d candidate %d/%d: merging\n",
-                        generation + 1, params.generations, candidate + 1, params.population);
-                write_evo_candidate(temporary, params, inputs, tensor_names, population[candidate], target_type, merge_backend);
-                population[candidate].fitness = evaluate_candidate(temporary, params, calibration);
+                normalize_genes(population[candidate], n_gene_tensors, inputs.size());
+            }
+
+            temporary_paths.clear();
+            temporary_paths.reserve(population.size());
+            for (size_t candidate = 0; candidate < population.size(); ++candidate) {
+                const std::string filename = "llama-merge-" + std::to_string(run_id) + "-g" +
+                    std::to_string(generation) + "-c" + std::to_string(candidate) + ".gguf";
+                temporary_paths.push_back((temp_dir / filename).string());
+            }
+            printf("evo generation %d/%d: merging %zu candidates tensor-major\n",
+                    generation + 1, params.generations, population.size());
+            write_evo_candidates(
+                    temporary_paths, params, inputs, tensor_names, population, gene_offsets, output_types, target_ftype, merge_backend);
+
+            common_jsonl_worker_pool eval_pool(n_eval_workers);
+            eval_pool.parallel_for(population.size(), [&](size_t candidate, size_t worker) {
+                const ggml_backend_dev_t device = fitness_devices.empty() ? nullptr : fitness_devices[worker];
+                population[candidate].fitness = evaluate_candidate(
+                        temporary_paths[candidate], params, calibration, device, fitness_threads);
                 if (!std::isfinite(population[candidate].fitness)) {
                     population[candidate].fitness = INFINITY;
                 }
+            });
+            for (size_t candidate = 0; candidate < population.size(); ++candidate) {
                 printf("evo generation %d candidate %d: nll %.6f ppl %.6f\n",
-                        generation + 1, candidate + 1, population[candidate].fitness,
+                        generation + 1, (int) candidate + 1, population[candidate].fitness,
                         std::exp(population[candidate].fitness));
+                std::remove(temporary_paths[candidate].c_str());
             }
+            temporary_paths.clear();
             std::sort(population.begin(), population.end(), [](const evo_candidate & a, const evo_candidate & b) {
                 return a.fitness < b.fitness;
             });
@@ -931,18 +1271,19 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
         }
         printf("evo final: writing %s (nll %.6f, ppl %.6f, seed %u)\n",
                 params.output.c_str(), best.fitness, std::exp(best.fitness), seed);
-        write_evo_candidate(params.output, params, inputs, tensor_names, best, target_type, merge_backend);
-        std::remove(temporary.c_str());
+        write_evo_candidates(
+                { params.output }, params, inputs, tensor_names, { best }, gene_offsets, output_types, target_ftype, merge_backend);
         if (merge_backend) ggml_backend_free(merge_backend);
         llama_backend_free();
     } catch (...) {
-        std::remove(temporary.c_str());
+        for (const std::string & path : temporary_paths) std::remove(path.c_str());
         if (merge_backend) ggml_backend_free(merge_backend);
         llama_backend_free();
         throw;
     }
 }
 
+#ifndef LLAMA_MERGE_NO_MAIN
 int main(int argc, char ** argv) {
     try {
         const merge_params params = parse_args(argc, argv);
@@ -954,9 +1295,7 @@ int main(int argc, char ** argv) {
 
         const gguf_input & base = *inputs[0];
         for (size_t i = 1; i < inputs.size(); ++i) {
-            if (get_kv_string(base.gguf, "general.architecture") != get_kv_string(inputs[i]->gguf, "general.architecture")) {
-                throw std::runtime_error("input models have different general.architecture values");
-            }
+            validate_metadata_compatibility(base, *inputs[i]);
             if (base.tensors.size() != inputs[i]->tensors.size()) {
                 throw std::runtime_error("input models have different tensor counts");
             }
@@ -1003,7 +1342,7 @@ int main(int argc, char ** argv) {
         std::map<std::string, ggml_type> output_types;
         for (const auto & entry : base.tensors) {
             const ggml_tensor * input_tensor = entry.second.tensor;
-            const ggml_type output_type = preserve_quant ? input_tensor->type : precision_output;
+            const ggml_type output_type = !tensor_can_decode(input_tensor) || preserve_quant ? input_tensor->type : precision_output;
             ggml_tensor * output_tensor = ggml_new_tensor(output_ctx, output_type, GGML_MAX_DIMS, input_tensor->ne);
             ggml_set_name(output_tensor, input_tensor->name);
             gguf_add_tensor(output_gguf, output_tensor);
@@ -1047,6 +1386,28 @@ int main(int argc, char ** argv) {
                             return;
                         }
                         const std::string & name = tensor_names[tensor_index];
+                        if (!tensor_can_decode(base.tensors.at(name).tensor)) {
+                            std::vector<uint8_t> base_bytes;
+                            base.read_tensor(name, base_bytes);
+                            for (size_t i = 1; i < inputs.size(); ++i) {
+                                if (inputs[i]->tensors.at(name).tensor->type != base.tensors.at(name).tensor->type) {
+                                    throw std::runtime_error("non-floating tensor type differs for '" + name + "'");
+                                }
+                                std::vector<uint8_t> other_bytes;
+                                inputs[i]->read_tensor(name, other_bytes);
+                                if (base_bytes != other_bytes) {
+                                    throw std::runtime_error("non-floating tensor data differs for '" + name + "'");
+                                }
+                            }
+                            std::unique_lock<std::mutex> lock(write_mutex);
+                            write_condition.wait(lock, [&] { return stop || tensor_index == next_to_write; });
+                            if (stop) return;
+                            write_encoded_tensor(output, base_bytes, GGUF_DEFAULT_ALIGNMENT);
+                            ++next_to_write;
+                            lock.unlock();
+                            write_condition.notify_all();
+                            continue;
+                        }
                         decode_tensor(base, name, bytes, base_values);
                         std::vector<std::vector<float>> tasks;
                         tasks.reserve(inputs.size() - 1);
@@ -1100,3 +1461,4 @@ int main(int argc, char ** argv) {
         return 1;
     }
 }
+#endif

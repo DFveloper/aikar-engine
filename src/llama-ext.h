@@ -19,6 +19,14 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
+// Decode and return mean sparse cross-entropy without copying logits to the host.
+LLAMA_API int32_t llama_decode_sparse_cross_entropy(
+        struct llama_context * ctx,
+        struct llama_batch batch,
+        const llama_token * targets,
+        size_t n_targets,
+        float * loss);
+
 struct quantize_state_impl;
 
 LLAMA_API quantize_state_impl * llama_quant_init(

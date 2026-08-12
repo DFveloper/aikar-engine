@@ -142,6 +142,11 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode_sparse_cross_entropy(
+            const llama_batch & batch,
+            const llama_token * targets,
+            size_t n_targets,
+            float * loss);
 
     //
     // state save/load
@@ -337,6 +342,14 @@ private:
     std::unique_ptr<llama_batch_allocr> balloc;
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+
+    struct sparse_loss_state {
+        bool active = false;
+        const llama_token * targets = nullptr;
+        size_t n_targets = 0;
+        size_t n_consumed = 0;
+        double sum = 0.0;
+    } sparse_loss;
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 
