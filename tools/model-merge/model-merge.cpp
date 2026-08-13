@@ -52,6 +52,7 @@ struct merge_params {
     bool seed_set = false;
     std::string temp_dir;
     bool ignore_chat_template = false;
+    std::string evo_mode = "low-mem";
 };
 
 static void usage(const char * executable) {
@@ -78,6 +79,7 @@ static void usage(const char * executable) {
     printf("  --ctx-size N                  fitness context size (default: 512)\n");
     printf("  --temp-dir DIR                local directory for Evo candidate files (default: system temp)\n");
     printf("  --ignore-chat-template        allow input models with different tokenizer.chat_template metadata\n");
+    printf("  --evo-mode MODE               candidate flow: low-mem or ram (default: low-mem)\n");
     printf("  --config FILE                 INI file: base=, models=comma,separated, output=, method=, density=, threads=, memory_budget=\n");
 }
 
@@ -204,6 +206,8 @@ static void load_config(const std::string & path, merge_params & params) {
             params.temp_dir = value;
         } else if (key == "ignore_chat_template") {
             params.ignore_chat_template = parse_bool(value);
+        } else if (key == "evo_mode") {
+            params.evo_mode = value;
         } else {
             throw std::runtime_error("unknown config key '" + key + "'");
         }
@@ -265,6 +269,8 @@ static merge_params parse_args(int argc, char ** argv) {
             params.temp_dir = argv[++i];
         } else if (arg == "--ignore-chat-template") {
             params.ignore_chat_template = true;
+        } else if (arg == "--evo-mode" && i + 1 < argc) {
+            params.evo_mode = argv[++i];
         } else {
             throw std::runtime_error("unknown or incomplete option '" + arg + "'");
         }
@@ -288,6 +294,18 @@ static merge_params parse_args(int argc, char ** argv) {
         if (params.population < 2 || params.generations < 1 || params.elite_count < 1 ||
                 params.elite_count >= params.population || params.mutation <= 0.0f || params.context_size < 2) {
             throw std::runtime_error("invalid Evo population, generation, elite, sigma, or context setting");
+        }
+        if (params.evo_mode != "low-mem" && params.evo_mode != "ram") {
+            throw std::runtime_error("--evo-mode must be low-mem or ram");
+        }
+        if (params.evo_mode == "ram" && params.merge_gpu) {
+            throw std::runtime_error("--evo-mode ram uses CPU merge and cannot be combined with --merge-gpu");
+        }
+        if (params.evo_mode == "ram" && params.devices.size() > 1) {
+            throw std::runtime_error("--evo-mode ram accepts at most one fitness device");
+        }
+        if (params.evo_mode == "ram" && params.temp_dir.empty()) {
+            throw std::runtime_error("--evo-mode ram requires --temp-dir on a RAM-backed filesystem");
         }
     }
     if (params.merge_gpu && params.method != "evo") {
@@ -614,7 +632,9 @@ static void ties_merge(const std::vector<float> & base, std::vector<std::vector<
 static std::vector<uint8_t> encode_tensor(
         ggml_type type,
         const ggml_tensor * shape,
-        const std::vector<float> & values) {
+        const std::vector<float> & values,
+        common_jsonl_worker_pool * worker_pool = nullptr,
+        int n_threads = 1) {
     if (type == GGML_TYPE_F32) {
         const size_t size = values.size() * sizeof(float);
         std::vector<uint8_t> encoded(size);
@@ -629,7 +649,19 @@ static std::vector<uint8_t> encode_tensor(
         const int64_t n_rows = values.size() / n_per_row;
         const size_t size = ggml_row_size(type, n_per_row) * n_rows;
         std::vector<uint8_t> quantized(size);
-        ggml_quantize_chunk(type, values.data(), quantized.data(), 0, n_rows, n_per_row, nullptr);
+        const int workers = std::max<int>(1, std::min<int64_t>(n_threads, n_rows));
+        if (workers == 1 || !worker_pool) {
+            ggml_quantize_chunk(type, values.data(), quantized.data(), 0, n_rows, n_per_row, nullptr);
+        } else {
+            ggml_quantize_init(type);
+            worker_pool->parallel_for(workers, [&](size_t worker, size_t) {
+                const int64_t first_row = n_rows * worker / workers;
+                const int64_t last_row = n_rows * (worker + 1) / workers;
+                ggml_quantize_chunk(
+                        type, values.data(), quantized.data(), first_row * n_per_row,
+                        last_row - first_row, n_per_row, nullptr);
+            });
+        }
         return quantized;
     }
     const ggml_type_traits * traits = ggml_get_type_traits(type);
@@ -1055,9 +1087,15 @@ static void write_evo_candidates(
     }
     const int n_workers = merge_backend ? 1 : select_evo_worker_count(params, largest_tensor, candidates.size());
     std::unique_ptr<common_jsonl_worker_pool> worker_pool;
+    std::unique_ptr<common_jsonl_worker_pool> element_pool;
+    const int n_element_workers = candidates.size() == 1 ? params.n_threads : 1;
     if (!merge_backend) {
         worker_pool.reset(new common_jsonl_worker_pool(n_workers));
         printf("evo merge: %d CPU candidate workers\n", n_workers);
+        if (n_element_workers > 1) {
+            element_pool.reset(new common_jsonl_worker_pool(n_element_workers));
+            printf("evo merge: %d CPU tensor workers\n", n_element_workers);
+        }
     }
     for (size_t tensor_index = 0; tensor_index < tensor_names.size(); ++tensor_index) {
         const std::string & name = tensor_names[tensor_index];
@@ -1110,12 +1148,23 @@ static void write_evo_candidates(
                 std::vector<float> decoded;
                 for (size_t input = 0; input < inputs.size(); ++input) {
                     decode_tensor(*inputs[input], name, bytes, decoded);
-                    for (size_t element = 0; element < merged.size(); ++element) {
-                        merged[element] += weights[input] * decoded[element];
+                    if (element_pool && merged.size() >= 262144) {
+                        element_pool->parallel_for(n_element_workers, [&](size_t task, size_t) {
+                            const size_t begin = merged.size() * task / n_element_workers;
+                            const size_t end = merged.size() * (task + 1) / n_element_workers;
+                            for (size_t element = begin; element < end; ++element) {
+                                merged[element] += weights[input] * decoded[element];
+                            }
+                        });
+                    } else {
+                        for (size_t element = 0; element < merged.size(); ++element) {
+                            merged[element] += weights[input] * decoded[element];
+                        }
                     }
                 }
                 report_progress(
-                        outputs[candidate]->append(encode_tensor(output_types[tensor_index], shape, merged)),
+                        outputs[candidate]->append(encode_tensor(
+                                output_types[tensor_index], shape, merged, element_pool.get(), n_element_workers)),
                         tensor_index, false);
             });
         }
@@ -1489,39 +1538,75 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
                     std::to_string(generation) + "-c" + std::to_string(candidate) + ".gguf";
                 temporary_paths.push_back((temp_dir / filename).string());
             }
-            printf("evo generation %d/%d: merging %zu candidates tensor-major\n",
-                    generation + 1, params.generations, population.size());
-            write_evo_candidates(
-                    temporary_paths, params, inputs, tensor_names, population, gene_offsets, output_types, target_ftype, merge_backend);
-
-            common_jsonl_worker_pool eval_pool(n_eval_workers);
-            eval_pool.parallel_for(population.size(), [&](size_t candidate, size_t worker) {
-                const ggml_backend_dev_t device = fitness_devices.empty() ? nullptr : fitness_devices[worker];
-                population[candidate].fitness = evaluate_candidate(
-                        temporary_paths[candidate], params, calibration, device, fitness_threads);
-                if (!std::isfinite(population[candidate].fitness)) {
-                    population[candidate].fitness = INFINITY;
+            const std::vector<std::string> candidate_paths = temporary_paths;
+            if (params.evo_mode == "ram") {
+                printf("evo generation %d/%d: one RAM candidate at a time, CPU merge then GPU fitness (%zu candidates)\n",
+                        generation + 1, params.generations, population.size());
+                const ggml_backend_dev_t fitness_device = fitness_devices.empty() ? nullptr : fitness_devices[0];
+                for (size_t candidate = 0; candidate < population.size(); ++candidate) {
+                    const std::string candidate_path = candidate_paths[candidate];
+                    temporary_paths = { candidate_path };
+                    printf("evo generation %d candidate %zu/%zu: CPU merging\n",
+                            generation + 1, candidate + 1, population.size());
+                    write_evo_candidates(
+                            { candidate_path }, params, inputs, tensor_names, { population[candidate] },
+                            gene_offsets, output_types, target_ftype, nullptr);
+                    printf("evo generation %d candidate %zu/%zu: loading for fitness\n",
+                            generation + 1, candidate + 1, population.size());
+                    population[candidate].fitness = evaluate_candidate(
+                            candidate_path, params, calibration, fitness_device, fitness_threads);
+                    if (!std::isfinite(population[candidate].fitness)) {
+                        population[candidate].fitness = INFINITY;
+                    }
+                    printf("evo generation %d candidate %zu: nll %.6f ppl %.6f\n",
+                            generation + 1, candidate + 1, population[candidate].fitness,
+                            std::exp(population[candidate].fitness));
+                    if (population[candidate].fitness < best.fitness) {
+                        best = population[candidate];
+                        printf("evo generation %d candidate %zu: fitness and genes retained as global winner\n",
+                                generation + 1, candidate + 1);
+                    }
+                    std::remove(candidate_path.c_str());
+                    temporary_paths.clear();
                 }
-            });
-            const size_t best_index = std::min_element(
-                    population.begin(), population.end(), [](const evo_candidate & a, const evo_candidate & b) {
-                        return a.fitness < b.fitness;
-                    }) - population.begin();
-            if (!std::isfinite(population[best_index].fitness)) {
+            } else {
+                printf("evo generation %d/%d: low-mem tensor-major merge of %zu candidates\n",
+                        generation + 1, params.generations, population.size());
+                write_evo_candidates(
+                        temporary_paths, params, inputs, tensor_names, population, gene_offsets, output_types, target_ftype, merge_backend);
+
+                common_jsonl_worker_pool eval_pool(n_eval_workers);
+                eval_pool.parallel_for(population.size(), [&](size_t candidate, size_t worker) {
+                    const ggml_backend_dev_t device = fitness_devices.empty() ? nullptr : fitness_devices[worker];
+                    population[candidate].fitness = evaluate_candidate(
+                            temporary_paths[candidate], params, calibration, device, fitness_threads);
+                    if (!std::isfinite(population[candidate].fitness)) {
+                        population[candidate].fitness = INFINITY;
+                    }
+                });
+                const size_t best_index = std::min_element(
+                        population.begin(), population.end(), [](const evo_candidate & a, const evo_candidate & b) {
+                            return a.fitness < b.fitness;
+                        }) - population.begin();
+                if (!std::isfinite(population[best_index].fitness)) {
+                    throw std::runtime_error("all Evo candidates produced non-finite fitness");
+                }
+                if (best.genes.empty() || population[best_index].fitness < best.fitness) {
+                    if (!best_path.empty()) std::remove(best_path.c_str());
+                    best = population[best_index];
+                    best_path = temporary_paths[best_index];
+                }
+                for (size_t candidate = 0; candidate < population.size(); ++candidate) {
+                    printf("evo generation %d candidate %d: nll %.6f ppl %.6f\n",
+                            generation + 1, (int) candidate + 1, population[candidate].fitness,
+                            std::exp(population[candidate].fitness));
+                    if (temporary_paths[candidate] != best_path) std::remove(temporary_paths[candidate].c_str());
+                }
+                temporary_paths.clear();
+            }
+            if (best.genes.empty()) {
                 throw std::runtime_error("all Evo candidates produced non-finite fitness");
             }
-            if (best.genes.empty() || population[best_index].fitness < best.fitness) {
-                if (!best_path.empty()) std::remove(best_path.c_str());
-                best = population[best_index];
-                best_path = temporary_paths[best_index];
-            }
-            for (size_t candidate = 0; candidate < population.size(); ++candidate) {
-                printf("evo generation %d candidate %d: nll %.6f ppl %.6f\n",
-                        generation + 1, (int) candidate + 1, population[candidate].fitness,
-                        std::exp(population[candidate].fitness));
-                if (temporary_paths[candidate] != best_path) std::remove(temporary_paths[candidate].c_str());
-            }
-            temporary_paths.clear();
             std::sort(population.begin(), population.end(), [](const evo_candidate & a, const evo_candidate & b) {
                 return a.fitness < b.fitness;
             });
@@ -1552,16 +1637,24 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
             sigma = std::max(0.005f, std::min(1.0f, (float) (sigma * std::exp(0.2 * (normalized_step - 1.0)))));
             printf("evo generation %d CMA-ES sigma %.6f\n", generation + 1, sigma);
         }
-        printf("evo final: promoting evaluated candidate to %s (nll %.6f, ppl %.6f, seed %u)\n",
-                params.output.c_str(), best.fitness, std::exp(best.fitness), seed);
-        std::error_code rename_error;
-        std::filesystem::rename(best_path, params.output, rename_error);
-        if (rename_error) {
-            std::filesystem::copy_file(
-                    best_path, params.output, std::filesystem::copy_options::overwrite_existing);
-            std::remove(best_path.c_str());
+        if (params.evo_mode == "ram") {
+            printf("evo final: regenerating winner to %s (nll %.6f, ppl %.6f, seed %u)\n",
+                    params.output.c_str(), best.fitness, std::exp(best.fitness), seed);
+            write_evo_candidates(
+                    { params.output }, params, inputs, tensor_names, { best }, gene_offsets,
+                    output_types, target_ftype, nullptr);
+        } else {
+            printf("evo final: promoting evaluated candidate to %s (nll %.6f, ppl %.6f, seed %u)\n",
+                    params.output.c_str(), best.fitness, std::exp(best.fitness), seed);
+            std::error_code rename_error;
+            std::filesystem::rename(best_path, params.output, rename_error);
+            if (rename_error) {
+                std::filesystem::copy_file(
+                        best_path, params.output, std::filesystem::copy_options::overwrite_existing);
+                std::remove(best_path.c_str());
+            }
+            best_path.clear();
         }
-        best_path.clear();
         if (merge_backend) ggml_backend_free(merge_backend);
         llama_backend_free();
     } catch (...) {

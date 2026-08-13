@@ -39,8 +39,18 @@ per-tensor policy as `llama-quantize`, including mixed K-quant rules and shape
 fallbacks. Integer and other non-float tensors are copied byte-for-byte after
 the inputs are checked for equality. Candidate generation reports completed
 GB, average GB/min, elapsed time, and ETA while it writes the output tensors.
-The best evaluated candidate is promoted directly to the final output instead
-of being merged and quantized a second time.
+In low-memory mode, the best evaluated candidate is promoted directly to the
+final output instead of being merged and quantized a second time.
+
+`--evo-mode low-mem` keeps this tensor-major flow. It minimizes repeated source
+reads, but stores the whole population until fitness evaluation finishes.
+`--evo-mode ram` is intended for cloud hosts with a large RAM filesystem. Input
+GGUFs remain on their source storage. The merger creates one complete candidate
+at a time on the CPU in a RAM-backed `--temp-dir`, loads it on the selected
+fitness device, records its fitness and genes, and then deletes all candidate
+weights. RAM mode keeps only one candidate in the RAM filesystem. It cannot be
+combined with `--merge-gpu` or multiple fitness devices. After evolution, the
+winner is regenerated once to persistent output from its saved genes.
 
 Fitness uses sparse cross-entropy in the llama compute graph. On a CUDA build,
 the loss stays on the GPU and only one scalar is copied to the host per batch.
@@ -134,4 +144,5 @@ threads = 32
 memory_budget = 128G
 temp_dir = /tmp/llama-merge-evo
 ignore_chat_template = true
+evo_mode = ram
 ```
