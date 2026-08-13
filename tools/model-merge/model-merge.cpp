@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -50,6 +51,7 @@ struct merge_params {
     uint32_t seed = 0;
     bool seed_set = false;
     std::string temp_dir;
+    bool ignore_chat_template = false;
 };
 
 static void usage(const char * executable) {
@@ -75,6 +77,7 @@ static void usage(const char * executable) {
     printf("  --merge-gpu                  run Evo weighted merge math on the selected GPU\n");
     printf("  --ctx-size N                  fitness context size (default: 512)\n");
     printf("  --temp-dir DIR                local directory for Evo candidate files (default: system temp)\n");
+    printf("  --ignore-chat-template        allow input models with different tokenizer.chat_template metadata\n");
     printf("  --config FILE                 INI file: base=, models=comma,separated, output=, method=, density=, threads=, memory_budget=\n");
 }
 
@@ -199,6 +202,8 @@ static void load_config(const std::string & path, merge_params & params) {
             params.context_size = std::stoi(value);
         } else if (key == "temp_dir") {
             params.temp_dir = value;
+        } else if (key == "ignore_chat_template") {
+            params.ignore_chat_template = parse_bool(value);
         } else {
             throw std::runtime_error("unknown config key '" + key + "'");
         }
@@ -258,6 +263,8 @@ static merge_params parse_args(int argc, char ** argv) {
             params.context_size = std::stoi(argv[++i]);
         } else if (arg == "--temp-dir" && i + 1 < argc) {
             params.temp_dir = argv[++i];
+        } else if (arg == "--ignore-chat-template") {
+            params.ignore_chat_template = true;
         } else {
             throw std::runtime_error("unknown or incomplete option '" + arg + "'");
         }
@@ -356,12 +363,21 @@ static bool same_kv_value(const gguf_context * a, int64_t ia, const gguf_context
     return memcmp(gguf_get_val_data(a, ia), gguf_get_val_data(b, ib), size) == 0;
 }
 
-static bool is_compatibility_key(const std::string & key, const std::string & architecture) {
+static bool is_compatibility_key(
+        const std::string & key,
+        const std::string & architecture,
+        bool ignore_chat_template) {
+    if (ignore_chat_template && key == "tokenizer.chat_template") {
+        return false;
+    }
     return key.rfind("tokenizer.", 0) == 0 || key.rfind(architecture + ".", 0) == 0 || key == "general.architecture";
 }
 
 struct gguf_input;
-static void validate_metadata_compatibility(const gguf_input & base, const gguf_input & input);
+static void validate_metadata_compatibility(
+        const gguf_input & base,
+        const gguf_input & input,
+        bool ignore_chat_template = false);
 
 static uint32_t get_file_type(const gguf_context * gguf) {
     const int64_t idx = gguf_find_key(gguf, "general.file_type");
@@ -410,32 +426,47 @@ struct gguf_input {
     }
 
     void read_tensor(const std::string & name, std::vector<uint8_t> & data) const {
+        const auto it = tensors.find(name);
+        if (it == tensors.end()) {
+            throw std::runtime_error("missing tensor '" + name + "' in " + path);
+        }
+        const size_t size = ggml_nbytes(it->second.tensor);
+        data.resize(size);
+        read_tensor_part(name, 0, data.data(), size);
+    }
+
+    void read_tensor_part(const std::string & name, size_t tensor_offset, void * data, size_t size) const {
         std::lock_guard<std::mutex> lock(mutex);
         const auto it = tensors.find(name);
         if (it == tensors.end()) {
             throw std::runtime_error("missing tensor '" + name + "' in " + path);
         }
+        const size_t tensor_size = ggml_nbytes(it->second.tensor);
+        if (tensor_offset > tensor_size || size > tensor_size - tensor_offset) {
+            throw std::runtime_error("tensor read is out of bounds for '" + name + "'");
+        }
         const int tensor_index = gguf_find_tensor(gguf, name.c_str());
-        const size_t size = ggml_nbytes(it->second.tensor);
         const size_t offset = gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, tensor_index);
-        data.resize(size);
         file.clear();
-        file.seekg(offset);
-        file.read((char *) data.data(), size);
+        file.seekg(offset + tensor_offset);
+        file.read((char *) data, size);
         if (!file) {
             throw std::runtime_error("failed to read tensor '" + name + "' from " + path);
         }
     }
 };
 
-static void validate_metadata_compatibility(const gguf_input & base, const gguf_input & input) {
+static void validate_metadata_compatibility(
+        const gguf_input & base,
+        const gguf_input & input,
+        bool ignore_chat_template) {
     const std::string architecture = get_kv_string(base.gguf, "general.architecture");
     for (int pass = 0; pass < 2; ++pass) {
         const gguf_context * source = pass == 0 ? base.gguf : input.gguf;
         const gguf_context * other = pass == 0 ? input.gguf : base.gguf;
         for (int64_t i = 0; i < gguf_get_n_kv(source); ++i) {
             const std::string key = gguf_get_key(source, i);
-            if (!is_compatibility_key(key, architecture)) {
+            if (!is_compatibility_key(key, architecture, ignore_chat_template)) {
                 continue;
             }
             const int64_t other_index = gguf_find_key(other, key.c_str());
@@ -696,15 +727,63 @@ static void normalize_genes(evo_candidate & candidate, size_t n_tensors, size_t 
     }
 }
 
-static void merge_weighted_gpu(
+static size_t write_backend_tensor_streaming(
+        ggml_tensor * tensor,
+        ggml_type output_type,
+        const ggml_tensor * shape,
+        std::ofstream & output) {
+    const int64_t n_per_row = shape->ne[0];
+    const int64_t n_rows = ggml_nelements(shape) / n_per_row;
+    const size_t float_row_size = n_per_row * sizeof(float);
+    const size_t rows_per_chunk = std::max<size_t>(1, (64ull * 1024 * 1024) / float_row_size);
+    const size_t output_row_size = ggml_row_size(output_type, n_per_row);
+    std::vector<float> decoded;
+    std::vector<uint8_t> encoded;
+    size_t written = 0;
+    for (int64_t first_row = 0; first_row < n_rows; first_row += rows_per_chunk) {
+        const int64_t chunk_rows = std::min<int64_t>(n_rows - first_row, rows_per_chunk);
+        const size_t chunk_elements = chunk_rows * n_per_row;
+        decoded.resize(chunk_elements);
+        ggml_backend_tensor_get(
+                tensor, decoded.data(), first_row * float_row_size, chunk_elements * sizeof(float));
+        if (output_type == GGML_TYPE_F32) {
+            output.write((const char *) decoded.data(), chunk_elements * sizeof(float));
+            written += chunk_elements * sizeof(float);
+            continue;
+        }
+        encoded.resize(output_row_size * chunk_rows);
+        if (ggml_is_quantized(output_type)) {
+            const size_t quantized = ggml_quantize_chunk(
+                    output_type, decoded.data(), encoded.data(), 0, chunk_rows, n_per_row, nullptr);
+            if (quantized != encoded.size()) {
+                throw std::runtime_error("unexpected quantized size for tensor '" + std::string(shape->name) + "'");
+            }
+        } else {
+            const ggml_type_traits * traits = ggml_get_type_traits(output_type);
+            if (!traits || !traits->from_float_ref) {
+                throw std::runtime_error("cannot encode output type " + std::string(ggml_type_name(output_type)));
+            }
+            traits->from_float_ref(decoded.data(), encoded.data(), chunk_elements);
+        }
+        output.write((const char *) encoded.data(), encoded.size());
+        written += encoded.size();
+    }
+    const size_t padded = GGML_PAD(written, GGUF_DEFAULT_ALIGNMENT);
+    write_zeros(output, padded - written);
+    return padded;
+}
+
+static size_t merge_weighted_gpu_streaming(
         ggml_backend_t backend,
         const ggml_tensor * shape,
-        const std::vector<std::vector<float>> & inputs,
+        const std::vector<std::unique_ptr<gguf_input>> & inputs,
+        const std::string & name,
         const float * weights,
-        std::vector<float> & result) {
-    const size_t tensor_count = inputs.size() * 2 + inputs.size();
+        ggml_type output_type,
+        std::ofstream & output) {
+    const size_t max_nodes = 8;
     ggml_init_params init_params = {
-        /*.mem_size   = */ tensor_count * ggml_tensor_overhead() + ggml_graph_overhead(),
+        /*.mem_size   = */ max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false),
         /*.mem_buffer = */ nullptr,
         /*.no_alloc   = */ true,
     };
@@ -712,14 +791,11 @@ static void merge_weighted_gpu(
     if (!ctx) {
         throw std::runtime_error("failed to create GPU merge graph context");
     }
-    std::vector<ggml_tensor *> source(inputs.size());
-    ggml_tensor * merged = nullptr;
-    for (size_t input = 0; input < inputs.size(); ++input) {
-        source[input] = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, shape->ne);
-        ggml_tensor * weighted = ggml_scale(ctx, source[input], weights[input]);
-        merged = merged ? ggml_add(ctx, merged, weighted) : weighted;
-    }
-    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_tensor * accumulator = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, shape->ne);
+    ggml_tensor * source = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, shape->ne);
+    ggml_tensor * weighted = ggml_scale(ctx, source, 0.0f);
+    ggml_tensor * merged = ggml_add(ctx, accumulator, weighted);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
     ggml_build_forward_expand(graph, merged);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buffer) {
@@ -728,35 +804,73 @@ static void merge_weighted_gpu(
     }
 
     try {
+        ggml_backend_buffer_clear(buffer, 0);
+        const int64_t n_per_row = shape->ne[0];
+        const int64_t n_rows = ggml_nelements(shape) / n_per_row;
+        const size_t float_row_size = n_per_row * sizeof(float);
+        const size_t rows_per_chunk = std::max<size_t>(1, (64ull * 1024 * 1024) / float_row_size);
+        std::vector<uint8_t> bytes;
+        std::vector<float> decoded;
         for (size_t input = 0; input < inputs.size(); ++input) {
-            ggml_backend_tensor_set(source[input], inputs[input].data(), 0, inputs[input].size() * sizeof(float));
+            const ggml_tensor * input_tensor = inputs[input]->tensors.at(name).tensor;
+            const size_t input_row_size = ggml_row_size(input_tensor->type, n_per_row);
+            const ggml_type_traits * traits = ggml_get_type_traits(input_tensor->type);
+            for (int64_t first_row = 0; first_row < n_rows; first_row += rows_per_chunk) {
+                const int64_t chunk_rows = std::min<int64_t>(n_rows - first_row, rows_per_chunk);
+                const size_t chunk_elements = chunk_rows * n_per_row;
+                const size_t chunk_input_size = chunk_rows * input_row_size;
+                decoded.resize(chunk_elements);
+                if (input_tensor->type == GGML_TYPE_F32) {
+                    inputs[input]->read_tensor_part(
+                            name, first_row * input_row_size, decoded.data(), chunk_input_size);
+                } else {
+                    bytes.resize(chunk_input_size);
+                    inputs[input]->read_tensor_part(
+                            name, first_row * input_row_size, bytes.data(), bytes.size());
+                    if (!traits || !traits->to_float) {
+                        throw std::runtime_error("tensor '" + name + "' has unsupported type " +
+                                ggml_type_name(input_tensor->type));
+                    }
+                    traits->to_float(bytes.data(), decoded.data(), chunk_elements);
+                }
+                ggml_backend_tensor_set(
+                        source, decoded.data(), first_row * float_row_size, chunk_elements * sizeof(float));
+            }
+            const float scale_params[2] = { weights[input], 0.0f };
+            memcpy(weighted->op_params, scale_params, sizeof(scale_params));
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("GPU merge graph computation failed for tensor '" + std::string(shape->name) + "'");
+            }
+            ggml_backend_tensor_copy(merged, accumulator);
         }
-        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("GPU merge graph computation failed for tensor '" + std::string(shape->name) + "'");
-        }
-        result.resize(ggml_nelements(merged));
-        ggml_backend_tensor_get(merged, result.data(), 0, result.size() * sizeof(float));
+        ggml_backend_synchronize(backend);
+        std::vector<uint8_t>().swap(bytes);
+        std::vector<float>().swap(decoded);
+        const size_t written = write_backend_tensor_streaming(accumulator, output_type, shape, output);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        return written;
     } catch (...) {
         ggml_backend_buffer_free(buffer);
         ggml_free(ctx);
         throw;
     }
-    ggml_backend_buffer_free(buffer);
-    ggml_free(ctx);
 }
 
 struct evo_output {
     gguf_context * gguf = nullptr;
     ggml_context * ctx = nullptr;
     std::ofstream file;
+    std::string path;
     size_t metadata_size = 0;
+    uint64_t expected_data_size = 0;
 
     evo_output(
             const std::string & path,
             const gguf_input & base,
             const std::vector<std::string> & tensor_names,
             const std::vector<ggml_type> & output_types,
-            llama_ftype target_ftype) {
+            llama_ftype target_ftype) : path(path) {
         gguf = gguf_init_empty();
         gguf_set_kv(gguf, base.gguf);
         gguf_remove_key(gguf, GGUF_KEY_GENERAL_ALIGNMENT);
@@ -779,12 +893,17 @@ struct evo_output {
             ggml_tensor * tensor = ggml_new_tensor(ctx, output_types[i], GGML_MAX_DIMS, source->ne);
             ggml_set_name(tensor, source->name);
             gguf_add_tensor(gguf, tensor);
+            expected_data_size += GGML_PAD(ggml_nbytes(tensor), GGUF_DEFAULT_ALIGNMENT);
         }
 
         metadata_size = gguf_get_meta_size(gguf);
-        file.open(path, std::ios::binary);
         file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
-        write_zeros(file, metadata_size);
+        try {
+            file.open(path, std::ios::binary);
+            write_zeros(file, metadata_size);
+        } catch (const std::ios_base::failure & error) {
+            throw std::runtime_error("failed to create Evo candidate '" + path + "': " + error.what());
+        }
     }
 
     evo_output(const evo_output &) = delete;
@@ -797,30 +916,62 @@ struct evo_output {
         if (gguf) gguf_free(gguf);
     }
 
-    void append(const std::vector<uint8_t> & encoded) {
-        write_encoded_tensor(file, encoded, GGUF_DEFAULT_ALIGNMENT);
+    size_t append(const std::vector<uint8_t> & encoded) {
+        try {
+            write_encoded_tensor(file, encoded, GGUF_DEFAULT_ALIGNMENT);
+        } catch (const std::ios_base::failure & error) {
+            throw std::runtime_error("failed to write Evo candidate '" + path + "': " + error.what());
+        }
+        return GGML_PAD(encoded.size(), GGUF_DEFAULT_ALIGNMENT);
     }
 
     void finish() {
-        std::vector<uint8_t> metadata(metadata_size);
-        gguf_get_meta_data(gguf, metadata.data());
-        file.seekp(0);
-        file.write((const char *) metadata.data(), metadata.size());
-        file.close();
+        try {
+            std::vector<uint8_t> metadata(metadata_size);
+            gguf_get_meta_data(gguf, metadata.data());
+            file.seekp(0);
+            file.write((const char *) metadata.data(), metadata.size());
+            file.close();
+        } catch (const std::ios_base::failure & error) {
+            throw std::runtime_error("failed to finish Evo candidate '" + path + "': " + error.what());
+        }
     }
 };
+
+static std::string format_duration(double seconds) {
+    const uint64_t total = seconds > 0.0 ? (uint64_t) seconds : 0;
+    const uint64_t hours = total / 3600;
+    const uint64_t minutes = total / 60 % 60;
+    const uint64_t secs = total % 60;
+    char result[32];
+    snprintf(result, sizeof(result), "%02llu:%02llu:%02llu",
+            (unsigned long long) hours, (unsigned long long) minutes, (unsigned long long) secs);
+    return result;
+}
 
 static int select_evo_worker_count(
         const merge_params & params,
         const ggml_tensor * tensor,
         size_t n_candidates) {
     const size_t elements = ggml_nelements(tensor);
-    const size_t bytes_per_worker = elements > SIZE_MAX / (2 * sizeof(float))
+    const size_t bytes_per_worker = elements > SIZE_MAX / (3 * sizeof(float))
         ? SIZE_MAX
-        : elements * 2 * sizeof(float);
+        : elements * 3 * sizeof(float);
+    size_t available_memory = SIZE_MAX;
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    size_t value_kib;
+    std::string unit;
+    while (meminfo >> key >> value_kib >> unit) {
+        if (key == "MemAvailable:") {
+            available_memory = value_kib > SIZE_MAX / 1024 ? SIZE_MAX : value_kib * 1024;
+            break;
+        }
+    }
+    const size_t effective_budget = std::min(params.memory_budget, available_memory - available_memory / 3);
     const size_t memory_workers = bytes_per_worker == 0
         ? 1
-        : std::max<size_t>(1, params.memory_budget / bytes_per_worker);
+        : std::max<size_t>(1, effective_budget / bytes_per_worker);
     return std::max(1, std::min<int>(params.n_threads, std::min(n_candidates, memory_workers)));
 }
 
@@ -844,6 +995,56 @@ static void write_evo_candidates(
     for (const std::string & path : paths) {
         outputs.emplace_back(new evo_output(path, base, tensor_names, output_types, target_ftype));
     }
+    uint64_t total_bytes = 0;
+    for (const auto & output : outputs) {
+        total_bytes += output->expected_data_size;
+    }
+    uint64_t required_bytes = total_bytes;
+    for (const auto & output : outputs) {
+        required_bytes += output->metadata_size;
+    }
+    const std::filesystem::path output_dir = std::filesystem::path(paths[0]).parent_path().empty()
+        ? std::filesystem::current_path()
+        : std::filesystem::path(paths[0]).parent_path();
+    std::error_code space_error;
+    const std::filesystem::space_info space = std::filesystem::space(output_dir, space_error);
+    if (!space_error) {
+        const uint64_t reserve_bytes = std::max<uint64_t>(2ull * 1024 * 1024 * 1024, required_bytes / 20);
+        if (space.available < required_bytes || space.available - required_bytes < reserve_bytes) {
+            throw std::runtime_error(
+                    "insufficient space in Evo temp directory '" + output_dir.string() + "': need " +
+                    std::to_string(required_bytes / 1000000000.0) + " GB plus " +
+                    std::to_string(reserve_bytes / 1000000000.0) + " GB reserve, have " +
+                    std::to_string(space.available / 1000000000.0) +
+                    " GB; reduce --population or select a larger --temp-dir");
+        }
+    }
+    std::atomic<uint64_t> completed_bytes{0};
+    std::mutex progress_mutex;
+    const auto progress_start = std::chrono::steady_clock::now();
+    auto last_progress = progress_start - std::chrono::seconds(5);
+    auto report_progress = [&](size_t written, size_t tensor_index, bool force) {
+        const uint64_t completed = completed_bytes.fetch_add(written) + written;
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - last_progress < std::chrono::seconds(5)) {
+            return;
+        }
+        last_progress = now;
+        const double elapsed = std::chrono::duration<double>(now - progress_start).count();
+        const double completed_gb = completed / 1e9;
+        const double total_gb = total_bytes / 1e9;
+        const double gb_per_minute = elapsed > 0.0 ? completed_gb * 60.0 / elapsed : 0.0;
+        const double eta = completed > 0 && completed < total_bytes
+            ? elapsed * (total_bytes - completed) / completed
+            : 0.0;
+        printf("evo merge: tensors %zu/%zu, %.1f%%, %.2f/%.2f GB, %.2f GB/min, elapsed %s, ETA %s\n",
+                std::min(tensor_index + 1, tensor_names.size()), tensor_names.size(),
+                total_bytes > 0 ? 100.0 * completed / total_bytes : 100.0,
+                completed_gb, total_gb, gb_per_minute,
+                format_duration(elapsed).c_str(), format_duration(eta).c_str());
+        fflush(stdout);
+    };
 
     const ggml_tensor * largest_tensor = nullptr;
     for (const std::string & name : tensor_names) {
@@ -875,43 +1076,52 @@ static void write_evo_candidates(
                     throw std::runtime_error("non-floating tensor data differs for '" + name + "'");
                 }
             }
-            for (auto & output : outputs) output->append(base_bytes);
+            for (auto & output : outputs) {
+                report_progress(output->append(base_bytes), tensor_index, false);
+            }
             continue;
         }
 
-        std::vector<std::vector<float>> decoded(inputs.size());
-        std::vector<uint8_t> bytes;
         for (size_t input = 0; input < inputs.size(); ++input) {
             if (!tensor_can_decode(inputs[input]->tensors.at(name).tensor)) {
                 throw std::runtime_error("floating tensor type differs for '" + name + "'");
             }
-            decode_tensor(*inputs[input], name, bytes, decoded[input]);
         }
 
         if (merge_backend) {
-            std::vector<float> merged;
             for (size_t candidate = 0; candidate < candidates.size(); ++candidate) {
                 const float * weights = candidates[candidate].genes.data() + gene_offsets[tensor_index];
-                merge_weighted_gpu(merge_backend, shape, decoded, weights, merged);
-                outputs[candidate]->append(encode_tensor(output_types[tensor_index], shape, merged));
+                try {
+                    report_progress(
+                            merge_weighted_gpu_streaming(
+                                    merge_backend, shape, inputs, name, weights,
+                                    output_types[tensor_index], outputs[candidate]->file),
+                            tensor_index, false);
+                } catch (const std::ios_base::failure & error) {
+                    throw std::runtime_error(
+                            "failed to write Evo candidate '" + outputs[candidate]->path + "': " + error.what());
+                }
             }
         } else {
             worker_pool->parallel_for(candidates.size(), [&](size_t candidate, size_t) {
                 const float * weights = candidates[candidate].genes.data() + gene_offsets[tensor_index];
                 std::vector<float> merged(ggml_nelements(shape), 0.0f);
+                std::vector<uint8_t> bytes;
+                std::vector<float> decoded;
                 for (size_t input = 0; input < inputs.size(); ++input) {
+                    decode_tensor(*inputs[input], name, bytes, decoded);
                     for (size_t element = 0; element < merged.size(); ++element) {
-                        merged[element] += weights[input] * decoded[input][element];
+                        merged[element] += weights[input] * decoded[element];
                     }
                 }
-                outputs[candidate]->append(encode_tensor(output_types[tensor_index], shape, merged));
+                report_progress(
+                        outputs[candidate]->append(encode_tensor(output_types[tensor_index], shape, merged)),
+                        tensor_index, false);
             });
-        }
-        if ((tensor_index + 1) % 32 == 0 || tensor_index + 1 == tensor_names.size()) {
-            printf("evo merge: tensors %zu/%zu\n", tensor_index + 1, tensor_names.size());
         }
     }
     for (auto & output : outputs) output->finish();
+    report_progress(0, tensor_names.size() - 1, true);
 }
 
 struct calibration_sample {
@@ -948,10 +1158,56 @@ static calibration_sample make_calibration_sample(
     return sample;
 }
 
+static std::string calibration_message_payload(const nlohmann::json & message) {
+    std::string result;
+    const char * reasoning_key = message.contains("reasoning") ? "reasoning" : "reasoning_content";
+    if (message.contains(reasoning_key) && message[reasoning_key].is_string() && !message[reasoning_key].get_ref<const std::string &>().empty()) {
+        result += message[reasoning_key].get_ref<const std::string &>();
+        result += '\n';
+    }
+    if (message.contains("content") && message["content"].is_string()) {
+        result += message["content"].get_ref<const std::string &>();
+    } else if (message.contains("content") && message["content"].is_array()) {
+        for (const auto & part : message["content"]) {
+            if (part.is_object() && part.value("type", "") == "text" && part.contains("text") && part["text"].is_string()) {
+                if (!result.empty() && result.back() != '\n') result += '\n';
+                result += part["text"].get_ref<const std::string &>();
+            }
+        }
+    }
+    if (message.contains("tool_calls") && message["tool_calls"].is_array() && !message["tool_calls"].empty()) {
+        if (!result.empty() && result.back() != '\n') {
+            result += '\n';
+        }
+        result += message["tool_calls"].dump();
+    }
+    return result;
+}
+
+static calibration_sample make_template_free_chat_sample(
+        const llama_vocab * vocab,
+        const nlohmann::json & messages,
+        size_t assistant_index) {
+    std::string prompt;
+    for (size_t i = 0; i < assistant_index; ++i) {
+        prompt += messages[i].value("role", "user");
+        prompt += ":\n";
+        prompt += calibration_message_payload(messages[i]);
+        prompt += '\n';
+    }
+    prompt += "assistant:\n";
+    const std::string response = calibration_message_payload(messages[assistant_index]);
+    if (response.empty()) {
+        throw std::runtime_error("last assistant calibration message has no text or tool calls");
+    }
+    return make_calibration_sample(vocab, prompt, response);
+}
+
 static std::vector<calibration_sample> load_calibration(
         const std::string & path,
         int32_t n_threads,
-        const llama_model * metadata_model) {
+        const llama_model * metadata_model,
+        bool ignore_chat_template) {
     std::ifstream input(path);
     if (!input) {
         throw std::runtime_error("failed to open calibration file " + path);
@@ -978,12 +1234,32 @@ static std::vector<calibration_sample> load_calibration(
         }
     });
     for (common_jsonl_line & line : lines) std::string().swap(line.text);
-    common_chat_templates_ptr templates = common_chat_templates_init(metadata_model, "");
+    common_chat_templates_ptr templates;
+    if (!ignore_chat_template) {
+        templates = common_chat_templates_init(metadata_model, "");
+    }
     for (size_t i = 0; i < lines.size(); ++i) {
         if (!errors[i].empty()) throw std::runtime_error("invalid calibration JSONL line " + std::to_string(lines[i].number) + ": " + errors[i]);
         const nlohmann::json & item = parsed[i];
         if (item.is_null()) continue;
         if (item.contains("messages") && item["messages"].is_array()) {
+            if (ignore_chat_template) {
+                const nlohmann::json & raw_messages = item["messages"];
+                size_t assistant_index = raw_messages.size();
+                for (size_t index = raw_messages.size(); index-- > 0;) {
+                    if (raw_messages[index].is_object() && raw_messages[index].value("role", "") == "assistant" &&
+                            !calibration_message_payload(raw_messages[index]).empty()) {
+                        assistant_index = index;
+                        break;
+                    }
+                }
+                if (assistant_index == raw_messages.size()) {
+                    throw std::runtime_error("calibration JSONL line " + std::to_string(lines[i].number) +
+                            " has no non-empty assistant response");
+                }
+                samples.push_back(make_template_free_chat_sample(vocab, raw_messages, assistant_index));
+                continue;
+            }
             std::vector<common_chat_msg> messages;
             for (const auto & data : item["messages"]) {
                 messages.push_back(common_jsonl_parse_chat_message(data, COMMON_JSONL_CHAT_PARSE_OPTIONAL_TEXT));
@@ -1133,6 +1409,7 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
     llama_backend_init();
     ggml_backend_t merge_backend = nullptr;
     std::vector<std::string> temporary_paths;
+    std::string best_path;
     try {
         llama_model_params metadata_params = llama_model_default_params();
         metadata_params.n_gpu_layers = 0;
@@ -1149,7 +1426,7 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
             throw std::runtime_error("Evo fitness requires a model with an initialized tokenizer");
         }
         const std::vector<calibration_sample> calibration = load_calibration(
-                params.calibration, params.n_threads, metadata_model.get());
+                params.calibration, params.n_threads, metadata_model.get(), params.ignore_chat_template);
         metadata_model.reset();
 
         std::vector<ggml_backend_dev_t> fitness_devices;
@@ -1226,22 +1503,28 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
                     population[candidate].fitness = INFINITY;
                 }
             });
+            const size_t best_index = std::min_element(
+                    population.begin(), population.end(), [](const evo_candidate & a, const evo_candidate & b) {
+                        return a.fitness < b.fitness;
+                    }) - population.begin();
+            if (!std::isfinite(population[best_index].fitness)) {
+                throw std::runtime_error("all Evo candidates produced non-finite fitness");
+            }
+            if (best.genes.empty() || population[best_index].fitness < best.fitness) {
+                if (!best_path.empty()) std::remove(best_path.c_str());
+                best = population[best_index];
+                best_path = temporary_paths[best_index];
+            }
             for (size_t candidate = 0; candidate < population.size(); ++candidate) {
                 printf("evo generation %d candidate %d: nll %.6f ppl %.6f\n",
                         generation + 1, (int) candidate + 1, population[candidate].fitness,
                         std::exp(population[candidate].fitness));
-                std::remove(temporary_paths[candidate].c_str());
+                if (temporary_paths[candidate] != best_path) std::remove(temporary_paths[candidate].c_str());
             }
             temporary_paths.clear();
             std::sort(population.begin(), population.end(), [](const evo_candidate & a, const evo_candidate & b) {
                 return a.fitness < b.fitness;
             });
-            if (!std::isfinite(population[0].fitness)) {
-                throw std::runtime_error("all Evo candidates produced non-finite fitness");
-            }
-            if (best.genes.empty() || population[0].fitness < best.fitness) {
-                best = population[0];
-            }
             printf("evo generation %d best: nll %.6f ppl %.6f\n",
                     generation + 1, population[0].fitness, std::exp(population[0].fitness));
             if (generation + 1 == params.generations) break;
@@ -1269,14 +1552,21 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
             sigma = std::max(0.005f, std::min(1.0f, (float) (sigma * std::exp(0.2 * (normalized_step - 1.0)))));
             printf("evo generation %d CMA-ES sigma %.6f\n", generation + 1, sigma);
         }
-        printf("evo final: writing %s (nll %.6f, ppl %.6f, seed %u)\n",
+        printf("evo final: promoting evaluated candidate to %s (nll %.6f, ppl %.6f, seed %u)\n",
                 params.output.c_str(), best.fitness, std::exp(best.fitness), seed);
-        write_evo_candidates(
-                { params.output }, params, inputs, tensor_names, { best }, gene_offsets, output_types, target_ftype, merge_backend);
+        std::error_code rename_error;
+        std::filesystem::rename(best_path, params.output, rename_error);
+        if (rename_error) {
+            std::filesystem::copy_file(
+                    best_path, params.output, std::filesystem::copy_options::overwrite_existing);
+            std::remove(best_path.c_str());
+        }
+        best_path.clear();
         if (merge_backend) ggml_backend_free(merge_backend);
         llama_backend_free();
     } catch (...) {
         for (const std::string & path : temporary_paths) std::remove(path.c_str());
+        if (!best_path.empty()) std::remove(best_path.c_str());
         if (merge_backend) ggml_backend_free(merge_backend);
         llama_backend_free();
         throw;
@@ -1295,7 +1585,7 @@ int main(int argc, char ** argv) {
 
         const gguf_input & base = *inputs[0];
         for (size_t i = 1; i < inputs.size(); ++i) {
-            validate_metadata_compatibility(base, *inputs[i]);
+            validate_metadata_compatibility(base, *inputs[i], params.ignore_chat_template);
             if (base.tensors.size() != inputs[i]->tensors.size()) {
                 throw std::runtime_error("input models have different tensor counts");
             }

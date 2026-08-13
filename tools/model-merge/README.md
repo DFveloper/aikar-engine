@@ -37,7 +37,10 @@ per generation, then all candidates are merged, quantized, and written in
 parallel within the memory budget. Quantized output types use the same
 per-tensor policy as `llama-quantize`, including mixed K-quant rules and shape
 fallbacks. Integer and other non-float tensors are copied byte-for-byte after
-the inputs are checked for equality.
+the inputs are checked for equality. Candidate generation reports completed
+GB, average GB/min, elapsed time, and ETA while it writes the output tensors.
+The best evaluated candidate is promoted directly to the final output instead
+of being merged and quantized a second time.
 
 Fitness uses sparse cross-entropy in the llama compute graph. On a CUDA build,
 the loss stays on the GPU and only one scalar is copied to the host per batch.
@@ -55,6 +58,16 @@ For multiple GPUs, choose one of these modes:
 deterministic seed. Temporary candidates default to the system temporary
 directory; set `--temp-dir` to fast local storage. The directory needs free
 space for roughly `population * candidate GGUF size` during each generation.
+Later generations can temporarily need one additional candidate file while the
+best result from the previous generation is retained. Before each generation,
+the merger checks free space and keeps a 5% or 2 GB minimum reserve. It reports
+the required and available space before writing if the temp directory is too
+small. Do not use a RAM-backed `/tmp` for large models.
+If compatible checkpoints differ only in `tokenizer.chat_template`, pass
+`--ignore-chat-template`. Tokenizer vocabulary and all other architecture
+metadata remain strictly checked. `messages` calibration records then bypass
+Jinja and use neutral `role:\ncontent` serialization, with only the last
+assistant payload contributing to loss.
 
 Calibration files may be plain text or JSONL. JSONL accepts the same basic
 schemas as the QLoRA trainer: `messages`, `prompt` plus `response`, or `text`.
@@ -120,4 +133,5 @@ ctx_size = 512
 threads = 32
 memory_budget = 128G
 temp_dir = /tmp/llama-merge-evo
+ignore_chat_template = true
 ```

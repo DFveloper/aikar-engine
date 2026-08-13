@@ -5,7 +5,11 @@ static void check(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-static void write_test_model(const std::string & path, const std::string & token, int32_t table_offset = 0) {
+static void write_test_model(
+        const std::string & path,
+        const std::string & token,
+        int32_t table_offset = 0,
+        const std::string & chat_template = "{{ messages }}") {
     gguf_context * gguf = gguf_init_empty();
     gguf_set_val_str(gguf, "general.architecture", "llama");
     gguf_set_val_u32(gguf, "general.file_type", LLAMA_FTYPE_ALL_F32);
@@ -19,6 +23,7 @@ static void write_test_model(const std::string & path, const std::string & token
     gguf_set_val_str(gguf, "tokenizer.ggml.model", "test");
     const char * tokens[] = { token.c_str() };
     gguf_set_arr_str(gguf, "tokenizer.ggml.tokens", tokens, 1);
+    gguf_set_val_str(gguf, "tokenizer.chat_template", chat_template.c_str());
 
     ggml_init_params params = {
         /*.mem_size   = */ 2 * 1024 * 1024,
@@ -55,12 +60,14 @@ int main() {
     const std::string model_b = (dir / "b.gguf").string();
     const std::string bad_model = (dir / "bad.gguf").string();
     const std::string bad_data_model = (dir / "bad-data.gguf").string();
+    const std::string other_template_model = (dir / "other-template.gguf").string();
     const std::string bad_output = (dir / "bad-output.gguf").string();
     const std::string output = (dir / "output.gguf").string();
     write_test_model(model_a, "same");
     write_test_model(model_b, "same");
     write_test_model(bad_model, "different");
     write_test_model(bad_data_model, "same", 1);
+    write_test_model(other_template_model, "same", 0, "{{ bos_token }}{{ messages }}");
 
     gguf_input a(model_a);
     gguf_input b(model_b);
@@ -73,6 +80,23 @@ int main() {
         rejected = true;
     }
     check(rejected, "tokenizer mismatch was not rejected");
+
+    gguf_input other_template(other_template_model);
+    rejected = false;
+    try {
+        validate_metadata_compatibility(a, other_template);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    check(rejected, "chat template mismatch was not rejected by default");
+    validate_metadata_compatibility(a, other_template, true);
+
+    nlohmann::json response_message = {
+        { "role", "assistant" },
+        { "content", "answer" },
+        { "reasoning", "think" },
+    };
+    check(calibration_message_payload(response_message) == "think\nanswer", "template-free assistant payload is wrong");
 
     llama_quant_model_desc desc = {
         /*.architecture  = */ "llama",
@@ -144,6 +168,7 @@ int main() {
     std::filesystem::remove(output);
     std::filesystem::remove(bad_output);
     std::filesystem::remove(bad_data_model);
+    std::filesystem::remove(other_template_model);
     std::filesystem::remove(bad_model);
     std::filesystem::remove(model_b);
     std::filesystem::remove(model_a);
