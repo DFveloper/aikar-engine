@@ -1,0 +1,201 @@
+#version 450
+
+#if ROUTED
+#extension GL_EXT_shader_16bit_storage : require
+layout(push_constant) uniform parameter {
+    uint n_blocks_row;
+    uint n_rows;
+    uint n_expert;
+    uint n_used;
+    uint n_tokens;
+} p;
+#else
+#include "generic_head.glsl"
+#endif
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#if WEIGHT_MXFP4
+layout (binding = 0) buffer W {block_mxfp4 weight[];};
+#else
+layout (binding = 0) buffer W {block_q4_0 weight[];};
+#endif
+#if ROUTED
+layout (binding = 1) readonly buffer A {float activations[];};
+layout (binding = 2) readonly buffer G {float grad[];};
+layout (binding = 3) readonly buffer IDS {int ids[];};
+layout (binding = 4) buffer M {block_q8_0 momentum[];};
+layout (binding = 5) buffer R {block_q4_0 residual[];};
+layout (binding = 6) readonly buffer P {float params[4];};
+#else
+layout (binding = 1) readonly buffer G {float grad[];};
+layout (binding = 2) buffer M {block_q8_0 momentum[];};
+layout (binding = 3) buffer R {block_q4_0 residual[];};
+layout (binding = 4) readonly buffer P {float params[4];};
+#endif
+
+shared float target_values[32];
+shared float momentum_values[32];
+
+float q4_value(block_q4_0 block, uint lane) {
+    const uint q = lane < 16 ? uint(block.qs[lane]) & 15 : uint(block.qs[lane - 16]) >> 4;
+    return float(block.d) * (float(q) - 8.0);
+}
+
+uint best_mxfp4(float value, float scale) {
+    uint best = 0;
+    float best_error = abs(float(kvalues_mxfp4[0]) * scale - value);
+    for (uint i = 1; i < 16; ++i) {
+        const float error = abs(float(kvalues_mxfp4[i]) * scale - value);
+        if (error < best_error) {
+            best = i;
+            best_error = error;
+        }
+    }
+    return best;
+}
+
+void main() {
+    init_iq_shmem(uvec3(32, 1, 1));
+    const uint ib = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+#if ROUTED
+    const uint n_blocks = p.n_blocks_row * p.n_rows * p.n_expert;
+    if (ib >= n_blocks) {
+        return;
+    }
+    const uint block = ib % p.n_blocks_row;
+    const uint row = (ib / p.n_blocks_row) % p.n_rows;
+    const uint expert = ib / (p.n_blocks_row * p.n_rows);
+#else
+    if (ib >= p.KX) {
+        return;
+    }
+#endif
+
+#if WEIGHT_MXFP4
+    const uint packed = uint(weight[ib].qs[lane & 15]);
+    const uint q = lane < 16 ? packed & 15 : packed >> 4;
+    const float weight_old = e8m0_to_fp32(weight[ib].e) * 0.5 * float(kvalues_mxfp4[q]);
+#else
+    const float weight_old = q4_value(weight[ib], lane);
+#endif
+    const float momentum_old = float(momentum[ib].d) * float(momentum[ib].qs[lane]);
+    const float residual_old = q4_value(residual[ib], lane);
+#if ROUTED
+    float g = 0.0;
+    for (uint token = 0; token < p.n_tokens; ++token) {
+        for (uint used = 0; used < p.n_used; ++used) {
+            const uint route = used + p.n_used * token;
+            if (ids[route] == int(expert)) {
+                g += activations[block * 32 + lane + p.n_blocks_row * 32 * route] * grad[row + p.n_rows * route];
+            }
+        }
+    }
+#else
+    float g = grad[ib * 32 + lane];
+#endif
+    g = isinf(g) || isnan(g) ? 0.0 : g;
+    if (params[3] > 0.0) {
+        g = clamp(g, -params[3], params[3]);
+    }
+    float momentum_new = params[1] * momentum_old + (1.0 - params[1]) * g;
+    momentum_new = isinf(momentum_new) || isnan(momentum_new) ? 0.0 : momentum_new;
+    momentum_new = clamp(momentum_new, -128.0 * 65504.0, 128.0 * 65504.0);
+    const float direction = momentum_new > 0.0 ? 1.0 : (momentum_new < 0.0 ? -1.0 : 0.0);
+    float target = weight_old + residual_old - params[0] * (direction + params[2] * weight_old);
+    target = isinf(target) || isnan(target) ? weight_old : target;
+#if !WEIGHT_MXFP4
+    target = clamp(target, -8.0 * 65504.0, 8.0 * 65504.0);
+#endif
+    target_values[lane] = target;
+    momentum_values[lane] = momentum_new;
+    barrier();
+
+    if (lane != 0) {
+        return;
+    }
+
+    float weight_new[32];
+#if WEIGHT_MXFP4
+    float amax = 0.0;
+    for (uint i = 0; i < 32; ++i) {
+        amax = max(amax, abs(target_values[i]));
+    }
+    const int exponent_i = amax > 0.0 ? int(floor(log2(amax))) - 2 + 127 : 0;
+    const uint8_t exponent = uint8_t(clamp(exponent_i, 0, 254));
+    const float weight_scale = e8m0_to_fp32(exponent) * 0.5;
+    weight[ib].e = exponent;
+    for (uint i = 0; i < 16; ++i) {
+        const uint q0 = best_mxfp4(target_values[i], weight_scale);
+        const uint q1 = best_mxfp4(target_values[i + 16], weight_scale);
+        weight[ib].qs[i] = uint8_t(q0 | (q1 << 4));
+        weight_new[i] = weight_scale * float(kvalues_mxfp4[q0]);
+        weight_new[i + 16] = weight_scale * float(kvalues_mxfp4[q1]);
+    }
+#else
+    float signed_max = 0.0;
+    float amax = 0.0;
+    for (uint i = 0; i < 32; ++i) {
+        if (amax < abs(target_values[i])) {
+            amax = abs(target_values[i]);
+            signed_max = target_values[i];
+        }
+    }
+    const float weight_scale = signed_max / -8.0;
+    const float weight_inverse = weight_scale != 0.0 ? 1.0 / weight_scale : 0.0;
+    weight[ib].d = float16_t(weight_scale);
+    for (uint i = 0; i < 16; ++i) {
+        const uint q0 = uint(clamp(int(target_values[i] * weight_inverse + 8.5), 0, 15));
+        const uint q1 = uint(clamp(int(target_values[i + 16] * weight_inverse + 8.5), 0, 15));
+        weight[ib].qs[i] = uint8_t(q0 | (q1 << 4));
+        weight_new[i] = float(weight[ib].d) * (float(q0) - 8.0);
+        weight_new[i + 16] = float(weight[ib].d) * (float(q1) - 8.0);
+    }
+#endif
+
+    float residual_new[32];
+    float residual_amax = 0.0;
+    float residual_signed_max = 0.0;
+    for (uint i = 0; i < 32; ++i) {
+        residual_new[i] = clamp(target_values[i] - weight_new[i], -8.0 * 65504.0, 8.0 * 65504.0);
+        if (residual_amax < abs(residual_new[i])) {
+            residual_amax = abs(residual_new[i]);
+            residual_signed_max = residual_new[i];
+        }
+    }
+    if (residual_amax > 0.0 && residual_amax < 8.0 * exp2(-24.0)) {
+        residual_amax = 0.0;
+        residual_signed_max = 0.0;
+        for (uint i = 0; i < 32; ++i) {
+            residual_new[i] = 0.0;
+        }
+    }
+    const float residual_scale = residual_signed_max / -8.0;
+    const float residual_inverse = residual_scale != 0.0 ? 1.0 / residual_scale : 0.0;
+    residual[ib].d = float16_t(residual_scale);
+    for (uint i = 0; i < 16; ++i) {
+        const uint q0 = uint(clamp(int(residual_new[i] * residual_inverse + 8.5), 0, 15));
+        const uint q1 = uint(clamp(int(residual_new[i + 16] * residual_inverse + 8.5), 0, 15));
+        residual[ib].qs[i] = uint8_t(q0 | (q1 << 4));
+    }
+
+    float momentum_amax = 0.0;
+    float momentum_signed_max = 0.0;
+    for (uint i = 0; i < 32; ++i) {
+        if (momentum_amax < abs(momentum_values[i])) {
+            momentum_amax = abs(momentum_values[i]);
+            momentum_signed_max = momentum_values[i];
+        }
+    }
+    const float momentum_scale = momentum_signed_max / -128.0;
+    const float momentum_inverse = momentum_scale != 0.0 ? 1.0 / momentum_scale : 0.0;
+    momentum[ib].d = float16_t(momentum_scale);
+    for (uint i = 0; i < 32; ++i) {
+        momentum[ib].qs[i] = int8_t(clamp(int(round(momentum_values[i] * momentum_inverse)), -128, 127));
+    }
+}

@@ -1022,6 +1022,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_ID_BACK",
     "OUT_PROD",
     "OUT_PROD_ID",
 
@@ -1098,12 +1099,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
+    "OPT_STEP_QLION_QAT",
+    "OPT_STEP_QLION_QAT_ID",
 
     "GLU",
     "GLU_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1139,6 +1142,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "X[i]^T*Y",
     "X*Y",
     "X_id⊗Y_id",
 
@@ -1215,12 +1219,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
     "sgd(x)",
+    "qlion_qat(x)",
+    "qlion_qat_id(x)",
 
     "glu(x)",
     "glu_back(dy,x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3373,6 +3379,27 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[1] = b;
     result->src[2] = ids;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_id_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as->ne[3] == 1 && grad->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[0] == grad->ne[1] && ids->ne[1] == grad->ne[2]);
+    GGML_ASSERT(as->ne[1] == grad->ne[0]);
+
+    const int64_t ne[4] = { as->ne[0], grad->ne[1], grad->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_MUL_MAT_ID_BACK;
+    result->src[0] = as;
+    result->src[1] = grad;
+    result->src[2] = ids;
     return result;
 }
 
@@ -6430,6 +6457,69 @@ struct ggml_tensor * ggml_opt_step_sgd(
     return result;
 }
 
+struct ggml_tensor * ggml_opt_step_qlion_qat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * momentum,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * params) {
+    GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(weight, grad));
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(momentum));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_nelements(momentum) == ggml_nelements(weight));
+    GGML_ASSERT(ggml_nelements(residual) == ggml_nelements(weight));
+    GGML_ASSERT(params->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(params) == 4);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
+    result->op     = GGML_OP_OPT_STEP_QLION_QAT;
+    result->src[0] = weight;
+    result->src[1] = grad;
+    result->src[2] = momentum;
+    result->src[3] = residual;
+    result->src[4] = params;
+    return result;
+}
+
+struct ggml_tensor * ggml_opt_step_qlion_qat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * activations,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * momentum,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * params) {
+    GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(activations->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(weight->ne[0] == activations->ne[0] && weight->ne[1] == grad->ne[0]);
+    GGML_ASSERT(activations->ne[1] == grad->ne[1] && activations->ne[2] == grad->ne[2]);
+    GGML_ASSERT(ids->ne[0] == grad->ne[1] && ids->ne[1] == grad->ne[2]);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 4);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
+    result->op = GGML_OP_OPT_STEP_QLION_QAT_ID;
+    result->src[0] = weight;
+    result->src[1] = activations;
+    result->src[2] = grad;
+    result->src[3] = ids;
+    result->src[4] = momentum;
+    result->src[5] = residual;
+    result->src[6] = params;
+    return result;
+}
+
 // solve_tri
 
 struct ggml_tensor * ggml_solve_tri(
@@ -6768,7 +6858,9 @@ static void ggml_add_or_set(
         cgraph->grads[isrc] = tensor;
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
-    ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
+    if (!(cgraph->defer_quantized_param_grads && (src->flags & GGML_TENSOR_FLAG_PARAM) && ggml_is_quantized(src->type))) {
+        ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
+    }
 }
 
 static void ggml_acc_or_set(
@@ -7067,14 +7159,14 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad_as);
             }
             if (src1_needs_grads) {
-                struct ggml_tensor * as = src0;
-                if (ggml_is_quantized(as->type)) {
-                    as = ggml_cast(ctx, as, GGML_TYPE_F32);
+                if (ggml_is_quantized(src0->type)) {
+                    struct ggml_tensor * grad_b = ggml_mul_mat_id_back(ctx, src0, grad, src2);
+                    ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
+                } else {
+                    struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, src0, 1, 0, 2, 3));
+                    struct ggml_tensor * grad_b = ggml_mul_mat_id(ctx, as_T, grad, src2);
+                    ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
                 }
-                // Transpose expert matrices: as [cols, rows, n_expert] -> as_T [rows, cols, n_expert]
-                struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, as, 1, 0, 2, 3));
-                struct ggml_tensor * grad_b = ggml_mul_mat_id(ctx, as_T, grad, src2);
-                ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
             }
         } break;
         case GGML_OP_SCALE: {
@@ -7614,15 +7706,18 @@ void ggml_build_forward_order(struct ggml_cgraph * cgraph, struct ggml_tensor * 
     ggml_build_forward_impl(cgraph, tensor, true, false);
 }
 
-void ggml_build_backward_expand(
+void ggml_build_backward_expand_with_callback(
         struct ggml_context *  ctx,
         struct ggml_cgraph  *  cgraph,
-        struct ggml_tensor  ** grad_accs) {
+        struct ggml_tensor  ** grad_accs,
+        ggml_backward_param_callback callback,
+        void * userdata) {
     GGML_ASSERT(cgraph->n_nodes > 0);
     GGML_ASSERT(cgraph->grads);
     GGML_ASSERT(cgraph->grad_accs);
 
     const int n_nodes_f = cgraph->n_nodes;
+    cgraph->defer_quantized_param_grads = callback != NULL;
 
     memset(cgraph->grads,     0, cgraph->visited_hash_set.size*sizeof(struct ggml_tensor *));
     memset(cgraph->grad_accs, 0, cgraph->visited_hash_set.size*sizeof(struct ggml_tensor *));
@@ -7677,11 +7772,8 @@ void ggml_build_backward_expand(
                 ignore_src[2] = true;
                 break;
 
-            // MUL_MAT_ID: expert dispatch indices (src2) are integer and quantized expert weights are frozen.
+            // MUL_MAT_ID: expert dispatch indices (src2) are integer.
             case GGML_OP_MUL_MAT_ID:
-                if (ggml_is_quantized(node->src[0]->type)) {
-                    ignore_src[0] = true;
-                }
                 ignore_src[2] = true; // ids: integer tensor
                 break;
 
@@ -7713,7 +7805,8 @@ void ggml_build_backward_expand(
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
                 continue;
             }
-            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16);
+            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
+                ((node->src[j]->flags & GGML_TENSOR_FLAG_PARAM) && ggml_is_quantized(node->src[j]->type)));
             node_needs_grad = true;
             break;
         }
@@ -7747,9 +7840,34 @@ void ggml_build_backward_expand(
         // inplace operations to add gradients are not created by ggml_compute_backward except for gradient accumulation
         // use allocator to automatically make inplace operations
         ggml_compute_backward(ctx, cgraph, i, grads_needed);
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (callback && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+            struct ggml_tensor * grad = ggml_graph_get_grad(cgraph, node);
+            if (grad) {
+                // Compute dX with the old parameter before the in-place update.
+                for (int j = 0; j < n_nodes_f; ++j) {
+                    struct ggml_tensor * pending_grad = ggml_graph_get_grad(cgraph, cgraph->nodes[j]);
+                    if (pending_grad && !(cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_PARAM)) {
+                        ggml_build_forward_expand(cgraph, pending_grad);
+                    }
+                }
+                struct ggml_tensor * update = callback(ctx, node, grad, userdata);
+                if (update) {
+                    ggml_build_forward_expand(cgraph, update);
+                }
+            }
+        }
     }
 
     free(grads_needed);
+    cgraph->defer_quantized_param_grads = false;
+}
+
+void ggml_build_backward_expand(
+        struct ggml_context *  ctx,
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  ** grad_accs) {
+    ggml_build_backward_expand_with_callback(ctx, cgraph, grad_accs, NULL, NULL);
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
@@ -7818,6 +7936,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.use_counts   =*/ use_counts_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
+        /*.defer_quantized_param_grads =*/ false,
         /*.uid          =*/ 0,
     };
 
@@ -7846,6 +7965,7 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
+        /*.defer_quantized_param_grads =*/ false,
         /*.uid              =*/ 0
     };
 
@@ -7860,6 +7980,7 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;
     dst->order   = src->order;
+    dst->defer_quantized_param_grads = src->defer_quantized_param_grads;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];

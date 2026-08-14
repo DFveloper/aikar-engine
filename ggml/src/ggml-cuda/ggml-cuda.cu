@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
+#include "ggml-cuda/opt-step-qlion-qat.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
@@ -2307,6 +2308,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            ggml_cuda_mul_mat_id_back(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -2447,6 +2451,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_cuda_opt_step_adamw(ctx, dst);
+            break;
+        case GGML_OP_OPT_STEP_QLION_QAT:
+            ggml_cuda_opt_step_qlion_qat(ctx, dst);
+            break;
+        case GGML_OP_OPT_STEP_QLION_QAT_ID:
+            ggml_cuda_opt_step_qlion_qat_id(ctx, dst);
             break;
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
@@ -5292,6 +5302,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32
                 && (op->src[0]->type == GGML_TYPE_F32 || ggml_is_quantized(op->src[0]->type))
                 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            return op->type == GGML_TYPE_F32
+                && (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0)
+                && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
         case GGML_OP_OUT_PROD_ID:
             return op->src[0] != nullptr && op->src[1] != nullptr && op->src[2] != nullptr
                 && op->type        == GGML_TYPE_F32
@@ -5614,6 +5628,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
+        case GGML_OP_OPT_STEP_QLION_QAT:
+        case GGML_OP_OPT_STEP_QLION_QAT_ID:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:

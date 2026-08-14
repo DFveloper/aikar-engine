@@ -512,6 +512,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_ID_BACK,
         GGML_OP_OUT_PROD,
         GGML_OP_OUT_PROD_ID, // scattered outer-product for MUL_MAT_ID backward (MoE LoRA)
 
@@ -588,6 +589,8 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
+        GGML_OP_OPT_STEP_QLION_QAT,
+        GGML_OP_OPT_STEP_QLION_QAT_ID,
 
         GGML_OP_GLU,
         GGML_OP_GLU_BACK,
@@ -1456,6 +1459,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad,
             struct ggml_tensor  * ids);
 
     // A: m columns, n rows,
@@ -2815,6 +2824,24 @@ extern "C" {
         struct ggml_tensor *  grad,
         struct ggml_tensor *  sgd_params); // alpha, weight decay
 
+    GGML_API struct ggml_tensor * ggml_opt_step_qlion_qat(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  weight,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  momentum,
+        struct ggml_tensor *  residual,
+        struct ggml_tensor *  params);
+
+    GGML_API struct ggml_tensor * ggml_opt_step_qlion_qat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  weight,
+        struct ggml_tensor *  activations,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  ids,
+        struct ggml_tensor *  momentum,
+        struct ggml_tensor *  residual,
+        struct ggml_tensor *  params);
+
     // build forward multiple tensors and select one of them for computing
     // this is useful for creating graphs that have constant topology but compute different things based on the input
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
@@ -2861,6 +2888,19 @@ extern "C" {
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,
         struct ggml_tensor  ** grad_accs);
+
+    typedef struct ggml_tensor * (*ggml_backward_param_callback)(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * param,
+            struct ggml_tensor  * grad,
+            void                * userdata);
+
+    GGML_API void ggml_build_backward_expand_with_callback(
+        struct ggml_context          * ctx,
+        struct ggml_cgraph           * cgraph,
+        struct ggml_tensor          ** grad_accs,
+        ggml_backward_param_callback   callback,
+        void                         * userdata);
 
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false

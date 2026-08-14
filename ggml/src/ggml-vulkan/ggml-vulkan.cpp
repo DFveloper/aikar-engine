@@ -962,7 +962,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_repeat_i16;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_bf16_f32, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
-    vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_bf16_f32, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
+    vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_u8_u8, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_bf16_f32, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
@@ -1080,6 +1080,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
+    vk_pipeline pipeline_opt_step_qlion_qat_mxfp4;
+    vk_pipeline pipeline_opt_step_qlion_qat_q4_0;
+    vk_pipeline pipeline_opt_step_qlion_qat_id_mxfp4;
+    vk_pipeline pipeline_opt_step_qlion_qat_id_q4_0;
+    vk_pipeline pipeline_mul_mat_id_back_mxfp4;
+    vk_pipeline pipeline_mul_mat_id_back_q4_0;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
@@ -1401,6 +1407,14 @@ struct vk_op_push_constants {
     float param2;
     float param3;
     float param4;
+};
+
+struct vk_op_mul_mat_id_back_push_constants {
+    uint32_t n_blocks;
+    uint32_t n_rows;
+    uint32_t n_expert;
+    uint32_t n_used;
+    uint32_t n_tokens;
 };
 
 struct vk_op_cross_entropy_push_constants {
@@ -5545,6 +5559,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_contig_cpy_f32_f32, "contig_cpy_f32_f32", contig_cpy_f32_f32_len, contig_cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_contig_cpy_f32_f16, "contig_cpy_f32_f16", contig_cpy_f32_f16_len, contig_cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_contig_cpy_f16_f16, "contig_cpy_f16_f16", contig_cpy_f16_f16_len, contig_cpy_f16_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_contig_cpy_u8_u8, "contig_cpy_u8_u8", contig_cpy_u8_u8_len, contig_cpy_u8_u8_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_contig_cpy_f16_f32, "contig_cpy_f16_f32", contig_cpy_f16_f32_len, contig_cpy_f16_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_contig_cpy_f32_bf16,"contig_cpy_f32_bf16",contig_cpy_f32_bf16_len,contig_cpy_f32_bf16_data,"main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_contig_cpy_bf16_f32,"contig_cpy_bf16_f32",contig_cpy_bf16_f32_len,contig_cpy_bf16_f32_data,"main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -5971,6 +5986,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_mxfp4, "opt_step_qlion_qat_mxfp4", opt_step_qlion_qat_mxfp4_len, opt_step_qlion_qat_mxfp4_data, "main", 5, sizeof(vk_op_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_q4_0, "opt_step_qlion_qat_q4_0", opt_step_qlion_qat_q4_0_len, opt_step_qlion_qat_q4_0_data, "main", 5, sizeof(vk_op_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_id_mxfp4, "opt_step_qlion_qat_id_mxfp4", opt_step_qlion_qat_id_mxfp4_len, opt_step_qlion_qat_id_mxfp4_data, "main", 7, sizeof(vk_op_mul_mat_id_back_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_id_q4_0, "opt_step_qlion_qat_id_q4_0", opt_step_qlion_qat_id_q4_0_len, opt_step_qlion_qat_id_q4_0_data, "main", 7, sizeof(vk_op_mul_mat_id_back_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_mxfp4, "mul_mat_id_back_mxfp4", mul_mat_id_back_mxfp4_len, mul_mat_id_back_mxfp4_data, "main", 4, sizeof(vk_op_mul_mat_id_back_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_q4_0, "mul_mat_id_back_q4_0", mul_mat_id_back_q4_0_len, mul_mat_id_back_q4_0_data, "main", 4, sizeof(vk_op_mul_mat_id_back_push_constants), {32, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9098,12 +9125,14 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
     }
 
     if (src->type == to) {
-        // Copy two or four bytes at a time, depending on block size.
+        // Copy one, two, or four bytes at a time, depending on block size.
         // For quantized types, we scale by block size/type size. But
         // this path is also used for bf16->bf16 for example, where the
         // type size must be exactly 2 or 4.
         GGML_ASSERT(ggml_is_quantized(to) || ggml_type_size(src->type) == 2 || ggml_type_size(src->type) == 4);
-        if ((ggml_type_size(src->type) % 4) == 0) {
+        if ((ggml_type_size(src->type) % 2) != 0 && contig) {
+            return ctx->device->pipeline_contig_cpy_u8_u8;
+        } else if ((ggml_type_size(src->type) % 4) == 0) {
             if (contig) {
                 return ctx->device->pipeline_contig_cpy_f32_f32;
             } else {
@@ -11276,6 +11305,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_out_prod_id_f32;
         }
         return nullptr;
+    case GGML_OP_MUL_MAT_ID_BACK:
+        if (src0->type == GGML_TYPE_MXFP4) {
+            return ctx->device->pipeline_mul_mat_id_back_mxfp4;
+        }
+        if (src0->type == GGML_TYPE_Q4_0) {
+            return ctx->device->pipeline_mul_mat_id_back_q4_0;
+        }
+        return nullptr;
     case GGML_OP_CONCAT: {
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
@@ -11741,6 +11778,22 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_OPT_STEP_ADAMW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;
+        }
+        return nullptr;
+    case GGML_OP_OPT_STEP_QLION_QAT:
+        if (src0->type == GGML_TYPE_MXFP4) {
+            return ctx->device->pipeline_opt_step_qlion_qat_mxfp4;
+        }
+        if (src0->type == GGML_TYPE_Q4_0) {
+            return ctx->device->pipeline_opt_step_qlion_qat_q4_0;
+        }
+        return nullptr;
+    case GGML_OP_OPT_STEP_QLION_QAT_ID:
+        if (src0->type == GGML_TYPE_MXFP4) {
+            return ctx->device->pipeline_opt_step_qlion_qat_id_mxfp4;
+        }
+        if (src0->type == GGML_TYPE_Q4_0) {
+            return ctx->device->pipeline_opt_step_qlion_qat_id_q4_0;
         }
         return nullptr;
     case GGML_OP_OPT_STEP_SGD:
@@ -12289,9 +12342,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         {
             uint32_t ne = ggml_nelements(dst);
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
-                // Convert from number of logical elements to 2- or 4-byte units.
+                // Convert from number of logical elements to copy units.
                 ne /= ggml_blck_size(src0->type);
-                if ((ggml_type_size(src0->type) % 4) == 0) {
+                if ((ggml_type_size(src0->type) % 2) != 0) {
+                    ne *= ggml_type_size(src0->type);
+                } else if ((ggml_type_size(src0->type) % 4) == 0) {
                     ne *= ggml_type_size(src0->type) / 4;
                 } else {
                     ne *= ggml_type_size(src0->type) / 2;
@@ -13021,6 +13076,87 @@ static void ggml_vk_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& su
     );
 }
 
+static void ggml_vk_opt_step_qlion_qat(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * momentum = dst->src[2];
+    const ggml_tensor * residual = dst->src[3];
+    const ggml_tensor * params = dst->src[4];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 4);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual) && ggml_is_contiguous(params));
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, weight, grad, momentum, dst, GGML_OP_OPT_STEP_QLION_QAT);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_subbuffer weight_buf = ggml_vk_tensor_subbuffer(ctx, weight);
+    const vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
+    const vk_subbuffer momentum_buf = ggml_vk_tensor_subbuffer(ctx, momentum);
+    const vk_subbuffer residual_buf = ggml_vk_tensor_subbuffer(ctx, residual);
+    const vk_subbuffer params_buf = ggml_vk_tensor_subbuffer(ctx, params);
+    const uint32_t ne = (uint32_t) ggml_nelements(weight);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { weight_buf, grad_buf, momentum_buf, residual_buf, params_buf },
+        vk_op_push_constants { ne / 32, 0, 0.0f, 0.0f, 0.0f, 0.0f },
+        std::array<uint32_t, 3> { ne, 1, 1 });
+}
+
+static void ggml_vk_opt_step_qlion_qat_id(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * activations = dst->src[1];
+    const ggml_tensor * grad = dst->src[2];
+    const ggml_tensor * ids = dst->src[3];
+    const ggml_tensor * momentum = dst->src[4];
+    const ggml_tensor * residual = dst->src[5];
+    const ggml_tensor * params = dst->src[6];
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, weight, activations, grad, dst, GGML_OP_OPT_STEP_QLION_QAT_ID);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_subbuffer weight_buf = ggml_vk_tensor_subbuffer(ctx, weight);
+    const vk_subbuffer activations_buf = ggml_vk_tensor_subbuffer(ctx, activations);
+    const vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
+    const vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
+    const vk_subbuffer momentum_buf = ggml_vk_tensor_subbuffer(ctx, momentum);
+    const vk_subbuffer residual_buf = ggml_vk_tensor_subbuffer(ctx, residual);
+    const vk_subbuffer params_buf = ggml_vk_tensor_subbuffer(ctx, params);
+    const uint32_t n_blocks_row = (uint32_t) weight->ne[0] / 32;
+    const uint32_t n_blocks = (uint32_t) ggml_nelements(weight) / 32;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { weight_buf, activations_buf, grad_buf, ids_buf, momentum_buf, residual_buf, params_buf },
+        vk_op_mul_mat_id_back_push_constants {
+            n_blocks_row, (uint32_t) weight->ne[1], (uint32_t) weight->ne[2],
+            (uint32_t) grad->ne[1], (uint32_t) grad->ne[2]
+        },
+        std::array<uint32_t, 3> { n_blocks * 32, 1, 1 });
+}
+
+static void ggml_vk_mul_mat_id_back(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(dst));
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, weight, grad, ids, dst, GGML_OP_MUL_MAT_ID_BACK);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_subbuffer weight_buf = ggml_vk_tensor_subbuffer(ctx, weight);
+    const vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
+    const vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    const uint32_t n_blocks = (uint32_t) weight->ne[0] / 32;
+    const uint32_t n_tasks = n_blocks * (uint32_t) grad->ne[1] * (uint32_t) grad->ne[2];
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { weight_buf, grad_buf, ids_buf, dst_buf },
+        vk_op_mul_mat_id_back_push_constants {
+            n_blocks, (uint32_t) weight->ne[1], (uint32_t) weight->ne[2],
+            (uint32_t) grad->ne[1], (uint32_t) grad->ne[2]
+        },
+        std::array<uint32_t, 3> { n_tasks * 32, 1, 1 });
+}
+
 static void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
     const size_t n = ggml_nelements(dst->src[0]);
 
@@ -13222,9 +13358,11 @@ static void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subct
 static void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t ne = (uint32_t)ggml_nelements(src0);
     if (ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
-        // Convert from number of logical elements to 2- or 4-byte units.
+        // Convert from number of logical elements to copy units.
         ne /= ggml_blck_size(src0->type);
-        if ((ggml_type_size(src0->type) % 4) == 0) {
+        if ((ggml_type_size(src0->type) % 2) != 0) {
+            ne *= ggml_type_size(src0->type);
+        } else if ((ggml_type_size(src0->type) % 4) == 0) {
             ne *= ggml_type_size(src0->type) / 4;
         } else {
             ne *= ggml_type_size(src0->type) / 2;
@@ -15897,6 +16035,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
 
         break;
+    case GGML_OP_MUL_MAT_ID_BACK:
+        ggml_vk_mul_mat_id_back(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_OUT_PROD:
         ggml_vk_out_prod(ctx, compute_ctx, src0, src1, node);
 
@@ -15948,6 +16090,15 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_OPT_STEP_QLION_QAT:
+        ggml_vk_opt_step_qlion_qat(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_OPT_STEP_QLION_QAT_ID:
+        ggml_vk_opt_step_qlion_qat_id(ctx, compute_ctx, node);
 
         break;
 
@@ -18370,6 +18521,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
                    op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
                    op->nb[0] == ggml_type_size(op->type);
+        case GGML_OP_MUL_MAT_ID_BACK:
+            return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;
@@ -18567,7 +18727,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // so the type/block size must be a multiple of 4.
                 if (src0_type == src1_type &&
                     (!ggml_is_quantized(src0_type) || (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op))) &&
-                    (ggml_type_size(src0_type) % 2) == 0) {
+                    ((ggml_type_size(src0_type) % 2) == 0 || src0_type == GGML_TYPE_MXFP4)) {
                     return true;
                 }
                 return false;
@@ -18625,6 +18785,27 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[3]) &&
                    ggml_is_contiguous(op->src[4]) &&
                    ggml_nelements(op->src[4]) == 8;
+        case GGML_OP_OPT_STEP_QLION_QAT:
+            return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_Q8_0 &&
+                   op->src[3]->type == GGML_TYPE_Q4_0 &&
+                   op->src[4]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op->src[3]) &&
+                   ggml_is_contiguous(op->src[4]) &&
+                   ggml_nelements(op->src[4]) == 4;
+        case GGML_OP_OPT_STEP_QLION_QAT_ID:
+            return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_I32 && op->src[4]->type == GGML_TYPE_Q8_0 &&
+                   op->src[5]->type == GGML_TYPE_Q4_0 && op->src[6]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                   ggml_is_contiguous(op->src[4]) && ggml_is_contiguous(op->src[5]) &&
+                   ggml_is_contiguous(op->src[6]);
         case GGML_OP_OPT_STEP_SGD:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_LOG:
@@ -19429,6 +19610,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+        } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK) {
+            tensor_clone = ggml_mul_mat_id_back(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {
@@ -19763,6 +19946,14 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
             src_clone[2], src_clone[3], src_clone[4]);
+        } else if (tensor->op == GGML_OP_OPT_STEP_QLION_QAT) {
+            src_clone[0]->flags = tensor->src[0]->flags;
+            tensor_clone = ggml_opt_step_qlion_qat(ggml_ctx, src_clone[0], src_clone[1],
+            src_clone[2], src_clone[3], src_clone[4]);
+        } else if (tensor->op == GGML_OP_OPT_STEP_QLION_QAT_ID) {
+            src_clone[0]->flags = tensor->src[0]->flags;
+            tensor_clone = ggml_opt_step_qlion_qat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+            src_clone[3], src_clone[4], src_clone[5], src_clone[6]);
         } else if (tensor->op == GGML_OP_OPT_STEP_SGD) {
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_sgd(ggml_ctx, src_clone[0], src_clone[1],

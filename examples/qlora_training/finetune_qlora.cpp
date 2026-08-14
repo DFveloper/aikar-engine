@@ -452,9 +452,11 @@ static std::vector<training_sample> load_jsonl(
     std::vector<common_chat_templates *> worker_templates(n_workers, tmpls);
     if (tmpls && n_workers > 1) {
         GGML_ASSERT(model != nullptr);
+        const std::string template_override = common_chat_templates_was_explicit(tmpls)
+            ? common_chat_templates_source(tmpls) : "";
         template_copies.reserve(n_workers - 1);
         for (size_t i = 1; i < n_workers; ++i) {
-            template_copies.push_back(common_chat_templates_init(model, ""));
+            template_copies.push_back(common_chat_templates_init(model, template_override));
             worker_templates[i] = template_copies.back().get();
         }
     }
@@ -1827,6 +1829,7 @@ static int run_grpo_mode(
 }
 
 // ---------------------------------------------------------------------------
+#ifndef LLAMA_FINETUNE_QLORA_SHARED_ONLY
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -1834,6 +1837,10 @@ int main(int argc, char ** argv) {
     params.escape = false;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FINETUNE_QLORA)) {
+        return 1;
+    }
+    if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+        LOG_ERR("%s: qlion is only supported by llama-finetune-qat\n", __func__);
         return 1;
     }
 
@@ -1973,7 +1980,7 @@ int main(int argc, char ** argv) {
 
     // --- Step 5: Load dataset ---
     // In GRPO mode the dataset comes from Python via stdin/stdout — skip file loading.
-    auto tmpls = common_chat_templates_init(model, "");
+    auto tmpls = common_chat_templates_init(model, params.chat_template);
     if (params.grpo_mode) {
         int rc = run_grpo_mode(params, model, ctx, lt, arch, lora_alpha, params.model.path,
                                resume_requested ? &resume_state : nullptr);
@@ -2254,3 +2261,4 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
+#endif

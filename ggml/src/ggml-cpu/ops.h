@@ -51,6 +51,7 @@ void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, str
 void ggml_compute_forward_out_prod(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_out_prod_accumulate(const struct ggml_compute_params * params, struct ggml_tensor * out_prod, struct ggml_tensor * dst);
 void ggml_compute_forward_out_prod_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_mul_mat_id_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_scale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_cpy(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -122,6 +123,8 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_opt_step_qlion_qat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_opt_step_qlion_qat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus
 }
 #endif

@@ -4669,6 +4669,45 @@ void ggml_compute_forward_out_prod_id(
     }
 }
 
+void ggml_compute_forward_mul_mat_id_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad   = dst->src[1];
+    const ggml_tensor * ids    = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(weight->ne[0] % 32 == 0);
+
+    const ggml_type_traits * traits = ggml_get_type_traits(weight->type);
+    GGML_ASSERT(traits->to_float && traits->blck_size == 32);
+    const int64_t n_blocks = weight->ne[0] / 32;
+    const int64_t n_routes = grad->ne[1] * grad->ne[2];
+    const int64_t n_tasks = n_routes * n_blocks;
+    const size_t block_bytes = ggml_type_size(weight->type);
+
+    for (int64_t task = params->ith; task < n_tasks; task += params->nth) {
+        const int64_t route = task / n_blocks;
+        const int64_t block = task % n_blocks;
+        const int64_t used = route % grad->ne[1];
+        const int64_t token = route / grad->ne[1];
+        const int32_t expert = *(const int32_t *) ((const char *) ids->data + used * ids->nb[0] + token * ids->nb[1]);
+        GGML_ASSERT(expert >= 0 && expert < weight->ne[2]);
+        float accum[32] = {};
+        float values[32];
+        for (int64_t row = 0; row < weight->ne[1]; ++row) {
+            const void * weight_block = (const char *) weight->data + row * weight->nb[1] + expert * weight->nb[2] + block * block_bytes;
+            traits->to_float(weight_block, values, 32);
+            const float g = *(const float *) ((const char *) grad->data + row * grad->nb[0] + used * grad->nb[1] + token * grad->nb[2]);
+            for (int lane = 0; lane < 32; ++lane) {
+                accum[lane] += values[lane] * g;
+            }
+        }
+        float * output = (float *) ((char *) dst->data + used * dst->nb[1] + token * dst->nb[2]) + block * 32;
+        memcpy(output, accum, sizeof(accum));
+    }
+}
+
 // ggml_compute_forward_scale
 
 static void ggml_compute_forward_scale_f32(
@@ -12265,6 +12304,155 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+static void ggml_qlion_qat_update_block(
+        enum ggml_type weight_type,
+        const ggml_type_traits * weight_traits,
+        const ggml_type_traits * momentum_traits,
+        const ggml_type_traits * residual_traits,
+        uint8_t * weight_block,
+        uint8_t * momentum_block,
+        uint8_t * residual_block,
+        const float * grad,
+        const float * p) {
+    float weight_f32[32];
+    float momentum_f32[32];
+    float residual_f32[32];
+    float momentum_new[32];
+    float target[32];
+    float weight_new[32];
+    float residual_new[32];
+    weight_traits->to_float(weight_block, weight_f32, 32);
+    momentum_traits->to_float(momentum_block, momentum_f32, 32);
+    residual_traits->to_float(residual_block, residual_f32, 32);
+    for (int j = 0; j < 32; ++j) {
+        float g = std::isfinite(grad[j]) ? grad[j] : 0.0f;
+        if (p[3] > 0.0f) {
+            g = std::max(-p[3], std::min(p[3], g));
+        }
+        float m = p[1] * momentum_f32[j] + (1.0f - p[1]) * g;
+        m = std::isfinite(m) ? m : 0.0f;
+        m = std::max(-128.0f * 65504.0f, std::min(128.0f * 65504.0f, m));
+        momentum_new[j] = m;
+        const float direction = m > 0.0f ? 1.0f : (m < 0.0f ? -1.0f : 0.0f);
+        float value = weight_f32[j] + residual_f32[j] - p[0] * (direction + p[2] * weight_f32[j]);
+        value = std::isfinite(value) ? value : weight_f32[j];
+        if (weight_type == GGML_TYPE_Q4_0) {
+            value = std::max(-8.0f * 65504.0f, std::min(8.0f * 65504.0f, value));
+        }
+        target[j] = value;
+    }
+    weight_traits->from_float_ref(target, weight_block, 32);
+    weight_traits->to_float(weight_block, weight_new, 32);
+    float residual_absmax = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        float value = target[j] - weight_new[j];
+        value = std::isfinite(value) ? value : 0.0f;
+        value = std::max(-8.0f * 65504.0f, std::min(8.0f * 65504.0f, value));
+        residual_new[j] = value;
+        residual_absmax = std::max(residual_absmax, std::abs(value));
+    }
+    if (residual_absmax > 0.0f && residual_absmax < 8.0f * 0x1p-24f) {
+        std::fill(residual_new, residual_new + 32, 0.0f);
+    }
+    residual_traits->from_float_ref(residual_new, residual_block, 32);
+    momentum_traits->from_float_ref(momentum_new, momentum_block, 32);
+}
+
+void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    ggml_tensor * momentum = dst->src[2];
+    ggml_tensor * residual = dst->src[3];
+    const ggml_tensor * opt_params = dst->src[4];
+
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(opt_params->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(momentum));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+
+    const ggml_type_traits * weight_traits = ggml_get_type_traits(weight->type);
+    const ggml_type_traits * momentum_traits = ggml_get_type_traits(momentum->type);
+    const ggml_type_traits * residual_traits = ggml_get_type_traits(residual->type);
+    GGML_ASSERT(weight_traits->blck_size == 32 && weight_traits->to_float && weight_traits->from_float_ref);
+    GGML_ASSERT(momentum_traits->blck_size == 32 && momentum_traits->to_float && momentum_traits->from_float_ref);
+    GGML_ASSERT(residual_traits->blck_size == 32 && residual_traits->to_float && residual_traits->from_float_ref);
+
+    const float * p = ggml_get_data_f32(opt_params);
+    GGML_ASSERT(p[0] > 0.0f && std::isfinite(p[0]));
+    GGML_ASSERT(p[1] >= 0.0f && p[1] < 1.0f && std::isfinite(p[1]));
+    GGML_ASSERT(p[2] >= 0.0f && std::isfinite(p[2]));
+    GGML_ASSERT(p[3] >= 0.0f && std::isfinite(p[3]));
+
+    const int64_t n_blocks = ggml_nelements(weight) / 32;
+    const int64_t blocks_per_thread = (n_blocks + params->nth - 1) / params->nth;
+    const int64_t block_begin = blocks_per_thread * params->ith;
+    const int64_t block_end = std::min(n_blocks, block_begin + blocks_per_thread);
+    uint8_t * weight_data = (uint8_t *) weight->data;
+    uint8_t * momentum_data = (uint8_t *) momentum->data;
+    uint8_t * residual_data = (uint8_t *) residual->data;
+    const float * grad_data = (const float *) grad->data;
+
+    for (int64_t ib = block_begin; ib < block_end; ++ib) {
+        uint8_t * weight_block = weight_data + ib * weight_traits->type_size;
+        uint8_t * momentum_block = momentum_data + ib * momentum_traits->type_size;
+        uint8_t * residual_block = residual_data + ib * residual_traits->type_size;
+        ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
+            weight_block, momentum_block, residual_block, grad_data + ib * 32, p);
+    }
+}
+
+void ggml_compute_forward_opt_step_qlion_qat_id(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * activations = dst->src[1];
+    const ggml_tensor * grad = dst->src[2];
+    const ggml_tensor * ids = dst->src[3];
+    ggml_tensor * momentum = dst->src[4];
+    ggml_tensor * residual = dst->src[5];
+    const ggml_tensor * opt_params = dst->src[6];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(activations->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+
+    const ggml_type_traits * weight_traits = ggml_get_type_traits(weight->type);
+    const ggml_type_traits * momentum_traits = ggml_get_type_traits(momentum->type);
+    const ggml_type_traits * residual_traits = ggml_get_type_traits(residual->type);
+    const float * p = ggml_get_data_f32(opt_params);
+    const int64_t n_blocks_row = weight->ne[0] / 32;
+    const int64_t n_blocks = ggml_nelements(weight) / 32;
+    const int64_t blocks_per_thread = (n_blocks + params->nth - 1) / params->nth;
+    const int64_t block_begin = blocks_per_thread * params->ith;
+    const int64_t block_end = std::min(n_blocks, block_begin + blocks_per_thread);
+    for (int64_t ib = block_begin; ib < block_end; ++ib) {
+        const int64_t block = ib % n_blocks_row;
+        const int64_t matrix_row = (ib / n_blocks_row) % weight->ne[1];
+        const int64_t expert = ib / (n_blocks_row * weight->ne[1]);
+        float grad_block[32] = {};
+        for (int64_t token = 0; token < grad->ne[2]; ++token) {
+            for (int64_t used = 0; used < grad->ne[1]; ++used) {
+                const int32_t route = *(const int32_t *) ((const char *) ids->data + used * ids->nb[0] + token * ids->nb[1]);
+                if (route != expert) {
+                    continue;
+                }
+                const float g = *(const float *) ((const char *) grad->data + matrix_row * grad->nb[0] + used * grad->nb[1] + token * grad->nb[2]);
+                const float * activation = (const float *) ((const char *) activations->data + used * activations->nb[1] + token * activations->nb[2]) + block * 32;
+                for (int lane = 0; lane < 32; ++lane) {
+                    grad_block[lane] += activation[lane] * g;
+                }
+            }
+        }
+        ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
+            (uint8_t *) weight->data + ib * weight_traits->type_size,
+            (uint8_t *) momentum->data + ib * momentum_traits->type_size,
+            (uint8_t *) residual->data + ib * residual_traits->type_size,
+            grad_block, p);
     }
 }
 

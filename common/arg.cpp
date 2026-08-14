@@ -115,6 +115,9 @@ common_arg & common_arg::set_preset_only() {
 }
 
 bool common_arg::in_example(enum llama_example ex) {
+    if (ex == LLAMA_EXAMPLE_FINETUNE_QAT && examples.find(LLAMA_EXAMPLE_FINETUNE_QLORA) != examples.end()) {
+        return true;
+    }
     return examples.find(ex) != examples.end();
 }
 
@@ -3634,7 +3637,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.use_jinja = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD,
+                    LLAMA_EXAMPLE_FINETUNE_QLORA}).set_env("LLAMA_ARG_JINJA"));
     add_opt(common_arg(
         {"--reasoning-format"}, "FORMAT",
         "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
@@ -3704,7 +3708,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.chat_template = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD,
+                    LLAMA_EXAMPLE_FINETUNE_QLORA}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
     add_opt(common_arg(
         {"--chat-template-file"}, "JINJA_TEMPLATE_FILE",
         string_format(
@@ -3716,7 +3721,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.chat_template = read_file(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER,
+                    LLAMA_EXAMPLE_FINETUNE_QLORA}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
     add_opt(common_arg(
         {"--skip-chat-parsing"},
         {"--no-skip-chat-parsing"},
@@ -4698,6 +4704,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
+        {"--qat-out"}, "FNAME",
+        "native QAT output model GGUF path (default: qat-model.gguf)",
+        [](common_params & params, const std::string & value) { params.qat_out = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-resume"}, "FNAME",
+        "resume native QAT from a model checkpoint; state is read from FNAME.qat-state.gguf",
+        [](common_params & params, const std::string & value) { params.qat_resume = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--quant-type"}, "mxfp4|q4_0",
+        "required native model-weight format",
+        [](common_params & params, const std::string & value) {
+            if (value != "mxfp4" && value != "q4_0") {
+                throw std::invalid_argument("--quant-type must be mxfp4 or q4_0");
+            }
+            params.qat_quant_type = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-momentum"}, "q8_0",
+        "native QAT momentum format; only q8_0 is supported",
+        [](common_params & params, const std::string & value) {
+            if (value != "q8_0") {
+                throw std::invalid_argument("--qat-momentum only supports q8_0");
+            }
+            params.qat_momentum = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-residual"}, "q4_0",
+        "native QAT error-feedback format; only q4_0 is supported",
+        [](common_params & params, const std::string & value) {
+            if (value != "q4_0") {
+                throw std::invalid_argument("--qat-residual only supports q4_0");
+            }
+            params.qat_residual = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-update-granularity"}, "tensor",
+        "native QAT update granularity; only tensor is supported",
+        [](common_params & params, const std::string & value) {
+            if (value != "tensor") {
+                throw std::invalid_argument("--qat-update-granularity only supports tensor");
+            }
+            params.qat_update_granularity = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--grpo-mode"},
         "enable GRPO IPC training loop (prompts and rewards supplied via stdin/stdout)",
         [](common_params & params) { params.grpo_mode = true; }
@@ -4728,8 +4784,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int epochs) { params.lr.epochs = epochs; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
-        {"-opt", "--optimizer"}, "sgd|adamw|adamw_f16|adamw_q8_0|adamw_q6_k|adamw_iq4_nl",
-        "optimizer (adamw_q8_0 uses device state when LoRA tensors are on CUDA or ROCm; q6_k/iq4_nl use CPU state)",
+        {"-opt", "--optimizer"}, ex == LLAMA_EXAMPLE_FINETUNE_QAT
+            ? "qlion" : "sgd|adamw|adamw_f16|adamw_q8_0|adamw_q6_k|adamw_iq4_nl",
+        ex == LLAMA_EXAMPLE_FINETUNE_QAT
+            ? "native quantized QAT optimizer"
+            : "optimizer (adamw_q8_0 uses device state when LoRA tensors are on CUDA or ROCm; q6_k/iq4_nl use CPU state)",
         [](common_params & params, const std::string & name) {
             params.optimizer = common_opt_get_optimizer(name.c_str());
             if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_COUNT) {

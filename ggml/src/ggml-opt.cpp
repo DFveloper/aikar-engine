@@ -82,6 +82,14 @@ struct ggml_opt_context {
     std::vector<quantized_state> quantized_states;
     std::vector<struct ggml_tensor *> quantized_params;
     std::vector<struct ggml_tensor *> quantized_grads;
+    std::vector<struct ggml_tensor *> qat_params;
+    std::vector<struct ggml_tensor *> qat_momentum;
+    std::vector<struct ggml_tensor *> qat_residual;
+    std::vector<std::vector<struct ggml_tensor *>> qat_aliases;
+    std::vector<std::vector<struct ggml_tensor *>> qat_pending_grads;
+    std::vector<size_t> qat_expected_grads;
+    std::vector<ggml_backend_buffer_t> qat_buffers;
+    std::vector<struct ggml_context *> qat_contexts;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -110,6 +118,45 @@ static bool ggml_opt_optimizer_is_adamw(enum ggml_opt_optimizer_type optimizer) 
         optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0 ||
         optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q6_K ||
         optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_IQ4_NL;
+}
+
+void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor * param) {
+    GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT);
+    GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q4_0));
+    GGML_ASSERT(ggml_is_contiguous(param));
+    for (size_t i = 0; i < opt_ctx->qat_params.size(); ++i) {
+        struct ggml_tensor * canonical = opt_ctx->qat_params[i];
+        if (canonical == param) {
+            return;
+        }
+        if (canonical->type == param->type && strcmp(canonical->name, param->name) == 0 &&
+            memcmp(canonical->ne, param->ne, sizeof(param->ne)) == 0) {
+            opt_ctx->qat_aliases[i].push_back(param);
+            return;
+        }
+    }
+    ggml_backend_buffer_type_t param_buft = param->buffer
+        ? ggml_backend_buffer_get_type(param->buffer)
+        : ggml_backend_cpu_buffer_type();
+    struct ggml_init_params state_params = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * state_ctx = ggml_init(state_params);
+    struct ggml_tensor * momentum = ggml_new_tensor(state_ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne);
+    struct ggml_tensor * residual = ggml_new_tensor(state_ctx, GGML_TYPE_Q4_0, GGML_MAX_DIMS, param->ne);
+    ggml_format_name(momentum, "QLion Q8_0 momentum for %s", param->name);
+    ggml_format_name(residual, "QLion Q4_0 residual for %s", param->name);
+    ggml_backend_buffer_t state_buffer = ggml_backend_alloc_ctx_tensors_from_buft(state_ctx, param_buft);
+    GGML_ASSERT(state_buffer);
+    ggml_backend_buffer_clear(state_buffer, 0);
+    opt_ctx->qat_params.push_back(param);
+    opt_ctx->qat_momentum.push_back(momentum);
+    opt_ctx->qat_residual.push_back(residual);
+    opt_ctx->qat_aliases.push_back({ param });
+    opt_ctx->qat_buffers.push_back(state_buffer);
+    opt_ctx->qat_contexts.push_back(state_ctx);
 }
 
 static enum ggml_type ggml_opt_optimizer_state_type(enum ggml_opt_optimizer_type optimizer) {
@@ -386,6 +433,11 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     result.sgd.alpha   = 1e-3f;
     result.sgd.wd      = 0.0f;
 
+    result.qlion_qat.alpha = 1e-4f;
+    result.qlion_qat.beta  = 0.9f;
+    result.qlion_qat.wd    = 0.0f;
+    result.qlion_qat.gclip = 0.0f;
+
     return result;
 }
 
@@ -479,13 +531,50 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     return dst;
 }
 
+static struct ggml_tensor * ggml_opt_qlion_qat_backward_callback(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * param,
+        struct ggml_tensor  * grad,
+        void                * userdata) {
+    ggml_opt_context_t opt_ctx = (ggml_opt_context_t) userdata;
+    for (size_t i = 0; i < opt_ctx->qat_aliases.size(); ++i) {
+        const auto & aliases = opt_ctx->qat_aliases[i];
+        if (std::find(aliases.begin(), aliases.end(), param) == aliases.end()) {
+            continue;
+        }
+        opt_ctx->qat_pending_grads[i].push_back(grad);
+        if (opt_ctx->qat_pending_grads[i].size() < opt_ctx->qat_expected_grads[i]) {
+            return nullptr;
+        }
+        struct ggml_tensor * combined = opt_ctx->qat_pending_grads[i][0];
+        for (size_t j = 1; j < opt_ctx->qat_pending_grads[i].size(); ++j) {
+            combined = ggml_add(ctx, combined, opt_ctx->qat_pending_grads[i][j]);
+        }
+        struct ggml_tensor * step = combined->op == GGML_OP_OUT_PROD_ID
+            ? ggml_opt_step_qlion_qat_id(ctx, param, combined->src[0], combined->src[1], combined->src[2],
+                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params)
+            : ggml_opt_step_qlion_qat(ctx, param, combined,
+                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
+        ggml_format_name(step, "QLion QAT step for %s", param->name);
+        struct ggml_tensor * result = step;
+        for (struct ggml_tensor * alias : aliases) {
+            if (alias != param) {
+                result = ggml_cpy(ctx, result, alias);
+            }
+        }
+        return result;
+    }
+    return nullptr;
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
 
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
-    const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
+    const bool qlion_qat = optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    const bool accumulate = !qlion_qat && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
         !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
 
     const bool need_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
@@ -494,6 +583,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0;
     const bool need_quantized_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
         ggml_opt_optimizer_state_type(opt_ctx->optimizer) != GGML_TYPE_COUNT;
+    const bool need_qat_state = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && qlion_qat;
 
     ggml_set_input(opt_ctx->inputs);
     ggml_set_output(opt_ctx->outputs);
@@ -787,6 +877,24 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
 
+    if (need_qat_state && opt_ctx->qat_params.empty()) {
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            struct ggml_tensor * node = opt_ctx->gf->nodes[i];
+            if (!(node->flags & GGML_TENSOR_FLAG_PARAM) ||
+                (node->type != GGML_TYPE_MXFP4 && node->type != GGML_TYPE_Q4_0)) {
+                continue;
+            }
+            ggml_opt_qat_register_param(opt_ctx, node);
+        }
+    }
+
+    if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT) {
+        const int64_t n_opt_params = ggml_opt_optimizer_is_adamw(optimizer) ? 8 : (qlion_qat ? 4 : 2);
+        opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, n_opt_params);
+        ggml_set_input(opt_ctx->opt_step_params);
+        ggml_format_name(opt_ctx->opt_step_params, "%s_params", ggml_opt_optimizer_name(optimizer));
+    }
+
     // Gradient checkpointing: mark every Nth forward node as OUTPUT so the allocator
     // keeps its memory alive through the backward pass.  The backward graph already
     // contains the forward ops (gb_grad is a superset of gf), so the checkpointed
@@ -814,7 +922,28 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
-    ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    if (qlion_qat) {
+        opt_ctx->qat_pending_grads.assign(opt_ctx->qat_params.size(), {});
+        opt_ctx->qat_expected_grads.assign(opt_ctx->qat_params.size(), 0);
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            struct ggml_tensor * node = opt_ctx->gf->nodes[i];
+            if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+            for (size_t state = 0; state < opt_ctx->qat_aliases.size(); ++state) {
+                const auto & aliases = opt_ctx->qat_aliases[state];
+                if (std::find(aliases.begin(), aliases.end(), node) != aliases.end()) {
+                    opt_ctx->qat_expected_grads[state]++;
+                    break;
+                }
+            }
+        }
+        ggml_build_backward_expand_with_callback(
+            opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(),
+            ggml_opt_qlion_qat_backward_callback, opt_ctx);
+    } else {
+        ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    }
 
     if (need_quantized_momenta) {
         const enum ggml_type state_type = ggml_opt_optimizer_state_type(opt_ctx->optimizer);
@@ -874,12 +1003,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
     opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
 
-    opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32,
-        ggml_opt_optimizer_is_adamw(optimizer) ? 8 : 2);
     ggml_tensor * adamw_params = opt_ctx->opt_step_params;
-    ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
-    ggml_format_name(adamw_params, "%s_params", optimizer_name);
     for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
@@ -952,6 +1077,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->fused_backward            = params.fused_backward;
 
     GGML_ASSERT(result->opt_period >= 1);
+    GGML_ASSERT(result->optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT || result->opt_period == 1);
 
     result->static_graphs = result->ctx_compute;
 
@@ -984,6 +1110,12 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     for (struct ggml_context * ctx : opt_ctx->ctxs_momenta) {
         ggml_free(ctx);
     }
+    for (ggml_backend_buffer_t buf : opt_ctx->qat_buffers) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (struct ggml_context * ctx : opt_ctx->qat_contexts) {
+        ggml_free(ctx);
+    }
     ggml_free(opt_ctx->ctx_static);
     ggml_free(opt_ctx->ctx_cpu);
     ggml_free(opt_ctx->ctx_copy);
@@ -999,6 +1131,9 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
         for (ggml_opt_context::quantized_state & state : opt_ctx->quantized_states) {
             std::fill(state.m.begin(), state.m.end(), 0);
             std::fill(state.v.begin(), state.v.end(), 0);
+        }
+        for (ggml_backend_buffer_t buf : opt_ctx->qat_buffers) {
+            ggml_backend_buffer_clear(buf, 0);
         }
         opt_ctx->iter = 1;
     } else {
@@ -1279,6 +1414,19 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 sgd[0] = opt_pars.sgd.alpha;
                 sgd[1] = opt_pars.sgd.wd;
             } break;
+            case GGML_OPT_OPTIMIZER_TYPE_QLION_QAT: {
+                GGML_ASSERT(opt_pars.qlion_qat.alpha > 0.0f);
+                GGML_ASSERT(opt_pars.qlion_qat.beta >= 0.0f);
+                GGML_ASSERT(opt_pars.qlion_qat.beta < 1.0f);
+                GGML_ASSERT(opt_pars.qlion_qat.wd >= 0.0f);
+                GGML_ASSERT(opt_pars.qlion_qat.wd <= 1.0f);
+                GGML_ASSERT(opt_pars.qlion_qat.gclip >= 0.0f);
+                float * qlion_qat = ggml_get_data_f32(opt_ctx->opt_step_params);
+                qlion_qat[0] = opt_pars.qlion_qat.alpha;
+                qlion_qat[1] = opt_pars.qlion_qat.beta;
+                qlion_qat[2] = opt_pars.qlion_qat.wd;
+                qlion_qat[3] = opt_pars.qlion_qat.gclip;
+            } break;
             default:
                 GGML_ABORT("fatal error");
         }
@@ -1549,6 +1697,34 @@ enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t 
     return c->optimizer;
 }
 
+int64_t ggml_opt_qat_state_count(ggml_opt_context_t opt_ctx) {
+    return (int64_t) opt_ctx->qat_params.size();
+}
+
+struct ggml_tensor * ggml_opt_qat_state_param(ggml_opt_context_t opt_ctx, int64_t index) {
+    GGML_ASSERT(index >= 0 && index < (int64_t) opt_ctx->qat_params.size());
+    return opt_ctx->qat_params[index];
+}
+
+struct ggml_tensor * ggml_opt_qat_state_momentum(ggml_opt_context_t opt_ctx, int64_t index) {
+    GGML_ASSERT(index >= 0 && index < (int64_t) opt_ctx->qat_momentum.size());
+    return opt_ctx->qat_momentum[index];
+}
+
+struct ggml_tensor * ggml_opt_qat_state_residual(ggml_opt_context_t opt_ctx, int64_t index) {
+    GGML_ASSERT(index >= 0 && index < (int64_t) opt_ctx->qat_residual.size());
+    return opt_ctx->qat_residual[index];
+}
+
+int64_t ggml_opt_step(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->iter - 1;
+}
+
+void ggml_opt_set_step(ggml_opt_context_t opt_ctx, int64_t step) {
+    GGML_ASSERT(step >= 0);
+    opt_ctx->iter = step + 1;
+}
+
 GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type o) {
     switch (o) {
         case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
@@ -1563,6 +1739,8 @@ GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type o) {
             return "adamw_iq4_nl";
         case GGML_OPT_OPTIMIZER_TYPE_SGD:
             return "sgd";
+        case GGML_OPT_OPTIMIZER_TYPE_QLION_QAT:
+            return "qlion_qat";
         default:
             return "undefined";
     };

@@ -340,6 +340,7 @@ struct ggml_cgraph {
     struct ggml_hash_set visited_hash_set;
 
     enum ggml_cgraph_eval_order order;
+    bool defer_quantized_param_grads;
 
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored

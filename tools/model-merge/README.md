@@ -32,47 +32,57 @@ first selected accelerator. Candidate quantization and GGUF I/O remain on the
 CPU. GPU merge currently applies to Evo only. TIES trimming and sign consensus
 use the CPU implementation.
 
-Evo writes candidates tensor-first: each source tensor is read and decoded once
-per generation, then all candidates are merged, quantized, and written in
-parallel within the memory budget. Quantized output types use the same
-per-tensor policy as `llama-quantize`, including mixed K-quant rules and shape
-fallbacks. Integer and other non-float tensors are copied byte-for-byte after
-the inputs are checked for equality. Candidate generation reports completed
-GB, average GB/min, elapsed time, and ETA while it writes the output tensors.
-In low-memory mode, the best evaluated candidate is promoted directly to the
-final output instead of being merged and quantized a second time.
+Evo creates, evaluates, and releases one complete candidate at a time. Quantized
+output types use the same per-tensor policy as `llama-quantize`, including mixed
+K-quant rules and shape fallbacks. Integer and other non-float tensors are copied
+byte-for-byte after the inputs are checked for equality. Candidate generation
+reports completed GB, average GB/min, elapsed time, and ETA.
 
-`--evo-mode low-mem` keeps this tensor-major flow. It minimizes repeated source
-reads, but stores the whole population until fitness evaluation finishes.
-`--evo-mode ram` is intended for cloud hosts with a large RAM filesystem. Input
-GGUFs remain on their source storage. The merger creates one complete candidate
-at a time on the CPU in a RAM-backed `--temp-dir`, loads it on the selected
-fitness device, records its fitness and genes, and then deletes all candidate
-weights. RAM mode keeps only one candidate in the RAM filesystem. It cannot be
-combined with `--merge-gpu` or multiple fitness devices. After evolution, the
-winner is regenerated once to persistent output from its saved genes.
+`--evo-mode` selects where source and candidate weights live:
+
+- `low-ram`: read sources from storage, write one candidate to `--temp-dir`,
+  evaluate it, delete it, and regenerate the winner to the final output.
+- `ssd-rich`: read sources from storage and write candidates one at a time to an
+  SSD `--temp-dir`. Keep only the best evaluated candidate file and promote it
+  to the final output without regenerating it.
+- `ram-rich`: cache every input GGUF in host RAM, write one candidate at a time
+  to a RAM-backed `--temp-dir`, evaluate and delete it, then regenerate the
+  winner to persistent storage. The full-size preset expects about 180 GB RAM.
+- `normal`: read input GGUFs from SSD, CPU-merge one candidate to a RAM-backed
+  `--temp-dir`, load it for GPU fitness, delete it, and regenerate the winner to
+  persistent storage.
+
+`normal` and `ram-rich` require an explicit `--temp-dir` and use CPU merge.
+`low-ram` and `ssd-rich` may use `--merge-gpu`. All four modes accept
+`--temp-dir`; if it is omitted in a disk mode, the system temporary directory is
+used. All modes evaluate one candidate at a time and accept at most one explicit
+fitness device.
+
+Fitness keeps the selected `--ctx-size` but processes it in smaller logical and
+physical batches. `--eval-batch` defaults to 128 and `--eval-ubatch` defaults to
+64, which leaves graph memory for a 13.8 GiB model on a 16 GiB V100. Lower these
+values if another process uses the GPU; this changes peak memory and throughput,
+not the selected evaluation context window.
+
+The `/mnt/openwebui/AIKAR/evo/merge.sh` V100 recipe uses batch 256 and ubatch
+128. On the 26B-A4B Q4_0 candidate this keeps all 31 layers on the V100 and uses
+about 14.4 GiB at `--ctx-size 1024`. GPU merge memory is released before the
+fitness model is loaded. Set `MERGE_GPU=0` only when CPU merge is preferred.
 
 Fitness uses sparse cross-entropy in the llama compute graph. On a CUDA build,
 the loss stays on the GPU and only one scalar is copied to the host per batch.
 Prompt tokens in `prompt`/`response` and `messages` JSONL records are masked;
 only response tokens affect fitness.
 
-For multiple GPUs, choose one of these modes:
-
-- `--devices CUDA0,CUDA1,...` loads one candidate on each GPU and evaluates
-  candidates concurrently. Use this when one candidate fits on one GPU.
-- Omit `--device` and `--devices` to let llama.cpp split one candidate across
-  all visible GPUs. Use this for a candidate that does not fit on one GPU.
+Use `--device CUDA0` when one candidate fits on one GPU. Omit `--device` and
+`--devices` to let llama.cpp split one candidate across all visible GPUs. The
+four candidate-at-a-time modes do not evaluate replicas concurrently.
 
 `--device` and `--devices` are mutually exclusive. `--seed 0` is a valid,
-deterministic seed. Temporary candidates default to the system temporary
-directory; set `--temp-dir` to fast local storage. The directory needs free
-space for roughly `population * candidate GGUF size` during each generation.
-Later generations can temporarily need one additional candidate file while the
-best result from the previous generation is retained. Before each generation,
-the merger checks free space and keeps a 5% or 2 GB minimum reserve. It reports
-the required and available space before writing if the temp directory is too
-small. Do not use a RAM-backed `/tmp` for large models.
+deterministic seed. The temporary directory needs room for one candidate, plus
+the retained winner in `ssd-rich` mode. Before each candidate, the merger checks
+free space and keeps a 5% or 2 GB minimum reserve. It reports required and
+available space if the directory is too small.
 If compatible checkpoints differ only in `tokenizer.chat_template`, pass
 `--ignore-chat-template`. Tokenizer vocabulary and all other architecture
 metadata remain strictly checked. `messages` calibration records then bypass
@@ -102,18 +112,18 @@ tools/model-merge/runpod-evo.sh build \
 ```
 
 The wrapper discovers visible NVIDIA GPUs, uses all CPU cores, sizes the merge
-worker budget from available RAM, enables GPU merge, and stores generation
-candidates under local `/tmp`. Its default `EVO_DEVICE_MODE=replica` evaluates
-one candidate per GPU. Set `EVO_DEVICE_MODE=split` when the model needs combined
-VRAM:
+worker budget from available RAM, and stores each candidate under local `/tmp`.
+Its default `EVO_MODE=low-ram` uses GPU merge and `EVO_DEVICE_MODE=single` uses
+`CUDA0`. Set `EVO_DEVICE_MODE=split` when the model needs combined VRAM:
 
 ```sh
 EVO_DEVICE_MODE=split POPULATION=8 GENERATIONS=20 \
     tools/model-merge/runpod-evo.sh build BASE OUT CALIB q4_k MODEL_A MODEL_B
 ```
 
-Useful overrides are `THREADS`, `MEMORY_BUDGET`, `POPULATION`, `GENERATIONS`,
-`ELITE_COUNT`, `CTX_SIZE`, `GPU_LAYERS`, and `SEED`.
+Useful overrides are `EVO_MODE`, `EVO_TMPDIR`, `THREADS`, `MEMORY_BUDGET`,
+`POPULATION`, `GENERATIONS`, `ELITE_COUNT`, `CTX_SIZE`, `EVAL_BATCH`,
+`EVAL_UBATCH`, `GPU_LAYERS`, and `SEED`.
 
 Keep source/final GGUFs on `/workspace`, but keep `--temp-dir` on local storage.
 RunPod documents typical standard network-volume throughput as 200-400 MB/s,
@@ -140,9 +150,11 @@ device = CUDA0
 # Or: devices = CUDA0, CUDA1, CUDA2, CUDA3
 merge_gpu = true
 ctx_size = 512
+eval_batch = 128
+eval_ubatch = 64
 threads = 32
 memory_budget = 128G
 temp_dir = /tmp/llama-merge-evo
 ignore_chat_template = true
-evo_mode = ram
+evo_mode = low-ram
 ```

@@ -1364,7 +1364,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (sparse_loss.active) {
+        if (sparse_loss.active && n_outputs > 0) {
             res->add_sparse_loss();
         }
 
@@ -1381,7 +1381,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-        if (sparse_loss.active) {
+        if (sparse_loss.active && n_outputs > 0) {
             GGML_ASSERT(sparse_loss.n_consumed + n_outputs <= sparse_loss.n_targets);
             res->set_sparse_loss_inputs(sparse_loss.targets + sparse_loss.n_consumed, n_outputs);
         }
@@ -1396,7 +1396,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (sparse_loss.active) {
+    if (sparse_loss.active && n_outputs > 0) {
         ggml_tensor * t_loss = res->get_sparse_loss();
         GGML_ASSERT(t_loss != nullptr);
         GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), t_loss) != nullptr);
@@ -3317,20 +3317,33 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
 // training
 //
 
-static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
-    if (!tensor || tensor->type != GGML_TYPE_F32) {
+static void llama_set_param(
+        struct ggml_tensor * tensor,
+        llama_opt_param_filter param_filter,
+        void * userdata,
+        enum ggml_opt_optimizer_type optimizer,
+        ggml_opt_context_t opt_ctx) {
+    if (!tensor) {
+        return;
+    }
+    const bool qat_type = tensor->type == GGML_TYPE_MXFP4 || tensor->type == GGML_TYPE_Q4_0;
+    if ((optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && !qat_type) ||
+        (optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && tensor->type != GGML_TYPE_F32)) {
         return;
     }
     if (!param_filter(tensor, userdata)) {
         return;
     }
-    if (strcmp(tensor->name, "token_embd.weight") == 0) {
+    if (optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && strcmp(tensor->name, "token_embd.weight") == 0) {
         return; // FIXME
     }
     if (strcmp(tensor->name, "rope_freqs.weight") == 0) {
         return; // FIXME
     }
     ggml_set_param(tensor);
+    if (optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+        ggml_opt_qat_register_param(opt_ctx, tensor);
+    }
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
@@ -3435,25 +3448,25 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
 
-  //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
-    llama_set_param(model->type_embd,       param_filter, param_filter_ud);
-    llama_set_param(model->pos_embd,        param_filter, param_filter_ud);
-    llama_set_param(model->tok_norm,        param_filter, param_filter_ud);
-    llama_set_param(model->tok_norm_b,      param_filter, param_filter_ud);
-    llama_set_param(model->output_norm,     param_filter, param_filter_ud);
-    llama_set_param(model->output_norm_b,   param_filter, param_filter_ud);
-    llama_set_param(model->output,          param_filter, param_filter_ud);
-    llama_set_param(model->output_b,        param_filter, param_filter_ud);
-    llama_set_param(model->output_norm_enc, param_filter, param_filter_ud);
-    llama_set_param(model->cls,             param_filter, param_filter_ud);
-    llama_set_param(model->cls_b,           param_filter, param_filter_ud);
-    llama_set_param(model->cls_out,         param_filter, param_filter_ud);
-    llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
-    llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
+    llama_set_param(model->tok_embd,        param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->type_embd,       param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->pos_embd,        param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->tok_norm,        param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->tok_norm_b,      param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->output_norm,     param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->output_norm_b,   param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->output,          param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->output_b,        param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->output_norm_enc, param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->cls,             param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->cls_b,           param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->cls_out,         param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->cls_out_b,       param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->cls_norm,        param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
 
     for (struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
-            llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
+            llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
         }
     }
 }
@@ -4500,6 +4513,36 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 }
 
+int64_t llama_context::opt_qat_state_count() const {
+    GGML_ASSERT(opt_ctx);
+    return ggml_opt_qat_state_count(opt_ctx);
+}
+
+struct ggml_tensor * llama_context::opt_qat_state_param(int64_t index) const {
+    GGML_ASSERT(opt_ctx);
+    return ggml_opt_qat_state_param(opt_ctx, index);
+}
+
+struct ggml_tensor * llama_context::opt_qat_state_momentum(int64_t index) const {
+    GGML_ASSERT(opt_ctx);
+    return ggml_opt_qat_state_momentum(opt_ctx, index);
+}
+
+struct ggml_tensor * llama_context::opt_qat_state_residual(int64_t index) const {
+    GGML_ASSERT(opt_ctx);
+    return ggml_opt_qat_state_residual(opt_ctx, index);
+}
+
+int64_t llama_context::opt_step() const {
+    GGML_ASSERT(opt_ctx);
+    return ggml_opt_step(opt_ctx);
+}
+
+void llama_context::opt_set_step(int64_t step) {
+    GGML_ASSERT(opt_ctx);
+    ggml_opt_set_step(opt_ctx, step);
+}
+
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
 }
@@ -4520,6 +4563,30 @@ void llama_opt_init(struct llama_context * ctx, struct llama_model * model, stru
 
 void llama_opt_reset(struct llama_context * ctx, bool recreate) {
     ctx->opt_reset(recreate);
+}
+
+int64_t llama_opt_qat_state_count(struct llama_context * ctx) {
+    return ctx->opt_qat_state_count();
+}
+
+struct ggml_tensor * llama_opt_qat_state_param(struct llama_context * ctx, int64_t index) {
+    return ctx->opt_qat_state_param(index);
+}
+
+struct ggml_tensor * llama_opt_qat_state_momentum(struct llama_context * ctx, int64_t index) {
+    return ctx->opt_qat_state_momentum(index);
+}
+
+struct ggml_tensor * llama_opt_qat_state_residual(struct llama_context * ctx, int64_t index) {
+    return ctx->opt_qat_state_residual(index);
+}
+
+int64_t llama_opt_step(struct llama_context * ctx) {
+    return ctx->opt_step();
+}
+
+void llama_opt_set_step(struct llama_context * ctx, int64_t step) {
+    ctx->opt_set_step(step);
 }
 
 void llama_opt_dataset_shuffle(

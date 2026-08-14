@@ -200,6 +200,12 @@ struct llama_context {
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
     void opt_reset(bool recreate);
+    int64_t opt_qat_state_count() const;
+    struct ggml_tensor * opt_qat_state_param(int64_t index) const;
+    struct ggml_tensor * opt_qat_state_momentum(int64_t index) const;
+    struct ggml_tensor * opt_qat_state_residual(int64_t index) const;
+    int64_t opt_step() const;
+    void opt_set_step(int64_t step);
     void opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata);
 
     // TODO: more flexible combinations of logical/physical batch size and context size

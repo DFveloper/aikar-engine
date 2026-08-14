@@ -103,6 +103,7 @@ enum llama_example {
     LLAMA_EXAMPLE_DIFFUSION,
     LLAMA_EXAMPLE_FINETUNE,
     LLAMA_EXAMPLE_FINETUNE_QLORA,
+    LLAMA_EXAMPLE_FINETUNE_QAT,
     LLAMA_EXAMPLE_FIT_PARAMS,
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
@@ -642,6 +643,14 @@ struct common_params {
     int32_t critical_warmup_steps = 0;
     float   critical_max_fraction = 1.0f;
     int32_t critical_stats_every = 10;
+
+    // native quantized QAT
+    std::string qat_out = "qat-model.gguf";
+    std::string qat_resume = "";
+    std::string qat_quant_type = "mxfp4";
+    std::string qat_momentum = "q8_0";
+    std::string qat_residual = "q4_0";
+    std::string qat_update_granularity = "tensor";
 
     // grpo training
     bool    grpo_mode              = false; // enable GRPO IPC training loop

@@ -1,0 +1,60 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_blocks;
+    uint n_rows;
+    uint n_expert;
+    uint n_used;
+    uint n_tokens;
+} p;
+
+#if WEIGHT_MXFP4
+layout(binding = 0) readonly buffer W { block_mxfp4 weight[]; };
+#else
+layout(binding = 0) readonly buffer W { block_q4_0 weight[]; };
+#endif
+layout(binding = 1) readonly buffer G { float grad[]; };
+layout(binding = 2) readonly buffer IDS { int ids[]; };
+layout(binding = 3) writeonly buffer D { float dst[]; };
+
+float q4_value(block_q4_0 block, uint lane) {
+    const uint q = lane < 16 ? uint(block.qs[lane]) & 15 : uint(block.qs[lane - 16]) >> 4;
+    return float(block.d) * (float(q) - 8.0);
+}
+
+void main() {
+    init_iq_shmem(uvec3(32, 1, 1));
+    const uint task = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint block = task % p.n_blocks;
+    const uint route = task / p.n_blocks;
+    if (route >= p.n_used * p.n_tokens) {
+        return;
+    }
+    const uint used = route % p.n_used;
+    const uint token = route / p.n_used;
+    const int expert = ids[used + p.n_used * token];
+    if (expert < 0 || expert >= int(p.n_expert)) {
+        dst[block * 32 + lane + p.n_blocks * 32 * route] = 0.0;
+        return;
+    }
+    float sum = 0.0;
+    for (uint row = 0; row < p.n_rows; ++row) {
+        const uint ib = block + p.n_blocks * (row + p.n_rows * uint(expert));
+#if WEIGHT_MXFP4
+        const uint packed = uint(weight[ib].qs[lane & 15]);
+        const uint q = lane < 16 ? packed & 15 : packed >> 4;
+        const float value = e8m0_to_fp32(weight[ib].e) * 0.5 * float(kvalues_mxfp4[q]);
+#else
+        const float value = q4_value(weight[ib], lane);
+#endif
+        sum += value * grad[row + p.n_rows * route];
+    }
+    dst[block * 32 + lane + p.n_blocks * 32 * route] = sum;
+}

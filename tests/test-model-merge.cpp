@@ -91,6 +91,13 @@ int main() {
     check(rejected, "chat template mismatch was not rejected by default");
     validate_metadata_compatibility(a, other_template, true);
 
+    std::vector<uint8_t> disk_tensor;
+    std::vector<uint8_t> cached_tensor;
+    b.read_tensor("blk.0.attn_q.weight", disk_tensor);
+    b.load_into_memory(1, 1);
+    b.read_tensor("blk.0.attn_q.weight", cached_tensor);
+    check(disk_tensor == cached_tensor, "RAM-cached tensor data changed");
+
     nlohmann::json response_message = {
         { "role", "assistant" },
         { "content", "answer" },

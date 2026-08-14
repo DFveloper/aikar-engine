@@ -2,6 +2,40 @@
 
 Native QLoRA + Reward-Weighted SFT training pipeline for quantized GGUF models.
 
+## Native full-parameter QAT (`llama-finetune-qat`)
+
+The QAT trainer updates MXFP4 or Q4_0 model tensors directly. It does not create LoRA adapters or a persistent floating-point master model. Each trainable tensor keeps these authoritative states:
+
+```text
+Q = MXFP4 or Q4_0 model weight
+M = Q8_0 QLion momentum
+R = Q4_0 error-feedback residual
+```
+
+One update decodes a 32-value block from each state, applies the QLion update, requantizes Q, stores `target - dequant(Q)` in R, and requantizes M. Dense parameter gradients are consumed by an in-graph update operation without a persistent full-model gradient accumulator. Routed MoE weights use a fused sparse update from routed activations, upstream gradients, and expert IDs, so `OUT_PROD_ID` does not materialize a full F32 expert gradient. Routed dX reads the native quantized expert weights without a whole-expert F32 transpose.
+
+```bash
+./build/bin/llama-finetune-qat \
+  --model model-mxfp4.gguf \
+  --train-file train.jsonl \
+  --quant-type mxfp4 \
+  --optimizer qlion \
+  --qat-momentum q8_0 \
+  --qat-residual q4_0 \
+  --qat-update-granularity tensor \
+  --qat-out trained-mxfp4.gguf \
+  -c 2048 -b 2048 -ub 2048 \
+  -lr 1e-5 --lr-scheduler cosine --epochs 3
+```
+
+Use `--quant-type q4_0` for an unmixed Q4_0 input model. Periodic checkpoints contain an ordinary inference GGUF plus a sibling `.qat-state.gguf` file with Q8_0 momentum, Q4_0 residual, optimizer step, scheduler step, epoch, and dataset window. Checkpoints are saved at the first packed-context boundary after `--save-every` optimizer steps so resume does not need an in-progress gradient or activation state. Resume with `--qat-resume checkpoint.gguf`. The final `--qat-out` file contains only inference weights.
+
+Both trainers accept `--chat-template-file template.jinja`. The file overrides the template stored in model metadata and is used by every dataset worker.
+
+The initial QAT implementation requires `-b == -ub == -c`. This provides one optimizer update per packed context without allocating a full-model accumulation buffer. Smaller microbatch gradient accumulation is rejected by the QAT optimizer rather than falling back to persistent F32 gradients. Small nonquantized tensors such as normalization weights remain in their model format and are currently frozen.
+
+Raw persistent state is 17.25 bits per weight for MXFP4 and 17.50 bits per weight for Q4_0, before model metadata, activations, and backend workspaces. The V100 CUDA and Vulkan correctness tests cover MXFP4 and Q4_0 state updates, routed MoE dX, and routed MoE optimizer updates. A100 execution has not been measured in this repository environment.
+
 The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). Only freshly-allocated F32 LoRA A/B tensors are trained. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
 
 **Status:** Working. Phase 1 (QLoRA SFT) and Phase 2 (Reward-Weighted SFT) are implemented and functional. Training speed is currently limited by full backprop through quantized weights — see [Known Limitations](#known-limitations).
@@ -94,6 +128,7 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--model` | *(required)* | Path to quantized GGUF model |
 | `--train-file` | *(required)* | JSONL training dataset |
 | `-dthr` / `--dataset-threads` | physical CPU cores | JSONL parse, template, and tokenization worker threads |
+| `--chat-template-file` | model metadata | Jinja template file used by every dataset worker |
 | `--lora-rank` | `16` | LoRA rank r |
 | `--lora-alpha` | `0` (= rank) | LoRA alpha; effective scale = alpha/rank |
 | `--lora-targets` | see below | Comma-separated internal tensor name substrings |

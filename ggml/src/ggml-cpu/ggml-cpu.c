@@ -1841,6 +1841,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            {
+                ggml_compute_forward_mul_mat_id_back(params, tensor);
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2121,6 +2125,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_OPT_STEP_QLION_QAT:
+            {
+                ggml_compute_forward_opt_step_qlion_qat(params, tensor);
+            }
+            break;
+        case GGML_OP_OPT_STEP_QLION_QAT_ID:
+            {
+                ggml_compute_forward_opt_step_qlion_qat_id(params, tensor);
+            }
+            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2337,6 +2351,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_BACK:
         case GGML_OP_OUT_PROD:
         case GGML_OP_OUT_PROD_ID:
             {
@@ -2469,6 +2484,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_OPT_STEP_QLION_QAT:
+        case GGML_OP_OPT_STEP_QLION_QAT_ID:
             {
                 n_tasks = n_threads;
             } break;

@@ -257,3 +257,70 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             &beta_acc,  d_base + e*dst_stride_e, (int)cols));
     }
 }
+
+static __device__ __forceinline__ float q4_0_get(const block_q4_0 & block, int lane) {
+    const uint8_t packed = block.qs[lane & 15];
+    const int q = lane < 16 ? packed & 0x0f : packed >> 4;
+    return __half2float(block.d) * (q - 8);
+}
+
+static __device__ __forceinline__ float mxfp4_get(const block_mxfp4 & block, int lane) {
+    const uint8_t packed = block.qs[lane & 15];
+    const int q = lane < 16 ? packed & 0x0f : packed >> 4;
+    return ggml_cuda_e8m0_to_fp32(block.e) * 0.5f * kvalues_mxfp4[q];
+}
+
+template<bool mxfp4>
+static __global__ void mul_mat_id_back_q4(
+        const void * weight_data,
+        const float * grad,
+        const int32_t * ids,
+        float * dst,
+        int64_t n_blocks,
+        int64_t n_rows,
+        int64_t n_expert,
+        int64_t n_used,
+        int64_t n_tokens) {
+    const int64_t task = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int64_t block = task % n_blocks;
+    const int64_t route = task / n_blocks;
+    if (route >= n_used * n_tokens) {
+        return;
+    }
+    const int64_t used = route % n_used;
+    const int64_t token = route / n_used;
+    const int32_t expert = ids[used + n_used * token];
+    if (expert < 0 || expert >= n_expert) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int64_t row = 0; row < n_rows; ++row) {
+        const int64_t ib = block + n_blocks * (row + n_rows * expert);
+        const float value = mxfp4
+            ? mxfp4_get(((const block_mxfp4 *) weight_data)[ib], lane)
+            : q4_0_get(((const block_q4_0 *) weight_data)[ib], lane);
+        sum += value * grad[row + n_rows * (used + n_used * token)];
+    }
+    dst[block * 32 + lane + n_blocks * 32 * (used + n_used * token)] = sum;
+}
+
+void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids) && ggml_is_contiguous(dst));
+    const int64_t n_blocks = weight->ne[0] / 32;
+    const int64_t n_tasks = n_blocks * grad->ne[1] * grad->ne[2];
+    if (weight->type == GGML_TYPE_MXFP4) {
+        mul_mat_id_back_q4<true><<<n_tasks, 32, 0, ctx.stream()>>>(
+            weight->data, (const float *) grad->data, (const int32_t *) ids->data, (float *) dst->data,
+            n_blocks, weight->ne[1], weight->ne[2], grad->ne[1], grad->ne[2]);
+    } else {
+        mul_mat_id_back_q4<false><<<n_tasks, 32, 0, ctx.stream()>>>(
+            weight->data, (const float *) grad->data, (const int32_t *) ids->data, (float *) dst->data,
+            n_blocks, weight->ne[1], weight->ne[2], grad->ne[1], grad->ne[2]);
+    }
+}

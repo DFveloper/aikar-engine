@@ -817,6 +817,7 @@ void process_shaders() {
     string_to_spv("contig_cpy_i32_f32", "contig_copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
     string_to_spv("contig_cpy_f32_f16", "contig_copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     string_to_spv("contig_cpy_f16_f16", "contig_copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
+    string_to_spv("contig_cpy_u8_u8", "contig_copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
     string_to_spv("contig_cpy_f16_f32", "contig_copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
     string_to_spv("contig_cpy_f32_bf16","contig_copy.comp",{{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
     string_to_spv("contig_cpy_bf16_f32","contig_copy.comp",{{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
@@ -1070,6 +1071,12 @@ void process_shaders() {
     string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+    string_to_spv("opt_step_qlion_qat_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}}));
+    string_to_spv("opt_step_qlion_qat_q4_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}}));
+    string_to_spv("opt_step_qlion_qat_id_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}, {"ROUTED", "1"}}));
+    string_to_spv("opt_step_qlion_qat_id_q4_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}, {"ROUTED", "1"}}));
+    string_to_spv("mul_mat_id_back_mxfp4", "mul_mat_id_back.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}}));
+    string_to_spv("mul_mat_id_back_q4_0", "mul_mat_id_back.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", {});
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", {});

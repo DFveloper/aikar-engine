@@ -873,6 +873,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
             } break;
+            case GGML_OP_MUL_MAT_ID_BACK:
+            case GGML_OP_OUT_PROD_ID:
             case GGML_OP_OUT_PROD: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1004,6 +1006,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_OPT_STEP_ADAMW:
             case GGML_OP_OPT_STEP_SGD:
+            case GGML_OP_OPT_STEP_QLION_QAT:
+            case GGML_OP_OPT_STEP_QLION_QAT_ID:
             case GGML_OP_GLU:
             case GGML_OP_GLU_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);

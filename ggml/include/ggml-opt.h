@@ -90,6 +90,7 @@ extern "C" {
         GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q6_K,
         GGML_OPT_OPTIMIZER_TYPE_ADAMW_IQ4_NL,
         GGML_OPT_OPTIMIZER_TYPE_SGD,
+        GGML_OPT_OPTIMIZER_TYPE_QLION_QAT,
 
         GGML_OPT_OPTIMIZER_TYPE_COUNT
     };
@@ -108,6 +109,12 @@ extern "C" {
             float alpha; // learning rate
             float wd;    // weight decay
         } sgd;
+        struct {
+            float alpha; // learning rate
+            float beta;  // momentum
+            float wd;    // weight decay
+            float gclip; // element-wise gradient clipping threshold - 0.0f to disable
+        } qlion_qat;
     };
 
     // callback to calculate optimizer parameters prior to a backward pass
@@ -196,6 +203,14 @@ extern "C" {
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);
+
+    GGML_API int64_t ggml_opt_qat_state_count(ggml_opt_context_t opt_ctx);
+    GGML_API void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor * param);
+    GGML_API struct ggml_tensor * ggml_opt_qat_state_param(ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor * ggml_opt_qat_state_momentum(ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor * ggml_opt_qat_state_residual(ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API int64_t ggml_opt_step(ggml_opt_context_t opt_ctx);
+    GGML_API void ggml_opt_set_step(ggml_opt_context_t opt_ctx, int64_t step);
 
     // ====== Optimization Result ======
 

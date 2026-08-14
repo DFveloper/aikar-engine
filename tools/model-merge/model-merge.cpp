@@ -47,12 +47,14 @@ struct merge_params {
     std::vector<std::string> devices;
     bool merge_gpu = false;
     int context_size = 512;
+    int eval_batch = 128;
+    int eval_ubatch = 64;
     float mutation = 0.10f;
     uint32_t seed = 0;
     bool seed_set = false;
     std::string temp_dir;
     bool ignore_chat_template = false;
-    std::string evo_mode = "low-mem";
+    std::string evo_mode = "low-ram";
 };
 
 static void usage(const char * executable) {
@@ -74,12 +76,14 @@ static void usage(const char * executable) {
     printf("  --seed N                      Evo random seed (default: random)\n");
     printf("  --gpu-layers N                layers offloaded for fitness; -1 means all (default: -1)\n");
     printf("  --device NAME                 fitness backend device, e.g. CUDA0 or Vulkan0\n");
-    printf("  --devices LIST                evaluate candidates concurrently, one per comma-separated device\n");
+    printf("  --devices LIST                fitness device list; candidate-at-a-time modes accept one device\n");
     printf("  --merge-gpu                  run Evo weighted merge math on the selected GPU\n");
     printf("  --ctx-size N                  fitness context size (default: 512)\n");
+    printf("  --eval-batch N                fitness logical batch size (default: 128)\n");
+    printf("  --eval-ubatch N               fitness physical microbatch size (default: 64)\n");
     printf("  --temp-dir DIR                local directory for Evo candidate files (default: system temp)\n");
     printf("  --ignore-chat-template        allow input models with different tokenizer.chat_template metadata\n");
-    printf("  --evo-mode MODE               candidate flow: low-mem or ram (default: low-mem)\n");
+    printf("  --evo-mode MODE               candidate flow: low-ram, ssd-rich, ram-rich, or normal (default: low-ram)\n");
     printf("  --config FILE                 INI file: base=, models=comma,separated, output=, method=, density=, threads=, memory_budget=\n");
 }
 
@@ -202,6 +206,10 @@ static void load_config(const std::string & path, merge_params & params) {
             params.merge_gpu = parse_bool(value);
         } else if (key == "ctx_size") {
             params.context_size = std::stoi(value);
+        } else if (key == "eval_batch") {
+            params.eval_batch = std::stoi(value);
+        } else if (key == "eval_ubatch") {
+            params.eval_ubatch = std::stoi(value);
         } else if (key == "temp_dir") {
             params.temp_dir = value;
         } else if (key == "ignore_chat_template") {
@@ -265,6 +273,10 @@ static merge_params parse_args(int argc, char ** argv) {
             params.merge_gpu = true;
         } else if (arg == "--ctx-size" && i + 1 < argc) {
             params.context_size = std::stoi(argv[++i]);
+        } else if (arg == "--eval-batch" && i + 1 < argc) {
+            params.eval_batch = std::stoi(argv[++i]);
+        } else if (arg == "--eval-ubatch" && i + 1 < argc) {
+            params.eval_ubatch = std::stoi(argv[++i]);
         } else if (arg == "--temp-dir" && i + 1 < argc) {
             params.temp_dir = argv[++i];
         } else if (arg == "--ignore-chat-template") {
@@ -292,20 +304,23 @@ static merge_params parse_args(int argc, char ** argv) {
             throw std::runtime_error("evo requires --calibration and --target-type");
         }
         if (params.population < 2 || params.generations < 1 || params.elite_count < 1 ||
-                params.elite_count >= params.population || params.mutation <= 0.0f || params.context_size < 2) {
+                params.elite_count >= params.population || params.mutation <= 0.0f || params.context_size < 2 ||
+                params.eval_batch < 1 || params.eval_batch > params.context_size ||
+                params.eval_ubatch < 1 || params.eval_ubatch > params.eval_batch) {
             throw std::runtime_error("invalid Evo population, generation, elite, sigma, or context setting");
         }
-        if (params.evo_mode != "low-mem" && params.evo_mode != "ram") {
-            throw std::runtime_error("--evo-mode must be low-mem or ram");
+        if (params.evo_mode != "low-ram" && params.evo_mode != "ssd-rich" &&
+                params.evo_mode != "ram-rich" && params.evo_mode != "normal") {
+            throw std::runtime_error("--evo-mode must be low-ram, ssd-rich, ram-rich, or normal");
         }
-        if (params.evo_mode == "ram" && params.merge_gpu) {
-            throw std::runtime_error("--evo-mode ram uses CPU merge and cannot be combined with --merge-gpu");
+        if ((params.evo_mode == "ram-rich" || params.evo_mode == "normal") && params.merge_gpu) {
+            throw std::runtime_error("--evo-mode ram-rich and normal use CPU merge and cannot be combined with --merge-gpu");
         }
-        if (params.evo_mode == "ram" && params.devices.size() > 1) {
-            throw std::runtime_error("--evo-mode ram accepts at most one fitness device");
+        if (params.devices.size() > 1) {
+            throw std::runtime_error("Evo candidate-at-a-time modes accept at most one fitness device");
         }
-        if (params.evo_mode == "ram" && params.temp_dir.empty()) {
-            throw std::runtime_error("--evo-mode ram requires --temp-dir on a RAM-backed filesystem");
+        if ((params.evo_mode == "ram-rich" || params.evo_mode == "normal") && params.temp_dir.empty()) {
+            throw std::runtime_error("--evo-mode ram-rich and normal require --temp-dir on a RAM-backed filesystem");
         }
     }
     if (params.merge_gpu && params.method != "evo") {
@@ -392,6 +407,7 @@ static bool is_compatibility_key(
 }
 
 struct gguf_input;
+static std::string format_duration(double seconds);
 static void validate_metadata_compatibility(
         const gguf_input & base,
         const gguf_input & input,
@@ -413,6 +429,7 @@ struct gguf_input {
     std::string path;
     mutable std::ifstream file;
     mutable std::mutex mutex;
+    std::vector<uint8_t> cached_file;
     ggml_context * ctx = nullptr;
     gguf_context * gguf = nullptr;
     std::map<std::string, tensor_ref> tensors;
@@ -443,6 +460,49 @@ struct gguf_input {
         ggml_free(ctx);
     }
 
+    void load_into_memory(size_t index, size_t count) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::error_code size_error;
+        const uintmax_t file_size = std::filesystem::file_size(path, size_error);
+        if (size_error || file_size > SIZE_MAX) {
+            throw std::runtime_error("failed to determine input GGUF size " + path);
+        }
+        try {
+            cached_file.resize((size_t) file_size);
+        } catch (const std::bad_alloc &) {
+            throw std::runtime_error("not enough host RAM to cache input GGUF " + path);
+        }
+        file.clear();
+        file.seekg(0);
+        const size_t chunk_size = 256ull * 1024 * 1024;
+        size_t completed = 0;
+        const auto start = std::chrono::steady_clock::now();
+        auto last_report = start - std::chrono::seconds(5);
+        while (completed < cached_file.size()) {
+            const size_t chunk = std::min(chunk_size, cached_file.size() - completed);
+            file.read((char *) cached_file.data() + completed, chunk);
+            if (!file) {
+                cached_file.clear();
+                throw std::runtime_error("failed to cache input GGUF " + path);
+            }
+            completed += chunk;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_report >= std::chrono::seconds(5) || completed == cached_file.size()) {
+                last_report = now;
+                const double elapsed = std::chrono::duration<double>(now - start).count();
+                const double rate = elapsed > 0.0 ? completed / 1e9 * 60.0 / elapsed : 0.0;
+                const double eta = completed > 0 && completed < cached_file.size()
+                    ? elapsed * (cached_file.size() - completed) / completed
+                    : 0.0;
+                printf("evo RAM cache: input %zu/%zu, %.2f/%.2f GB, %.2f GB/min, elapsed %s, ETA %s\n",
+                        index, count, completed / 1e9, cached_file.size() / 1e9, rate,
+                        format_duration(elapsed).c_str(), format_duration(eta).c_str());
+                fflush(stdout);
+            }
+        }
+        file.close();
+    }
+
     void read_tensor(const std::string & name, std::vector<uint8_t> & data) const {
         const auto it = tensors.find(name);
         if (it == tensors.end()) {
@@ -465,11 +525,19 @@ struct gguf_input {
         }
         const int tensor_index = gguf_find_tensor(gguf, name.c_str());
         const size_t offset = gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, tensor_index);
-        file.clear();
-        file.seekg(offset + tensor_offset);
-        file.read((char *) data, size);
-        if (!file) {
-            throw std::runtime_error("failed to read tensor '" + name + "' from " + path);
+        const size_t source_offset = offset + tensor_offset;
+        if (!cached_file.empty()) {
+            if (source_offset > cached_file.size() || size > cached_file.size() - source_offset) {
+                throw std::runtime_error("cached tensor read is out of bounds for '" + name + "'");
+            }
+            memcpy(data, cached_file.data() + source_offset, size);
+        } else {
+            file.clear();
+            file.seekg(source_offset);
+            file.read((char *) data, size);
+            if (!file) {
+                throw std::runtime_error("failed to read tensor '" + name + "' from " + path);
+            }
         }
     }
 };
@@ -1370,55 +1438,80 @@ static double evaluate_candidate(
     }
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = params.context_size;
-    context_params.n_batch = params.context_size;
-    context_params.n_ubatch = params.context_size;
+    context_params.n_batch = params.eval_batch;
+    context_params.n_ubatch = params.eval_ubatch;
     context_params.n_threads = fitness_threads;
     context_params.n_threads_batch = fitness_threads;
     std::unique_ptr<llama_context, decltype(&llama_free)> context(
             llama_init_from_model(model.get(), context_params), llama_free);
     if (!context) {
-        throw std::runtime_error("failed to create Evo fitness context");
+        throw std::runtime_error(
+                "failed to create Evo fitness context with ctx=" + std::to_string(params.context_size) +
+                ", batch=" + std::to_string(params.eval_batch) +
+                ", ubatch=" + std::to_string(params.eval_ubatch));
     }
+    printf("evo fitness: ctx %d, batch %d, ubatch %d, GPU layers %d\n",
+            params.context_size, params.eval_batch, params.eval_ubatch, params.gpu_layers);
 
     double total_nll = 0.0;
     size_t total_tokens = 0;
     for (const calibration_sample & sample : samples) {
         const std::vector<llama_token> & tokens = sample.tokens;
         for (size_t begin = 0; begin + 1 < tokens.size();) {
-            const size_t count = std::min<size_t>(params.context_size, tokens.size() - begin);
-            std::vector<llama_token> targets;
-            for (size_t i = 0; i + 1 < count; ++i) {
-                if (begin + i + 1 >= sample.loss_begin) targets.push_back(tokens[begin + i + 1]);
-            }
-            if (targets.empty()) {
-                begin += count > 1 ? count - 1 : count;
-                continue;
-            }
-            llama_batch batch = llama_batch_init(count, 0, 1);
-            batch.n_tokens = count;
-            for (size_t i = 0; i < count; ++i) {
-                batch.token[i] = tokens[begin + i];
-                batch.pos[i] = i;
-                batch.n_seq_id[i] = 1;
-                batch.seq_id[i][0] = 0;
-                batch.logits[i] = i + 1 < count && begin + i + 1 >= sample.loss_begin;
-            }
+            const size_t window_count = std::min<size_t>(params.context_size, tokens.size() - begin);
             llama_memory_clear(llama_get_memory(context.get()), true);
-            float batch_nll = 0.0f;
-            if (llama_decode_sparse_cross_entropy(context.get(), batch, targets.data(), targets.size(), &batch_nll) != 0) {
+            const size_t window_end = begin + window_count;
+            for (size_t cursor = begin; cursor + 1 < window_end;) {
+                const size_t count = std::min<size_t>(params.eval_batch, window_end - cursor);
+                std::vector<llama_token> targets;
+                llama_batch batch = llama_batch_init(count, 0, 1);
+                batch.n_tokens = count;
+                for (size_t i = 0; i < count; ++i) {
+                    const size_t token_index = cursor + i;
+                    const size_t target_index = token_index + 1;
+                    batch.token[i] = tokens[token_index];
+                    batch.pos[i] = token_index - begin;
+                    batch.n_seq_id[i] = 1;
+                    batch.seq_id[i][0] = 0;
+                    batch.logits[i] = target_index < window_end && target_index >= sample.loss_begin;
+                    if (batch.logits[i]) {
+                        targets.push_back(tokens[target_index]);
+                    }
+                }
+                int status = 0;
+                float batch_nll = 0.0f;
+                if (targets.empty()) {
+                    status = llama_decode(context.get(), batch);
+                } else {
+                    status = llama_decode_sparse_cross_entropy(
+                            context.get(), batch, targets.data(), targets.size(), &batch_nll);
+                }
                 llama_batch_free(batch);
-                throw std::runtime_error("sparse cross-entropy decode failed during Evo fitness evaluation");
+                if (status != 0) {
+                    throw std::runtime_error(
+                            "Evo fitness decode failed with ctx=" + std::to_string(params.context_size) +
+                            ", batch=" + std::to_string(params.eval_batch) +
+                            ", ubatch=" + std::to_string(params.eval_ubatch));
+                }
+                total_nll += (double) batch_nll*targets.size();
+                total_tokens += targets.size();
+                cursor += count;
             }
-            total_nll += (double) batch_nll*targets.size();
-            total_tokens += targets.size();
-            llama_batch_free(batch);
-            begin += count > 1 ? count - 1 : count;
+            begin += window_count > 1 ? window_count - 1 : window_count;
         }
     }
     if (total_tokens == 0) {
         throw std::runtime_error("calibration data produced fewer than two tokens");
     }
     return total_nll / total_tokens;
+}
+
+static void remove_evo_file(const std::string & path) {
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    if (error) {
+        throw std::runtime_error("failed to remove Evo candidate '" + path + "': " + error.message());
+    }
 }
 
 static void run_evo(const merge_params & params, const std::vector<std::unique_ptr<gguf_input>> & inputs) {
@@ -1491,34 +1584,42 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
             }
             fitness_devices.push_back(device);
         }
-        const size_t n_eval_workers = fitness_devices.empty()
-            ? 1
-            : std::min<size_t>(fitness_devices.size(), params.population);
-        const int fitness_threads = std::max(1, params.n_threads / (int) n_eval_workers);
-        if (fitness_devices.size() > 1) {
-            printf("evo: %zu concurrent fitness devices, %d host threads each\n", n_eval_workers, fitness_threads);
-        }
+        const int fitness_threads = params.n_threads;
 
+        ggml_backend_dev_t merge_device = nullptr;
         if (params.merge_gpu) {
-            ggml_backend_dev_t device = !fitness_devices.empty()
+            merge_device = !fitness_devices.empty()
                 ? fitness_devices[0]
                 : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-            if (!device || (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU &&
-                            ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_IGPU &&
-                            ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_ACCEL)) {
+            if (!merge_device || (ggml_backend_dev_type(merge_device) != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                            ggml_backend_dev_type(merge_device) != GGML_BACKEND_DEVICE_TYPE_IGPU &&
+                            ggml_backend_dev_type(merge_device) != GGML_BACKEND_DEVICE_TYPE_ACCEL)) {
                 throw std::runtime_error("--merge-gpu requires a GPU or accelerator device");
             }
-            merge_backend = ggml_backend_dev_init(device, nullptr);
-            if (!merge_backend) {
-                throw std::runtime_error("failed to initialize merge device " + std::string(ggml_backend_dev_name(device)));
-            }
-            printf("evo: GPU merge device %s (%s)\n", ggml_backend_dev_name(device), ggml_backend_dev_description(device));
         }
+        auto start_merge_backend = [&]() {
+            merge_backend = ggml_backend_dev_init(merge_device, nullptr);
+            if (!merge_backend) {
+                throw std::runtime_error(
+                        "failed to initialize merge device " + std::string(ggml_backend_dev_name(merge_device)));
+            }
+            printf("evo: GPU merge device %s (%s)\n",
+                    ggml_backend_dev_name(merge_device), ggml_backend_dev_description(merge_device));
+        };
 
         const std::filesystem::path temp_dir = params.temp_dir.empty()
             ? std::filesystem::temp_directory_path()
             : std::filesystem::path(params.temp_dir);
         std::filesystem::create_directories(temp_dir);
+        if (params.evo_mode == "ram-rich") {
+            printf("evo ram-rich: caching %zu input GGUF files in host RAM\n", inputs.size());
+            for (size_t input = 0; input < inputs.size(); ++input) {
+                inputs[input]->load_into_memory(input + 1, inputs.size());
+            }
+        }
+
+        const bool retain_winner_file = params.evo_mode == "ssd-rich";
+        const ggml_backend_dev_t fitness_device = fitness_devices.empty() ? nullptr : fitness_devices[0];
         const uint32_t run_id = std::random_device{}();
         for (int generation = 0; generation < params.generations; ++generation) {
             std::vector<evo_candidate> population(params.population);
@@ -1531,76 +1632,54 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
                 normalize_genes(population[candidate], n_gene_tensors, inputs.size());
             }
 
-            temporary_paths.clear();
-            temporary_paths.reserve(population.size());
+            printf("evo generation %d/%d: %s, one candidate at a time (%zu candidates)\n",
+                    generation + 1, params.generations, params.evo_mode.c_str(), population.size());
             for (size_t candidate = 0; candidate < population.size(); ++candidate) {
                 const std::string filename = "llama-merge-" + std::to_string(run_id) + "-g" +
                     std::to_string(generation) + "-c" + std::to_string(candidate) + ".gguf";
-                temporary_paths.push_back((temp_dir / filename).string());
-            }
-            const std::vector<std::string> candidate_paths = temporary_paths;
-            if (params.evo_mode == "ram") {
-                printf("evo generation %d/%d: one RAM candidate at a time, CPU merge then GPU fitness (%zu candidates)\n",
-                        generation + 1, params.generations, population.size());
-                const ggml_backend_dev_t fitness_device = fitness_devices.empty() ? nullptr : fitness_devices[0];
-                for (size_t candidate = 0; candidate < population.size(); ++candidate) {
-                    const std::string candidate_path = candidate_paths[candidate];
-                    temporary_paths = { candidate_path };
-                    printf("evo generation %d candidate %zu/%zu: CPU merging\n",
+                const std::string candidate_path = (temp_dir / filename).string();
+                temporary_paths = { candidate_path };
+                printf("evo generation %d candidate %zu/%zu: %s merging to %s\n",
+                        generation + 1, candidate + 1, population.size(),
+                        merge_device ? "GPU" : "CPU", candidate_path.c_str());
+                if (merge_device) {
+                    start_merge_backend();
+                }
+                write_evo_candidates(
+                        { candidate_path }, params, inputs, tensor_names, { population[candidate] },
+                        gene_offsets, output_types, target_ftype, merge_backend);
+                if (merge_backend) {
+                    ggml_backend_free(merge_backend);
+                    merge_backend = nullptr;
+                    printf("evo generation %d candidate %zu/%zu: GPU merge memory released\n",
                             generation + 1, candidate + 1, population.size());
-                    write_evo_candidates(
-                            { candidate_path }, params, inputs, tensor_names, { population[candidate] },
-                            gene_offsets, output_types, target_ftype, nullptr);
-                    printf("evo generation %d candidate %zu/%zu: loading for fitness\n",
-                            generation + 1, candidate + 1, population.size());
-                    population[candidate].fitness = evaluate_candidate(
-                            candidate_path, params, calibration, fitness_device, fitness_threads);
-                    if (!std::isfinite(population[candidate].fitness)) {
-                        population[candidate].fitness = INFINITY;
+                }
+                printf("evo generation %d candidate %zu/%zu: loading for GPU fitness\n",
+                        generation + 1, candidate + 1, population.size());
+                population[candidate].fitness = evaluate_candidate(
+                        candidate_path, params, calibration, fitness_device, fitness_threads);
+                if (!std::isfinite(population[candidate].fitness)) {
+                    population[candidate].fitness = INFINITY;
+                }
+                printf("evo generation %d candidate %zu: nll %.6f ppl %.6f\n",
+                        generation + 1, candidate + 1, population[candidate].fitness,
+                        std::exp(population[candidate].fitness));
+                if (population[candidate].fitness < best.fitness) {
+                    if (retain_winner_file && !best_path.empty()) {
+                        remove_evo_file(best_path);
                     }
-                    printf("evo generation %d candidate %zu: nll %.6f ppl %.6f\n",
-                            generation + 1, candidate + 1, population[candidate].fitness,
-                            std::exp(population[candidate].fitness));
-                    if (population[candidate].fitness < best.fitness) {
-                        best = population[candidate];
+                    best = population[candidate];
+                    if (retain_winner_file) {
+                        best_path = candidate_path;
+                        printf("evo generation %d candidate %zu: cached as SSD winner\n",
+                                generation + 1, candidate + 1);
+                    } else {
                         printf("evo generation %d candidate %zu: fitness and genes retained as global winner\n",
                                 generation + 1, candidate + 1);
                     }
-                    std::remove(candidate_path.c_str());
-                    temporary_paths.clear();
                 }
-            } else {
-                printf("evo generation %d/%d: low-mem tensor-major merge of %zu candidates\n",
-                        generation + 1, params.generations, population.size());
-                write_evo_candidates(
-                        temporary_paths, params, inputs, tensor_names, population, gene_offsets, output_types, target_ftype, merge_backend);
-
-                common_jsonl_worker_pool eval_pool(n_eval_workers);
-                eval_pool.parallel_for(population.size(), [&](size_t candidate, size_t worker) {
-                    const ggml_backend_dev_t device = fitness_devices.empty() ? nullptr : fitness_devices[worker];
-                    population[candidate].fitness = evaluate_candidate(
-                            temporary_paths[candidate], params, calibration, device, fitness_threads);
-                    if (!std::isfinite(population[candidate].fitness)) {
-                        population[candidate].fitness = INFINITY;
-                    }
-                });
-                const size_t best_index = std::min_element(
-                        population.begin(), population.end(), [](const evo_candidate & a, const evo_candidate & b) {
-                            return a.fitness < b.fitness;
-                        }) - population.begin();
-                if (!std::isfinite(population[best_index].fitness)) {
-                    throw std::runtime_error("all Evo candidates produced non-finite fitness");
-                }
-                if (best.genes.empty() || population[best_index].fitness < best.fitness) {
-                    if (!best_path.empty()) std::remove(best_path.c_str());
-                    best = population[best_index];
-                    best_path = temporary_paths[best_index];
-                }
-                for (size_t candidate = 0; candidate < population.size(); ++candidate) {
-                    printf("evo generation %d candidate %d: nll %.6f ppl %.6f\n",
-                            generation + 1, (int) candidate + 1, population[candidate].fitness,
-                            std::exp(population[candidate].fitness));
-                    if (temporary_paths[candidate] != best_path) std::remove(temporary_paths[candidate].c_str());
+                if (candidate_path != best_path) {
+                    remove_evo_file(candidate_path);
                 }
                 temporary_paths.clear();
             }
@@ -1637,12 +1716,15 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
             sigma = std::max(0.005f, std::min(1.0f, (float) (sigma * std::exp(0.2 * (normalized_step - 1.0)))));
             printf("evo generation %d CMA-ES sigma %.6f\n", generation + 1, sigma);
         }
-        if (params.evo_mode == "ram") {
+        if (!retain_winner_file) {
             printf("evo final: regenerating winner to %s (nll %.6f, ppl %.6f, seed %u)\n",
                     params.output.c_str(), best.fitness, std::exp(best.fitness), seed);
+            if (merge_device) {
+                start_merge_backend();
+            }
             write_evo_candidates(
                     { params.output }, params, inputs, tensor_names, { best }, gene_offsets,
-                    output_types, target_ftype, nullptr);
+                    output_types, target_ftype, merge_backend);
         } else {
             printf("evo final: promoting evaluated candidate to %s (nll %.6f, ppl %.6f, seed %u)\n",
                     params.output.c_str(), best.fitness, std::exp(best.fitness), seed);
@@ -1651,15 +1733,16 @@ static void run_evo(const merge_params & params, const std::vector<std::unique_p
             if (rename_error) {
                 std::filesystem::copy_file(
                         best_path, params.output, std::filesystem::copy_options::overwrite_existing);
-                std::remove(best_path.c_str());
+                remove_evo_file(best_path);
             }
             best_path.clear();
         }
         if (merge_backend) ggml_backend_free(merge_backend);
         llama_backend_free();
     } catch (...) {
-        for (const std::string & path : temporary_paths) std::remove(path.c_str());
-        if (!best_path.empty()) std::remove(best_path.c_str());
+        std::error_code cleanup_error;
+        for (const std::string & path : temporary_paths) std::filesystem::remove(path, cleanup_error);
+        if (!best_path.empty()) std::filesystem::remove(best_path, cleanup_error);
         if (merge_backend) ggml_backend_free(merge_backend);
         llama_backend_free();
         throw;

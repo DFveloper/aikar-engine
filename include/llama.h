@@ -1701,6 +1701,12 @@ extern "C" {
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
     // When recreate is true, drop optimizer state while preserving model weights.
     LLAMA_API void llama_opt_reset(struct llama_context * lctx, bool recreate);
+    LLAMA_API int64_t llama_opt_qat_state_count(struct llama_context * lctx);
+    LLAMA_API struct ggml_tensor * llama_opt_qat_state_param(struct llama_context * lctx, int64_t index);
+    LLAMA_API struct ggml_tensor * llama_opt_qat_state_momentum(struct llama_context * lctx, int64_t index);
+    LLAMA_API struct ggml_tensor * llama_opt_qat_state_residual(struct llama_context * lctx, int64_t index);
+    LLAMA_API int64_t llama_opt_step(struct llama_context * lctx);
+    LLAMA_API void llama_opt_set_step(struct llama_context * lctx, int64_t step);
 
     // Shuffle the first idata dataset entries with the optimizer RNG, or all entries if idata is negative.
     LLAMA_API void llama_opt_dataset_shuffle(

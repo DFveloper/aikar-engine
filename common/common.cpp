@@ -2053,6 +2053,9 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char * n) {
     if (eq_case_insensitive("sgd", n)) {
         return GGML_OPT_OPTIMIZER_TYPE_SGD;
     }
+    if (eq_case_insensitive("qlion", n) || eq_case_insensitive("qlion_qat", n)) {
+        return GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    }
     return GGML_OPT_OPTIMIZER_TYPE_COUNT;
 }
 
