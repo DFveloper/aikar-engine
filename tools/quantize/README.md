@@ -66,6 +66,19 @@ Advanced options:
 * `--prune-layers` prune (remove) the layers in the list
 * `--override-kv` option to override model metadata by key in the quantized model. May be specified multiple times.
 
+### MXFP4
+
+`MXFP4` applies block-scaled 4-bit floating-point quantization to every eligible dense and MoE matrix. One-dimensional tensors, normalization weights, routing gates, and other tensors excluded by the normal quantization policy keep their original type. `MXFP4_MOE` is accepted as a compatibility alias and has the same unified behavior.
+
+```bash
+./build/bin/llama-quantize \
+  gemma-4-E2B-it-bf16.gguf \
+  gemma-4-E2B-it-mxfp4.gguf \
+  MXFP4
+```
+
+F16 and BF16 input matrices are converted with a 64 MiB F32 row-chunk target, with at least one complete row per chunk. The output buffer is sized to the actual quantized tensor instead of the uncompressed F32 size. This prevents large embeddings and output matrices from requiring two full F32-size temporary buffers.
+
 ## (Optional) Convert the multimodal components
 
 llama.cpp will convert the LLM portion of the source model, which is enough for conversational applications. If the model accepts multimodal inputs and you wish to take advantage of them, you need to create a separate GGUF file. This file is generically known as `mmproj`, for "multimedia projector"; however, it may contain various components such as vision or audio encoders in addition to projections.
@@ -124,8 +137,7 @@ python convert_hf_to_gguf.py --mmproj --outfile mmproj-gemma-4-E2B-it-Q8_0.gguf 
 
 ## Memory/Disk Requirements
 
-When running the larger models, make sure you have enough disk space to store all the intermediate files.
-As the models are currently fully loaded into memory, you will need adequate disk space to save them and sufficient RAM to load them. At the moment, memory and disk requirements are the same. For example (Llama 3.1):
+When running the larger models, make sure you have enough disk space to store all the intermediate files. Quantization processes one tensor at a time. On Linux and Windows the input is memory-mapped, while F16 and BF16 conversion uses a 64 MiB F32 row-chunk target. Peak resident memory still depends on the operating system, the largest input and output tensors, row size, thread count, and file-system cache.
 
 | Model | Original size | Quantized size (Q4_K_M) |
 | ----: | ------------: | ----------------------: |

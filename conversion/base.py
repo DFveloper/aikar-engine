@@ -1007,7 +1007,7 @@ class ModelBase:
             if self._is_nvfp4:
                 self.ftype = gguf.LlamaFileType.MOSTLY_NVFP4
             elif self._is_mxfp4:
-                self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+                self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4
 
         # Generate parameter weight class (useful for leader boards) if not yet determined
         if self.metadata.size_label is None and total_params > 0:

@@ -228,6 +228,7 @@ llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-model-merge.cpp)
 target_include_directories(test-model-merge PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-model-merge PRIVATE llama)
+llama_build_and_test(test-model-quantize.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

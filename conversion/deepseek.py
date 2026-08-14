@@ -932,7 +932,7 @@ class DeepseekV4Model(TextModel):
     def prepare_tensors(self):
         super().prepare_tensors()
         self._is_mxfp4 = True
-        self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+        self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4
 
 
 @ModelBase.register("DeepseekV4DSparkModel")

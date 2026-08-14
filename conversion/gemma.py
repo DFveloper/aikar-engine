@@ -624,7 +624,7 @@ class Gemma4Model(Gemma3Model):
         return super().dequant_model()
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        if self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4_MOE:
+        if self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4:
             return gguf.GGMLQuantizationType.BF16
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 

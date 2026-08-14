@@ -55,7 +55,7 @@ static const ftype_name_entry ftype_name_table[] = {
     { "IQ4_XS",    LLAMA_FTYPE_MOSTLY_IQ4_XS    },
     { "TQ1_0",     LLAMA_FTYPE_MOSTLY_TQ1_0     },
     { "TQ2_0",     LLAMA_FTYPE_MOSTLY_TQ2_0     },
-    { "MXFP4_MOE", LLAMA_FTYPE_MOSTLY_MXFP4_MOE },
+    { "MXFP4",     LLAMA_FTYPE_MOSTLY_MXFP4     },
     { "NVFP4",     LLAMA_FTYPE_MOSTLY_NVFP4     },
 };
 

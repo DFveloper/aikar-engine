@@ -131,7 +131,7 @@ static uint32_t ggml_type_to_llama_ftype(ggml_type type) {
         { GGML_TYPE_Q4_K,  LLAMA_FTYPE_MOSTLY_Q4_K_M    },
         { GGML_TYPE_Q5_K,  LLAMA_FTYPE_MOSTLY_Q5_K_M    },
         { GGML_TYPE_Q6_K,  LLAMA_FTYPE_MOSTLY_Q6_K      },
-        { GGML_TYPE_MXFP4, LLAMA_FTYPE_MOSTLY_MXFP4_MOE },
+        { GGML_TYPE_MXFP4, LLAMA_FTYPE_MOSTLY_MXFP4 },
     };
     auto it = k_map.find(type);
     if (it != k_map.end()) {

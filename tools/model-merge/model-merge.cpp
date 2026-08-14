@@ -602,7 +602,7 @@ static uint32_t type_to_ftype(ggml_type type) {
         case GGML_TYPE_Q4_0: return LLAMA_FTYPE_MOSTLY_Q4_0;
         case GGML_TYPE_Q3_K: return LLAMA_FTYPE_MOSTLY_Q3_K_M;
         case GGML_TYPE_Q4_K: return LLAMA_FTYPE_MOSTLY_Q4_K_M;
-        case GGML_TYPE_MXFP4:return LLAMA_FTYPE_MOSTLY_MXFP4_MOE;
+        case GGML_TYPE_MXFP4:return LLAMA_FTYPE_MOSTLY_MXFP4;
         default:             return LLAMA_FTYPE_GUESSED;
     }
 }
@@ -612,7 +612,7 @@ static llama_ftype parse_target_ftype(std::string value) {
     if (value == "q4_0")  return LLAMA_FTYPE_MOSTLY_Q4_0;
     if (value == "q3_k")  return LLAMA_FTYPE_MOSTLY_Q3_K_M;
     if (value == "q4_k")  return LLAMA_FTYPE_MOSTLY_Q4_K_M;
-    if (value == "mxfp4") return LLAMA_FTYPE_MOSTLY_MXFP4_MOE;
+    if (value == "mxfp4") return LLAMA_FTYPE_MOSTLY_MXFP4;
     throw std::runtime_error("Evo target type must be q4_0, q3_k, q4_k, or mxfp4");
 }
 

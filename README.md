@@ -95,6 +95,14 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [server](tools/server/README.md)
 - [GBNF grammars](grammars/README.md)
 
+#### AIKAR extensions
+
+- [Native QLoRA, reward-weighted SFT, and full-parameter QAT](examples/qlora_training/README.md)
+- [Unified dense and MoE MXFP4 quantization](tools/quantize/README.md#mxfp4)
+- [Quant-aware TIES and evolutionary model merge](tools/model-merge/README.md)
+- [Static MoE expert pruning](docs/moe-pruning.md)
+- [LoRA adapter export and merge](tools/export-lora/README.md)
+
 #### Development
 
 - [How to build](docs/build.md)
