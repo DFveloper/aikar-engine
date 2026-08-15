@@ -1650,13 +1650,6 @@ void ggml_cuda_opt_step_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_ten
             1
         ) /
         QLION_QAT_WARPS_PER_BLOCK;
-    const int64_t grid_blocks =
-        (
-            n_blocks +
-            QLION_QAT_WARPS_PER_BLOCK -
-            1
-        ) /
-        QLION_QAT_WARPS_PER_BLOCK;
     if (weight->type == GGML_TYPE_MXFP4) {
         opt_step_qlion_qat_rows<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const float *) grad->data, (const int32_t *) ids->data,
