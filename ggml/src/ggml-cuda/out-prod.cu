@@ -280,7 +280,12 @@ static __global__ void mul_mat_id_back_q4(
         int64_t n_rows,
         int64_t n_expert,
         int64_t n_used,
-        int64_t n_tokens) {
+        int64_t n_tokens,
+        int64_t grad_s0,
+        int64_t grad_s1,
+        int64_t grad_s2,
+        int64_t ids_s0,
+        int64_t ids_s1) {
     const int64_t task = blockIdx.x;
     const int lane = threadIdx.x;
     const int64_t block = task % n_blocks;
@@ -290,7 +295,8 @@ static __global__ void mul_mat_id_back_q4(
     }
     const int64_t used = route % n_used;
     const int64_t token = route / n_used;
-    const int32_t expert = ids[used + n_used * token];
+    const int32_t expert =
+        ids[used * ids_s0 + token * ids_s1];
     if (expert < 0 || expert >= n_expert) {
         return;
     }
@@ -300,7 +306,11 @@ static __global__ void mul_mat_id_back_q4(
         const float value = mxfp4
             ? mxfp4_get(((const block_mxfp4 *) weight_data)[ib], lane)
             : q4_0_get(((const block_q4_0 *) weight_data)[ib], lane);
-        sum += value * grad[row + n_rows * (used + n_used * token)];
+        sum += value * grad[
+            row   * grad_s0 +
+            used  * grad_s1 +
+            token * grad_s2
+        ];
     }
     dst[block * 32 + lane + n_blocks * 32 * (used + n_used * token)] = sum;
 }
@@ -311,16 +321,58 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const ggml_tensor * ids = dst->src[2];
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids) && ggml_is_contiguous(dst));
+    GGML_ASSERT(
+        ggml_is_contiguous(weight) &&
+        ggml_is_contiguous(dst)
+    );
+
+    GGML_ASSERT(grad->nb[0] % sizeof(float) == 0);
+    GGML_ASSERT(grad->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(grad->nb[2] % sizeof(float) == 0);
+
+    GGML_ASSERT(ids->nb[0] % sizeof(int32_t) == 0);
+    GGML_ASSERT(ids->nb[1] % sizeof(int32_t) == 0);
+    const int64_t grad_s0 = grad->nb[0] / sizeof(float);
+    const int64_t grad_s1 = grad->nb[1] / sizeof(float);
+    const int64_t grad_s2 = grad->nb[2] / sizeof(float);
+
+    const int64_t ids_s0 = ids->nb[0] / sizeof(int32_t);
+    const int64_t ids_s1 = ids->nb[1] / sizeof(int32_t);
     const int64_t n_blocks = weight->ne[0] / 32;
     const int64_t n_tasks = n_blocks * grad->ne[1] * grad->ne[2];
     if (weight->type == GGML_TYPE_MXFP4) {
         mul_mat_id_back_q4<true><<<n_tasks, 32, 0, ctx.stream()>>>(
-            weight->data, (const float *) grad->data, (const int32_t *) ids->data, (float *) dst->data,
-            n_blocks, weight->ne[1], weight->ne[2], grad->ne[1], grad->ne[2]);
+            weight->data,
+            (const float *) grad->data,
+            (const int32_t *) ids->data,
+            (float *) dst->data,
+            n_blocks,
+            weight->ne[1],
+            weight->ne[2],
+            grad->ne[1],
+            grad->ne[2],
+            grad_s0,
+            grad_s1,
+            grad_s2,
+            ids_s0,
+            ids_s1
+        );
     } else {
         mul_mat_id_back_q4<false><<<n_tasks, 32, 0, ctx.stream()>>>(
-            weight->data, (const float *) grad->data, (const int32_t *) ids->data, (float *) dst->data,
-            n_blocks, weight->ne[1], weight->ne[2], grad->ne[1], grad->ne[2]);
+            weight->data,
+            (const float *) grad->data,
+            (const int32_t *) ids->data,
+            (float *) dst->data,
+            n_blocks,
+            weight->ne[1],
+            weight->ne[2],
+            grad->ne[1],
+            grad->ne[2],
+            grad_s0,
+            grad_s1,
+            grad_s2,
+            ids_s0,
+            ids_s1
+        );
     }
 }
