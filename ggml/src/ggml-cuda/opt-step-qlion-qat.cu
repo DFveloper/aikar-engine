@@ -136,12 +136,6 @@ static __device__ __forceinline__ int mxfp4_best_index(
 
 template<bool mxfp4>
 static __device__ void opt_step_qlion_qat_apply(
-        const float alpha = pars[0];
-        const float beta  = pars[1];
-        const float wd    = pars[2];
-        const float gclip = pars[3];
-        const bool fast_state_scale = pars[4] != 0.0f;
-
         void * __restrict__ weight_data,
         block_q8_0 * __restrict__ momentum,
         block_q4_0 * __restrict__ residual,
@@ -149,12 +143,20 @@ static __device__ void opt_step_qlion_qat_apply(
         int64_t ib,
         int lane,
         float g) {
+
     const float alpha = pars[0];
-    const float beta = pars[1];
-    const float wd = pars[2];
+    const float beta  = pars[1];
+    const float wd    = pars[2];
     const float gclip = pars[3];
-    const block_q8_0 momentum_old = momentum[ib];
-    const block_q4_0 residual_old = residual[ib];
+
+    const bool fast_state_scale =
+        pars[4] != 0.0f;
+
+    const block_q8_0 momentum_old =
+        momentum[ib];
+
+    const block_q4_0 residual_old =
+        residual[ib];
     const float weight_old = mxfp4
         ? mxfp4_value(((const block_mxfp4 *) weight_data)[ib], lane)
         : q4_0_value(((const block_q4_0 *) weight_data)[ib], lane);
