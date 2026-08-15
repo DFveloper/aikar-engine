@@ -56,12 +56,37 @@ static bool qat_param_filter(const struct ggml_tensor * tensor, void * userdata)
     return tensor && tensor->type == expected && strcmp(tensor->name, "rope_freqs.weight") != 0;
 }
 
-static ggml_opt_optimizer_params qat_opt_lr_pars(void * userdata) {
-    qlora_lr_schedule & schedule = *(qlora_lr_schedule *) userdata;
-    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
-    schedule.current_lr = schedule.get_lr();
-    result.qlion_qat.alpha = schedule.current_lr;
-    result.qlion_qat.wd = schedule.lr->wd;
+struct qat_opt_lr_context {
+    qlora_lr_schedule * schedule;
+    bool fast_state_scale;
+};
+
+static ggml_opt_optimizer_params qat_opt_lr_pars(
+        void * userdata) {
+
+    qat_opt_lr_context & opt =
+        *(qat_opt_lr_context *) userdata;
+
+    qlora_lr_schedule & schedule =
+        *opt.schedule;
+
+    ggml_opt_optimizer_params result =
+        ggml_opt_get_default_optimizer_params(
+            nullptr
+        );
+
+    schedule.current_lr =
+        schedule.get_lr();
+
+    result.qlion_qat.alpha =
+        schedule.current_lr;
+
+    result.qlion_qat.wd =
+        schedule.lr->wd;
+
+    result.qlion_qat.fast_state_scale =
+        opt.fast_state_scale;
+
     return result;
 }
 
@@ -412,8 +437,12 @@ int main(int argc, char ** argv) {
     qlora_lr_schedule schedule {
         &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio, 0, 0
     };
+    qat_opt_lr_context qat_lr_ctx {
+        &schedule,
+        params.qat_fast_state_scale
+    };
     struct llama_opt_params opt_params {
-        0, qat_param_filter, &weight_type, qat_opt_lr_pars, &schedule,
+        0, qat_param_filter, &weight_type, qat_opt_lr_pars, &qat_lr_ctx,
         GGML_OPT_OPTIMIZER_TYPE_QLION_QAT, LLAMA_LORA_QAT_TYPE_NONE,
         params.grad_checkpoint_interval, critical_token_mode_from_string(params.critical_token_mode),
         params.critical_token_weight, params.critical_confidence_threshold,

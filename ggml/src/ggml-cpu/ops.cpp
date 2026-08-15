@@ -12489,7 +12489,7 @@ void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * pa
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(opt_params->type == GGML_TYPE_F32 && ggml_nelements(opt_params) == 4);
+    GGML_ASSERT(opt_params->type == GGML_TYPE_F32 && ggml_nelements(opt_params) == 5);
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
 

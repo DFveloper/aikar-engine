@@ -439,6 +439,7 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     result.qlion_qat.beta  = 0.9f;
     result.qlion_qat.wd    = 0.0f;
     result.qlion_qat.gclip = 0.0f;
+    result.qlion_qat.fast_state_scale = false;
 
     return result;
 }
@@ -932,7 +933,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT) {
-        const int64_t n_opt_params = ggml_opt_optimizer_is_adamw(optimizer) ? 8 : (qlion_qat ? 4 : 2);
+        const int64_t n_opt_params =
+            ggml_opt_optimizer_is_adamw(optimizer)
+                ? 8
+                : (qlion_qat ? 5 : 2);
         opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, n_opt_params);
         ggml_set_input(opt_ctx->opt_step_params);
         ggml_format_name(opt_ctx->opt_step_params, "%s_params", ggml_opt_optimizer_name(optimizer));
@@ -1473,6 +1477,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 qlion_qat[1] = opt_pars.qlion_qat.beta;
                 qlion_qat[2] = opt_pars.qlion_qat.wd;
                 qlion_qat[3] = opt_pars.qlion_qat.gclip;
+                qlion_qat[4] = opt_pars.qlion_qat.fast_state_scale ? 1.0f : 0.0f;
             } break;
             default:
                 GGML_ABORT("fatal error");

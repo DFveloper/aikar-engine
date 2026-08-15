@@ -114,6 +114,7 @@ extern "C" {
             float beta;  // momentum
             float wd;    // weight decay
             float gclip; // element-wise gradient clipping threshold - 0.0f to disable
+            bool  fast_state_scale;
         } qlion_qat;
     };
 

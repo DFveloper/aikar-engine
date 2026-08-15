@@ -13125,7 +13125,7 @@ static void ggml_vk_opt_step_qlion_qat(ggml_backend_vk_context * ctx, vk_context
     const ggml_tensor * params = dst->src[4];
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 4);
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 5);
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual) && ggml_is_contiguous(params));
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, weight, grad, momentum, dst, GGML_OP_OPT_STEP_QLION_QAT);
@@ -18868,7 +18868,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[2]) &&
                    ggml_is_contiguous(op->src[3]) &&
                    ggml_is_contiguous(op->src[4]) &&
-                   ggml_nelements(op->src[4]) == 4;
+                   ggml_nelements(op->src[4]) == 5;
         case GGML_OP_OPT_STEP_QLION_QAT_ID:
             return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&

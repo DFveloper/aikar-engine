@@ -4815,6 +4815,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--qat-fast-state-scale"},
+        "reuse Q4_0/Q8_0 QAT state scales while values remain representable; faster but not bit-identical",
+        [](common_params & params) {
+            params.qat_fast_state_scale = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--grpo-mode"},
         "enable GRPO IPC training loop (prompts and rewards supplied via stdin/stdout)",
         [](common_params & params) { params.grpo_mode = true; }

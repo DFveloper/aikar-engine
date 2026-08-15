@@ -6523,7 +6523,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat(
     GGML_ASSERT(ggml_nelements(momentum) == ggml_nelements(weight));
     GGML_ASSERT(ggml_nelements(residual) == ggml_nelements(weight));
     GGML_ASSERT(params->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_nelements(params) == 4);
+    GGML_ASSERT(ggml_nelements(params) == 5);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
     result->op     = GGML_OP_OPT_STEP_QLION_QAT;
@@ -6562,7 +6562,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_id(
     GGML_ASSERT(ids->ne[1] == n_tokens);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
-    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 4);
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 5);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
     result->op = GGML_OP_OPT_STEP_QLION_QAT_ID;
@@ -6592,7 +6592,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_rows(
     GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
-    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 4);
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 5);
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
 
