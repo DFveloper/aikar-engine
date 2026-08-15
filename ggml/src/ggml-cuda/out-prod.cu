@@ -1,6 +1,8 @@
 #include "out-prod.cuh"
 #include "convert.cuh"
+#include "moe-route.cuh"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
