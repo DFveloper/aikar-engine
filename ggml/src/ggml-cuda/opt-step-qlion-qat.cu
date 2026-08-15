@@ -1,10 +1,7 @@
 #include "ggml-impl.h"
 #include "opt-step-qlion-qat.cuh"
 
-#include <algorithm>
 #include <cstdint>
-#include <cstring>
-#include <vector>
 
 static __device__ __forceinline__ float q4_0_value(const block_q4_0 & block, int lane) {
     const uint8_t packed = block.qs[lane & 15];
@@ -145,155 +142,219 @@ static __global__ void opt_step_qlion_qat(
         opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, grad[ib * 32 + lane]);
     }
 }
-
-static __global__ void qlion_qat_id_gather(
-        const float * __restrict__ activations,
-        const float * __restrict__ grad,
-        const int32_t * __restrict__ routes,
-        float * __restrict__ a_gathered,
-        float * __restrict__ g_gathered,
-        int64_t cols,
-        int64_t rows,
-        int64_t n_act_used,
+static __global__ void qlion_qat_id_build_routes(
+        const int32_t * __restrict__ ids,
+        int32_t * __restrict__ expert_offsets,
+        int32_t * __restrict__ cursor,
+        int32_t * __restrict__ routes,
+        int64_t n_expert,
         int64_t n_used,
-        int64_t n_routes) {
+        int64_t n_tokens,
+        int64_t ids_s0,
+        int64_t ids_s1) {
 
-    const int64_t per_route = cols + rows;
-
-    const int64_t i =
-        (int64_t) blockIdx.x * blockDim.x +
-        threadIdx.x;
-
-    const int64_t total =
-        n_routes * per_route;
-
-    if (i >= total) {
+    // Route 수는 현재 8192개뿐이라
+    // 여기서는 단일 GPU thread로 deterministic하게 정리해도 충분히 작다.
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
 
-    const int64_t route_index =
-        i / per_route;
+    for (int64_t e = 0; e < n_expert; ++e) {
+        cursor[e] = 0;
+    }
 
-    const int64_t j =
-        i - route_index * per_route;
+    const int64_t total_routes =
+        n_used * n_tokens;
 
-    const int64_t route =
-        routes[route_index];
+    // 1) expert별 route 개수 세기
+    for (int64_t route = 0; route < total_routes; ++route) {
+        const int64_t used =
+            route % n_used;
 
-    const int64_t used =
-        route % n_used;
+        const int64_t token =
+            route / n_used;
 
-    const int64_t token =
-        route / n_used;
-
-    if (j < cols) {
-        //
-        // Gather activation column.
-        //
-        // activations may be:
-        //
-        //   [cols, 1,      tokens]
-        // or
-        //   [cols, n_used, tokens]
-        //
-
-        const int64_t act_route =
-            n_act_used == 1
-                ? token
-                : used + n_act_used * token;
-
-        a_gathered[
-            j + cols * route_index
-        ] =
-            activations[
-                j + cols * act_route
+        const int32_t expert =
+            ids[
+                used  * ids_s0 +
+                token * ids_s1
             ];
-    } else {
-        //
-        // Gather upstream gradient column.
-        //
 
-        const int64_t row =
-            j - cols;
+        if (expert >= 0 && expert < n_expert) {
+            cursor[expert]++;
+        }
+    }
 
-        g_gathered[
-            row + rows * route_index
-        ] =
-            grad[
-                row + rows * route
+    // 2) prefix sum
+    int32_t sum = 0;
+
+    expert_offsets[0] = 0;
+
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const int32_t count =
+            cursor[e];
+
+        cursor[e] =
+            sum;
+
+        sum += count;
+
+        expert_offsets[e + 1] =
+            sum;
+    }
+
+    // 3) route를 expert별 contiguous 영역에 기록
+    for (int64_t route = 0; route < total_routes; ++route) {
+        const int64_t used =
+            route % n_used;
+
+        const int64_t token =
+            route / n_used;
+
+        const int32_t expert =
+            ids[
+                used  * ids_s0 +
+                token * ids_s1
             ];
+
+        if (expert >= 0 && expert < n_expert) {
+            routes[
+                cursor[expert]++
+            ] =
+                (int32_t) route;
+        }
     }
 }
 
 template<bool mxfp4>
-static __global__ void opt_step_qlion_qat_id_apply_expert(
+static __global__ void opt_step_qlion_qat_id_compact(
         void * __restrict__ weight_data,
-        const float * __restrict__ expert_grad,
+        const float * __restrict__ activations,
+        const float * __restrict__ grad,
+        const int32_t * __restrict__ expert_offsets,
+        const int32_t * __restrict__ routes,
         block_q8_0 * __restrict__ momentum,
         block_q4_0 * __restrict__ residual,
         const float * __restrict__ pars,
         int64_t n_blocks_row,
         int64_t n_rows,
-        int64_t expert) {
+        int64_t n_expert,
+        int64_t n_act_used,
+        int64_t n_used) {
 
-    const int64_t local_ib =
+    const int64_t ib =
         blockIdx.x;
-
-    const int64_t n_blocks_expert =
-        n_blocks_row * n_rows;
-
-    if (local_ib >= n_blocks_expert) {
-        return;
-    }
 
     const int lane =
         threadIdx.x;
 
+    const int64_t n_blocks_expert =
+        n_blocks_row * n_rows;
+
+    const int64_t n_blocks =
+        n_blocks_expert * n_expert;
+
+    if (ib >= n_blocks) {
+        return;
+    }
+
     const int64_t block =
-        local_ib % n_blocks_row;
+        ib % n_blocks_row;
 
     const int64_t row =
-        local_ib / n_blocks_row;
+        (ib / n_blocks_row) % n_rows;
 
-    const int64_t cols =
-        n_blocks_row * 32;
+    const int64_t expert =
+        ib / n_blocks_expert;
+
+    const int32_t begin =
+        expert_offsets[expert];
+
+    const int32_t end =
+        expert_offsets[expert + 1];
+
+    float g = 0.0f;
 
     //
-    // expert_grad layout:
+    // 핵심:
     //
-    // [cols, rows]
+    // 예전에는 여기서 8192 route 전부 검사했지만,
+    // 이제 현재 expert에 실제로 배정된 route만 읽는다.
     //
-    // If expert_grad == nullptr, this expert received no
-    // routed tokens. g=0, but we still run QLion so momentum
-    // decay / weight decay semantics remain unchanged.
-    //
-    const float g =
-        expert_grad != nullptr
-            ? expert_grad[
+    for (int32_t p = begin; p < end; ++p) {
+        const int64_t route =
+            routes[p];
+
+        const int64_t used =
+            route % n_used;
+
+        const int64_t token =
+            route / n_used;
+
+        //
+        // MUL_MAT_ID forward broadcast와 동일한 의미.
+        //
+        // 현재 케이스:
+        // n_act_used = 1
+        //
+        // 일반적으로 n_act_used가 n_used의 divisor인 경우도 처리.
+        //
+        const int64_t act_used =
+            used % n_act_used;
+
+        const int64_t act_route =
+            act_used +
+            n_act_used * token;
+
+        const float a =
+            activations[
                 block * 32 +
                 lane +
-                cols * row
-              ]
-            : 0.0f;
+                n_blocks_row * 32 * act_route
+            ];
+
+        //
+        // grad[row, route]는 warp의 32 lanes 모두 동일하므로
+        // lane 0 하나만 읽고 broadcast.
+        //
+        float dg = 0.0f;
+
+        if (lane == 0) {
+            dg =
+                grad[
+                    row +
+                    n_rows * route
+                ];
+        }
+
+        dg =
+            __shfl_sync(
+                0xffffffff,
+                dg,
+                0
+            );
+
+        g =
+            fmaf(
+                a,
+                dg,
+                g
+            );
+    }
 
     //
-    // Weight/momentum/residual are laid out:
+    // route가 없는 expert라면 begin == end,
+    // 따라서 g == 0.
     //
-    // [cols, rows, expert]
+    // 기존 optimizer의 momentum decay / weight decay
+    // semantics도 그대로 유지된다.
     //
-    // opt_step_qlion_qat_apply() expects the GLOBAL
-    // quant block index.
-    //
-    const int64_t global_ib =
-        expert * n_blocks_expert +
-        local_ib;
-
     opt_step_qlion_qat_apply<mxfp4>(
         weight_data,
         momentum,
         residual,
         pars,
-        global_ib,
+        ib,
         lane,
         g
     );
@@ -383,9 +444,6 @@ void ggml_cuda_opt_step_qlion_qat_id(
     const ggml_tensor * pars =
         dst->src[6];
 
-    //
-    // Types
-    //
     GGML_ASSERT(
         weight->type == GGML_TYPE_MXFP4 ||
         weight->type == GGML_TYPE_Q4_0
@@ -412,15 +470,12 @@ void ggml_cuda_opt_step_qlion_qat_id(
     );
 
     GGML_ASSERT(
-        pars->type == GGML_TYPE_F32
-    );
-
-    GGML_ASSERT(
+        pars->type == GGML_TYPE_F32 &&
         ggml_nelements(pars) == 4
     );
 
     //
-    // Persistent QAT tensors remain contiguous.
+    // Persistent tensors.
     //
     GGML_ASSERT(
         ggml_is_contiguous(weight)
@@ -439,10 +494,8 @@ void ggml_cuda_opt_step_qlion_qat_id(
     );
 
     //
-    // For this fast path we currently require activations
-    // and grad to be contiguous.
-    //
-    // Your current graph already satisfies these.
+    // 현재 backward graph에서는 이 둘이 contiguous인 것이
+    // 이미 앞 실행에서 확인됐다.
     //
     GGML_ASSERT(
         ggml_is_contiguous(activations)
@@ -487,8 +540,11 @@ void ggml_cuda_opt_step_qlion_qat_id(
     );
 
     GGML_ASSERT(
-        n_act_used == 1 ||
-        n_act_used == n_used
+        n_act_used > 0
+    );
+
+    GGML_ASSERT(
+        n_used % n_act_used == 0
     );
 
     GGML_ASSERT(
@@ -503,6 +559,9 @@ void ggml_cuda_opt_step_qlion_qat_id(
         ids->ne[1] == n_tokens
     );
 
+    //
+    // ids는 non-contiguous view여도 됨.
+    //
     GGML_ASSERT(
         ids->nb[0] % sizeof(int32_t) == 0
     );
@@ -511,6 +570,12 @@ void ggml_cuda_opt_step_qlion_qat_id(
         ids->nb[1] % sizeof(int32_t) == 0
     );
 
+    const int64_t ids_s0 =
+        ids->nb[0] / sizeof(int32_t);
+
+    const int64_t ids_s1 =
+        ids->nb[1] / sizeof(int32_t);
+
     const int64_t total_routes =
         n_used * n_tokens;
 
@@ -518,450 +583,149 @@ void ggml_cuda_opt_step_qlion_qat_id(
         total_routes > 0
     );
 
+    GGML_ASSERT(
+        total_routes <= INT32_MAX
+    );
+
+    GGML_ASSERT(
+        n_expert > 0
+    );
+
+    //
+    // stream은 이미 CUDA Graph capture 중일 수 있다.
+    // 따라서 여기부터 host synchronization 금지.
+    //
     cudaStream_t stream =
         ctx.stream();
 
-    cublasHandle_t handle =
-        ctx.cublas_handle();
-
-    CUBLAS_CHECK(
-        cublasSetStream(handle, stream)
-    );
-
     //
-    // =========================================================
-    // 1. Copy routing IDs to host.
-    // =========================================================
+    // GPU temporary buffers:
     //
-    // ids can be a non-contiguous view, so we preserve nb[].
+    // expert_offsets: [n_expert + 1]
+    // cursor:         [n_expert]
+    // routes:         [total_routes]
     //
-    // This follows the same strategy already used by
-    // ggml_cuda_out_prod_id().
+    // 현재 값이면 대략 수십 KB 수준.
     //
-
-    const size_t ids_nbytes =
-        ggml_nbytes(ids);
-
-    std::vector<char> ids_host(
-        ids_nbytes
-    );
-
-    if (
-        ids->buffer &&
-        !ggml_backend_buffer_is_host(ids->buffer)
-    ) {
-        CUDA_CHECK(
-            cudaMemcpyAsync(
-                ids_host.data(),
-                ids->data,
-                ids_nbytes,
-                cudaMemcpyDeviceToHost,
-                stream
-            )
+    ggml_cuda_pool_alloc<int32_t>
+        expert_offsets(
+            ctx.pool(),
+            n_expert + 1
         );
-
-        //
-        // We need the routing IDs on CPU before constructing
-        // expert route lists.
-        //
-        CUDA_CHECK(
-            cudaStreamSynchronize(stream)
-        );
-    } else {
-        memcpy(
-            ids_host.data(),
-            ids->data,
-            ids_nbytes
-        );
-    }
-
-    auto read_expert_id =
-        [&](int64_t used, int64_t token) -> int32_t {
-
-            return *reinterpret_cast<const int32_t *>(
-                ids_host.data() +
-                used  * ids->nb[0] +
-                token * ids->nb[1]
-            );
-        };
-
-    //
-    // =========================================================
-    // 2. Count routes for each expert.
-    // =========================================================
-    //
-
-    std::vector<int64_t> expert_count(
-        n_expert,
-        0
-    );
-
-    for (int64_t token = 0;
-         token < n_tokens;
-         ++token) {
-
-        for (int64_t used = 0;
-             used < n_used;
-             ++used) {
-
-            const int32_t expert =
-                read_expert_id(
-                    used,
-                    token
-                );
-
-            GGML_ASSERT(
-                expert >= 0 &&
-                expert < n_expert
-            );
-
-            expert_count[expert]++;
-        }
-    }
-
-    //
-    // Prefix offsets:
-    //
-    // expert_routes for expert e are:
-    //
-    //   [expert_offset[e],
-    //    expert_offset[e+1])
-    //
-
-    std::vector<int64_t> expert_offset(
-        n_expert + 1,
-        0
-    );
-
-    for (int64_t e = 0;
-         e < n_expert;
-         ++e) {
-
-        expert_offset[e + 1] =
-            expert_offset[e] +
-            expert_count[e];
-    }
-
-    GGML_ASSERT(
-        expert_offset[n_expert] ==
-        total_routes
-    );
-
-    //
-    // =========================================================
-    // 3. Build route array grouped by expert.
-    // =========================================================
-    //
-    // A route is flattened as:
-    //
-    //   route = used + n_used * token
-    //
-
-    std::vector<int32_t> route_host(
-        total_routes
-    );
-
-    std::vector<int64_t> cursor =
-        expert_offset;
-
-    for (int64_t token = 0;
-         token < n_tokens;
-         ++token) {
-
-        for (int64_t used = 0;
-             used < n_used;
-             ++used) {
-
-            const int32_t expert =
-                read_expert_id(
-                    used,
-                    token
-                );
-
-            const int64_t route =
-                used +
-                n_used * token;
-
-            GGML_ASSERT(
-                route <= INT32_MAX
-            );
-
-            route_host[
-                cursor[expert]++
-            ] =
-                (int32_t) route;
-        }
-    }
-
-    int64_t max_routes =
-        0;
-
-    for (int64_t e = 0;
-         e < n_expert;
-         ++e) {
-
-        max_routes =
-            std::max(
-                max_routes,
-                expert_count[e]
-            );
-    }
-
-    GGML_ASSERT(
-        max_routes > 0
-    );
-
-    //
-    // =========================================================
-    // 4. GPU scratch buffers.
-    // =========================================================
-    //
 
     ggml_cuda_pool_alloc<int32_t>
-        routes_gpu(
+        cursor(
+            ctx.pool(),
+            n_expert
+        );
+
+    ggml_cuda_pool_alloc<int32_t>
+        routes(
             ctx.pool(),
             total_routes
         );
 
+    //
+    // GPU에서 route grouping.
+    //
+    qlion_qat_id_build_routes
+        <<<1, 1, 0, stream>>>(
+            (const int32_t *)
+                ids->data,
+
+            expert_offsets.ptr,
+            cursor.ptr,
+            routes.ptr,
+
+            n_expert,
+            n_used,
+            n_tokens,
+
+            ids_s0,
+            ids_s1
+        );
+
     CUDA_CHECK(
-        cudaMemcpyAsync(
-            routes_gpu.ptr,
-            route_host.data(),
-            total_routes * sizeof(int32_t),
-            cudaMemcpyHostToDevice,
-            stream
-        )
+        cudaGetLastError()
     );
 
     //
-    // Gather buffers only need to fit the largest expert.
+    // 같은 stream이므로 위 route-builder 완료 후
+    // compact kernel이 자동으로 실행됨.
+    // synchronize 필요 없음.
     //
-    ggml_cuda_pool_alloc<float>
-        a_gathered(
-            ctx.pool(),
-            cols * max_routes
-        );
-
-    ggml_cuda_pool_alloc<float>
-        g_gathered(
-            ctx.pool(),
-            rows * max_routes
-        );
-
-    //
-    // One expert gradient only:
-    //
-    //   [cols, rows]
-    //
-    // For your 2816 x 1408 matrix:
-    // ~15.1 MiB.
-    //
-    ggml_cuda_pool_alloc<float>
-        expert_grad(
-            ctx.pool(),
-            cols * rows
-        );
-
     const int64_t n_blocks_row =
         cols / 32;
 
-    const int64_t n_blocks_expert =
-        n_blocks_row * rows;
+    const int64_t n_blocks =
+        ggml_nelements(weight) / 32;
 
-    const float alpha =
-        1.0f;
+    if (
+        weight->type ==
+        GGML_TYPE_MXFP4
+    ) {
+        opt_step_qlion_qat_id_compact<true>
+            <<<n_blocks, 32, 0, stream>>>(
+                weight->data,
 
-    const float beta =
-        0.0f;
+                (const float *)
+                    activations->data,
 
-    constexpr int gather_threads =
-        256;
+                (const float *)
+                    grad->data,
 
-    //
-    // =========================================================
-    // 5. Process one expert at a time.
-    // =========================================================
-    //
+                expert_offsets.ptr,
+                routes.ptr,
 
-    for (int64_t expert = 0;
-         expert < n_expert;
-         ++expert) {
+                (block_q8_0 *)
+                    momentum->data,
 
-        const int64_t n_routes =
-            expert_count[expert];
+                (block_q4_0 *)
+                    residual->data,
 
-        const float * expert_grad_ptr =
-            nullptr;
+                (const float *)
+                    pars->data,
 
-        if (n_routes > 0) {
-
-            const int32_t * routes_e =
-                routes_gpu.ptr +
-                expert_offset[expert];
-
-            //
-            // -------------------------------------------------
-            // Gather only routes assigned to this expert.
-            // -------------------------------------------------
-            //
-
-            const int64_t gather_elements =
-                n_routes *
-                (cols + rows);
-
-            const int64_t gather_blocks =
-                (
-                    gather_elements +
-                    gather_threads -
-                    1
-                ) /
-                gather_threads;
-
-            qlion_qat_id_gather
-                <<<gather_blocks,
-                   gather_threads,
-                   0,
-                   stream>>>(
-                    (const float *)
-                        activations->data,
-
-                    (const float *)
-                        grad->data,
-
-                    routes_e,
-
-                    a_gathered.ptr,
-                    g_gathered.ptr,
-
-                    cols,
-                    rows,
-
-                    n_act_used,
-                    n_used,
-                    n_routes
-                );
-
-            CUDA_CHECK(
-                cudaGetLastError()
+                n_blocks_row,
+                rows,
+                n_expert,
+                n_act_used,
+                n_used
             );
+    } else {
+        opt_step_qlion_qat_id_compact<false>
+            <<<n_blocks, 32, 0, stream>>>(
+                weight->data,
 
-            //
-            // -------------------------------------------------
-            // expert_grad =
-            //
-            //   A_e @ G_e^T
-            //
-            // A_e:
-            //   [cols, n_routes]
-            //
-            // G_e:
-            //   [rows, n_routes]
-            //
-            // result:
-            //   [cols, rows]
-            //
-            // -------------------------------------------------
-            //
+                (const float *)
+                    activations->data,
 
-            CUBLAS_CHECK(
-                cublasSgemm(
-                    handle,
+                (const float *)
+                    grad->data,
 
-                    CUBLAS_OP_N,
-                    CUBLAS_OP_T,
+                expert_offsets.ptr,
+                routes.ptr,
 
-                    (int) cols,
-                    (int) rows,
-                    (int) n_routes,
+                (block_q8_0 *)
+                    momentum->data,
 
-                    &alpha,
+                (block_q4_0 *)
+                    residual->data,
 
-                    a_gathered.ptr,
-                    (int) cols,
+                (const float *)
+                    pars->data,
 
-                    g_gathered.ptr,
-                    (int) rows,
-
-                    &beta,
-
-                    expert_grad.ptr,
-                    (int) cols
-                )
+                n_blocks_row,
+                rows,
+                n_expert,
+                n_act_used,
+                n_used
             );
-
-            expert_grad_ptr =
-                expert_grad.ptr;
-        }
-
-        //
-        // -----------------------------------------------------
-        // Apply QLion to this expert.
-        //
-        // If n_routes == 0:
-        //
-        // expert_grad_ptr == nullptr
-        //
-        // and the kernel uses g = 0.
-        //
-        // This preserves momentum/weight-decay behavior.
-        // -----------------------------------------------------
-        //
-
-        if (
-            weight->type ==
-            GGML_TYPE_MXFP4
-        ) {
-            opt_step_qlion_qat_id_apply_expert<true>
-                <<<n_blocks_expert,
-                   32,
-                   0,
-                   stream>>>(
-                    weight->data,
-
-                    expert_grad_ptr,
-
-                    (block_q8_0 *)
-                        momentum->data,
-
-                    (block_q4_0 *)
-                        residual->data,
-
-                    (const float *)
-                        pars->data,
-
-                    n_blocks_row,
-                    rows,
-                    expert
-                );
-        } else {
-            opt_step_qlion_qat_id_apply_expert<false>
-                <<<n_blocks_expert,
-                   32,
-                   0,
-                   stream>>>(
-                    weight->data,
-
-                    expert_grad_ptr,
-
-                    (block_q8_0 *)
-                        momentum->data,
-
-                    (block_q4_0 *)
-                        residual->data,
-
-                    (const float *)
-                        pars->data,
-
-                    n_blocks_row,
-                    rows,
-                    expert
-                );
-        }
-
-        CUDA_CHECK(
-            cudaGetLastError()
-        );
     }
+
+    CUDA_CHECK(
+        cudaGetLastError()
+    );
 }
 
 void ggml_cuda_opt_step_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
