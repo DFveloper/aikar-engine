@@ -652,6 +652,7 @@ struct common_params {
     std::string qat_momentum = "q8_0";
     std::string qat_residual = "q4_0";
     std::string qat_update_granularity = "tensor";
+    bool        qat_fast_state_scale = false;
 
     // grpo training
     bool    grpo_mode              = false; // enable GRPO IPC training loop
