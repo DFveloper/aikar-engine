@@ -162,7 +162,7 @@ static int ggml_opt_qat_backend_priority(
 
     if (!tensor ||
         !tensor->buffer) {
-        return 0;
+        return -1;
     }
 
     ggml_backend_buffer_type_t buft =
@@ -170,44 +170,40 @@ static int ggml_opt_qat_backend_priority(
             tensor->buffer
         );
 
+    if (!buft) {
+        return -1;
+    }
+
     ggml_backend_dev_t dev =
         ggml_backend_buft_get_device(
             buft
         );
 
     if (!dev) {
-        return 0;
+        return -1;
     }
 
-    ggml_backend_reg_t reg =
-        ggml_backend_dev_backend_reg(
-            dev
-        );
+    switch (
+        ggml_backend_dev_type(dev)
+    ) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+            return 100;
 
-    if (!reg) {
-        return 0;
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return 90;
+
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            return 50;
+
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return 40;
+
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+            return 0;
+
+        default:
+            return -1;
     }
-
-    const char * name =
-        ggml_backend_reg_name(
-            reg
-        );
-
-    //
-    // TIED implementation is provided by ggml-cuda,
-    // which also covers HIP/ROCm builds.
-    //
-    if (strcmp(name, "CUDA") == 0 ||
-        strcmp(name, "ROCm") == 0) {
-
-        return 100;
-    }
-
-    if (strcmp(name, "CPU") == 0) {
-        return 0;
-    }
-
-    return 10;
 }
 
 void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor * param) {
@@ -1049,6 +1045,86 @@ ggml_opt_qlion_qat_backward_callback(
 
         ggml_tensor * combined =
             pending[0];
+
+        if (
+    strcmp(
+        group.aliases[0]->name,
+        "token_embd.weight"
+    ) == 0
+) {
+
+    fprintf(
+        stderr,
+        "\n=== QAT ALIAS PLACEMENT ===\n"
+    );
+
+    for (size_t j = 0;
+         j < group.aliases.size();
+         ++j) {
+
+        ggml_tensor * t =
+            group.aliases[j];
+
+        const char * buffer_name =
+            t->buffer
+                ? ggml_backend_buffer_name(
+                    t->buffer
+                )
+                : "(null)";
+
+        ggml_backend_dev_t dev =
+            nullptr;
+
+        if (t->buffer) {
+
+            ggml_backend_buffer_type_t buft =
+                ggml_backend_buffer_get_type(
+                    t->buffer
+                );
+
+            if (buft) {
+                dev =
+                    ggml_backend_buft_get_device(
+                        buft
+                    );
+            }
+        }
+
+        fprintf(
+            stderr,
+            "alias[%zu]:"
+            " ptr=%p"
+            " data=%p"
+            " buffer=%s"
+            " device=%s"
+            " dev_type=%d"
+            " priority=%d\n",
+
+            j,
+
+            (void *) t,
+            t->data,
+
+            buffer_name,
+
+            dev
+                ? ggml_backend_dev_name(dev)
+                : "(none)",
+
+            dev
+                ? (int)
+                    ggml_backend_dev_type(dev)
+                : -1,
+
+            ggml_opt_qat_backend_priority(t)
+        );
+    }
+
+    fprintf(
+        stderr,
+        "===========================\n"
+    );
+}
 
         for (size_t j = 1;
             j < pending.size();
