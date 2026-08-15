@@ -76,18 +76,55 @@ static __device__ __forceinline__ float warp_signed_absmax(float value) {
     return __shfl_sync(0xffffffff, value, __ffs(mask) - 1);
 }
 
-static __device__ __forceinline__ int mxfp4_best_index(float value, float scale) {
-    int best = 0;
-    float error = fabsf(kvalues_mxfp4[0] * scale - value);
-#pragma unroll
-    for (int i = 1; i < 16; ++i) {
-        const float candidate = fabsf(kvalues_mxfp4[i] * scale - value);
-        if (candidate < error) {
-            best = i;
-            error = candidate;
+static __device__ __forceinline__ int mxfp4_best_index_fast(
+        float value,
+        float inv_scale) {
+
+    if (inv_scale == 0.0f || !isfinite(value)) {
+        return 0;
+    }
+
+    const float x =
+        fabsf(value) * inv_scale;
+
+    int mag;
+
+    //
+    // Levels:
+    //
+    // 0, 1, 2, 3, 4, 6, 8, 12
+    //
+    // Midpoints:
+    //
+    // 0.5, 1.5, 2.5, 3.5, 5, 7, 10
+    //
+    // Binary decision tree:
+    //
+    if (x <= 3.5f) {
+        if (x <= 1.5f) {
+            mag = x <= 0.5f ? 0 : 1;
+        } else {
+            mag = x <= 2.5f ? 2 : 3;
+        }
+    } else {
+        if (x <= 7.0f) {
+            mag = x <= 5.0f ? 4 : 5;
+        } else {
+            mag = x <= 10.0f ? 6 : 7;
         }
     }
-    return best;
+
+    //
+    // Existing linear search chooses code 0 for zero,
+    // including the negative-zero-equivalent grid entry.
+    //
+    if (mag == 0) {
+        return 0;
+    }
+
+    return signbit(value)
+        ? (mag | 8)
+        : mag;
 }
 
 template<bool mxfp4>
@@ -126,11 +163,65 @@ static __device__ void opt_step_qlion_qat_apply(
 
     float weight_new;
     if constexpr (mxfp4) {
-        const float amax = warp_reduce_max(fabsf(target));
-        const int exponent_i = amax > 0.0f ? (int) floorf(log2f(amax)) - 2 + 127 : 0;
-        const uint8_t exponent = (uint8_t) (exponent_i < 0 ? 0 : (exponent_i > 254 ? 254 : exponent_i));
-        const float scale = ggml_cuda_e8m0_to_fp32(exponent) * 0.5f;
-        const int q = mxfp4_best_index(target, scale);
+        const float amax =
+            warp_reduce_max(fabsf(target));
+
+        int exponent_i32 = 0;
+        float scale = 0.0f;
+        float inv_scale = 0.0f;
+
+        if (lane == 0) {
+            const int exponent_i =
+                amax > 0.0f
+                    ? (int) floorf(log2f(amax)) - 2 + 127
+                    : 0;
+
+            exponent_i32 =
+                exponent_i < 0
+                    ? 0
+                    : (exponent_i > 254
+                        ? 254
+                        : exponent_i);
+
+            scale =
+                ggml_cuda_e8m0_to_fp32(
+                    (uint8_t) exponent_i32
+                ) * 0.5f;
+
+            inv_scale =
+                scale != 0.0f
+                    ? 1.0f / scale
+                    : 0.0f;
+        }
+
+        exponent_i32 =
+            __shfl_sync(
+                0xffffffff,
+                exponent_i32,
+                0
+            );
+
+        scale =
+            __shfl_sync(
+                0xffffffff,
+                scale,
+                0
+            );
+
+        inv_scale =
+            __shfl_sync(
+                0xffffffff,
+                inv_scale,
+                0
+            );
+
+        const uint8_t exponent =
+            (uint8_t) exponent_i32;
+        const int q =
+            mxfp4_best_index_fast(
+                target,
+                inv_scale
+            );
         const int q_hi = __shfl_sync(0xffffffff, q, (lane + 16) & 31);
         if (lane == 0) {
             ((block_mxfp4 *) weight_data)[ib].e = exponent;
@@ -892,17 +983,6 @@ void ggml_cuda_opt_step_qlion_qat_id(
     constexpr int gather_threads =
         256;
 
-    const int64_t gather_elements =
-        cap * (cols + rows);
-
-    const int64_t gather_blocks =
-        (
-            gather_elements +
-            gather_threads -
-            1
-        ) /
-        gather_threads;
-
     //
     // Fixed expert loop.
     //
@@ -930,9 +1010,9 @@ void ggml_cuda_opt_step_qlion_qat_id(
         //
 
         const int64_t gather_elements =
-    (int64_t) batch_count *
-    cap *
-    (cols + rows);
+            (int64_t) batch_count *
+            cap *
+            (cols + rows);
 
 const int64_t gather_blocks =
     (
