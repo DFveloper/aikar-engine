@@ -1108,7 +1108,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,12 +1224,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "qlion_qat(x)",
     "qlion_qat_id(x)",
     "qlion_qat_rows(x)",
+    "qlion_qat_tied(x)",
 
     "glu(x)",
     "glu_back(dy,x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
