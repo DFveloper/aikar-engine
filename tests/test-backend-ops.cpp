@@ -6098,6 +6098,11 @@ struct test_concat : public test_case {
             ggml_set_name(b, "b");
         }
 
+        if (type == GGML_TYPE_F32) {
+            ggml_set_param(a);
+            ggml_set_param(b);
+        }
+
         ggml_tensor * out = ggml_concat(ctx, a, b, dim);
         ggml_set_name(out, "out");
 
@@ -6928,6 +6933,9 @@ struct test_pad : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_set_name(a, "a");
+        if (type == GGML_TYPE_F32 && !circular) {
+            ggml_set_param(a);
+        }
 
         ggml_tensor * out = circular
             ? ggml_pad_circular(ctx, a, pad_0, pad_1, 0, 0)
@@ -6975,6 +6983,10 @@ struct test_pad_ext : public test_case {
         } else if (tfrm == 2) {
             a = ggml_permute(ctx, a, 2, 1, 0, 3);
             ggml_set_name(a, "permuted a");
+        }
+
+        if (type == GGML_TYPE_F32 && !circular) {
+            ggml_set_param(a);
         }
 
         ggml_tensor * out = circular
@@ -7805,6 +7817,10 @@ struct test_fill : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+
+    std::vector<float> grad_expect() override {
+        return { 0.0f };
     }
 };
 
@@ -9995,6 +10011,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rope(type, {128,  32, 2, 3}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 1, true, true));
             }
         }
+    }
+
+    for (int dim : { 0, 1, 2, 3 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 2, 2, 1}, 2, dim, 0));
     }
 
     for (int v : { 0, 1, 2, 3 }) {

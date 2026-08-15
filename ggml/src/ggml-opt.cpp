@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <random>
+#include <set>
 #include <vector>
 
 struct ggml_opt_dataset {
@@ -88,6 +89,7 @@ struct ggml_opt_context {
     std::vector<std::vector<struct ggml_tensor *>> qat_aliases;
     std::vector<std::vector<struct ggml_tensor *>> qat_pending_grads;
     std::vector<size_t> qat_expected_grads;
+    std::set<struct ggml_tensor *> qat_forward_nodes;
     std::vector<ggml_backend_buffer_t> qat_buffers;
     std::vector<struct ggml_context *> qat_contexts;
 
@@ -531,6 +533,32 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     return dst;
 }
 
+static bool ggml_opt_depends_on_qat_alias(
+        struct ggml_tensor * tensor,
+        const std::vector<struct ggml_tensor *> & aliases,
+        const std::set<struct ggml_tensor *> & forward_nodes,
+        std::map<struct ggml_tensor *, bool> & memo) {
+    if (std::find(aliases.begin(), aliases.end(), tensor) != aliases.end()) {
+        return true;
+    }
+    if (forward_nodes.find(tensor) != forward_nodes.end()) {
+        return false;
+    }
+    const auto cached = memo.find(tensor);
+    if (cached != memo.end()) {
+        return cached->second;
+    }
+    bool result = false;
+    for (struct ggml_tensor * src : tensor->src) {
+        if (src && ggml_opt_depends_on_qat_alias(src, aliases, forward_nodes, memo)) {
+            result = true;
+            break;
+        }
+    }
+    memo[tensor] = result;
+    return result;
+}
+
 static struct ggml_tensor * ggml_opt_qlion_qat_backward_callback(
         struct ggml_context * ctx,
         struct ggml_tensor  * param,
@@ -546,15 +574,30 @@ static struct ggml_tensor * ggml_opt_qlion_qat_backward_callback(
         if (opt_ctx->qat_pending_grads[i].size() < opt_ctx->qat_expected_grads[i]) {
             return nullptr;
         }
+        std::map<struct ggml_tensor *, bool> dependency_memo;
+        for (int j = 0; j < opt_ctx->gf->n_nodes; ++j) {
+            struct ggml_tensor * node = opt_ctx->gb_grad->nodes[j];
+            struct ggml_tensor * pending_grad = ggml_graph_get_grad(opt_ctx->gb_grad, node);
+            if (pending_grad && !(node->flags & GGML_TENSOR_FLAG_PARAM) &&
+                ggml_opt_depends_on_qat_alias(pending_grad, aliases, opt_ctx->qat_forward_nodes, dependency_memo)) {
+                ggml_build_forward_expand(opt_ctx->gb_grad, pending_grad);
+            }
+        }
         struct ggml_tensor * combined = opt_ctx->qat_pending_grads[i][0];
         for (size_t j = 1; j < opt_ctx->qat_pending_grads[i].size(); ++j) {
             combined = ggml_add(ctx, combined, opt_ctx->qat_pending_grads[i][j]);
         }
-        struct ggml_tensor * step = combined->op == GGML_OP_OUT_PROD_ID
-            ? ggml_opt_step_qlion_qat_id(ctx, param, combined->src[0], combined->src[1], combined->src[2],
-                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params)
-            : ggml_opt_step_qlion_qat(ctx, param, combined,
+        struct ggml_tensor * step;
+        if (combined->op == GGML_OP_OUT_PROD_ID) {
+            step = ggml_opt_step_qlion_qat_id(ctx, param, combined->src[0], combined->src[1], combined->src[2],
                 opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
+        } else if (combined->op == GGML_OP_GET_ROWS_BACK) {
+            step = ggml_opt_step_qlion_qat_rows(ctx, param, combined->src[0], combined->src[1],
+                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
+        } else {
+            step = ggml_opt_step_qlion_qat(ctx, param, combined,
+                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
+        }
         ggml_format_name(step, "QLion QAT step for %s", param->name);
         struct ggml_tensor * result = step;
         for (struct ggml_tensor * alias : aliases) {
@@ -923,6 +966,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
     if (qlion_qat) {
+        opt_ctx->qat_forward_nodes.clear();
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            opt_ctx->qat_forward_nodes.insert(opt_ctx->gf->nodes[i]);
+        }
         opt_ctx->qat_pending_grads.assign(opt_ctx->qat_params.size(), {});
         opt_ctx->qat_expected_grads.assign(opt_ctx->qat_params.size(), 0);
         for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {

@@ -7,6 +7,8 @@ struct qat_model_info {
     enum ggml_type weight_type = GGML_TYPE_COUNT;
     uint64_t quantized_bytes = 0;
     uint64_t nonquantized_bytes = 0;
+    uint64_t momentum_bytes = 0;
+    uint64_t residual_bytes = 0;
     int64_t quantized_tensors = 0;
 };
 
@@ -33,6 +35,8 @@ static bool qat_inspect_model(const std::string & path, enum ggml_type expected,
                 return false;
             }
             info.quantized_bytes += ggml_nbytes(tensor);
+            info.momentum_bytes += ggml_row_size(GGML_TYPE_Q8_0, tensor->ne[0]) * ggml_nrows(tensor);
+            info.residual_bytes += ggml_row_size(GGML_TYPE_Q4_0, tensor->ne[0]) * ggml_nrows(tensor);
             info.quantized_tensors++;
         } else {
             info.nonquantized_bytes += ggml_nbytes(tensor);
@@ -121,11 +125,15 @@ static bool qat_save_state(
     const size_t header_size = gguf_get_meta_size(gctx);
     std::vector<char> header(header_size, 0);
     out.write(header.data(), header.size());
+    const size_t chunk_max = 16 * 1024 * 1024;
+    std::vector<char> data(chunk_max);
     for (struct ggml_tensor * source : sources) {
         const size_t nbytes = ggml_nbytes(source);
-        std::vector<char> data(nbytes);
-        ggml_backend_tensor_get(source, data.data(), 0, nbytes);
-        out.write(data.data(), data.size());
+        for (size_t offset = 0; offset < nbytes; offset += chunk_max) {
+            const size_t chunk = std::min(chunk_max, nbytes - offset);
+            ggml_backend_tensor_get(source, data.data(), offset, chunk);
+            out.write(data.data(), chunk);
+        }
         const size_t padding = GGML_PAD(nbytes, 32) - nbytes;
         if (padding) {
             std::vector<char> zeros(padding, 0);
@@ -149,7 +157,7 @@ static bool qat_load_state(
         const std::string & quant_type,
         struct qat_resume_state & resume) {
     struct ggml_context * data_ctx = nullptr;
-    struct gguf_init_params params = { false, &data_ctx };
+    struct gguf_init_params params = { true, &data_ctx };
     const std::string path = qat_state_path(model_path);
     struct gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
     if (!gctx) {
@@ -165,6 +173,16 @@ static bool qat_load_state(
         ggml_free(data_ctx);
         return false;
     }
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
+        gguf_free(gctx);
+        ggml_free(data_ctx);
+        return false;
+    }
+    const size_t chunk_max = 16 * 1024 * 1024;
+    std::vector<uint8_t> data(chunk_max);
+    std::vector<uint8_t> check_data(chunk_max);
     for (int64_t i = 0; i < count; ++i) {
         const std::string param_key = "training.qat.param." + std::to_string(i);
         const int64_t key = gguf_find_key(gctx, param_key.c_str());
@@ -186,18 +204,32 @@ static bool qat_load_state(
         }
         const size_t momentum_bytes = ggml_nbytes(momentum);
         const size_t residual_bytes = ggml_nbytes(residual);
-        ggml_backend_tensor_set(momentum, momentum_saved->data, 0, momentum_bytes);
-        ggml_backend_tensor_set(residual, residual_saved->data, 0, residual_bytes);
-        std::vector<uint8_t> momentum_check(momentum_bytes);
-        std::vector<uint8_t> residual_check(residual_bytes);
-        ggml_backend_tensor_get(momentum, momentum_check.data(), 0, momentum_bytes);
-        ggml_backend_tensor_get(residual, residual_check.data(), 0, residual_bytes);
-        if (memcmp(momentum_check.data(), momentum_saved->data, momentum_bytes) != 0 ||
-            memcmp(residual_check.data(), residual_saved->data, residual_bytes) != 0) {
-            LOG_ERR("%s: backend changed state data for parameter %s\n", __func__, param->name);
-            gguf_free(gctx);
-            ggml_free(data_ctx);
-            return false;
+        struct ggml_tensor * targets[] = { momentum, residual };
+        struct ggml_tensor * saved[] = { momentum_saved, residual_saved };
+        const size_t sizes[] = { momentum_bytes, residual_bytes };
+        for (int state = 0; state < 2; ++state) {
+            const int64_t tensor_id = gguf_find_tensor(gctx, saved[state]->name);
+            GGML_ASSERT(tensor_id >= 0);
+            const size_t file_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tensor_id);
+            for (size_t offset = 0; offset < sizes[state]; offset += chunk_max) {
+                const size_t chunk = std::min(chunk_max, sizes[state] - offset);
+                in.seekg(file_offset + offset);
+                in.read((char *) data.data(), chunk);
+                if (!in.good()) {
+                    LOG_ERR("%s: failed to read state for parameter %s\n", __func__, param->name);
+                    gguf_free(gctx);
+                    ggml_free(data_ctx);
+                    return false;
+                }
+                ggml_backend_tensor_set(targets[state], data.data(), offset, chunk);
+                ggml_backend_tensor_get(targets[state], check_data.data(), offset, chunk);
+                if (memcmp(check_data.data(), data.data(), chunk) != 0) {
+                    LOG_ERR("%s: backend changed state data for parameter %s\n", __func__, param->name);
+                    gguf_free(gctx);
+                    ggml_free(data_ctx);
+                    return false;
+                }
+            }
         }
     }
     const int64_t step_key = gguf_find_key(gctx, "training.optimizer.step");
@@ -345,6 +377,10 @@ int main(int argc, char ** argv) {
     if (!qat_inspect_model(params.model.path, weight_type, model_info)) {
         return 1;
     }
+    LOG_INF("qat_memory_estimate: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu nonquantized_model=%llu persistent_qat=%llu\n",
+        (unsigned long long) model_info.quantized_bytes, (unsigned long long) model_info.momentum_bytes,
+        (unsigned long long) model_info.residual_bytes, (unsigned long long) model_info.nonquantized_bytes,
+        (unsigned long long) (model_info.quantized_bytes + model_info.momentum_bytes + model_info.residual_bytes));
 
     common_init();
     llama_backend_init();

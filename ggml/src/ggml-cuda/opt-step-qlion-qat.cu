@@ -178,6 +178,42 @@ static __global__ void opt_step_qlion_qat_id(
     opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, g);
 }
 
+template<bool mxfp4>
+static __global__ void opt_step_qlion_qat_rows(
+        void * __restrict__ weight_data,
+        const float * __restrict__ grad,
+        const int32_t * __restrict__ ids,
+        block_q8_0 * __restrict__ momentum,
+        block_q4_0 * __restrict__ residual,
+        const float * __restrict__ pars,
+        int64_t n_blocks_row,
+        int64_t n_rows,
+        int64_t n_indices) {
+    const int64_t index = blockIdx.x / n_blocks_row;
+    const int64_t block = blockIdx.x % n_blocks_row;
+    const int lane = threadIdx.x;
+    if (index >= n_indices) {
+        return;
+    }
+    const int32_t row = ids[index];
+    if (row < 0 || row >= n_rows) {
+        return;
+    }
+    for (int64_t i = 0; i < index; ++i) {
+        if (ids[i] == row) {
+            return;
+        }
+    }
+    float g = 0.0f;
+    for (int64_t i = index; i < n_indices; ++i) {
+        if (ids[i] == row) {
+            g += grad[i * n_blocks_row * 32 + block * 32 + lane];
+        }
+    }
+    const int64_t ib = row * n_blocks_row + block;
+    opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, g);
+}
+
 void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * weight = dst->src[0];
     const ggml_tensor * grad = dst->src[1];
@@ -226,5 +262,33 @@ void ggml_cuda_opt_step_qlion_qat_id(ggml_backend_cuda_context & ctx, ggml_tenso
             weight->data, (const float *) activations->data, (const float *) grad->data, (const int32_t *) ids->data,
             (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
             n_blocks_row, weight->ne[1], weight->ne[2], grad->ne[1], grad->ne[2]);
+    }
+}
+
+void ggml_cuda_opt_step_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    ggml_tensor * momentum = dst->src[3];
+    ggml_tensor * residual = dst->src[4];
+    const ggml_tensor * pars = dst->src[5];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0 && pars->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
+    const int64_t n_blocks_row = weight->ne[0] / 32;
+    const int64_t n_indices = ggml_nelements(ids);
+    const int64_t n_blocks = n_indices * n_blocks_row;
+    if (weight->type == GGML_TYPE_MXFP4) {
+        opt_step_qlion_qat_rows<true><<<n_blocks, 32, 0, ctx.stream()>>>(
+            weight->data, (const float *) grad->data, (const int32_t *) ids->data,
+            (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
+            n_blocks_row, weight->ne[1], n_indices);
+    } else {
+        opt_step_qlion_qat_rows<false><<<n_blocks, 32, 0, ctx.stream()>>>(
+            weight->data, (const float *) grad->data, (const int32_t *) ids->data,
+            (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
+            n_blocks_row, weight->ne[1], n_indices);
     }
 }

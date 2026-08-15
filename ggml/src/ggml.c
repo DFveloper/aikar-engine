@@ -1101,12 +1101,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
     "OPT_STEP_QLION_QAT",
     "OPT_STEP_QLION_QAT_ID",
+    "OPT_STEP_QLION_QAT_ROWS",
 
     "GLU",
     "GLU_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1221,12 +1222,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
     "qlion_qat(x)",
     "qlion_qat_id(x)",
+    "qlion_qat_rows(x)",
 
     "glu(x)",
     "glu_back(dy,x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3466,6 +3468,33 @@ struct ggml_tensor * ggml_out_prod_id(
     GGML_ASSERT(a->type   == GGML_TYPE_F32);
     GGML_ASSERT(b->type   == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    if (a->ne[1] != b->ne[1] || a->ne[2] != b->ne[2]) {
+        fprintf(stderr,
+            "\n[OUT_PROD_ID SHAPE MISMATCH]\n"
+            "a   = %s [%lld, %lld, %lld, %lld]\n"
+            "b   = %s [%lld, %lld, %lld, %lld]\n"
+            "ids = %s [%lld, %lld, %lld, %lld]\n"
+            "n_expert = %lld\n",
+            ggml_get_name(a),
+            (long long) a->ne[0],
+            (long long) a->ne[1],
+            (long long) a->ne[2],
+            (long long) a->ne[3],
+
+            ggml_get_name(b),
+            (long long) b->ne[0],
+            (long long) b->ne[1],
+            (long long) b->ne[2],
+            (long long) b->ne[3],
+
+            ggml_get_name(ids),
+            (long long) ids->ne[0],
+            (long long) ids->ne[1],
+            (long long) ids->ne[2],
+            (long long) ids->ne[3],
+
+            (long long) n_expert);
+    }
     GGML_ASSERT(a->ne[1]  == b->ne[1]);   // n_expert_used matches
     GGML_ASSERT(a->ne[2]  == b->ne[2]);   // n_tokens matches
     GGML_ASSERT(ids->ne[0] == a->ne[1]);  // n_expert_used matches ids
@@ -6520,6 +6549,37 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_id(
     return result;
 }
 
+struct ggml_tensor * ggml_opt_step_qlion_qat_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * momentum,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * params) {
+    GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(weight->ne[0] == grad->ne[0]);
+    GGML_ASSERT(ggml_nelements(ids) == ggml_nrows(grad));
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 4);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
+    result->op = GGML_OP_OPT_STEP_QLION_QAT_ROWS;
+    result->src[0] = weight;
+    result->src[1] = grad;
+    result->src[2] = ids;
+    result->src[3] = momentum;
+    result->src[4] = residual;
+    result->src[5] = params;
+    return result;
+}
+
 // solve_tri
 
 struct ggml_tensor * ggml_solve_tri(
@@ -7061,6 +7121,18 @@ static void ggml_compute_backward(
                 ggml_add1_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, 1.0f/src0->ne[0], 0.0, false));
             }
         } break;
+        case GGML_OP_CUMSUM: {
+            if (src0_needs_grads) {
+                const int64_t n = src0->ne[0];
+                struct ggml_tensor * ones = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+                ones = ggml_fill(ctx, ones, 1.0f);
+                ones = ggml_tri(ctx, ones, GGML_TRI_TYPE_UPPER_DIAG);
+
+                struct ggml_tensor * grad_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, grad), n, ggml_nelements(grad)/n);
+                struct ggml_tensor * back = ggml_mul_mat(ctx, ones, grad_2d);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, back, src0));
+            }
+        } break;
         case GGML_OP_REPEAT: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_repeat_back(ctx, grad, src0));
@@ -7069,6 +7141,22 @@ static void ggml_compute_backward(
         case GGML_OP_REPEAT_BACK: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_repeat(ctx, grad, src0));
+            }
+        } break;
+        case GGML_OP_CONCAT: {
+            const int32_t dim = ggml_get_op_params_i32(tensor, 0);
+            if (src0_needs_grads) {
+                struct ggml_tensor * back = ggml_view_4d(ctx, grad,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, back));
+            }
+            if (src1_needs_grads) {
+                const size_t offset = src0->ne[dim] * grad->nb[dim];
+                struct ggml_tensor * back = ggml_view_4d(ctx, grad,
+                        src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, back));
             }
         } break;
         case GGML_OP_RMS_NORM: {
@@ -7136,6 +7224,30 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_SOLVE_TRI: {
+            if (src0_needs_grads || src1_needs_grads) {
+                const int64_t n = src0->ne[0];
+                struct ggml_tensor * identity = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+                identity = ggml_diag(ctx, ggml_fill(ctx, identity, 1.0f));
+                if (!ggml_are_same_shape(identity, src0)) {
+                    identity = ggml_repeat(ctx, identity, src0);
+                }
+
+                struct ggml_tensor * a_inv = ggml_solve_tri(ctx, src0, ggml_cont(ctx, identity), true, true, false);
+                struct ggml_tensor * a_inv_t = ggml_cont(ctx, ggml_transpose(ctx, a_inv));
+                struct ggml_tensor * grad_t = ggml_cont(ctx, ggml_transpose(ctx, grad));
+                struct ggml_tensor * grad_b = ggml_cont(ctx, ggml_transpose(ctx, ggml_mul_mat(ctx, a_inv_t, grad_t)));
+
+                if (src0_needs_grads) {
+                    struct ggml_tensor * grad_a = ggml_neg(ctx, ggml_mul_mat(ctx, tensor, grad_b));
+                    grad_a = ggml_tri(ctx, ggml_cont(ctx, grad_a), GGML_TRI_TYPE_LOWER_DIAG);
+                    ggml_add_or_set(ctx, cgraph, isrc0, grad_a);
+                }
+                if (src1_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
+                }
+            }
+        } break;
         case GGML_OP_MUL_MAT_ID: {
             // Backward pass for indirect matrix multiplication (MoE).
             //
@@ -7173,7 +7285,8 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 float s;
                 memcpy(&s, tensor->op_params, sizeof(float));
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, s, 0.0, false));
+                struct ggml_tensor * grad_scale = ggml_is_padded_1d(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad_scale, s, 0.0, false));
             }
         } break;
         case GGML_OP_SET: {
@@ -7202,6 +7315,29 @@ static void ggml_compute_backward(
             if (src1_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_cont(ctx, tensor_grad_view), src1));
             }
+        } break;
+        case GGML_OP_PAD: {
+            GGML_ASSERT(ggml_get_op_params_i32(tensor, 8) == 0 && "backward pass for circular padding not implemented");
+            if (src0_needs_grads) {
+                const int32_t lp0 = ggml_get_op_params_i32(tensor, 0);
+                const int32_t lp1 = ggml_get_op_params_i32(tensor, 2);
+                const int32_t lp2 = ggml_get_op_params_i32(tensor, 4);
+                const int32_t lp3 = ggml_get_op_params_i32(tensor, 6);
+                const size_t offset = lp0*grad->nb[0] + lp1*grad->nb[1] + lp2*grad->nb[2] + lp3*grad->nb[3];
+                struct ggml_tensor * back = ggml_view_4d(ctx, grad,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, back));
+            }
+        } break;
+        case GGML_OP_TRI: {
+            if (src0_needs_grads) {
+                const enum ggml_tri_type type = ggml_get_op_params_i32(tensor, 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, ggml_cont(ctx, grad), type));
+            }
+        } break;
+        case GGML_OP_FILL: {
+            // The output does not depend on the input values.
         } break;
         case GGML_OP_CPY: {
             // cpy overwrites value of src1 by src0 and returns view(src1)
@@ -7284,6 +7420,14 @@ static void ggml_compute_backward(
             }
             if (src1_needs_grads) {
                 // noop
+            }
+        } break;
+        case GGML_OP_DIAG: {
+            if (src0_needs_grads) {
+                struct ggml_tensor * ones = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, src0->ne[0]);
+                struct ggml_tensor * identity = ggml_diag(ctx, ggml_fill(ctx, ones, 1.0f));
+                struct ggml_tensor * back = ggml_sum_rows(ctx, ggml_mul(ctx, grad, identity));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, back, src0));
             }
         } break;
         case GGML_OP_DIAG_MASK_INF: {
@@ -7772,6 +7916,10 @@ void ggml_build_backward_expand_with_callback(
                 ignore_src[2] = true;
                 break;
 
+            case GGML_OP_FILL:
+                ignore_src[0] = true;
+                break;
+
             // MUL_MAT_ID: expert dispatch indices (src2) are integer.
             case GGML_OP_MUL_MAT_ID:
                 ignore_src[2] = true; // ids: integer tensor
@@ -7815,7 +7963,7 @@ void ggml_build_backward_expand_with_callback(
         }
 
         // inplace operations are currently not supported — warn and skip instead of crashing
-        if (node->view_src && node->op != GGML_OP_CPY && node->op != GGML_OP_VIEW &&
+        if (node->view_src && node->op != GGML_OP_CPY && node->op != GGML_OP_SET && node->op != GGML_OP_VIEW &&
             node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE &&
             node->op != GGML_OP_CLAMP) {
             GGML_LOG_WARN("%s: skipping unsupported inplace op '%s' in backward graph\n", __func__, ggml_op_name(node->op));
@@ -7844,13 +7992,6 @@ void ggml_build_backward_expand_with_callback(
         if (callback && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
             struct ggml_tensor * grad = ggml_graph_get_grad(cgraph, node);
             if (grad) {
-                // Compute dX with the old parameter before the in-place update.
-                for (int j = 0; j < n_nodes_f; ++j) {
-                    struct ggml_tensor * pending_grad = ggml_graph_get_grad(cgraph, cgraph->nodes[j]);
-                    if (pending_grad && !(cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_PARAM)) {
-                        ggml_build_forward_expand(cgraph, pending_grad);
-                    }
-                }
                 struct ggml_tensor * update = callback(ctx, node, grad, userdata);
                 if (update) {
                     ggml_build_forward_expand(cgraph, update);

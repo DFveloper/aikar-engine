@@ -3375,6 +3375,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(!opt_ctx);
     opt_model  = model;
     opt_params = lopt_params;
+    cparams.fused_gdn_ar = false;
+    cparams.fused_gdn_ch = false;
+    cparams.auto_fgdn    = false;
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
@@ -3399,8 +3402,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             if (mctx_tmp) {
                 // graph_reserve() uses gf_res_reserve to build the graph, so both
                 // must be large enough to hold the training forward graph.
-                // Use 16x n_tensors as a generous temporary cap for the measurement pass.
-                const uint32_t tmp_cap = std::max<uint32_t>(4096u, 16u * model->n_tensors());
+                // Chunked recurrent graphs add nodes in proportion to the training context.
+                const uint32_t tmp_cap = std::max<uint32_t>(4096u, 32u * model->n_tensors() + 16u * n_ubatch);
                 gf_res_prev.reset(new llm_graph_result(tmp_cap));
                 gf_res_reserve.reset(new llm_graph_result(tmp_cap));
                 // split_only=true: only splits the graph, doesn't reallocate compute buffers
@@ -3488,6 +3491,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     llama_set_param(model->cls_out,         param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
     llama_set_param(model->cls_out_b,       param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
     llama_set_param(model->cls_norm,        param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->per_layer_tok_embd,   param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->per_layer_model_proj, param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
+    llama_set_param(model->per_layer_proj_norm,  param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
 
     for (struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {

@@ -9,6 +9,12 @@ layout(push_constant) uniform parameter {
     uint n_used;
     uint n_tokens;
 } p;
+#elif ROWS
+layout(push_constant) uniform parameter {
+    uint n_blocks_row;
+    uint n_rows;
+    uint n_indices;
+} p;
 #else
 #include "generic_head.glsl"
 #endif
@@ -31,6 +37,12 @@ layout (binding = 3) readonly buffer IDS {int ids[];};
 layout (binding = 4) buffer M {block_q8_0 momentum[];};
 layout (binding = 5) buffer R {block_q4_0 residual[];};
 layout (binding = 6) readonly buffer P {float params[4];};
+#elif ROWS
+layout (binding = 1) readonly buffer G {float grad[];};
+layout (binding = 2) readonly buffer IDS {int ids[];};
+layout (binding = 3) buffer M {block_q8_0 momentum[];};
+layout (binding = 4) buffer R {block_q4_0 residual[];};
+layout (binding = 5) readonly buffer P {float params[4];};
 #else
 layout (binding = 1) readonly buffer G {float grad[];};
 layout (binding = 2) buffer M {block_q8_0 momentum[];};
@@ -63,6 +75,7 @@ void main() {
     init_iq_shmem(uvec3(32, 1, 1));
     const uint ib = gl_WorkGroupID.x;
     const uint lane = gl_LocalInvocationID.x;
+    uint state_ib = ib;
 #if ROUTED
     const uint n_blocks = p.n_blocks_row * p.n_rows * p.n_expert;
     if (ib >= n_blocks) {
@@ -71,6 +84,22 @@ void main() {
     const uint block = ib % p.n_blocks_row;
     const uint row = (ib / p.n_blocks_row) % p.n_rows;
     const uint expert = ib / (p.n_blocks_row * p.n_rows);
+#elif ROWS
+    const uint index = ib / p.n_blocks_row;
+    const uint block = ib % p.n_blocks_row;
+    if (index >= p.n_indices) {
+        return;
+    }
+    const int row = ids[index];
+    if (row < 0 || row >= int(p.n_rows)) {
+        return;
+    }
+    for (uint i = 0; i < index; ++i) {
+        if (ids[i] == row) {
+            return;
+        }
+    }
+    state_ib = uint(row) * p.n_blocks_row + block;
 #else
     if (ib >= p.KX) {
         return;
@@ -78,14 +107,14 @@ void main() {
 #endif
 
 #if WEIGHT_MXFP4
-    const uint packed = uint(weight[ib].qs[lane & 15]);
+    const uint packed = uint(weight[state_ib].qs[lane & 15]);
     const uint q = lane < 16 ? packed & 15 : packed >> 4;
-    const float weight_old = e8m0_to_fp32(weight[ib].e) * 0.5 * float(kvalues_mxfp4[q]);
+    const float weight_old = e8m0_to_fp32(weight[state_ib].e) * 0.5 * float(kvalues_mxfp4[q]);
 #else
-    const float weight_old = q4_value(weight[ib], lane);
+    const float weight_old = q4_value(weight[state_ib], lane);
 #endif
-    const float momentum_old = float(momentum[ib].d) * float(momentum[ib].qs[lane]);
-    const float residual_old = q4_value(residual[ib], lane);
+    const float momentum_old = float(momentum[state_ib].d) * float(momentum[state_ib].qs[lane]);
+    const float residual_old = q4_value(residual[state_ib], lane);
 #if ROUTED
     float g = 0.0;
     for (uint token = 0; token < p.n_tokens; ++token) {
@@ -94,6 +123,13 @@ void main() {
             if (ids[route] == int(expert)) {
                 g += activations[block * 32 + lane + p.n_blocks_row * 32 * route] * grad[row + p.n_rows * route];
             }
+        }
+    }
+#elif ROWS
+    float g = 0.0;
+    for (uint i = index; i < p.n_indices; ++i) {
+        if (ids[i] == row) {
+            g += grad[i * p.n_blocks_row * 32 + block * 32 + lane];
         }
     }
 #else
@@ -129,11 +165,11 @@ void main() {
     const int exponent_i = amax > 0.0 ? int(floor(log2(amax))) - 2 + 127 : 0;
     const uint8_t exponent = uint8_t(clamp(exponent_i, 0, 254));
     const float weight_scale = e8m0_to_fp32(exponent) * 0.5;
-    weight[ib].e = exponent;
+    weight[state_ib].e = exponent;
     for (uint i = 0; i < 16; ++i) {
         const uint q0 = best_mxfp4(target_values[i], weight_scale);
         const uint q1 = best_mxfp4(target_values[i + 16], weight_scale);
-        weight[ib].qs[i] = uint8_t(q0 | (q1 << 4));
+        weight[state_ib].qs[i] = uint8_t(q0 | (q1 << 4));
         weight_new[i] = weight_scale * float(kvalues_mxfp4[q0]);
         weight_new[i + 16] = weight_scale * float(kvalues_mxfp4[q1]);
     }
@@ -148,13 +184,13 @@ void main() {
     }
     const float weight_scale = signed_max / -8.0;
     const float weight_inverse = weight_scale != 0.0 ? 1.0 / weight_scale : 0.0;
-    weight[ib].d = float16_t(weight_scale);
+    weight[state_ib].d = float16_t(weight_scale);
     for (uint i = 0; i < 16; ++i) {
         const uint q0 = uint(clamp(int(target_values[i] * weight_inverse + 8.5), 0, 15));
         const uint q1 = uint(clamp(int(target_values[i + 16] * weight_inverse + 8.5), 0, 15));
-        weight[ib].qs[i] = uint8_t(q0 | (q1 << 4));
-        weight_new[i] = float(weight[ib].d) * (float(q0) - 8.0);
-        weight_new[i + 16] = float(weight[ib].d) * (float(q1) - 8.0);
+        weight[state_ib].qs[i] = uint8_t(q0 | (q1 << 4));
+        weight_new[i] = float(weight[state_ib].d) * (float(q0) - 8.0);
+        weight_new[i + 16] = float(weight[state_ib].d) * (float(q1) - 8.0);
     }
 #endif
 
@@ -177,11 +213,11 @@ void main() {
     }
     const float residual_scale = residual_signed_max / -8.0;
     const float residual_inverse = residual_scale != 0.0 ? 1.0 / residual_scale : 0.0;
-    residual[ib].d = float16_t(residual_scale);
+    residual[state_ib].d = float16_t(residual_scale);
     for (uint i = 0; i < 16; ++i) {
         const uint q0 = uint(clamp(int(residual_new[i] * residual_inverse + 8.5), 0, 15));
         const uint q1 = uint(clamp(int(residual_new[i + 16] * residual_inverse + 8.5), 0, 15));
-        residual[ib].qs[i] = uint8_t(q0 | (q1 << 4));
+        residual[state_ib].qs[i] = uint8_t(q0 | (q1 << 4));
     }
 
     float momentum_amax = 0.0;
@@ -194,8 +230,8 @@ void main() {
     }
     const float momentum_scale = momentum_signed_max / -128.0;
     const float momentum_inverse = momentum_scale != 0.0 ? 1.0 / momentum_scale : 0.0;
-    momentum[ib].d = float16_t(momentum_scale);
+    momentum[state_ib].d = float16_t(momentum_scale);
     for (uint i = 0; i < 32; ++i) {
-        momentum[ib].qs[i] = int8_t(clamp(int(round(momentum_values[i] * momentum_inverse)), -128, 127));
+        momentum[state_ib].qs[i] = int8_t(clamp(int(round(momentum_values[i] * momentum_inverse)), -128, 127));
     }
 }

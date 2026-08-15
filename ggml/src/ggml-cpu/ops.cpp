@@ -12456,6 +12456,67 @@ void ggml_compute_forward_opt_step_qlion_qat_id(const ggml_compute_params * para
     }
 }
 
+void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    ggml_tensor * momentum = dst->src[3];
+    ggml_tensor * residual = dst->src[4];
+    const ggml_tensor * opt_params = dst->src[5];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(opt_params->type == GGML_TYPE_F32 && ggml_nelements(opt_params) == 4);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
+
+    const ggml_type_traits * weight_traits = ggml_get_type_traits(weight->type);
+    const ggml_type_traits * momentum_traits = ggml_get_type_traits(momentum->type);
+    const ggml_type_traits * residual_traits = ggml_get_type_traits(residual->type);
+    const float * p = ggml_get_data_f32(opt_params);
+    const int32_t * rows = (const int32_t *) ids->data;
+    const float * grad_data = (const float *) grad->data;
+    const int64_t n_indices = ggml_nelements(ids);
+    const int64_t n_blocks_row = weight->ne[0] / 32;
+    const int64_t n_work = n_indices * n_blocks_row;
+    const int64_t work_per_thread = (n_work + params->nth - 1) / params->nth;
+    const int64_t work_begin = work_per_thread * params->ith;
+    const int64_t work_end = std::min(n_work, work_begin + work_per_thread);
+
+    for (int64_t iw = work_begin; iw < work_end; ++iw) {
+        const int64_t index = iw / n_blocks_row;
+        const int64_t block = iw % n_blocks_row;
+        const int32_t row = rows[index];
+        GGML_ASSERT(row >= 0 && row < weight->ne[1]);
+        bool first = true;
+        for (int64_t i = 0; i < index; ++i) {
+            if (rows[i] == row) {
+                first = false;
+                break;
+            }
+        }
+        if (!first) {
+            continue;
+        }
+        float grad_block[32] = {};
+        for (int64_t i = index; i < n_indices; ++i) {
+            if (rows[i] != row) {
+                continue;
+            }
+            const float * grad_row = grad_data + i * weight->ne[0] + block * 32;
+            for (int lane = 0; lane < 32; ++lane) {
+                grad_block[lane] += grad_row[lane];
+            }
+        }
+        const int64_t ib = row * n_blocks_row + block;
+        ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
+            (uint8_t *) weight->data + ib * weight_traits->type_size,
+            (uint8_t *) momentum->data + ib * momentum_traits->type_size,
+            (uint8_t *) residual->data + ib * residual_traits->type_size,
+            grad_block, p);
+    }
+}
+
 static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];

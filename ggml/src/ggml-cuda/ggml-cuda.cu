@@ -2489,6 +2489,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_OPT_STEP_QLION_QAT_ID:
             ggml_cuda_opt_step_qlion_qat_id(ctx, dst);
             break;
+        case GGML_OP_OPT_STEP_QLION_QAT_ROWS:
+            ggml_cuda_opt_step_qlion_qat_rows(ctx, dst);
+            break;
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
             break;
@@ -5660,6 +5663,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_QLION_QAT:
         case GGML_OP_OPT_STEP_QLION_QAT_ID:
+        case GGML_OP_OPT_STEP_QLION_QAT_ROWS:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:

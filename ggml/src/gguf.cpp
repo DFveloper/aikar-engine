@@ -1605,14 +1605,19 @@ struct gguf_writer_file final : public gguf_writer_base {
         GGML_ASSERT(ggml_is_contiguous(&info.t));
         const size_t nbytes = ggml_nbytes(&info.t);
 
-        std::vector<int8_t> buf(nbytes);
-        if (info.t.buffer) {
-            ggml_backend_tensor_get(&info.t, buf.data(), 0, nbytes);
-        } else {
-            GGML_ASSERT(info.t.data);
-            memcpy(buf.data(), info.t.data, nbytes);
+        const size_t chunk_max = 16 * 1024 * 1024;
+        std::vector<int8_t> buf(std::min(nbytes, chunk_max));
+        for (size_t offset = 0; offset < nbytes; offset += chunk_max) {
+            const size_t chunk = std::min(chunk_max, nbytes - offset);
+            buf.resize(chunk);
+            if (info.t.buffer) {
+                ggml_backend_tensor_get(&info.t, buf.data(), offset, chunk);
+            } else {
+                GGML_ASSERT(info.t.data);
+                memcpy(buf.data(), (const char *) info.t.data + offset, chunk);
+            }
+            write(buf);
         }
-        write(buf);
 
         pad(alignment);
     }

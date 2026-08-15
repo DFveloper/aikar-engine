@@ -490,14 +490,18 @@ static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t
 
 struct moe_op_trace {
     bool routed_update = false;
+    bool rows_update = false;
     bool full_gradient = false;
+    bool rows_gradient = false;
 };
 
 static bool trace_moe_ops(struct ggml_tensor * tensor, bool ask, void * userdata) {
     GGML_UNUSED(ask);
     moe_op_trace & trace = *(moe_op_trace *) userdata;
     trace.routed_update = trace.routed_update || tensor->op == GGML_OP_OPT_STEP_QLION_QAT_ID;
+    trace.rows_update = trace.rows_update || tensor->op == GGML_OP_OPT_STEP_QLION_QAT_ROWS;
     trace.full_gradient = trace.full_gradient || tensor->op == GGML_OP_OUT_PROD_ID;
+    trace.rows_gradient = trace.rows_gradient || tensor->op == GGML_OP_GET_ROWS_BACK;
     return false;
 }
 
@@ -544,7 +548,6 @@ static void test_native_routed_update(enum qat_weight_format format, ggml_backen
     params.gradient_clip = 0.03f;
     qat_step_stats stats;
     check(qat_tensor_state_step(reference, full_gradient.data(), params, stats, error), error.c_str());
-
     ggml_backend_t backend = device ? ggml_backend_dev_init(device, nullptr) : nullptr;
     if (!backend && !required) {
         return;
@@ -589,6 +592,105 @@ static void test_native_routed_update(enum qat_weight_format format, ggml_backen
     check(weight_after == reference.weight, "native routed QAT weight differs from reference");
     check(momentum_after == reference.momentum, "native routed QAT momentum differs from reference");
     check(residual_after == reference.residual, "native routed QAT residual differs from reference");
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+static void test_native_rows_update(enum qat_weight_format format, ggml_backend_dev_t device, bool required) {
+    constexpr int64_t cols = 64;
+    constexpr int64_t rows = 5;
+    constexpr int64_t indices = 4;
+    const enum ggml_type weight_type = qat_weight_ggml_type(format);
+    std::vector<float> initial_values(cols * rows);
+    for (size_t i = 0; i < initial_values.size(); ++i) {
+        initial_values[i] = 0.35f + 0.08f * std::sin(0.11f * (float) i);
+    }
+    const std::vector<uint8_t> initial_weight = quantize_rows(weight_type, initial_values, cols);
+    std::vector<float> upstream(cols * indices);
+    for (size_t i = 0; i < upstream.size(); ++i) {
+        upstream[i] = 0.12f * std::cos(0.17f * (float) i);
+    }
+    const int32_t row_ids[indices] = { 1, 3, 1, 1 };
+    std::vector<float> full_gradient(cols * rows, 0.0f);
+    for (int64_t index = 0; index < indices; ++index) {
+        for (int64_t col = 0; col < cols; ++col) {
+            full_gradient[col + cols * row_ids[index]] += upstream[col + cols * index];
+        }
+    }
+    qat_tensor_state reference;
+    std::string error;
+    check(qat_tensor_state_init_quantized(reference, format, initial_weight.data(), initial_weight.size(), initial_values.size(), error), error.c_str());
+    qat_qlion_params params;
+    params.learning_rate = 0.006f;
+    params.beta = 0.0f;
+    params.weight_decay = 0.0f;
+    params.gradient_clip = 0.04f;
+    qat_step_stats stats;
+    check(qat_tensor_state_step(reference, full_gradient.data(), params, stats, error), error.c_str());
+    const size_t weight_row_bytes = ggml_row_size(weight_type, cols);
+    const size_t momentum_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, cols);
+    const size_t residual_row_bytes = ggml_row_size(GGML_TYPE_Q4_0, cols);
+    std::vector<uint8_t> expected_weight = initial_weight;
+    std::vector<uint8_t> expected_momentum(reference.momentum.size(), 0);
+    std::vector<uint8_t> expected_residual(reference.residual.size(), 0);
+    for (int64_t row : { 1, 3 }) {
+        memcpy(expected_weight.data() + row * weight_row_bytes,
+            reference.weight.data() + row * weight_row_bytes, weight_row_bytes);
+        memcpy(expected_momentum.data() + row * momentum_row_bytes,
+            reference.momentum.data() + row * momentum_row_bytes, momentum_row_bytes);
+        memcpy(expected_residual.data() + row * residual_row_bytes,
+            reference.residual.data() + row * residual_row_bytes, residual_row_bytes);
+    }
+
+    ggml_backend_t backend = device ? ggml_backend_dev_init(device, nullptr) : nullptr;
+    if (!backend && !required) {
+        return;
+    }
+    check(backend != nullptr, "failed to create row QAT backend");
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ 12 * ggml_tensor_overhead() + ggml_graph_overhead_custom(12, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, cols, rows);
+    ggml_set_param(weight);
+    ggml_tensor * grad = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, indices);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, indices);
+    ggml_tensor * momentum = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, cols, rows);
+    ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, cols, rows);
+    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * result = ggml_opt_step_qlion_qat_rows(ctx, weight, grad, ids, momentum, residual, opt_params);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 12, false);
+    ggml_build_forward_expand(graph, result);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "failed to allocate row QAT tensors");
+    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip };
+    std::vector<uint8_t> momentum_zero(ggml_nbytes(momentum), 0);
+    std::vector<uint8_t> residual_zero(ggml_nbytes(residual), 0);
+    ggml_backend_tensor_set(weight, initial_weight.data(), 0, initial_weight.size());
+    ggml_backend_tensor_set(grad, upstream.data(), 0, upstream.size() * sizeof(float));
+    ggml_backend_tensor_set(ids, row_ids, 0, sizeof(row_ids));
+    ggml_backend_tensor_set(momentum, momentum_zero.data(), 0, momentum_zero.size());
+    ggml_backend_tensor_set(residual, residual_zero.data(), 0, residual_zero.size());
+    ggml_backend_tensor_set(opt_params, native_params, 0, sizeof(native_params));
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "native row QAT update failed");
+    std::vector<uint8_t> weight_after(reference.weight.size());
+    std::vector<uint8_t> momentum_after(reference.momentum.size());
+    std::vector<uint8_t> residual_after(reference.residual.size());
+    ggml_backend_tensor_get(weight, weight_after.data(), 0, weight_after.size());
+    ggml_backend_tensor_get(momentum, momentum_after.data(), 0, momentum_after.size());
+    ggml_backend_tensor_get(residual, residual_after.data(), 0, residual_after.size());
+    check(weight_after == expected_weight, "native row QAT weight differs from reference");
+    check(momentum_after == expected_momentum, "native row QAT momentum differs from reference");
+    check(residual_after == expected_residual, "native row QAT residual differs from reference");
+    const size_t row_bytes = weight_row_bytes;
+    check(memcmp(weight_after.data(), initial_weight.data(), row_bytes) == 0, "inactive embedding row 0 changed");
+    check(memcmp(weight_after.data() + 2 * row_bytes, initial_weight.data() + 2 * row_bytes, row_bytes) == 0,
+        "inactive embedding row 2 changed");
+    check(memcmp(weight_after.data() + 4 * row_bytes, initial_weight.data() + 4 * row_bytes, row_bytes) == 0,
+        "inactive embedding row 4 changed");
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);
@@ -681,6 +783,80 @@ static void test_moe_sparse_qat(enum qat_weight_format format) {
     ggml_backend_free(backend);
 }
 
+static void test_embedding_sparse_qat(enum qat_weight_format format) {
+    constexpr int64_t cols = 64;
+    constexpr int64_t rows = 6;
+    constexpr int64_t indices = 4;
+    const enum ggml_type weight_type = qat_weight_ggml_type(format);
+    std::vector<float> weight_values(cols * rows);
+    for (size_t i = 0; i < weight_values.size(); ++i) {
+        weight_values[i] = 0.3f + 0.05f * std::sin(0.09f * (float) i);
+    }
+    const std::vector<uint8_t> weight_data = quantize_rows(weight_type, weight_values, cols);
+
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backends[] = { backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_init_params static_params = {
+        /*.mem_size   =*/ 4 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx_static, weight_type, cols, rows);
+    ggml_set_name(weight, "embedding.weight");
+    ggml_set_param(weight);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, indices);
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    check(static_buffer != nullptr, "failed to allocate embedding test tensors");
+    const int32_t row_ids[indices] = { 1, 4, 1, 4 };
+    ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size());
+    ggml_backend_tensor_set(ids, row_ids, 0, sizeof(row_ids));
+
+    ggml_init_params compute_params = {
+        /*.mem_size   =*/ GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 3 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+    ggml_tensor * output = ggml_get_rows(ctx_compute, weight, ids);
+    ggml_opt_params opt_params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
+    opt_params.ctx_compute = ctx_compute;
+    opt_params.inputs = ids;
+    opt_params.outputs = output;
+    opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    opt_params.get_opt_pars = test_qlion_optimizer_params;
+    ggml_opt_context_t opt = ggml_opt_init(opt_params);
+    ggml_opt_alloc(opt, true);
+    ggml_set_zero(ggml_opt_labels(opt));
+    check(ggml_opt_grad_acc(opt, weight) == nullptr, "embedding QAT allocated a persistent full gradient accumulator");
+    moe_op_trace trace;
+    ggml_backend_sched_set_eval_callback(sched, trace_moe_ops, &trace);
+    ggml_opt_result_t result = ggml_opt_result_init();
+    ggml_opt_eval(opt, result);
+    check(trace.rows_update, "embedding QAT did not use the sparse row optimizer update");
+    check(!trace.rows_gradient, "embedding QAT materialized a full row gradient tensor");
+
+    std::vector<uint8_t> weight_after(weight_data.size());
+    ggml_backend_tensor_get(weight, weight_after.data(), 0, weight_after.size());
+    const size_t row_bytes = ggml_row_size(weight_type, cols);
+    check(memcmp(weight_after.data(), weight_data.data(), row_bytes) == 0, "inactive embedding row 0 changed");
+    check(memcmp(weight_after.data() + 2 * row_bytes, weight_data.data() + 2 * row_bytes, row_bytes) == 0,
+        "inactive embedding row 2 changed");
+    check(memcmp(weight_after.data() + 3 * row_bytes, weight_data.data() + 3 * row_bytes, row_bytes) == 0,
+        "inactive embedding row 3 changed");
+    check(memcmp(weight_after.data() + 5 * row_bytes, weight_data.data() + 5 * row_bytes, row_bytes) == 0,
+        "inactive embedding row 5 changed");
+
+    ggml_opt_result_free(result);
+    ggml_opt_free(opt);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(ctx_static);
+    ggml_free(ctx_compute);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
     test_zero_gradient(QAT_WEIGHT_MXFP4);
@@ -703,6 +879,8 @@ int main() {
     test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_rows_update(QAT_WEIGHT_MXFP4, cpu_device, true);
+    test_native_rows_update(QAT_WEIGHT_Q4_0, cpu_device, true);
     const char * backend_filter = getenv("QAT_TEST_BACKEND");
     for (size_t i = 0; backend_filter && i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t device = ggml_backend_dev_get(i);
@@ -719,11 +897,15 @@ int main() {
         test_native_moe_dx(QAT_WEIGHT_Q4_0, device, false);
         test_native_routed_update(QAT_WEIGHT_MXFP4, device, false);
         test_native_routed_update(QAT_WEIGHT_Q4_0, device, false);
+        test_native_rows_update(QAT_WEIGHT_MXFP4, device, false);
+        test_native_rows_update(QAT_WEIGHT_Q4_0, device, false);
     }
     test_native_optimizer_graph(QAT_WEIGHT_MXFP4);
     test_native_optimizer_graph(QAT_WEIGHT_Q4_0);
     test_moe_sparse_qat(QAT_WEIGHT_MXFP4);
     test_moe_sparse_qat(QAT_WEIGHT_Q4_0);
+    test_embedding_sparse_qat(QAT_WEIGHT_MXFP4);
+    test_embedding_sparse_qat(QAT_WEIGHT_Q4_0);
     printf("QAT reference tests passed\n");
     return 0;
 }

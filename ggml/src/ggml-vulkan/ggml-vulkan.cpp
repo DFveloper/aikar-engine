@@ -1084,6 +1084,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_opt_step_qlion_qat_q4_0;
     vk_pipeline pipeline_opt_step_qlion_qat_id_mxfp4;
     vk_pipeline pipeline_opt_step_qlion_qat_id_q4_0;
+    vk_pipeline pipeline_opt_step_qlion_qat_rows_mxfp4;
+    vk_pipeline pipeline_opt_step_qlion_qat_rows_q4_0;
     vk_pipeline pipeline_mul_mat_id_back_mxfp4;
     vk_pipeline pipeline_mul_mat_id_back_q4_0;
     vk_pipeline pipeline_opt_step_sgd_f32;
@@ -1415,6 +1417,12 @@ struct vk_op_mul_mat_id_back_push_constants {
     uint32_t n_expert;
     uint32_t n_used;
     uint32_t n_tokens;
+};
+
+struct vk_op_qlion_qat_rows_push_constants {
+    uint32_t n_blocks_row;
+    uint32_t n_rows;
+    uint32_t n_indices;
 };
 
 struct vk_op_cross_entropy_push_constants {
@@ -6010,6 +6018,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_id_mxfp4, "opt_step_qlion_qat_id_mxfp4", opt_step_qlion_qat_id_mxfp4_len, opt_step_qlion_qat_id_mxfp4_data, "main", 7, sizeof(vk_op_mul_mat_id_back_push_constants), {32, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_id_q4_0, "opt_step_qlion_qat_id_q4_0", opt_step_qlion_qat_id_q4_0_len, opt_step_qlion_qat_id_q4_0_data, "main", 7, sizeof(vk_op_mul_mat_id_back_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_rows_mxfp4, "opt_step_qlion_qat_rows_mxfp4", opt_step_qlion_qat_rows_mxfp4_len, opt_step_qlion_qat_rows_mxfp4_data, "main", 6, sizeof(vk_op_qlion_qat_rows_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_qlion_qat_rows_q4_0, "opt_step_qlion_qat_rows_q4_0", opt_step_qlion_qat_rows_q4_0_len, opt_step_qlion_qat_rows_q4_0_data, "main", 6, sizeof(vk_op_qlion_qat_rows_push_constants), {32, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_mxfp4, "mul_mat_id_back_mxfp4", mul_mat_id_back_mxfp4_len, mul_mat_id_back_mxfp4_data, "main", 4, sizeof(vk_op_mul_mat_id_back_push_constants), {32, 1, 1}, {}, 1);
 
@@ -11817,6 +11829,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_opt_step_qlion_qat_id_q4_0;
         }
         return nullptr;
+    case GGML_OP_OPT_STEP_QLION_QAT_ROWS:
+        if (src0->type == GGML_TYPE_MXFP4) {
+            return ctx->device->pipeline_opt_step_qlion_qat_rows_mxfp4;
+        }
+        if (src0->type == GGML_TYPE_Q4_0) {
+            return ctx->device->pipeline_opt_step_qlion_qat_rows_q4_0;
+        }
+        return nullptr;
     case GGML_OP_OPT_STEP_SGD:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_sgd_f32;
@@ -13150,6 +13170,30 @@ static void ggml_vk_opt_step_qlion_qat_id(ggml_backend_vk_context * ctx, vk_cont
             (uint32_t) grad->ne[1], (uint32_t) grad->ne[2]
         },
         std::array<uint32_t, 3> { n_blocks * 32, 1, 1 });
+}
+
+static void ggml_vk_opt_step_qlion_qat_rows(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    const ggml_tensor * momentum = dst->src[3];
+    const ggml_tensor * residual = dst->src[4];
+    const ggml_tensor * params = dst->src[5];
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, weight, grad, ids, dst, GGML_OP_OPT_STEP_QLION_QAT_ROWS);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_subbuffer weight_buf = ggml_vk_tensor_subbuffer(ctx, weight);
+    const vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
+    const vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
+    const vk_subbuffer momentum_buf = ggml_vk_tensor_subbuffer(ctx, momentum);
+    const vk_subbuffer residual_buf = ggml_vk_tensor_subbuffer(ctx, residual);
+    const vk_subbuffer params_buf = ggml_vk_tensor_subbuffer(ctx, params);
+    const uint32_t n_blocks_row = (uint32_t) weight->ne[0] / 32;
+    const uint32_t n_indices = (uint32_t) ggml_nelements(ids);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { weight_buf, grad_buf, ids_buf, momentum_buf, residual_buf, params_buf },
+        vk_op_qlion_qat_rows_push_constants { n_blocks_row, (uint32_t) weight->ne[1], n_indices },
+        std::array<uint32_t, 3> { n_indices * n_blocks_row * 32, 1, 1 });
 }
 
 static void ggml_vk_mul_mat_id_back(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
@@ -16122,6 +16166,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_opt_step_qlion_qat_id(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_OPT_STEP_QLION_QAT_ROWS:
+        ggml_vk_opt_step_qlion_qat_rows(ctx, compute_ctx, node);
+
+        break;
 
     case GGML_OP_OPT_STEP_SGD:
         ggml_vk_opt_step_sgd(ctx, compute_ctx, src0, src1, src2, node);
@@ -18830,6 +18878,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
                    ggml_is_contiguous(op->src[4]) && ggml_is_contiguous(op->src[5]) &&
                    ggml_is_contiguous(op->src[6]);
+        case GGML_OP_OPT_STEP_QLION_QAT_ROWS:
+            return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                   op->src[3]->type == GGML_TYPE_Q8_0 && op->src[4]->type == GGML_TYPE_Q4_0 &&
+                   op->src[5]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op->src[4]) &&
+                   ggml_is_contiguous(op->src[5]);
         case GGML_OP_OPT_STEP_SGD:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_LOG:
@@ -19978,6 +20034,10 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_qlion_qat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
             src_clone[3], src_clone[4], src_clone[5], src_clone[6]);
+        } else if (tensor->op == GGML_OP_OPT_STEP_QLION_QAT_ROWS) {
+            src_clone[0]->flags = tensor->src[0]->flags;
+            tensor_clone = ggml_opt_step_qlion_qat_rows(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+            src_clone[3], src_clone[4], src_clone[5]);
         } else if (tensor->op == GGML_OP_OPT_STEP_SGD) {
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_sgd(ggml_ctx, src_clone[0], src_clone[1],

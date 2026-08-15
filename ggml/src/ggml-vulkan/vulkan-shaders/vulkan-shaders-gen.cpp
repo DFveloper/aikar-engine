@@ -1076,6 +1076,8 @@ void process_shaders() {
     string_to_spv("opt_step_qlion_qat_q4_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}}));
     string_to_spv("opt_step_qlion_qat_id_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}, {"ROUTED", "1"}}));
     string_to_spv("opt_step_qlion_qat_id_q4_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}, {"ROUTED", "1"}}));
+    string_to_spv("opt_step_qlion_qat_rows_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}, {"ROWS", "1"}}));
+    string_to_spv("opt_step_qlion_qat_rows_q4_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}, {"ROWS", "1"}}));
     string_to_spv("mul_mat_id_back_mxfp4", "mul_mat_id_back.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}}));
     string_to_spv("mul_mat_id_back_q4_0", "mul_mat_id_back.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));

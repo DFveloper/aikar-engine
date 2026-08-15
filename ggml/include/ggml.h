@@ -591,6 +591,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
         GGML_OP_OPT_STEP_QLION_QAT,
         GGML_OP_OPT_STEP_QLION_QAT_ID,
+        GGML_OP_OPT_STEP_QLION_QAT_ROWS,
 
         GGML_OP_GLU,
         GGML_OP_GLU_BACK,
@@ -2836,6 +2837,15 @@ extern "C" {
         struct ggml_context * ctx,
         struct ggml_tensor *  weight,
         struct ggml_tensor *  activations,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  ids,
+        struct ggml_tensor *  momentum,
+        struct ggml_tensor *  residual,
+        struct ggml_tensor *  params);
+
+    GGML_API struct ggml_tensor * ggml_opt_step_qlion_qat_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  weight,
         struct ggml_tensor *  grad,
         struct ggml_tensor *  ids,
         struct ggml_tensor *  momentum,
