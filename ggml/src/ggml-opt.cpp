@@ -859,23 +859,6 @@ ggml_opt_qlion_qat_backward_callback(
 
     struct ggml_tensor * step;
 
-    if (ggml_nelements(param) > 100000000) {
-    fprintf(
-        stderr,
-        "\nQLION HUGE:"
-        " param=%s"
-        " ne=%lld"
-        " combined_op=%s"
-        " pending=%zu"
-        " aliases=%zu\n",
-        param->name,
-        (long long) ggml_nelements(param),
-        ggml_op_desc(combined),
-        pending.size(),
-        opt_ctx->qat_aliases[i].size()
-    );
-}
-
     if (combined->op ==
         GGML_OP_OUT_PROD_ID) {
 
@@ -937,6 +920,80 @@ ggml_opt_qlion_qat_backward_callback(
                 opt_ctx->
                     opt_step_params
             );
+    }
+
+    static bool dumped_tied_grad = false;
+
+    if (!dumped_tied_grad &&
+        strcmp(param->name, "token_embd.weight") == 0) {
+
+        dumped_tied_grad = true;
+
+        fprintf(
+            stderr,
+            "\n=== TIED GRAD DUMP ===\n"
+            "param=%s pending=%zu aliases=%zu\n",
+            param->name,
+            pending.size(),
+            opt_ctx->qat_aliases[i].size()
+        );
+
+        for (size_t k = 0;
+            k < pending.size();
+            ++k) {
+
+            ggml_tensor * t =
+                pending[k];
+
+            fprintf(
+                stderr,
+                "pending[%zu]:"
+                " op=%s"
+                " type=%s"
+                " ne=[%lld,%lld,%lld,%lld]\n",
+                k,
+                ggml_op_desc(t),
+                ggml_type_name(t->type),
+                (long long) t->ne[0],
+                (long long) t->ne[1],
+                (long long) t->ne[2],
+                (long long) t->ne[3]
+            );
+
+            for (int s = 0;
+                s < GGML_MAX_SRC;
+                ++s) {
+
+                if (!t->src[s]) {
+                    continue;
+                }
+
+                ggml_tensor * src =
+                    t->src[s];
+
+                fprintf(
+                    stderr,
+                    "  src[%d]:"
+                    " op=%s"
+                    " type=%s"
+                    " ne=[%lld,%lld,%lld,%lld]"
+                    " name=%s\n",
+                    s,
+                    ggml_op_desc(src),
+                    ggml_type_name(src->type),
+                    (long long) src->ne[0],
+                    (long long) src->ne[1],
+                    (long long) src->ne[2],
+                    (long long) src->ne[3],
+                    src->name
+                );
+            }
+        }
+
+        fprintf(
+            stderr,
+            "======================\n"
+        );
     }
 
     ggml_format_name(
