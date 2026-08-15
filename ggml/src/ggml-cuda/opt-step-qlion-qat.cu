@@ -1,38 +1,33 @@
 #include "ggml-impl.h"
 #include "opt-step-qlion-qat.cuh"
 
+#include <algorithm>
 #include <cstdint>
 
-static constexpr int QLION_QAT_ID_GEMM_CAP = 256;
+static constexpr int QLION_QAT_ID_GEMM_CAP   = 128;
+static constexpr int QLION_QAT_ID_GEMM_BATCH = 8;
 
-static inline void qlion_qat_id_gemm(
+static inline void qlion_qat_id_gemm_batched(
         cublasHandle_t handle,
         int m,
         int n,
         int k,
         const float * a,
         int lda,
+        long long stride_a,
         const float * b,
         int ldb,
+        long long stride_b,
         float * c,
-        int ldc) {
+        int ldc,
+        long long stride_c,
+        int batch_count) {
 
     const float alpha = 1.0f;
     const float beta  = 0.0f;
 
-#if !defined(GGML_USE_HIP) && \
-    !defined(GGML_USE_MUSA) && \
-    CUDART_VERSION >= 11000
-
-    //
-    // NVIDIA Ampere+ fast path.
-    //
-    // Inputs/output remain FP32.
-    // Multiplication uses TF32 Tensor Cores where supported.
-    // Accumulation remains FP32.
-    //
     CUBLAS_CHECK(
-        cublasGemmEx(
+        cublasSgemmStridedBatched(
             handle,
 
             CUBLAS_OP_N,
@@ -45,57 +40,22 @@ static inline void qlion_qat_id_gemm(
             &alpha,
 
             a,
-            CUDA_R_32F,
             lda,
+            stride_a,
 
             b,
-            CUDA_R_32F,
             ldb,
+            stride_b,
 
             &beta,
 
             c,
-            CUDA_R_32F,
             ldc,
+            stride_c,
 
-            CUBLAS_COMPUTE_32F_FAST_TF32,
-
-            CUBLAS_GEMM_DEFAULT
+            batch_count
         )
     );
-
-#else
-
-    //
-    // ROCm / MUSA / old CUDA fallback.
-    //
-    CUBLAS_CHECK(
-        cublasSgemm(
-            handle,
-
-            CUBLAS_OP_N,
-            CUBLAS_OP_T,
-
-            m,
-            n,
-            k,
-
-            &alpha,
-
-            a,
-            lda,
-
-            b,
-            ldb,
-
-            &beta,
-
-            c,
-            ldc
-        )
-    );
-
-#endif
 }
 
 static __device__ __forceinline__ float q4_0_value(const block_q4_0 & block, int lane) {
@@ -321,7 +281,7 @@ static __global__ void qlion_qat_id_build_routes(
     }
 }
 
-static __global__ void qlion_qat_id_gather_expert_padded(
+static __global__ void qlion_qat_id_gather_expert_batch_padded(
         const float * __restrict__ activations,
         const float * __restrict__ grad,
         const int32_t * __restrict__ expert_offsets,
@@ -332,14 +292,18 @@ static __global__ void qlion_qat_id_gather_expert_padded(
         int64_t rows,
         int64_t n_act_used,
         int64_t n_used,
-        int64_t expert,
+        int64_t expert_base,
+        int64_t batch_count,
         int64_t cap) {
 
     const int64_t per_slot =
         cols + rows;
 
-    const int64_t total =
+    const int64_t per_expert =
         cap * per_slot;
+
+    const int64_t total =
+        batch_count * per_expert;
 
     const int64_t i =
         (int64_t) blockIdx.x * blockDim.x +
@@ -349,11 +313,20 @@ static __global__ void qlion_qat_id_gather_expert_padded(
         return;
     }
 
+    const int64_t batch_expert =
+        i / per_expert;
+
+    const int64_t local =
+        i - batch_expert * per_expert;
+
     const int64_t slot =
-        i / per_slot;
+        local / per_slot;
 
     const int64_t j =
-        i - slot * per_slot;
+        local - slot * per_slot;
+
+    const int64_t expert =
+        expert_base + batch_expert;
 
     const int32_t begin =
         expert_offsets[expert];
@@ -366,13 +339,6 @@ static __global__ void qlion_qat_id_gather_expert_padded(
 
     const bool valid =
         route_pos < end;
-
-    //
-    // Invalid padded slots become zero.
-    //
-    // Therefore every expert can use exactly the same
-    // fixed GEMM K=cap without the CPU knowing route counts.
-    //
 
     int64_t route = 0;
 
@@ -390,12 +356,6 @@ static __global__ void qlion_qat_id_gather_expert_padded(
             const int64_t token =
                 route / n_used;
 
-            //
-            // activation broadcast support:
-            //
-            // [cols, 1, T]
-            // [cols, n_used, T]
-            //
             const int64_t act_used =
                 used % n_act_used;
 
@@ -411,10 +371,11 @@ static __global__ void qlion_qat_id_gather_expert_padded(
         }
 
         a_gathered[
+            batch_expert * cols * cap +
             j +
             cols * slot
-        ] =
-            value;
+        ] = value;
+
     } else {
         const int64_t row =
             j - cols;
@@ -430,10 +391,10 @@ static __global__ void qlion_qat_id_gather_expert_padded(
         }
 
         g_gathered[
+            batch_expert * rows * cap +
             row +
             rows * slot
-        ] =
-            value;
+        ] = value;
     }
 }
 
@@ -452,10 +413,11 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
         int64_t n_rows,
         int64_t n_act_used,
         int64_t n_used,
-        int64_t expert,
+        int64_t expert_base,
+        int64_t batch_count,
         int64_t cap) {
 
-    const int64_t local_ib =
+    const int64_t task =
         blockIdx.x;
 
     const int lane =
@@ -464,9 +426,18 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     const int64_t n_blocks_expert =
         n_blocks_row * n_rows;
 
-    if (local_ib >= n_blocks_expert) {
+    const int64_t batch_expert =
+        task / n_blocks_expert;
+
+    const int64_t local_ib =
+        task % n_blocks_expert;
+
+    if (batch_expert >= batch_count) {
         return;
     }
+
+    const int64_t expert =
+        expert_base + batch_expert;
 
     const int64_t block =
         local_ib % n_blocks_row;
@@ -477,26 +448,16 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     const int64_t cols =
         n_blocks_row * 32;
 
-    //
-    // GEMM result:
-    //
-    // expert_grad = A @ G^T
-    //
-    // layout [cols, rows]
-    //
+    const float * current_expert_grad =
+        expert_grad +
+        batch_expert * cols * n_rows;
+
     float g =
-        expert_grad[
+        current_expert_grad[
             block * 32 +
             lane +
             cols * row
         ];
-
-    //
-    // Handle extremely overloaded experts exactly.
-    //
-    // First cap routes were handled by GEMM.
-    // Any remaining routes are accumulated here.
-    //
 
     const int32_t begin =
         expert_offsets[expert];
@@ -504,81 +465,9 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     const int32_t end =
         expert_offsets[expert + 1];
 
-    int64_t overflow_begin =
+    const int64_t overflow_begin =
         (int64_t) begin + cap;
 
-    if (overflow_begin < end) {
-        for (int64_t p = overflow_begin;
-             p < end;
-             ++p) {
-
-            const int64_t route =
-                routes[p];
-
-            const int64_t used =
-                route % n_used;
-
-            const int64_t token =
-                route / n_used;
-
-            const int64_t act_used =
-                used % n_act_used;
-
-            const int64_t act_route =
-                act_used +
-                n_act_used * token;
-
-            const float a =
-                activations[
-                    block * 32 +
-                    lane +
-                    cols * act_route
-                ];
-
-            float dg = 0.0f;
-
-            if (lane == 0) {
-                dg =
-                    grad[
-                        row +
-                        n_rows * route
-                    ];
-            }
-
-            dg =
-                __shfl_sync(
-                    0xffffffff,
-                    dg,
-                    0
-                );
-
-            g =
-                fmaf(
-                    a,
-                    dg,
-                    g
-                );
-        }
-    }
-
-    //
-    // Convert expert-local block index into the
-    // global quantized-weight block index.
-    //
-    const int64_t global_ib =
-        expert * n_blocks_expert +
-        local_ib;
-
-    opt_step_qlion_qat_apply<mxfp4>(
-        weight_data,
-        momentum,
-        residual,
-        pars,
-        global_ib,
-        lane,
-        g
-    );
-}
 
 template<bool mxfp4>
 static __global__ void opt_step_qlion_qat_rows(
@@ -889,23 +778,23 @@ void ggml_cuda_opt_step_qlion_qat_id(
     //
     // Total       ~ 19.3 MiB
     //
-    ggml_cuda_pool_alloc<float>
-        a_gathered(
-            ctx.pool(),
-            cols * cap
-        );
+    constexpr int64_t expert_batch =
+        QLION_QAT_ID_GEMM_BATCH;
 
-    ggml_cuda_pool_alloc<float>
-        g_gathered(
-            ctx.pool(),
-            rows * cap
-        );
+    ggml_cuda_pool_alloc<float> a_gathered(
+        ctx.pool(),
+        expert_batch * cols * cap
+    );
 
-    ggml_cuda_pool_alloc<float>
-        expert_grad(
-            ctx.pool(),
-            cols * rows
-        );
+    ggml_cuda_pool_alloc<float> g_gathered(
+        ctx.pool(),
+        expert_batch * rows * cap
+    );
+
+    ggml_cuda_pool_alloc<float> expert_grad(
+        ctx.pool(),
+        expert_batch * cols * rows
+    );
 
     const int64_t n_blocks_row =
         cols / 32;
@@ -945,9 +834,15 @@ void ggml_cuda_opt_step_qlion_qat_id(
     //
     // Therefore CUDA Graph capture remains valid.
     //
-    for (int64_t expert = 0;
-         expert < n_expert;
-         ++expert) {
+    for (int64_t expert_base = 0;
+        expert_base < n_expert;
+        expert_base += expert_batch) {
+
+        const int batch_count =
+            (int) std::min<int64_t>(
+                expert_batch,
+                n_expert - expert_base
+            );
 
         //
         // --------------------------------------------------------
@@ -957,16 +852,25 @@ void ggml_cuda_opt_step_qlion_qat_id(
         // --------------------------------------------------------
         //
 
-        qlion_qat_id_gather_expert_padded
-            <<<gather_blocks,
-               gather_threads,
-               0,
-               stream>>>(
-                (const float *)
-                    activations->data,
+        const int64_t gather_elements =
+    (int64_t) batch_count *
+    cap *
+    (cols + rows);
 
-                (const float *)
-                    grad->data,
+const int64_t gather_blocks =
+    (
+        gather_elements +
+        gather_threads - 1
+    ) /
+        gather_threads;
+
+        qlion_qat_id_gather_expert_batch_padded
+            <<<gather_blocks,
+            gather_threads,
+            0,
+            stream>>>(
+                (const float *) activations->data,
+                (const float *) grad->data,
 
                 expert_offsets.ptr,
                 routes.ptr,
@@ -978,13 +882,14 @@ void ggml_cuda_opt_step_qlion_qat_id(
                 rows,
                 n_act_used,
                 n_used,
-                expert,
+
+                expert_base,
+                batch_count,
                 cap
             );
 
-        CUDA_CHECK(
-            cudaGetLastError()
-        );
+        CUDA_CHECK(cudaGetLastError());
+
 
         //
         // --------------------------------------------------------
@@ -1001,7 +906,7 @@ void ggml_cuda_opt_step_qlion_qat_id(
         // --------------------------------------------------------
         //
 
-        qlion_qat_id_gemm(
+        qlion_qat_id_gemm_batched(
             handle,
 
             (int) cols,
@@ -1010,12 +915,17 @@ void ggml_cuda_opt_step_qlion_qat_id(
 
             a_gathered.ptr,
             (int) cols,
+            (long long) cols * cap,
 
             g_gathered.ptr,
             (int) rows,
+            (long long) rows * cap,
 
             expert_grad.ptr,
-            (int) cols
+            (int) cols,
+            (long long) cols * rows,
+
+            batch_count
         );
 
         //
@@ -1027,77 +937,60 @@ void ggml_cuda_opt_step_qlion_qat_id(
         // --------------------------------------------------------
         //
 
+        const int64_t apply_blocks =
+            (int64_t) batch_count *
+            n_blocks_expert;
         if (
             weight->type ==
             GGML_TYPE_MXFP4
         ) {
             opt_step_qlion_qat_id_apply_gemm<true>
-                <<<n_blocks_expert,
-                   32,
-                   0,
-                   stream>>>(
+                <<<apply_blocks, 32, 0, stream>>>(
                     weight->data,
-
                     expert_grad.ptr,
 
-                    (const float *)
-                        activations->data,
-
-                    (const float *)
-                        grad->data,
+                    (const float *) activations->data,
+                    (const float *) grad->data,
 
                     expert_offsets.ptr,
                     routes.ptr,
 
-                    (block_q8_0 *)
-                        momentum->data,
-
-                    (block_q4_0 *)
-                        residual->data,
-
-                    (const float *)
-                        pars->data,
+                    (block_q8_0 *) momentum->data,
+                    (block_q4_0 *) residual->data,
+                    (const float *) pars->data,
 
                     n_blocks_row,
                     rows,
                     n_act_used,
                     n_used,
-                    expert,
+
+                    expert_base,
+                    batch_count,
                     cap
                 );
         } else {
             opt_step_qlion_qat_id_apply_gemm<false>
-                <<<n_blocks_expert,
-                   32,
-                   0,
-                   stream>>>(
+                <<<apply_blocks, 32, 0, stream>>>(
                     weight->data,
-
                     expert_grad.ptr,
 
-                    (const float *)
-                        activations->data,
-
-                    (const float *)
-                        grad->data,
+                    (const float *) activations->data,
+                    (const float *) grad->data,
 
                     expert_offsets.ptr,
                     routes.ptr,
 
-                    (block_q8_0 *)
-                        momentum->data,
-
-                    (block_q4_0 *)
-                        residual->data,
-
-                    (const float *)
-                        pars->data,
+                    (block_q8_0 *) momentum->data,
+                    (block_q4_0 *) residual->data,
+                    (const float *) pars->data,
 
                     n_blocks_row,
                     rows,
                     n_act_used,
                     n_used,
-                    expert,
+
+                    expert_base,
+                    batch_count,
                     cap
                 );
         }
