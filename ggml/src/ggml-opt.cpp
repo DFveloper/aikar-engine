@@ -859,6 +859,23 @@ ggml_opt_qlion_qat_backward_callback(
 
     struct ggml_tensor * step;
 
+    if (ggml_nelements(param) > 100000000) {
+    fprintf(
+        stderr,
+        "\nQLION HUGE:"
+        " param=%s"
+        " ne=%lld"
+        " combined_op=%s"
+        " pending=%zu"
+        " aliases=%zu\n",
+        param->name,
+        (long long) ggml_nelements(param),
+        ggml_op_desc(combined),
+        pending.size(),
+        opt_ctx->qat_aliases[i].size()
+    );
+}
+
     if (combined->op ==
         GGML_OP_OUT_PROD_ID) {
 
