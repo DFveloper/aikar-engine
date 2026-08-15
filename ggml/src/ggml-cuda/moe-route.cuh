@@ -228,6 +228,7 @@ static inline void ggml_cuda_moe_build_routes(
             expert_offsets,
             cursor,
             routes,
+            route_rank,
             total_routes,
             n_expert,
             n_used,

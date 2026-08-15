@@ -142,6 +142,616 @@ static __device__ __forceinline__ int mxfp4_best_index(
 }
 
 template<bool mxfp4>
+static __device__ void opt_step_qlion_qat_apply(
+        void * __restrict__ weight_data,
+        block_q8_0 * __restrict__ momentum,
+        block_q4_0 * __restrict__ residual,
+        const float * __restrict__ pars,
+        int64_t ib,
+        int lane,
+        float g) {
+
+    const float alpha = pars[0];
+    const float beta  = pars[1];
+    const float wd    = pars[2];
+    const float gclip = pars[3];
+
+    const bool fast_state_scale =
+        pars[4] != 0.0f;
+
+    const float momentum_old_scale =
+        __half2float(
+            momentum[ib].d
+        );
+
+    const float momentum_value =
+        momentum_old_scale *
+        (float)
+            momentum[ib].qs[lane];
+
+    const float residual_old_scale =
+        __half2float(
+            residual[ib].d
+        );
+
+    const uint8_t residual_old_packed =
+        residual[ib].
+            qs[lane & 15];
+
+    const int residual_old_q =
+        lane < 16
+            ? residual_old_packed &
+                0x0f
+            : residual_old_packed >>
+                4;
+
+    const float residual_value =
+        residual_old_scale *
+        (
+            residual_old_q -
+            8
+        );
+
+    const float weight_old =
+        mxfp4
+            ? mxfp4_value(
+                ((const block_mxfp4 *)
+                    weight_data)[ib],
+                lane
+            )
+            : q4_0_value(
+                ((const block_q4_0 *)
+                    weight_data)[ib],
+                lane
+            );
+    g = isfinite(g) ? g : 0.0f;
+    if (gclip > 0.0f) {
+        g = fmaxf(-gclip, fminf(gclip, g));
+    }
+    float momentum_new = beta * momentum_value + (1.0f - beta) * g;
+    momentum_new = isfinite(momentum_new) ? momentum_new : 0.0f;
+    momentum_new = fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, momentum_new));
+    const float direction = momentum_new > 0.0f ? 1.0f : (momentum_new < 0.0f ? -1.0f : 0.0f);
+    float target = weight_old + residual_value - alpha * (direction + wd * weight_old);
+    target = isfinite(target) ? target : weight_old;
+    if (!mxfp4) {
+        target = fmaxf(-8.0f * 65504.0f, fminf(8.0f * 65504.0f, target));
+    }
+
+    float weight_new;
+    if constexpr (mxfp4) {
+        const float amax =
+            warp_reduce_max(fabsf(target));
+
+        int exponent_i32 = 0;
+        float scale = 0.0f;
+        float inv_scale = 0.0f;
+
+        if (lane == 0) {
+            if (amax > 0.0f) {
+                const uint32_t bits =
+                    __float_as_uint(amax);
+
+                const int fp32_exponent =
+                    (int) ((bits >> 23) & 0xff);
+
+                //
+                // For normal FP32:
+                //
+                // floor(log2(x)) - 2 + 127
+                //   == biased_exponent - 2
+                //
+                // exponent <= 2, including subnormals,
+                // clamps to E8M0 exponent 0 anyway.
+                //
+                exponent_i32 =
+                    fp32_exponent > 2
+                        ? fp32_exponent - 2
+                        : 0;
+
+                if (exponent_i32 > 254) {
+                    exponent_i32 = 254;
+                }
+            } else {
+                exponent_i32 = 0;
+            }
+
+            scale =
+                ggml_cuda_e8m0_to_fp32(
+                    (uint8_t) exponent_i32
+                ) * 0.5f;
+
+            inv_scale =
+                scale != 0.0f
+                    ? 1.0f / scale
+                    : 0.0f;
+        }
+        exponent_i32 =
+            __shfl_sync(
+                0xffffffff,
+                exponent_i32,
+                0
+            );
+
+        scale =
+            __shfl_sync(
+                0xffffffff,
+                scale,
+                0
+            );
+
+        inv_scale =
+            __shfl_sync(
+                0xffffffff,
+                inv_scale,
+                0
+            );
+
+        const uint8_t exponent =
+            (uint8_t) exponent_i32;
+        const int q =
+            mxfp4_best_index(
+                target,
+                inv_scale
+            );
+        const int q_hi = __shfl_sync(0xffffffff, q, (lane + 16) & 31);
+        if (lane == 0) {
+            ((block_mxfp4 *) weight_data)[ib].e = exponent;
+        }
+        if (lane < 16) {
+            ((block_mxfp4 *) weight_data)[ib].qs[lane] = q | (q_hi << 4);
+        }
+        weight_new = scale * kvalues_mxfp4[q];
+    } else {
+        const float signed_max = warp_signed_absmax(target);
+        const float scale = signed_max / -8.0f;
+        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+        const int q = min(15, (int) (target * inverse + 8.5f));
+        const int q_hi = __shfl_sync(0xffffffff, q, (lane + 16) & 31);
+        if (lane == 0) {
+            ((block_q4_0 *) weight_data)[ib].d = __float2half(scale);
+        }
+        if (lane < 16) {
+            ((block_q4_0 *) weight_data)[ib].qs[lane] = q | (q_hi << 4);
+        }
+        weight_new = __half2float(__float2half(scale)) * (q - 8);
+    }
+
+    //
+    // ============================================================
+    // Residual Q4_0 update
+    // ============================================================
+    //
+
+    float residual_new =
+        target - weight_new;
+
+    residual_new =
+        isfinite(residual_new)
+            ? residual_new
+            : 0.0f;
+
+    residual_new =
+        fmaxf(
+            -8.0f * 65504.0f,
+            fminf(
+                8.0f * 65504.0f,
+                residual_new
+            )
+        );
+
+
+    //
+    // 최종적으로 Q4_0에 쓸 값들.
+    //
+    // residual_scale:
+    //   block_q4_0.d 에 저장할 scale
+    //
+    // residual_inverse:
+    //   quantization할 때 사용할 1 / scale
+    //
+    // residual_q:
+    //   현재 lane의 4-bit code
+    //
+    float residual_scale   = 0.0f;
+    float residual_inverse = 0.0f;
+    int   residual_q       = 8;
+
+
+    //
+    // fast path가 실제 성공했는지.
+    //
+    // 이 값은 __all_sync() 결과이기 때문에
+    // warp 내 32 lanes 모두 동일한 값을 갖는다.
+    //
+    bool reused_residual_scale = false;
+
+
+    //
+    // ------------------------------------------------------------
+    // Fast path:
+    // 이전 step에서 사용한 Q4_0 scale을 그대로 재사용해 본다.
+    // ------------------------------------------------------------
+    //
+    if (fast_state_scale) {
+
+        float old_scale   = 0.0f;
+        float old_inverse = 0.0f;
+
+        //
+        // scale은 block당 하나뿐이므로
+        // lane 0만 half -> float 변환 + reciprocal 수행.
+        //
+        if (lane == 0) {
+
+            old_scale =
+                residual_old_scale;
+
+            if (old_scale != 0.0f &&
+                isfinite(old_scale)) {
+
+                old_inverse =
+                    1.0f / old_scale;
+            }
+        }
+
+        //
+        // lane 0이 계산한 값을 warp 전체에 broadcast.
+        //
+        old_scale =
+            __shfl_sync(
+                0xffffffff,
+                old_scale,
+                0
+            );
+
+        old_inverse =
+            __shfl_sync(
+                0xffffffff,
+                old_inverse,
+                0
+            );
+
+        //
+        // 기존 Q4_0 quantization 공식 그대로.
+        //
+        // q = int(value / scale + 8.5)
+        //
+        const float qf =
+            residual_new *
+            old_inverse +
+            8.5f;
+
+        //
+        // 중요한 부분.
+        //
+        // old scale을 그대로 썼을 때
+        // 현재 lane의 값이 q=0..15 범위 안에
+        // clamp 없이 들어오는가?
+        //
+        const bool lane_fits =
+            old_inverse != 0.0f &&
+            isfinite(qf) &&
+            qf >= 0.0f &&
+            qf < 16.0f;
+
+        //
+        // 32개 값 중 단 하나라도 범위를 넘으면
+        // 이 block 전체의 scale reuse를 포기한다.
+        //
+        reused_residual_scale =
+            __all_sync(
+                0xffffffff,
+                lane_fits
+            );
+
+        //
+        // 32 lanes 모두 representable하면
+        // reduction 없이 old scale 재사용.
+        //
+        if (reused_residual_scale) {
+
+            residual_scale =
+                old_scale;
+
+            residual_inverse =
+                old_inverse;
+
+            residual_q =
+                (int) qf;
+        }
+    }
+
+
+    //
+    // ------------------------------------------------------------
+    // Slow / exact fresh-scale path.
+    //
+    // --qat-fast-state-scale이 꺼졌거나,
+    // scale reuse가 실패했을 때만 실행.
+    // ------------------------------------------------------------
+    //
+    if (!reused_residual_scale) {
+
+        //
+        // 이 reduction 하나로
+        // absmax + signed max를 동시에 얻는다.
+        //
+        float residual_signed_max =
+            warp_signed_absmax(
+                residual_new
+            );
+
+        const float residual_absmax =
+            fabsf(
+                residual_signed_max
+            );
+
+        //
+        // 기존 subnormal 보호 로직 유지.
+    // 너무 작은 residual은 전부 0으로 취급.
+    //
+        if (residual_absmax > 0.0f &&
+            residual_absmax <
+                8.0f * 0x1p-24f) {
+
+            residual_new = 0.0f;
+            residual_signed_max = 0.0f;
+        }
+
+        //
+        // 기존 Q4_0 scale 계산.
+        //
+        residual_scale =
+            residual_signed_max /
+            -8.0f;
+
+        //
+        // reciprocal division은 lane 0 한 번만.
+        //
+        if (lane == 0 &&
+            residual_scale != 0.0f) {
+
+            residual_inverse =
+                1.0f /
+                residual_scale;
+        }
+
+        residual_inverse =
+            __shfl_sync(
+                0xffffffff,
+                residual_inverse,
+                0
+            );
+
+        //
+        // 기존 Q4_0 code 계산.
+        //
+        residual_q =
+            min(
+                15,
+                (int) (
+                    residual_new *
+                    residual_inverse +
+                    8.5f
+                )
+            );
+    }
+
+
+    //
+    // Q4_0 packing.
+    // lane 0..15가 두 개씩 묶어서 byte 하나를 저장.
+    //
+    const int residual_q_hi =
+        __shfl_sync(
+            0xffffffff,
+            residual_q,
+            (lane + 16) & 31
+        );
+
+
+    //
+    // scale 저장.
+    //
+    if (lane == 0) {
+
+        residual[ib].d =
+            __float2half(
+                residual_scale
+            );
+    }
+
+
+    //
+    // 32개의 4-bit 값을
+    // 16 bytes로 packing.
+    //
+    if (lane < 16) {
+
+        residual[ib].qs[lane] =
+            residual_q |
+            (residual_q_hi << 4);
+    }
+
+
+    //
+    // ============================================================
+    // Momentum Q8_0 update
+    // ============================================================
+    //
+
+    float momentum_scale   = 0.0f;
+    float momentum_inverse = 0.0f;
+    int   momentum_q       = 0;
+
+    bool reused_momentum_scale = false;
+
+
+    //
+    // ------------------------------------------------------------
+    // Fast path:
+    // 이전 Q8_0 scale 재사용 시도.
+    // ------------------------------------------------------------
+    //
+    if (fast_state_scale) {
+
+        float old_scale   = 0.0f;
+        float old_inverse = 0.0f;
+
+        if (lane == 0) {
+
+            old_scale =
+                momentum_old_scale;
+
+            if (old_scale != 0.0f &&
+                isfinite(old_scale)) {
+
+                old_inverse =
+                    1.0f /
+                    old_scale;
+            }
+        }
+
+        //
+        // warp broadcast
+        //
+        old_scale =
+            __shfl_sync(
+                0xffffffff,
+                old_scale,
+                0
+            );
+
+        old_inverse =
+            __shfl_sync(
+                0xffffffff,
+                old_inverse,
+                0
+            );
+
+        //
+        // 기존 momentum quantization은 roundf().
+        //
+        // 여기서 round까지 한 결과가
+        // 실제 int8 범위 안에 있는지 검사.
+        //
+        const float qf =
+            roundf(
+                momentum_new *
+                old_inverse
+            );
+
+        const bool lane_fits =
+            old_inverse != 0.0f &&
+            isfinite(qf) &&
+            qf >= -128.0f &&
+            qf <= 127.0f;
+
+        //
+        // 모든 32 lanes가 들어갈 때만
+        // old Q8 scale 사용.
+        //
+        reused_momentum_scale =
+            __all_sync(
+                0xffffffff,
+                lane_fits
+            );
+
+        if (reused_momentum_scale) {
+
+            momentum_scale =
+                old_scale;
+
+            momentum_inverse =
+                old_inverse;
+
+            momentum_q =
+                (int) qf;
+        }
+    }
+
+
+    //
+    // ------------------------------------------------------------
+    // Fresh Q8 scale path
+    // ------------------------------------------------------------
+    //
+    if (!reused_momentum_scale) {
+
+        //
+        // block 전체 max magnitude 한 번 계산.
+        //
+        const float momentum_signed_max =
+            warp_signed_absmax(
+                momentum_new
+            );
+
+        //
+        // 기존 코드와 동일.
+    // signed max를 -128에 대응시킨다.
+    //
+        momentum_scale =
+            momentum_signed_max /
+            -128.0f;
+
+        //
+        // reciprocal division도 lane0만.
+        //
+        if (lane == 0 &&
+            momentum_scale != 0.0f) {
+
+            momentum_inverse =
+                1.0f /
+                momentum_scale;
+        }
+
+        momentum_inverse =
+            __shfl_sync(
+                0xffffffff,
+                momentum_inverse,
+                0
+            );
+
+        //
+        // 기존 Q8_0 quantization.
+        //
+        momentum_q =
+            max(
+                -128,
+                min(
+                    127,
+                    (int) roundf(
+                        momentum_new *
+                        momentum_inverse
+                    )
+                )
+            );
+    }
+
+
+    //
+    // Q8_0 scale 저장.
+    //
+    if (lane == 0) {
+
+        momentum[ib].d =
+            __float2half(
+                momentum_scale
+            );
+    }
+
+
+    //
+    // lane 하나 = int8 하나.
+    // packing 필요 없음.
+    //
+    momentum[ib].qs[lane] =
+        momentum_q;
+}
+
+
+template<bool mxfp4>
 static __global__ void
 opt_step_qlion_qat_tied_apply(
         void * __restrict__
