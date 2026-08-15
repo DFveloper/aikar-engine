@@ -93,7 +93,6 @@ struct ggml_opt_context {
     std::set<struct ggml_tensor *> qat_forward_nodes;
     std::vector<ggml_backend_buffer_t> qat_buffers;
     std::vector<struct ggml_context *> qat_contexts;
-    std::set<struct ggml_tensor *> qat_forward_nodes;
 
     //
     // QLion dynamic-graph dependency-plan cache.
