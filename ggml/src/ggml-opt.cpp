@@ -793,6 +793,133 @@ ggml_opt_qlion_qat_backward_callback(
         canonical_param
     );
 
+    static bool dumped_qat_placement = false;
+
+if (!dumped_qat_placement &&
+    strcmp(
+        canonical_param->name,
+        "token_embd.weight"
+    ) == 0) {
+
+    dumped_qat_placement = true;
+
+    auto dump_tensor_backend =
+        [](const char * label,
+           const ggml_tensor * t) {
+
+        if (!t) {
+            fprintf(
+                stderr,
+                "%s: NULL\n",
+                label
+            );
+            return;
+        }
+
+        ggml_backend_buffer_type_t buft =
+            t->buffer
+                ? ggml_backend_buffer_get_type(
+                    t->buffer
+                )
+                : nullptr;
+
+        ggml_backend_dev_t dev =
+            buft
+                ? ggml_backend_buft_get_device(
+                    buft
+                )
+                : nullptr;
+
+        //
+        // Dump tensor backend information
+        //
+        fprintf(
+            stderr,
+            "%s:"
+            " tensor=%p"
+            " data=%p"
+            " buffer=%s"
+            " buft=%s"
+            " device=%s"
+            " dev_type=%d\n",
+
+            label,
+
+            (const void *) t,
+            t->data,
+
+            t->buffer
+                ? ggml_backend_buffer_name(
+                    t->buffer
+                )
+                : "(null)",
+
+            buft
+                ? ggml_backend_buft_name(
+                    buft
+                )
+                : "(null)",
+
+            dev
+                ? ggml_backend_dev_name(
+                    dev
+                )
+                : "(none)",
+
+            dev
+                ? (int)
+                    ggml_backend_dev_type(
+                        dev
+                    )
+                : -1
+        );
+    };
+
+    fprintf(
+        stderr,
+        "\n=== REAL QAT PLACEMENT ===\n"
+    );
+
+    dump_tensor_backend(
+        "canonical",
+        canonical_param
+    );
+
+    dump_tensor_backend(
+        "momentum",
+        opt_ctx->qat_momentum[i]
+    );
+
+    dump_tensor_backend(
+        "residual",
+        opt_ctx->qat_residual[i]
+    );
+
+    for (size_t j = 0;
+         j < opt_ctx->qat_aliases[i].size();
+         ++j) {
+
+        char label[64];
+
+        snprintf(
+            label,
+            sizeof(label),
+            "alias[%zu]",
+            j
+        );
+
+        dump_tensor_backend(
+            label,
+            opt_ctx->qat_aliases[i][j]
+        );
+    }
+
+    fprintf(
+        stderr,
+        "==========================\n"
+    );
+}
+
     auto & pending =
         opt_ctx->
             qat_pending_grads[i];
