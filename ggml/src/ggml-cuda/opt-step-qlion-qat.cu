@@ -5,6 +5,83 @@
 
 static constexpr int QLION_QAT_ID_GEMM_CAP = 256;
 
+static inline void qlion_qat_id_gemm(
+        cublasHandle_t handle,
+        int m,
+        int n,
+        int k,
+        const float * a,
+        int lda,
+        const float * b,
+        int ldb,
+        float * c,
+        int ldc) {
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+
+#if !defined(GGML_USE_HIP) && \
+    !defined(GGML_USE_MUSA) && \
+    CUDART_VERSION >= 11000
+
+    //
+    // NVIDIA Ampere+ fast path.
+    //
+    // Inputs/output remain FP32.
+    // Multiplication uses TF32 Tensor Cores where supported.
+    // Accumulation remains FP32.
+    //
+    qlion_qat_id_gemm(
+        handle,
+
+        (int) cols,
+        (int) rows,
+        (int) cap,
+
+        a_gathered.ptr,
+        (int) cols,
+
+        g_gathered.ptr,
+        (int) rows,
+
+        expert_grad.ptr,
+        (int) cols
+    );
+
+#else
+
+    //
+    // ROCm / MUSA / old CUDA fallback.
+    //
+    CUBLAS_CHECK(
+        cublasSgemm(
+            handle,
+
+            CUBLAS_OP_N,
+            CUBLAS_OP_T,
+
+            m,
+            n,
+            k,
+
+            &alpha,
+
+            a,
+            lda,
+
+            b,
+            ldb,
+
+            &beta,
+
+            c,
+            ldc
+        )
+    );
+
+#endif
+}
+
 static __device__ __forceinline__ float q4_0_value(const block_q4_0 & block, int lane) {
     const uint8_t packed = block.qs[lane & 15];
     const int q = lane < 16 ? packed & 0x0f : packed >> 4;
@@ -775,7 +852,7 @@ void ggml_cuda_opt_step_qlion_qat_id(
     CUDA_CHECK(
         cudaGetLastError()
     );
-    
+
     //
     // ============================================================
     // GEMM-based expert gradient path
@@ -829,12 +906,6 @@ void ggml_cuda_opt_step_qlion_qat_id(
             stream
         )
     );
-
-    const float alpha =
-        1.0f;
-
-    const float beta =
-        0.0f;
 
     constexpr int gather_threads =
         256;
@@ -914,30 +985,21 @@ void ggml_cuda_opt_step_qlion_qat_id(
         // --------------------------------------------------------
         //
 
-        CUBLAS_CHECK(
-            cublasSgemm(
-                handle,
+        qlion_qat_id_gemm(
+            handle,
 
-                CUBLAS_OP_N,
-                CUBLAS_OP_T,
+            (int) cols,
+            (int) rows,
+            (int) cap,
 
-                (int) cols,
-                (int) rows,
-                (int) cap,
+            a_gathered.ptr,
+            (int) cols,
 
-                &alpha,
+            g_gathered.ptr,
+            (int) rows,
 
-                a_gathered.ptr,
-                (int) cols,
-
-                g_gathered.ptr,
-                (int) rows,
-
-                &beta,
-
-                expert_grad.ptr,
-                (int) cols
-            )
+            expert_grad.ptr,
+            (int) cols
         );
 
         //
