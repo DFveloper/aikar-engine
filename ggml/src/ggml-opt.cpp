@@ -138,6 +138,78 @@ static bool ggml_opt_optimizer_is_adamw(enum ggml_opt_optimizer_type optimizer) 
         optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_IQ4_NL;
 }
 
+static bool ggml_opt_qat_same_logical_param(
+        const ggml_tensor * a,
+        const ggml_tensor * b) {
+
+    if (!a || !b) {
+        return false;
+    }
+
+    return
+        a->type == b->type &&
+        strcmp(a->name, b->name) == 0 &&
+        memcmp(
+            a->ne,
+            b->ne,
+            sizeof(a->ne)
+        ) == 0;
+}
+
+
+static int ggml_opt_qat_backend_priority(
+        const ggml_tensor * tensor) {
+
+    if (!tensor ||
+        !tensor->buffer) {
+        return 0;
+    }
+
+    ggml_backend_buffer_type_t buft =
+        ggml_backend_buffer_get_type(
+            tensor->buffer
+        );
+
+    ggml_backend_dev_t dev =
+        ggml_backend_buft_get_device(
+            buft
+        );
+
+    if (!dev) {
+        return 0;
+    }
+
+    ggml_backend_reg_t reg =
+        ggml_backend_dev_backend_reg(
+            dev
+        );
+
+    if (!reg) {
+        return 0;
+    }
+
+    const char * name =
+        ggml_backend_reg_name(
+            reg
+        );
+
+    //
+    // TIED implementation is provided by ggml-cuda,
+    // which also covers HIP/ROCm builds.
+    //
+    if (strcmp(name, "CUDA") == 0 ||
+        strcmp(name, "ROCm") == 0) {
+
+        return 100;
+    }
+
+    if (strcmp(name, "CPU") == 0) {
+        return 0;
+    }
+
+    return 10;
+}
+
 void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor * param) {
     GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT);
     GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q4_0));
@@ -717,6 +789,13 @@ ggml_opt_qlion_qat_backward_callback(
 
     const size_t i =
         found->second;
+    
+    ggml_tensor * canonical_param =
+        opt_ctx->qat_params[i];
+
+    GGML_ASSERT(
+        canonical_param
+    );
 
     auto & pending =
         opt_ctx->
@@ -842,84 +921,212 @@ ggml_opt_qlion_qat_backward_callback(
         }
     }
 
-    struct ggml_tensor * combined =
-        pending[0];
+    struct ggml_tensor * step =
+        nullptr;
 
-    for (size_t j = 1;
-         j < pending.size();
-         ++j) {
 
-        combined =
-            ggml_add(
-                ctx,
-                combined,
-                pending[j]
-            );
+    // ============================================================
+    // Tied embedding specialization.
+    //
+    // Exact pattern:
+    //
+    //   OUT_PROD
+    //     src0 = dense activations
+    //     src1 = dense output gradient
+    //
+    // + GET_ROWS_BACK
+    //     src0 = sparse embedding gradient
+    //     src1 = token ids
+    //
+    // DO NOT create ggml_add() for this case.
+    // ============================================================
+
+    if (pending.size() == 2) {
+
+        ggml_tensor * out_prod =
+            nullptr;
+
+        ggml_tensor * rows_back =
+            nullptr;
+
+        for (ggml_tensor * g :
+            pending) {
+
+            if (g->op ==
+                GGML_OP_OUT_PROD) {
+
+                out_prod =
+                    g;
+
+            } else if (
+                g->op ==
+                GGML_OP_GET_ROWS_BACK) {
+
+                rows_back =
+                    g;
+            }
+        }
+
+        if (out_prod &&
+            rows_back &&
+
+            ggml_are_same_shape(
+                out_prod,
+                canonical_param
+            ) &&
+
+            ggml_are_same_shape(
+                rows_back,
+                canonical_param
+            ) &&
+
+            out_prod->src[0] &&
+            out_prod->src[1] &&
+
+            rows_back->src[0] &&
+            rows_back->src[1] &&
+
+            out_prod->src[0]->type ==
+                GGML_TYPE_F32 &&
+
+            out_prod->src[1]->type ==
+                GGML_TYPE_F32 &&
+
+            rows_back->src[0]->type ==
+                GGML_TYPE_F32 &&
+
+            rows_back->src[1]->type ==
+                GGML_TYPE_I32 &&
+
+            ggml_is_contiguous(
+                out_prod->src[0]
+            ) &&
+
+            ggml_is_contiguous(
+                out_prod->src[1]
+            ) &&
+
+            ggml_is_contiguous(
+                rows_back->src[0]
+            ) &&
+
+            ggml_is_contiguous(
+                rows_back->src[1]
+            )) {
+
+            step =
+                ggml_opt_step_qlion_qat_tied(
+                    ctx,
+
+                    canonical_param,
+
+                    // OUT_PROD sources
+                    out_prod->src[0],
+                    out_prod->src[1],
+
+                    // GET_ROWS_BACK sources
+                    rows_back->src[0],
+                    rows_back->src[1],
+
+                    opt_ctx->
+                        qat_momentum[i],
+
+                    opt_ctx->
+                        qat_residual[i],
+
+                    opt_ctx->
+                        opt_step_params
+                );
+        }
     }
 
-    struct ggml_tensor * step;
 
-    if (combined->op ==
-        GGML_OP_OUT_PROD_ID) {
+    // ============================================================
+    // Existing paths.
+    // ============================================================
 
-        step =
-            ggml_opt_step_qlion_qat_id(
-                ctx,
-                param,
+    if (!step) {
 
-                combined->src[0],
-                combined->src[1],
-                combined->src[2],
+        ggml_tensor * combined =
+            pending[0];
 
-                opt_ctx->
-                    qat_momentum[i],
+        for (size_t j = 1;
+            j < pending.size();
+            ++j) {
 
-                opt_ctx->
-                    qat_residual[i],
+            combined =
+                ggml_add(
+                    ctx,
+                    combined,
+                    pending[j]
+                );
+        }
 
-                opt_ctx->
-                    opt_step_params
-            );
+        if (combined->op ==
+            GGML_OP_OUT_PROD_ID) {
 
-    } else if (
-        combined->op ==
-        GGML_OP_GET_ROWS_BACK) {
+            step =
+                ggml_opt_step_qlion_qat_id(
+                    ctx,
 
-        step =
-            ggml_opt_step_qlion_qat_rows(
-                ctx,
-                param,
+                    canonical_param,
 
-                combined->src[0],
-                combined->src[1],
+                    combined->src[0],
+                    combined->src[1],
+                    combined->src[2],
 
-                opt_ctx->
-                    qat_momentum[i],
+                    opt_ctx->
+                        qat_momentum[i],
 
-                opt_ctx->
-                    qat_residual[i],
+                    opt_ctx->
+                        qat_residual[i],
 
-                opt_ctx->
-                    opt_step_params
-            );
+                    opt_ctx->
+                        opt_step_params
+                );
 
-    } else {
+        } else if (
+            combined->op ==
+            GGML_OP_GET_ROWS_BACK) {
 
-        step =
-            ggml_opt_step_qlion_qat(
-                ctx,
-                param,
-                combined,
+            step =
+                ggml_opt_step_qlion_qat_rows(
+                    ctx,
 
-                opt_ctx->
-                    qat_momentum[i],
+                    canonical_param,
 
-                opt_ctx->
-                    qat_residual[i],
+                    combined->src[0],
+                    combined->src[1],
 
-                opt_ctx->
-                    opt_step_params
-            );
+                    opt_ctx->
+                        qat_momentum[i],
+
+                    opt_ctx->
+                        qat_residual[i],
+
+                    opt_ctx->
+                        opt_step_params
+                );
+
+        } else {
+
+            step =
+                ggml_opt_step_qlion_qat(
+                    ctx,
+
+                    canonical_param,
+                    combined,
+
+                    opt_ctx->
+                        qat_momentum[i],
+
+                    opt_ctx->
+                        qat_residual[i],
+
+                    opt_ctx->
+                        opt_step_params
+                );
+        }
     }
 
     static bool dumped_tied_grad = false;
@@ -999,7 +1206,7 @@ ggml_opt_qlion_qat_backward_callback(
     ggml_format_name(
         step,
         "QLion QAT step for %s",
-        param->name
+        canonical_param->name
     );
 
     struct ggml_tensor * result =
@@ -1008,19 +1215,28 @@ ggml_opt_qlion_qat_backward_callback(
     for (struct ggml_tensor * alias :
          opt_ctx->qat_aliases[i]) {
 
-        if (alias != param) {
-            result =
-                ggml_cpy(
-                    ctx,
-                    result,
-                    alias
-                );
+        if (alias == canonical_param) {
+            continue;
         }
+
+        if (alias->buffer ==
+                canonical_param->buffer &&
+            alias->data ==
+                canonical_param->data) {
+
+            continue;
+        }
+
+        result =
+            ggml_cpy(
+                ctx,
+                result,
+                alias
+            );
     }
 
     return result;
 }
-
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -1391,14 +1607,153 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
 
-    if (need_qat_state && opt_ctx->qat_params.empty()) {
-        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
-            struct ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if (!(node->flags & GGML_TENSOR_FLAG_PARAM) ||
-                (node->type != GGML_TYPE_MXFP4 && node->type != GGML_TYPE_Q4_0)) {
+    if (need_qat_state &&
+        opt_ctx->qat_params.empty()) {
+
+        struct qat_param_group {
+            std::vector<ggml_tensor *> aliases;
+        };
+
+        std::vector<qat_param_group> groups;
+
+        //
+        // First pass:
+        // group logical aliases without allocating any QAT state.
+        //
+        for (int i = 0;
+            i < opt_ctx->gf->n_nodes;
+            ++i) {
+
+            ggml_tensor * node =
+                opt_ctx->gf->nodes[i];
+
+            if (!(node->flags &
+                GGML_TENSOR_FLAG_PARAM)) {
                 continue;
             }
-            ggml_opt_qat_register_param(opt_ctx, node);
+
+            if (node->type != GGML_TYPE_MXFP4 &&
+                node->type != GGML_TYPE_Q4_0) {
+                continue;
+            }
+
+            bool grouped =
+                false;
+
+            for (auto & group :
+                groups) {
+
+                GGML_ASSERT(
+                    !group.aliases.empty()
+                );
+
+                if (
+                    ggml_opt_qat_same_logical_param(
+                        group.aliases[0],
+                        node
+                    )
+                ) {
+
+                    //
+                    // Avoid duplicate pointer insertion.
+                    //
+                    if (std::find(
+                            group.aliases.begin(),
+                            group.aliases.end(),
+                            node
+                        ) ==
+                        group.aliases.end()) {
+
+                        group.aliases.push_back(
+                            node
+                        );
+                    }
+
+                    grouped =
+                        true;
+
+                    break;
+                }
+            }
+
+            if (!grouped) {
+
+                qat_param_group group;
+
+                group.aliases.push_back(
+                    node
+                );
+
+                groups.push_back(
+                    std::move(group)
+                );
+            }
+        }
+
+        //
+        // Second pass:
+        // preserve logical parameter ordering, but choose
+        // the best device alias as canonical inside each group.
+        //
+        for (auto & group :
+            groups) {
+
+            GGML_ASSERT(
+                !group.aliases.empty()
+            );
+
+            size_t best =
+                0;
+
+            int best_priority =
+                ggml_opt_qat_backend_priority(
+                    group.aliases[0]
+                );
+
+            for (size_t j = 1;
+                j < group.aliases.size();
+                ++j) {
+
+                const int priority =
+                    ggml_opt_qat_backend_priority(
+                        group.aliases[j]
+                    );
+
+                if (priority >
+                    best_priority) {
+
+                    best =
+                        j;
+
+                    best_priority =
+                        priority;
+                }
+            }
+
+            if (best != 0) {
+                std::swap(
+                    group.aliases[0],
+                    group.aliases[best]
+                );
+            }
+
+            //
+            // First registration determines QAT state placement.
+            //
+            ggml_opt_qat_register_param(
+                opt_ctx,
+                group.aliases[0]
+            );
+
+            for (size_t j = 1;
+                j < group.aliases.size();
+                ++j) {
+
+                ggml_opt_qat_register_param(
+                    opt_ctx,
+                    group.aliases[j]
+                );
+            }
         }
     }
 

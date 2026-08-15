@@ -592,6 +592,7 @@ extern "C" {
         GGML_OP_OPT_STEP_QLION_QAT,
         GGML_OP_OPT_STEP_QLION_QAT_ID,
         GGML_OP_OPT_STEP_QLION_QAT_ROWS,
+        GGML_OP_OPT_STEP_QLION_QAT_TIED,
 
         GGML_OP_GLU,
         GGML_OP_GLU_BACK,
@@ -2851,6 +2852,26 @@ extern "C" {
         struct ggml_tensor *  momentum,
         struct ggml_tensor *  residual,
         struct ggml_tensor *  params);
+
+    GGML_API struct ggml_tensor * ggml_opt_step_qlion_qat_tied(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+
+        // OUT_PROD sources:
+        // dense_a [cols, k]
+        // dense_b [rows, k]
+        struct ggml_tensor  * dense_a,
+        struct ggml_tensor  * dense_b,
+
+        // GET_ROWS_BACK sources:
+        // sparse_grad [cols, n_indices]
+        // sparse_ids  [n_indices]
+        struct ggml_tensor  * sparse_grad,
+        struct ggml_tensor  * sparse_ids,
+
+        struct ggml_tensor  * momentum,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * params);
 
     // build forward multiple tensors and select one of them for computing
     // this is useful for creating graphs that have constant topology but compute different things based on the input

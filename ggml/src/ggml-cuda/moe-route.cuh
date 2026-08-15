@@ -91,6 +91,7 @@ static __global__ void ggml_cuda_moe_route_scatter(
         const int32_t * __restrict__ expert_offsets,
         int32_t * __restrict__ cursor,
         int32_t * __restrict__ routes,
+        int32_t * __restrict__ route_rank,
         int64_t total_routes,
         int64_t n_expert,
         int64_t n_used,
@@ -98,18 +99,23 @@ static __global__ void ggml_cuda_moe_route_scatter(
         int64_t ids_s1) {
 
     const int64_t route =
-        (int64_t) blockIdx.x * blockDim.x +
+        (int64_t) blockIdx.x *
+            blockDim.x +
         threadIdx.x;
 
-    if (route >= total_routes) {
+    if (route >=
+        total_routes) {
+
         return;
     }
 
     const int64_t used =
-        route % n_used;
+        route %
+        n_used;
 
     const int64_t token =
-        route / n_used;
+        route /
+        n_used;
 
     const int32_t expert =
         ids[
@@ -119,6 +125,7 @@ static __global__ void ggml_cuda_moe_route_scatter(
 
     if (expert < 0 ||
         expert >= n_expert) {
+
         return;
     }
 
@@ -130,78 +137,15 @@ static __global__ void ggml_cuda_moe_route_scatter(
 
     routes[pos] =
         (int32_t) route;
-}
-
-
-//
-// Atomic scatter above is parallel but not ordered.
-//
-// Original implementation emitted routes in ascending route order.
-// Sort each expert's small route list to restore deterministic order.
-//
-// Also optionally generate route_rank[route] = local position inside
-// the expert. This is used by the grouped MUL_MAT_ID_BACK overflow path.
-//
-static __global__ void ggml_cuda_moe_route_sort(
-        const int32_t * __restrict__ expert_offsets,
-        int32_t * __restrict__ routes,
-        int32_t * __restrict__ route_rank,
-        int64_t n_expert) {
-
-    const int64_t expert =
-        blockIdx.x;
-
-    if (expert >= n_expert ||
-        threadIdx.x != 0) {
-        return;
-    }
-
-    const int32_t begin =
-        expert_offsets[expert];
-
-    const int32_t end =
-        expert_offsets[expert + 1];
-
-    //
-    // Usually only ~64 routes/expert here.
-    // Insertion sort is intentionally simple and deterministic.
-    //
-    for (int32_t i = begin + 1;
-         i < end;
-         ++i) {
-
-        const int32_t key =
-            routes[i];
-
-        int32_t j =
-            i - 1;
-
-        while (j >= begin &&
-               routes[j] > key) {
-
-            routes[j + 1] =
-                routes[j];
-
-            --j;
-        }
-
-        routes[j + 1] =
-            key;
-    }
 
     if (route_rank) {
-        for (int32_t p = begin;
-             p < end;
-             ++p) {
 
-            const int32_t route =
-                routes[p];
-
-            route_rank[route] =
-                p - begin;
-        }
+        route_rank[route] =
+            pos -
+            expert_offsets[expert];
     }
 }
+
 
 
 static inline void ggml_cuda_moe_build_routes(
@@ -295,13 +239,6 @@ static inline void ggml_cuda_moe_build_routes(
         cudaGetLastError()
     );
 
-    ggml_cuda_moe_route_sort
-        <<<n_expert, 1, 0, stream>>>(
-            expert_offsets,
-            routes,
-            route_rank,
-            n_expert
-        );
 
     CUDA_CHECK(
         cudaGetLastError()

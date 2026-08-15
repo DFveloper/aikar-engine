@@ -1102,6 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_QLION_QAT",
     "OPT_STEP_QLION_QAT_ID",
     "OPT_STEP_QLION_QAT_ROWS",
+    "OPT_STEP_QLION_QAT_TIED",
 
     "GLU",
     "GLU_BACK",
@@ -6604,6 +6605,125 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_rows(
     result->src[3] = momentum;
     result->src[4] = residual;
     result->src[5] = params;
+    return result;
+}
+
+struct ggml_tensor * ggml_opt_step_qlion_qat_tied(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * dense_a,
+        struct ggml_tensor  * dense_b,
+        struct ggml_tensor  * sparse_grad,
+        struct ggml_tensor  * sparse_ids,
+        struct ggml_tensor  * momentum,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * params) {
+
+    GGML_ASSERT(
+        weight->type == GGML_TYPE_MXFP4 ||
+        weight->type == GGML_TYPE_Q4_0
+    );
+
+    GGML_ASSERT(dense_a->type == GGML_TYPE_F32);
+    GGML_ASSERT(dense_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(sparse_grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(sparse_ids->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(residual->type == GGML_TYPE_Q4_0);
+
+    GGML_ASSERT(
+        params->type == GGML_TYPE_F32 &&
+        ggml_nelements(params) == 5
+    );
+
+    GGML_ASSERT(
+        ggml_are_same_shape(weight, momentum)
+    );
+
+    GGML_ASSERT(
+        ggml_are_same_shape(weight, residual)
+    );
+
+    //
+    // Initial implementation is for a normal 2-D tied embedding.
+    //
+    GGML_ASSERT(weight->ne[2] == 1);
+    GGML_ASSERT(weight->ne[3] == 1);
+
+    const int64_t cols =
+        weight->ne[0];
+
+    const int64_t rows =
+        weight->ne[1];
+
+    const int64_t k =
+        dense_a->ne[1];
+
+    const int64_t n_indices =
+        ggml_nelements(sparse_ids);
+
+    //
+    // OUT_PROD:
+    //
+    // dense_a: [cols, k]
+    // dense_b: [rows, k]
+    // result:  [cols, rows]
+    //
+    GGML_ASSERT(dense_a->ne[0] == cols);
+    GGML_ASSERT(dense_a->ne[2] == 1);
+    GGML_ASSERT(dense_a->ne[3] == 1);
+
+    GGML_ASSERT(dense_b->ne[0] == rows);
+    GGML_ASSERT(dense_b->ne[1] == k);
+    GGML_ASSERT(dense_b->ne[2] == 1);
+    GGML_ASSERT(dense_b->ne[3] == 1);
+
+    //
+    // GET_ROWS_BACK:
+    //
+    // sparse_grad: [cols, n_indices]
+    //
+    GGML_ASSERT(sparse_grad->ne[0] == cols);
+    GGML_ASSERT(sparse_grad->ne[1] == n_indices);
+    GGML_ASSERT(sparse_grad->ne[2] == 1);
+    GGML_ASSERT(sparse_grad->ne[3] == 1);
+
+    //
+    // First CUDA version deliberately requires these to be
+    // contiguous so cuBLAS can directly consume them.
+    //
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(ggml_is_contiguous(dense_a));
+    GGML_ASSERT(ggml_is_contiguous(dense_b));
+    GGML_ASSERT(ggml_is_contiguous(sparse_grad));
+    GGML_ASSERT(ggml_is_contiguous(sparse_ids));
+    GGML_ASSERT(ggml_is_contiguous(momentum));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(params));
+
+    //
+    // Same pattern as all existing QLion operations:
+    // optimizer output is a view of the weight.
+    //
+    struct ggml_tensor * result =
+        ggml_view_tensor(ctx, weight);
+
+    result->op =
+        GGML_OP_OPT_STEP_QLION_QAT_TIED;
+
+    result->src[0] = weight;
+
+    result->src[1] = dense_a;
+    result->src[2] = dense_b;
+
+    result->src[3] = sparse_grad;
+    result->src[4] = sparse_ids;
+
+    result->src[5] = momentum;
+    result->src[6] = residual;
+    result->src[7] = params;
+
     return result;
 }
 

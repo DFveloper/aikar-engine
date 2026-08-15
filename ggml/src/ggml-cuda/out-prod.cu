@@ -273,7 +273,7 @@ static __device__ __forceinline__ float mxfp4_get(const block_mxfp4 & block, int
 }
 
 static constexpr int MUL_MAT_ID_BACK_CAP =
-    128;
+    256;
 
 static constexpr int MUL_MAT_ID_BACK_BATCH =
     8;
