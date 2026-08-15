@@ -448,6 +448,9 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     const int64_t cols =
         n_blocks_row * 32;
 
+    //
+    // 해당 batch expert의 GEMM 결과.
+    //
     const float * current_expert_grad =
         expert_grad +
         batch_expert * cols * n_rows;
@@ -459,6 +462,9 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
             cols * row
         ];
 
+    //
+    // cap을 넘은 route는 scalar fallback으로 정확하게 추가.
+    //
     const int32_t begin =
         expert_offsets[expert];
 
@@ -468,8 +474,78 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     const int64_t overflow_begin =
         (int64_t) begin + cap;
 
+    if (overflow_begin < end) {
+        for (int64_t p = overflow_begin;
+             p < end;
+             ++p) {
 
-template<bool mxfp4>
+            const int64_t route =
+                routes[p];
+
+            const int64_t used =
+                route % n_used;
+
+            const int64_t token =
+                route / n_used;
+
+            const int64_t act_used =
+                used % n_act_used;
+
+            const int64_t act_route =
+                act_used +
+                n_act_used * token;
+
+            const float a =
+                activations[
+                    block * 32 +
+                    lane +
+                    cols * act_route
+                ];
+
+            float dg = 0.0f;
+
+            if (lane == 0) {
+                dg =
+                    grad[
+                        row +
+                        n_rows * route
+                    ];
+            }
+
+            dg =
+                __shfl_sync(
+                    0xffffffff,
+                    dg,
+                    0
+                );
+
+            g =
+                fmaf(
+                    a,
+                    dg,
+                    g
+                );
+        }
+    }
+
+    //
+    // expert-local → 전체 weight block index.
+    //
+    const int64_t global_ib =
+        expert * n_blocks_expert +
+        local_ib;
+
+    opt_step_qlion_qat_apply<mxfp4>(
+        weight_data,
+        momentum,
+        residual,
+        pars,
+        global_ib,
+        lane,
+        g
+    );
+}
+
 static __global__ void opt_step_qlion_qat_rows(
         void * __restrict__ weight_data,
         const float * __restrict__ grad,
