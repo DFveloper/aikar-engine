@@ -546,6 +546,7 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     );
 }
 
+template<bool mxfp4>
 static __global__ void opt_step_qlion_qat_rows(
         void * __restrict__ weight_data,
         const float * __restrict__ grad,
