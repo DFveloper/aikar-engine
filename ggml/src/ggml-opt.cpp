@@ -165,6 +165,18 @@ static int ggml_opt_qat_backend_priority(
         return -1;
     }
 
+    //
+    // IMPORTANT:
+    // CUDA_Host belongs to CUDA0 and therefore its device type is GPU,
+    // but the actual storage is still host memory.
+    //
+    // Check physical buffer residency FIRST.
+    //
+    if (ggml_backend_buffer_is_host(
+            tensor->buffer)) {
+        return 0;
+    }
+
     ggml_backend_buffer_type_t buft =
         ggml_backend_buffer_get_type(
             tensor->buffer
@@ -183,9 +195,8 @@ static int ggml_opt_qat_backend_priority(
         return -1;
     }
 
-    switch (
-        ggml_backend_dev_type(dev)
-    ) {
+    switch (ggml_backend_dev_type(dev)) {
+
         case GGML_BACKEND_DEVICE_TYPE_GPU:
             return 100;
 
