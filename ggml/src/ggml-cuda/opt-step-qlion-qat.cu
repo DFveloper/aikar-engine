@@ -31,21 +31,37 @@ static inline void qlion_qat_id_gemm(
     // Multiplication uses TF32 Tensor Cores where supported.
     // Accumulation remains FP32.
     //
-    qlion_qat_id_gemm(
-        handle,
+    CUBLAS_CHECK(
+        cublasGemmEx(
+            handle,
 
-        (int) cols,
-        (int) rows,
-        (int) cap,
+            CUBLAS_OP_N,
+            CUBLAS_OP_T,
 
-        a_gathered.ptr,
-        (int) cols,
+            m,
+            n,
+            k,
 
-        g_gathered.ptr,
-        (int) rows,
+            &alpha,
 
-        expert_grad.ptr,
-        (int) cols
+            a,
+            CUDA_R_32F,
+            lda,
+
+            b,
+            CUDA_R_32F,
+            ldb,
+
+            &beta,
+
+            c,
+            CUDA_R_32F,
+            ldc,
+
+            CUBLAS_COMPUTE_32F_FAST_TF32,
+
+            CUBLAS_GEMM_DEFAULT
+        )
     );
 
 #else
