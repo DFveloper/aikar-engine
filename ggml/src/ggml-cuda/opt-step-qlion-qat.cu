@@ -172,6 +172,14 @@ static __global__ void opt_step_qlion_qat_id(
         for (int64_t used = 0; used < n_used; ++used) {
             const int64_t route = used + n_used * token;
 
+            const int32_t routed_expert =
+                ids[
+                    used  * ids_s0 +
+                    token * ids_s1
+                ];
+
+            if (routed_expert == expert) {
+
             // activations may have either:
             //
             // [K, n_used, T] -> normal routed layout
@@ -276,7 +284,7 @@ void ggml_cuda_opt_step_qlion_qat_id(ggml_backend_cuda_context & ctx, ggml_tenso
     GGML_ASSERT(activations->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0 && pars->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(activations) && ggml_is_contiguous(grad));
-    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
     const int64_t n_act_used = activations->ne[1];
     const int64_t n_used     = grad->ne[1];
     const int64_t n_tokens   = grad->ne[2];
@@ -290,23 +298,34 @@ void ggml_cuda_opt_step_qlion_qat_id(ggml_backend_cuda_context & ctx, ggml_tenso
 
     GGML_ASSERT(ids->ne[0] == n_used);
     GGML_ASSERT(ids->ne[1] == n_tokens);
+    GGML_ASSERT(ids->nb[0] % sizeof(int32_t) == 0);
+    GGML_ASSERT(ids->nb[1] % sizeof(int32_t) == 0);
+
+    const int64_t ids_s0 =
+        ids->nb[0] / sizeof(int32_t);
+
+    const int64_t ids_s1 =
+        ids->nb[1] / sizeof(int32_t);
     const int64_t n_blocks_row = weight->ne[0] / 32;
     const int64_t n_blocks = ggml_nelements(weight) / 32;
     if (weight->type == GGML_TYPE_MXFP4) {
-    opt_step_qlion_qat_id<true><<<n_blocks, 32, 0, ctx.stream()>>>(
-        weight->data,
-        (const float *) activations->data,
-        (const float *) grad->data,
-        (const int32_t *) ids->data,
-        (block_q8_0 *) momentum->data,
-        (block_q4_0 *) residual->data,
-        (const float *) pars->data,
-        n_blocks_row,
-        weight->ne[1],
-        weight->ne[2],
-        n_act_used,
-        n_used,
-        n_tokens);
+        opt_step_qlion_qat_id<true><<<n_blocks, 32, 0, ctx.stream()>>>(
+            weight->data,
+            (const float *) activations->data,
+            (const float *) grad->data,
+            (const int32_t *) ids->data,
+            (block_q8_0 *) momentum->data,
+            (block_q4_0 *) residual->data,
+            (const float *) pars->data,
+            n_blocks_row,
+            weight->ne[1],
+            weight->ne[2],
+            n_act_used,
+            n_used,
+            n_tokens,
+            ids_s0,
+            ids_s1
+        );
     } else {
         opt_step_qlion_qat_id<false><<<n_blocks, 32, 0, ctx.stream()>>>(
             weight->data,
@@ -321,7 +340,10 @@ void ggml_cuda_opt_step_qlion_qat_id(ggml_backend_cuda_context & ctx, ggml_tenso
             weight->ne[2],
             n_act_used,
             n_used,
-            n_tokens);
+            n_tokens,
+            ids_s0,
+            ids_s1
+        );
     }
 }
 
