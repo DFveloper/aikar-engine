@@ -157,42 +157,54 @@ static __global__ void opt_step_qlion_qat_id(
         int64_t n_expert,
         int64_t n_act_used,
         int64_t n_used,
-        int64_t n_tokens) {
+        int64_t n_tokens,
+        int64_t ids_s0,
+        int64_t ids_s1) {
+
     const int64_t ib = blockIdx.x;
     const int lane = threadIdx.x;
-    const int64_t n_blocks = n_blocks_row * n_rows * n_expert;
+
+    const int64_t n_blocks =
+        n_blocks_row * n_rows * n_expert;
+
     if (ib >= n_blocks) {
         return;
     }
-    const int64_t block = ib % n_blocks_row;
-    const int64_t row = (ib / n_blocks_row) % n_rows;
-    const int64_t expert = ib / (n_blocks_row * n_rows);
+
+    const int64_t block =
+        ib % n_blocks_row;
+
+    const int64_t row =
+        (ib / n_blocks_row) % n_rows;
+
+    const int64_t expert =
+        ib / (n_blocks_row * n_rows);
+
     float g = 0.0f;
+
     for (int64_t token = 0; token < n_tokens; ++token) {
         for (int64_t used = 0; used < n_used; ++used) {
-            const int64_t route = used + n_used * token;
 
+            const int64_t route =
+                used + n_used * token;
+
+            // ids may be a non-contiguous view.
             const int32_t routed_expert =
                 ids[
                     used  * ids_s0 +
                     token * ids_s1
                 ];
 
-            if (routed_expert == expert) {
-
-            // activations may have either:
+            // activations:
             //
-            // [K, n_used, T] -> normal routed layout
-            // [K, 1,      T] -> broadcast layout
-            //
-            // For broadcast layout, all routes of a token reuse
-            // the same activation vector.
+            // [K, n_used, T] -> normal
+            // [K, 1,      T] -> broadcast
             const int64_t act_route =
                 n_act_used == 1
                     ? token
                     : used + n_act_used * token;
 
-            if (ids[route] == expert) {
+            if (routed_expert == expert) {
                 const float a =
                     activations[
                         block * 32 +
@@ -210,7 +222,16 @@ static __global__ void opt_step_qlion_qat_id(
             }
         }
     }
-    opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, g);
+
+    opt_step_qlion_qat_apply<mxfp4>(
+        weight_data,
+        momentum,
+        residual,
+        pars,
+        ib,
+        lane,
+        g
+    );
 }
 
 template<bool mxfp4>
