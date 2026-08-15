@@ -3468,7 +3468,8 @@ struct ggml_tensor * ggml_out_prod_id(
     GGML_ASSERT(a->type   == GGML_TYPE_F32);
     GGML_ASSERT(b->type   == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
-    if (a->ne[1] != b->ne[1] || a->ne[2] != b->ne[2]) {
+    if ((a->ne[1] != 1 && a->ne[1] != b->ne[1]) ||
+    a->ne[2] != b->ne[2]) {
         fprintf(stderr,
             "\n[OUT_PROD_ID SHAPE MISMATCH]\n"
             "a   = %s [%lld, %lld, %lld, %lld]\n"
@@ -3495,10 +3496,26 @@ struct ggml_tensor * ggml_out_prod_id(
 
             (long long) n_expert);
     }
-    GGML_ASSERT(a->ne[1]  == b->ne[1]);   // n_expert_used matches
-    GGML_ASSERT(a->ne[2]  == b->ne[2]);   // n_tokens matches
-    GGML_ASSERT(ids->ne[0] == a->ne[1]);  // n_expert_used matches ids
-    GGML_ASSERT(ids->ne[1] == a->ne[2]);  // n_tokens matches ids
+    // a may be broadcast across the routed-expert dimension.
+    //
+    // Normal:
+    //   a   [K, n_exp_used, n_tokens]
+    //   b   [N, n_exp_used, n_tokens]
+    //
+    // Broadcast:
+    //   a   [K, 1,          n_tokens]
+    //   b   [N, n_exp_used, n_tokens]
+    //
+    // ids is always:
+    //   ids [n_exp_used, n_tokens]
+
+    GGML_ASSERT(a->ne[1] == 1 || a->ne[1] == b->ne[1]);
+    GGML_ASSERT(a->ne[2] == b->ne[2]);
+
+    // ids describes the routed dimensions of b, not necessarily a
+    GGML_ASSERT(ids->ne[0] == b->ne[1]);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);
+
     GGML_ASSERT(n_expert > 0);
 
     const int64_t ne[4] = { a->ne[0], b->ne[0], n_expert, 1 };
@@ -6531,8 +6548,18 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_id(
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(activations->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(weight->ne[0] == activations->ne[0] && weight->ne[1] == grad->ne[0]);
-    GGML_ASSERT(activations->ne[1] == grad->ne[1] && activations->ne[2] == grad->ne[2]);
-    GGML_ASSERT(ids->ne[0] == grad->ne[1] && ids->ne[1] == grad->ne[2]);
+    const int64_t n_exp_used = grad->ne[1];
+    const int64_t n_tokens   = grad->ne[2];
+
+    GGML_ASSERT(
+        activations->ne[1] == 1 ||
+        activations->ne[1] == n_exp_used
+    );
+
+    GGML_ASSERT(activations->ne[2] == n_tokens);
+
+    GGML_ASSERT(ids->ne[0] == n_exp_used);
+    GGML_ASSERT(ids->ne[1] == n_tokens);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
     GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 4);

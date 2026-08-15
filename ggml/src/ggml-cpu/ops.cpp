@@ -4602,10 +4602,24 @@ static void ggml_compute_forward_out_prod_id_f32(
     const int nth = params->nth;
 
     const int64_t cols       = src0->ne[0];
-    const int64_t n_exp_used = src0->ne[1];
-    const int64_t n_tokens   = src0->ne[2];
+
+    // Routed dimensions come from src1/grad.
+    // src0 may be broadcast on dimension 1.
+    const int64_t n_exp_used = src1->ne[1];
+    const int64_t n_tokens   = src1->ne[2];
+
     const int64_t rows       = src1->ne[0];
     const int64_t n_expert   = dst->ne[2];
+
+    GGML_ASSERT(
+        src0->ne[1] == 1 ||
+        src0->ne[1] == n_exp_used
+    );
+
+    GGML_ASSERT(src0->ne[2] == n_tokens);
+
+    GGML_ASSERT(ids->ne[0] == n_exp_used);
+    GGML_ASSERT(ids->ne[1] == n_tokens);
 
     // zero dst
     if (ith == 0) {
@@ -4617,8 +4631,12 @@ static void ggml_compute_forward_out_prod_id_f32(
     const int64_t n_slots = n_exp_used * n_tokens;
 
     // strides for src0 (a): [cols, n_exp_used, n_tokens]
-    const size_t a_nb_exp = src0->nb[1]; // stride per expert slot (cols * sizeof(float))
-    const size_t a_nb_tok = src0->nb[2]; // stride per token
+    const size_t a_nb_exp =
+        src0->ne[1] == 1
+            ? 0
+            : src0->nb[1];
+
+    const size_t a_nb_tok = src0->nb[2];
 
     // strides for src1 (b): [rows, n_exp_used, n_tokens]
     const size_t b_nb_exp = src1->nb[1]; // stride per expert slot
@@ -4640,7 +4658,12 @@ static void ggml_compute_forward_out_prod_id_f32(
             continue;
         }
 
-        const float * a_col = (const float *)((const char *)src0->data + iexp * a_nb_exp + itok * a_nb_tok);
+        const int64_t iaexp = src0->ne[1] == 1 ? 0 : iexp;
+
+        const float * a_col =
+            (const float *)((const char *) src0->data +
+                    iaexp*src0->nb[1] +
+                    itok*src0->nb[2]);
         const float * b_col = (const float *)((const char *)src1->data + iexp * b_nb_exp + itok * b_nb_tok);
         float       * d_mat = (float       *)((char       *) dst->data + eid  * d_nb_exp);
 

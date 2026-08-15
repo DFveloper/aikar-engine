@@ -155,6 +155,7 @@ static __global__ void opt_step_qlion_qat_id(
         int64_t n_blocks_row,
         int64_t n_rows,
         int64_t n_expert,
+        int64_t n_act_used,
         int64_t n_used,
         int64_t n_tokens) {
     const int64_t ib = blockIdx.x;
@@ -170,8 +171,34 @@ static __global__ void opt_step_qlion_qat_id(
     for (int64_t token = 0; token < n_tokens; ++token) {
         for (int64_t used = 0; used < n_used; ++used) {
             const int64_t route = used + n_used * token;
+
+            // activations may have either:
+            //
+            // [K, n_used, T] -> normal routed layout
+            // [K, 1,      T] -> broadcast layout
+            //
+            // For broadcast layout, all routes of a token reuse
+            // the same activation vector.
+            const int64_t act_route =
+                n_act_used == 1
+                    ? token
+                    : used + n_act_used * token;
+
             if (ids[route] == expert) {
-                g += activations[block * 32 + lane + n_blocks_row * 32 * route] * grad[row + n_rows * route];
+                const float a =
+                    activations[
+                        block * 32 +
+                        lane +
+                        n_blocks_row * 32 * act_route
+                    ];
+
+                const float dg =
+                    grad[
+                        row +
+                        n_rows * route
+                    ];
+
+                g += a * dg;
             }
         }
     }
@@ -250,18 +277,51 @@ void ggml_cuda_opt_step_qlion_qat_id(ggml_backend_cuda_context & ctx, ggml_tenso
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0 && pars->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(activations) && ggml_is_contiguous(grad));
     GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
+    const int64_t n_act_used = activations->ne[1];
+    const int64_t n_used     = grad->ne[1];
+    const int64_t n_tokens   = grad->ne[2];
+
+    GGML_ASSERT(
+        n_act_used == 1 ||
+        n_act_used == n_used
+    );
+
+    GGML_ASSERT(activations->ne[2] == n_tokens);
+
+    GGML_ASSERT(ids->ne[0] == n_used);
+    GGML_ASSERT(ids->ne[1] == n_tokens);
     const int64_t n_blocks_row = weight->ne[0] / 32;
     const int64_t n_blocks = ggml_nelements(weight) / 32;
     if (weight->type == GGML_TYPE_MXFP4) {
-        opt_step_qlion_qat_id<true><<<n_blocks, 32, 0, ctx.stream()>>>(
-            weight->data, (const float *) activations->data, (const float *) grad->data, (const int32_t *) ids->data,
-            (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
-            n_blocks_row, weight->ne[1], weight->ne[2], grad->ne[1], grad->ne[2]);
+    opt_step_qlion_qat_id<true><<<n_blocks, 32, 0, ctx.stream()>>>(
+        weight->data,
+        (const float *) activations->data,
+        (const float *) grad->data,
+        (const int32_t *) ids->data,
+        (block_q8_0 *) momentum->data,
+        (block_q4_0 *) residual->data,
+        (const float *) pars->data,
+        n_blocks_row,
+        weight->ne[1],
+        weight->ne[2],
+        n_act_used,
+        n_used,
+        n_tokens);
     } else {
         opt_step_qlion_qat_id<false><<<n_blocks, 32, 0, ctx.stream()>>>(
-            weight->data, (const float *) activations->data, (const float *) grad->data, (const int32_t *) ids->data,
-            (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
-            n_blocks_row, weight->ne[1], weight->ne[2], grad->ne[1], grad->ne[2]);
+            weight->data,
+            (const float *) activations->data,
+            (const float *) grad->data,
+            (const int32_t *) ids->data,
+            (block_q8_0 *) momentum->data,
+            (block_q4_0 *) residual->data,
+            (const float *) pars->data,
+            n_blocks_row,
+            weight->ne[1],
+            weight->ne[2],
+            n_act_used,
+            n_used,
+            n_tokens);
     }
 }
 
