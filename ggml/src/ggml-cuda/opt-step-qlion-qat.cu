@@ -76,54 +76,97 @@ static __device__ __forceinline__ float warp_signed_absmax(float value) {
     return __shfl_sync(0xffffffff, value, __ffs(mask) - 1);
 }
 
-static __device__ __forceinline__ int mxfp4_best_index_fast(
+static __device__ __forceinline__ int mxfp4_best_index(
         float value,
-        float inv_scale) {
+        float scale) {
 
-    if (inv_scale == 0.0f || !isfinite(value)) {
+    //
+    // MXFP4 grid:
+    //
+    //   index 0..7:
+    //      0, 1, 2, 3, 4, 6, 8, 12
+    //
+    //   index 8..15:
+    //      0,-1,-2,-3,-4,-6,-8,-12
+    //
+    // Nearest-neighbor boundaries:
+    //
+    //      0.5, 1.5, 2.5, 3.5, 5, 7, 10
+    //
+    // Existing linear search uses strict '<',
+    // therefore exact midpoint ties select the
+    // lower-magnitude value.
+    //
+
+    if (!(scale > 0.0f) || !isfinite(value)) {
         return 0;
     }
 
-    const float x =
-        fabsf(value) * inv_scale;
+    const float ax =
+        fabsf(value);
+
+    const float t05 =
+        scale * 0.5f;
+
+    const float t15 =
+        scale * 1.5f;
+
+    const float t25 =
+        scale * 2.5f;
+
+    const float t35 =
+        scale * 3.5f;
+
+    const float t50 =
+        scale * 5.0f;
+
+    const float t70 =
+        scale * 7.0f;
+
+    const float t100 =
+        scale * 10.0f;
 
     int mag;
 
     //
-    // Levels:
+    // Binary decision tree.
     //
-    // 0, 1, 2, 3, 4, 6, 8, 12
-    //
-    // Midpoints:
-    //
-    // 0.5, 1.5, 2.5, 3.5, 5, 7, 10
-    //
-    // Binary decision tree:
-    //
-    if (x <= 3.5f) {
-        if (x <= 1.5f) {
-            mag = x <= 0.5f ? 0 : 1;
+    if (ax <= t35) {
+        if (ax <= t15) {
+            mag =
+                ax <= t05
+                    ? 0
+                    : 1;
         } else {
-            mag = x <= 2.5f ? 2 : 3;
+            mag =
+                ax <= t25
+                    ? 2
+                    : 3;
         }
     } else {
-        if (x <= 7.0f) {
-            mag = x <= 5.0f ? 4 : 5;
+        if (ax <= t70) {
+            mag =
+                ax <= t50
+                    ? 4
+                    : 5;
         } else {
-            mag = x <= 10.0f ? 6 : 7;
+            mag =
+                ax <= t100
+                    ? 6
+                    : 7;
         }
     }
 
     //
-    // Existing linear search chooses code 0 for zero,
-    // including the negative-zero-equivalent grid entry.
+    // Both +0 and -0 map to code 0,
+    // matching the original linear search.
     //
     if (mag == 0) {
         return 0;
     }
 
-    return signbit(value)
-        ? (mag | 8)
+    return value < 0.0f
+        ? mag + 8
         : mag;
 }
 
@@ -218,7 +261,7 @@ static __device__ void opt_step_qlion_qat_apply(
         const uint8_t exponent =
             (uint8_t) exponent_i32;
         const int q =
-            mxfp4_best_index_fast(
+            mxfp4_best_index(
                 target,
                 inv_scale
             );
