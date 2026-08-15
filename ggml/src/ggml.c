@@ -7298,14 +7298,56 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad_as);
             }
             if (src1_needs_grads) {
+                struct ggml_tensor * grad_b = NULL;
+
                 if (ggml_is_quantized(src0->type)) {
-                    struct ggml_tensor * grad_b = ggml_mul_mat_id_back(ctx, src0, grad, src2);
-                    ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
+                    grad_b = ggml_mul_mat_id_back(
+                        ctx,
+                        src0,
+                        grad,
+                        src2
+                    );
                 } else {
-                    struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, src0, 1, 0, 2, 3));
-                    struct ggml_tensor * grad_b = ggml_mul_mat_id(ctx, as_T, grad, src2);
-                    ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
+                    struct ggml_tensor * as_T =
+                        ggml_cont(
+                            ctx,
+                            ggml_permute(ctx, src0, 1, 0, 2, 3)
+                        );
+
+                    grad_b = ggml_mul_mat_id(
+                        ctx,
+                        as_T,
+                        grad,
+                        src2
+                    );
                 }
+
+                // MUL_MAT_ID allows src1 to be broadcast across
+                // the routed-expert dimension:
+                //
+                //   src1   [K, 1,      T]
+                //   output [N, n_used, T]
+                //
+                // grad_b is therefore initially produced per route:
+                //
+                //   [K, n_used, T]
+                //
+                // If src1 was broadcast, accumulate all repeated
+                // route gradients back into src1's original shape.
+                if (!ggml_are_same_shape(grad_b, src1)) {
+                    grad_b = ggml_repeat_back(
+                        ctx,
+                        grad_b,
+                        src1
+                    );
+                }
+
+                ggml_add_or_set(
+                    ctx,
+                    cgraph,
+                    isrc1,
+                    grad_b
+                );
             }
         } break;
         case GGML_OP_SCALE: {
