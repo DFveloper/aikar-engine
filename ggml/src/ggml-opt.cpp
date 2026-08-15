@@ -226,9 +226,183 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
         if (canonical == param) {
             return;
         }
-        if (canonical->type == param->type && strcmp(canonical->name, param->name) == 0 &&
-            memcmp(canonical->ne, param->ne, sizeof(param->ne)) == 0) {
-            opt_ctx->qat_aliases[i].push_back(param);
+        if (canonical->type == param->type &&
+            strcmp(canonical->name, param->name) == 0 &&
+            memcmp(
+                canonical->ne,
+                param->ne,
+                sizeof(param->ne)
+            ) == 0) {
+
+            //
+            // Register this tensor as another physical alias.
+            //
+            if (std::find(
+                    opt_ctx->qat_aliases[i].begin(),
+                    opt_ctx->qat_aliases[i].end(),
+                    param
+                ) == opt_ctx->qat_aliases[i].end()) {
+
+                opt_ctx->qat_aliases[i].push_back(
+                    param
+                );
+            }
+
+            const int old_priority =
+                ggml_opt_qat_backend_priority(
+                    canonical
+                );
+
+            const int new_priority =
+                ggml_opt_qat_backend_priority(
+                    param
+                );
+
+            //
+            // The first alias is not necessarily the best optimizer location.
+            //
+            // Example for tied Gemma embedding:
+            //
+            //   token_embd alias 0 -> CUDA_Host
+            //   token_embd alias 1 -> CUDA0
+            //
+            // If a better resident alias appears later, promote it to canonical
+            // and move the QLion states to the same buffer type.
+            //
+            if (new_priority > old_priority) {
+
+                ggml_backend_buffer_type_t param_buft =
+                    param->buffer
+                        ? ggml_backend_buffer_get_type(
+                            param->buffer
+                        )
+                        : ggml_backend_cpu_buffer_type();
+
+                GGML_ASSERT(param_buft);
+
+                //
+                // Create replacement state metadata.
+                //
+                struct ggml_init_params state_params = {
+                    /* .mem_size   = */
+                        2 * ggml_tensor_overhead(),
+                    /* .mem_buffer = */
+                        nullptr,
+                    /* .no_alloc   = */
+                        true,
+                };
+
+                struct ggml_context * new_state_ctx =
+                    ggml_init(
+                        state_params
+                    );
+
+                GGML_ASSERT(
+                    new_state_ctx
+                );
+
+                struct ggml_tensor * new_momentum =
+                    ggml_new_tensor(
+                        new_state_ctx,
+                        GGML_TYPE_Q8_0,
+                        GGML_MAX_DIMS,
+                        param->ne
+                    );
+
+                struct ggml_tensor * new_residual =
+                    ggml_new_tensor(
+                        new_state_ctx,
+                        GGML_TYPE_Q4_0,
+                        GGML_MAX_DIMS,
+                        param->ne
+                    );
+
+                ggml_format_name(
+                    new_momentum,
+                    "QLion Q8_0 momentum for %s",
+                    param->name
+                );
+
+                ggml_format_name(
+                    new_residual,
+                    "QLion Q4_0 residual for %s",
+                    param->name
+                );
+
+                ggml_backend_buffer_t new_state_buffer =
+                    ggml_backend_alloc_ctx_tensors_from_buft(
+                        new_state_ctx,
+                        param_buft
+                    );
+
+                GGML_ASSERT(
+                    new_state_buffer
+                );
+
+                //
+                // Preserve existing state.
+                //
+                // During normal opt_init this is currently all-zero,
+                // but copying makes promotion safe even if registration
+                // happens after state initialization in another caller.
+                //
+                ggml_backend_tensor_copy(
+                    opt_ctx->qat_momentum[i],
+                    new_momentum
+                );
+
+                ggml_backend_tensor_copy(
+                    opt_ctx->qat_residual[i],
+                    new_residual
+                );
+
+                GGML_LOG_INFO(
+                    "QLion QAT: promoting canonical %s: %s -> %s\n",
+                    param->name,
+
+                    canonical->buffer
+                        ? ggml_backend_buffer_name(
+                            canonical->buffer
+                        )
+                        : "(null)",
+
+                    param->buffer
+                        ? ggml_backend_buffer_name(
+                            param->buffer
+                        )
+                        : "(null)"
+                );
+
+                //
+                // Old state can now be released.
+                //
+                ggml_backend_buffer_free(
+                    opt_ctx->qat_buffers[i]
+                );
+
+                ggml_free(
+                    opt_ctx->qat_contexts[i]
+                );
+
+                //
+                // Install new canonical + states.
+                //
+                opt_ctx->qat_params[i] =
+                    param;
+
+                opt_ctx->qat_momentum[i] =
+                    new_momentum;
+
+                opt_ctx->qat_residual[i] =
+                    new_residual;
+
+                opt_ctx->qat_buffers[i] =
+                    new_state_buffer;
+
+                opt_ctx->qat_contexts[i] =
+                    new_state_ctx;
+            }
+
             return;
         }
     }
