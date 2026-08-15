@@ -3373,6 +3373,9 @@ static void llama_set_param(
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
+    opt_ctx_compute_cache.reset();
+
+    opt_ctx_compute_cache_size = 0;
     opt_model  = model;
     opt_params = lopt_params;
     cparams.fused_gdn_ar = false;
@@ -3600,7 +3603,6 @@ void llama_context::opt_epoch_iter(
 
         uint32_t pos_batch = 0;
         static bool timings_printed = false;  // print per-ubatch timings only for the first window
-        struct ggml_context * ctx_compute_opt = nullptr;
         do {
             const auto & ubatch = mctx->get_ubatch();
 
@@ -3623,22 +3625,66 @@ void llama_context::opt_epoch_iter(
             // Allocate the tensor metadata context once, then reset it each iteration.
             // ggml_reset() is much cheaper than ggml_free()+ggml_init() — it just resets the
             // allocation pointer without freeing/reallocating the backing memory buffer.
-            if (!ctx_compute_opt) {
-                const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+            const size_t size_gf =
+                ggml_graph_size(gf);
+
+            const size_t size_meta =
+                4 *
+                    size_gf *
+                    ggml_tensor_overhead() +
+                3 *
+                    ggml_graph_overhead_custom(
+                        size_gf,
+                        /*grads=*/ true
+                    );
+
+            if (!opt_ctx_compute_cache ||
+                opt_ctx_compute_cache_size <
+                    size_meta) {
+
                 struct ggml_init_params params = {
-                    /*.mem_size   =*/ size_meta,
-                    /*.mem_buffer =*/ nullptr,
-                    /*.no_alloc   =*/ true,
+                    /*.mem_size   =*/
+                        size_meta,
+
+                    /*.mem_buffer =*/
+                        nullptr,
+
+                    /*.no_alloc   =*/
+                        true,
                 };
-                ctx_compute_opt = ggml_init(params);
+
+                opt_ctx_compute_cache.reset(
+                    ggml_init(params)
+                );
+
+                GGML_ASSERT(
+                    opt_ctx_compute_cache
+                );
+
+                opt_ctx_compute_cache_size =
+                    size_meta;
+
                 if (!timings_printed) {
-                    LLAMA_LOG_INFO("%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n", __func__,
-                            size_gf, ggml_graph_n_nodes(gf), (double)size_meta / (1024*1024));
+                    LLAMA_LOG_INFO(
+                        "%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n",
+                        __func__,
+                        size_gf,
+                        ggml_graph_n_nodes(gf),
+                        (double) size_meta /
+                            (1024 * 1024)
+                    );
                 }
+
             } else {
-                ggml_reset(ctx_compute_opt);
+
+                ggml_reset(
+                    opt_ctx_compute_cache.get()
+                );
             }
+
+            struct ggml_context *
+                ctx_compute_opt =
+                    opt_ctx_compute_cache.get();
 
             const int64_t t1_alloc = ggml_time_ms();
             if (confidence_weighting) {
@@ -3759,7 +3805,6 @@ void llama_context::opt_epoch_iter(
 
             pos_batch += ubatch.n_tokens;
         } while (mctx->next());
-        ggml_free(ctx_compute_opt);
     }
     if (critical_stats_due) {
         fprintf(stderr,

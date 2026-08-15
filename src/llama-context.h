@@ -379,6 +379,15 @@ private:
     struct llama_model * opt_model = nullptr;
     struct llama_opt_params opt_params {};
 
+    //
+    // Dynamic training still rebuilds tensor metadata,
+    // but keep the backing ggml_context allocation alive
+    // instead of free/init every training window.
+    //
+    ggml_context_ptr opt_ctx_compute_cache;
+
+    size_t opt_ctx_compute_cache_size = 0;
+
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
 

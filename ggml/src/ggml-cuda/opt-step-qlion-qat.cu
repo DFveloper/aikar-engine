@@ -1,11 +1,17 @@
 #include "ggml-impl.h"
 #include "opt-step-qlion-qat.cuh"
+#include "moe-route.cuh"
 
 #include <algorithm>
 #include <cstdint>
 
 static constexpr int QLION_QAT_ID_GEMM_CAP   = 128;
 static constexpr int QLION_QAT_ID_GEMM_BATCH = 8;
+
+static constexpr int QLION_QAT_WARPS_PER_BLOCK = 4;
+
+static constexpr int QLION_QAT_THREADS =
+QLION_QAT_WARPS_PER_BLOCK * 32;
 
 static inline void qlion_qat_id_gemm_batched(
         cublasHandle_t handle,
@@ -152,16 +158,51 @@ static __device__ void opt_step_qlion_qat_apply(
     const bool fast_state_scale =
         pars[4] != 0.0f;
 
-    const block_q8_0 momentum_old =
-        momentum[ib];
+    const float momentum_old_scale =
+        __half2float(
+            momentum[ib].d
+        );
 
-    const block_q4_0 residual_old =
-        residual[ib];
-    const float weight_old = mxfp4
-        ? mxfp4_value(((const block_mxfp4 *) weight_data)[ib], lane)
-        : q4_0_value(((const block_q4_0 *) weight_data)[ib], lane);
-    const float momentum_value = __half2float(momentum_old.d) * momentum_old.qs[lane];
-    const float residual_value = q4_0_value(residual_old, lane);
+    const float momentum_value =
+        momentum_old_scale *
+        (float)
+            momentum[ib].qs[lane];
+
+    const float residual_old_scale =
+        __half2float(
+            residual[ib].d
+        );
+
+    const uint8_t residual_old_packed =
+        residual[ib].
+            qs[lane & 15];
+
+    const int residual_old_q =
+        lane < 16
+            ? residual_old_packed &
+                0x0f
+            : residual_old_packed >>
+                4;
+
+    const float residual_value =
+        residual_old_scale *
+        (
+            residual_old_q -
+            8
+        );
+
+    const float weight_old =
+        mxfp4
+            ? mxfp4_value(
+                ((const block_mxfp4 *)
+                    weight_data)[ib],
+                lane
+            )
+            : q4_0_value(
+                ((const block_q4_0 *)
+                    weight_data)[ib],
+                lane
+            );
     g = isfinite(g) ? g : 0.0f;
     if (gclip > 0.0f) {
         g = fmaxf(-gclip, fminf(gclip, g));
@@ -343,9 +384,7 @@ static __device__ void opt_step_qlion_qat_apply(
         if (lane == 0) {
 
             old_scale =
-                __half2float(
-                    residual_old.d
-                );
+                residual_old_scale;
 
             if (old_scale != 0.0f &&
                 isfinite(old_scale)) {
@@ -562,9 +601,7 @@ static __device__ void opt_step_qlion_qat_apply(
         if (lane == 0) {
 
             old_scale =
-                __half2float(
-                    momentum_old.d
-                );
+                momentum_old_scale;
 
             if (old_scale != 0.0f &&
                 isfinite(old_scale)) {
@@ -720,95 +757,36 @@ static __global__ void opt_step_qlion_qat(
         block_q4_0 * __restrict__ residual,
         const float * __restrict__ pars,
         int64_t n_blocks) {
-    const int64_t ib = blockIdx.x;
-    const int lane = threadIdx.x;
-    if (ib < n_blocks) {
-        opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, grad[ib * 32 + lane]);
-    }
-}
-static __global__ void qlion_qat_id_build_routes(
-        const int32_t * __restrict__ ids,
-        int32_t * __restrict__ expert_offsets,
-        int32_t * __restrict__ cursor,
-        int32_t * __restrict__ routes,
-        int64_t n_expert,
-        int64_t n_used,
-        int64_t n_tokens,
-        int64_t ids_s0,
-        int64_t ids_s1) {
 
-    // Route 수는 현재 8192개뿐이라
-    // 여기서는 단일 GPU thread로 deterministic하게 정리해도 충분히 작다.
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
+    const int warp =
+        threadIdx.x >> 5;
+
+    const int lane =
+        threadIdx.x & 31;
+
+    const int64_t ib =
+        (int64_t) blockIdx.x *
+            QLION_QAT_WARPS_PER_BLOCK +
+        warp;
+
+    if (ib >= n_blocks) {
         return;
     }
 
-    for (int64_t e = 0; e < n_expert; ++e) {
-        cursor[e] = 0;
-    }
-
-    const int64_t total_routes =
-        n_used * n_tokens;
-
-    // 1) expert별 route 개수 세기
-    for (int64_t route = 0; route < total_routes; ++route) {
-        const int64_t used =
-            route % n_used;
-
-        const int64_t token =
-            route / n_used;
-
-        const int32_t expert =
-            ids[
-                used  * ids_s0 +
-                token * ids_s1
-            ];
-
-        if (expert >= 0 && expert < n_expert) {
-            cursor[expert]++;
-        }
-    }
-
-    // 2) prefix sum
-    int32_t sum = 0;
-
-    expert_offsets[0] = 0;
-
-    for (int64_t e = 0; e < n_expert; ++e) {
-        const int32_t count =
-            cursor[e];
-
-        cursor[e] =
-            sum;
-
-        sum += count;
-
-        expert_offsets[e + 1] =
-            sum;
-    }
-
-    // 3) route를 expert별 contiguous 영역에 기록
-    for (int64_t route = 0; route < total_routes; ++route) {
-        const int64_t used =
-            route % n_used;
-
-        const int64_t token =
-            route / n_used;
-
-        const int32_t expert =
-            ids[
-                used  * ids_s0 +
-                token * ids_s1
-            ];
-
-        if (expert >= 0 && expert < n_expert) {
-            routes[
-                cursor[expert]++
-            ] =
-                (int32_t) route;
-        }
-    }
+    opt_step_qlion_qat_apply<mxfp4>(
+        weight_data,
+        momentum,
+        residual,
+        pars,
+        ib,
+        lane,
+        grad[
+            ib * 32 +
+            lane
+        ]
+    );
 }
+
 
 static __global__ void qlion_qat_id_gather_expert_batch_padded(
         const float * __restrict__ activations,
@@ -946,14 +924,27 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
         int64_t batch_count,
         int64_t cap) {
 
-    const int64_t task =
-        blockIdx.x;
+    const int warp =
+        threadIdx.x >> 5;
 
     const int lane =
-        threadIdx.x;
+        threadIdx.x & 31;
+
+    const int64_t task =
+        (int64_t) blockIdx.x *
+            QLION_QAT_WARPS_PER_BLOCK +
+        warp;
 
     const int64_t n_blocks_expert =
         n_blocks_row * n_rows;
+
+    const int64_t total_tasks =
+        batch_count *
+        n_blocks_expert;
+
+    if (task >= total_tasks) {
+        return;
+    }
 
     const int64_t batch_expert =
         task / n_blocks_expert;
@@ -1086,9 +1077,32 @@ static __global__ void opt_step_qlion_qat_rows(
         int64_t n_blocks_row,
         int64_t n_rows,
         int64_t n_indices) {
-    const int64_t index = blockIdx.x / n_blocks_row;
-    const int64_t block = blockIdx.x % n_blocks_row;
-    const int lane = threadIdx.x;
+    const int warp =
+        threadIdx.x >> 5;
+
+    const int lane =
+        threadIdx.x & 31;
+
+    const int64_t task =
+        (int64_t) blockIdx.x *
+            QLION_QAT_WARPS_PER_BLOCK +
+        warp;
+
+    const int64_t total_tasks =
+        n_indices *
+        n_blocks_row;
+
+    if (task >= total_tasks) {
+        return;
+    }
+
+    const int64_t index =
+        task /
+        n_blocks_row;
+
+    const int64_t block =
+        task %
+        n_blocks_row;
     if (index >= n_indices) {
         return;
     }
@@ -1123,12 +1137,19 @@ void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual) && ggml_is_contiguous(pars));
     const int64_t n_blocks = ggml_nelements(weight) / 32;
+    const int64_t grid_blocks =
+        (
+            n_blocks +
+            QLION_QAT_WARPS_PER_BLOCK -
+            1
+        ) /
+    QLION_QAT_WARPS_PER_BLOCK;
     if (weight->type == GGML_TYPE_MXFP4) {
-        opt_step_qlion_qat<true><<<n_blocks, 32, 0, ctx.stream()>>>(
+        opt_step_qlion_qat<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const float *) grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     } else {
-        opt_step_qlion_qat<false><<<n_blocks, 32, 0, ctx.stream()>>>(
+        opt_step_qlion_qat<false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const float *) grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     }
@@ -1343,25 +1364,28 @@ void ggml_cuda_opt_step_qlion_qat_id(
     //
     // GPU에서 route grouping.
     //
-    qlion_qat_id_build_routes
-        <<<1, 1, 0, stream>>>(
-            (const int32_t *)
-                ids->data,
+    ggml_cuda_moe_build_routes(
+        stream,
 
-            expert_offsets.ptr,
-            cursor.ptr,
-            routes.ptr,
+        (const int32_t *)
+            ids->data,
 
-            n_expert,
-            n_used,
-            n_tokens,
+        expert_offsets.ptr,
+        cursor.ptr,
+        routes.ptr,
 
-            ids_s0,
-            ids_s1
-        );
+        //
+        // QLion path does not need
+        // local route rank.
+        //
+        nullptr,
 
-    CUDA_CHECK(
-        cudaGetLastError()
+        n_expert,
+        n_used,
+        n_tokens,
+
+        ids_s0,
+        ids_s1
     );
 
     //
@@ -1532,15 +1556,24 @@ const int64_t gather_blocks =
         // --------------------------------------------------------
         //
 
+        const int64_t apply_tasks =
+            (int64_t)
+                batch_count *
+                n_blocks_expert;
+
         const int64_t apply_blocks =
-            (int64_t) batch_count *
-            n_blocks_expert;
+            (
+                apply_tasks +
+                QLION_QAT_WARPS_PER_BLOCK -
+                1
+            ) /
+            QLION_QAT_WARPS_PER_BLOCK;
         if (
             weight->type ==
             GGML_TYPE_MXFP4
         ) {
             opt_step_qlion_qat_id_apply_gemm<true>
-                <<<apply_blocks, 32, 0, stream>>>(
+                <<<apply_blocks, QLION_QAT_THREADS, 0, stream>>>(
                     weight->data,
                     expert_grad.ptr,
 
@@ -1565,7 +1598,7 @@ const int64_t gather_blocks =
                 );
         } else {
             opt_step_qlion_qat_id_apply_gemm<false>
-                <<<apply_blocks, 32, 0, stream>>>(
+                <<<apply_blocks, QLION_QAT_THREADS, 0, stream>>>(
                     weight->data,
                     expert_grad.ptr,
 
@@ -1610,13 +1643,27 @@ void ggml_cuda_opt_step_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t n_blocks_row = weight->ne[0] / 32;
     const int64_t n_indices = ggml_nelements(ids);
     const int64_t n_blocks = n_indices * n_blocks_row;
+    const int64_t grid_blocks =
+        (
+            n_blocks +
+            QLION_QAT_WARPS_PER_BLOCK -
+            1
+        ) /
+        QLION_QAT_WARPS_PER_BLOCK;
+    const int64_t grid_blocks =
+        (
+            n_blocks +
+            QLION_QAT_WARPS_PER_BLOCK -
+            1
+        ) /
+        QLION_QAT_WARPS_PER_BLOCK;
     if (weight->type == GGML_TYPE_MXFP4) {
-        opt_step_qlion_qat_rows<true><<<n_blocks, 32, 0, ctx.stream()>>>(
+        opt_step_qlion_qat_rows<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const float *) grad->data, (const int32_t *) ids->data,
             (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
             n_blocks_row, weight->ne[1], n_indices);
     } else {
-        opt_step_qlion_qat_rows<false><<<n_blocks, 32, 0, ctx.stream()>>>(
+        opt_step_qlion_qat_rows<false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const float *) grad->data, (const int32_t *) ids->data,
             (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
             n_blocks_row, weight->ne[1], n_indices);

@@ -15,6 +15,7 @@
 #include <random>
 #include <set>
 #include <vector>
+#include <unordered_map>
 
 struct ggml_opt_dataset {
     struct ggml_context   * ctx    = nullptr;
@@ -92,6 +93,22 @@ struct ggml_opt_context {
     std::set<struct ggml_tensor *> qat_forward_nodes;
     std::vector<ggml_backend_buffer_t> qat_buffers;
     std::vector<struct ggml_context *> qat_contexts;
+    std::set<struct ggml_tensor *> qat_forward_nodes;
+
+    //
+    // QLion dynamic-graph dependency-plan cache.
+    //
+    // Graph tensor pointers are rebuilt every step,
+    // but fixed-shape training keeps node ordering/topology stable.
+    // Cache node indices rather than tensor pointers.
+    //
+    std::unordered_map<struct ggml_tensor *, size_t> qat_alias_to_state;
+
+    std::vector<std::vector<int32_t> > qat_dependency_plan;
+
+    uint64_t qat_dependency_signature = 0;
+
+    bool qat_dependency_plan_ready = false;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -560,55 +577,375 @@ static bool ggml_opt_depends_on_qat_alias(
     return result;
 }
 
-static struct ggml_tensor * ggml_opt_qlion_qat_backward_callback(
+static inline void ggml_opt_qat_hash_mix(
+        uint64_t & h,
+        uint64_t value) {
+
+    h ^= value;
+    h *= 1099511628211ULL;
+}
+
+
+static uint64_t ggml_opt_qat_graph_signature(
+        const ggml_opt_context_t opt_ctx) {
+
+    const ggml_cgraph * gf =
+        opt_ctx->gf;
+
+    uint64_t h =
+        1469598103934665603ULL;
+
+    ggml_opt_qat_hash_mix(
+        h,
+        (uint64_t) gf->n_nodes
+    );
+
+    ggml_opt_qat_hash_mix(
+        h,
+        (uint64_t)
+            opt_ctx->critical_max_tokens
+    );
+
+    ggml_opt_qat_hash_mix(
+        h,
+        (uint64_t)
+            opt_ctx->critical_token_weighting
+    );
+
+    ggml_opt_qat_hash_mix(
+        h,
+        (uint64_t)
+            opt_ctx->critical_confidence_weighting
+    );
+
+    ggml_opt_qat_hash_mix(
+        h,
+        (uint64_t)
+            opt_ctx->sparse_labels
+    );
+
+    ggml_opt_qat_hash_mix(
+        h,
+        (uint64_t)
+            opt_ctx->fused_backward
+    );
+
+    for (int i = 0;
+         i < gf->n_nodes;
+         ++i) {
+
+        const ggml_tensor * node =
+            gf->nodes[i];
+
+        ggml_opt_qat_hash_mix(
+            h,
+            (uint64_t) node->op
+        );
+
+        ggml_opt_qat_hash_mix(
+            h,
+            (uint64_t) node->type
+        );
+
+        ggml_opt_qat_hash_mix(
+            h,
+            (uint64_t) (
+                node->flags &
+                (
+                    GGML_TENSOR_FLAG_PARAM |
+                    GGML_TENSOR_FLAG_INPUT |
+                    GGML_TENSOR_FLAG_OUTPUT
+                )
+            )
+        );
+
+        for (int d = 0;
+             d < GGML_MAX_DIMS;
+             ++d) {
+
+            ggml_opt_qat_hash_mix(
+                h,
+                (uint64_t)
+                    node->ne[d]
+            );
+        }
+
+        //
+        // Parameter names are stable across
+        // rebuilt dynamic graphs.
+        //
+        if (node->flags &
+            GGML_TENSOR_FLAG_PARAM) {
+
+            for (const char * p =
+                     node->name;
+                 *p;
+                 ++p) {
+
+                ggml_opt_qat_hash_mix(
+                    h,
+                    (uint8_t) *p
+                );
+            }
+        }
+    }
+
+    return h;
+}
+static struct ggml_tensor *
+ggml_opt_qlion_qat_backward_callback(
         struct ggml_context * ctx,
         struct ggml_tensor  * param,
         struct ggml_tensor  * grad,
         void                * userdata) {
-    ggml_opt_context_t opt_ctx = (ggml_opt_context_t) userdata;
-    for (size_t i = 0; i < opt_ctx->qat_aliases.size(); ++i) {
-        const auto & aliases = opt_ctx->qat_aliases[i];
-        if (std::find(aliases.begin(), aliases.end(), param) == aliases.end()) {
-            continue;
-        }
-        opt_ctx->qat_pending_grads[i].push_back(grad);
-        if (opt_ctx->qat_pending_grads[i].size() < opt_ctx->qat_expected_grads[i]) {
-            return nullptr;
-        }
-        std::map<struct ggml_tensor *, bool> dependency_memo;
-        for (int j = 0; j < opt_ctx->gf->n_nodes; ++j) {
-            struct ggml_tensor * node = opt_ctx->gb_grad->nodes[j];
-            struct ggml_tensor * pending_grad = ggml_graph_get_grad(opt_ctx->gb_grad, node);
-            if (pending_grad && !(node->flags & GGML_TENSOR_FLAG_PARAM) &&
-                ggml_opt_depends_on_qat_alias(pending_grad, aliases, opt_ctx->qat_forward_nodes, dependency_memo)) {
-                ggml_build_forward_expand(opt_ctx->gb_grad, pending_grad);
-            }
-        }
-        struct ggml_tensor * combined = opt_ctx->qat_pending_grads[i][0];
-        for (size_t j = 1; j < opt_ctx->qat_pending_grads[i].size(); ++j) {
-            combined = ggml_add(ctx, combined, opt_ctx->qat_pending_grads[i][j]);
-        }
-        struct ggml_tensor * step;
-        if (combined->op == GGML_OP_OUT_PROD_ID) {
-            step = ggml_opt_step_qlion_qat_id(ctx, param, combined->src[0], combined->src[1], combined->src[2],
-                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
-        } else if (combined->op == GGML_OP_GET_ROWS_BACK) {
-            step = ggml_opt_step_qlion_qat_rows(ctx, param, combined->src[0], combined->src[1],
-                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
-        } else {
-            step = ggml_opt_step_qlion_qat(ctx, param, combined,
-                opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
-        }
-        ggml_format_name(step, "QLion QAT step for %s", param->name);
-        struct ggml_tensor * result = step;
-        for (struct ggml_tensor * alias : aliases) {
-            if (alias != param) {
-                result = ggml_cpy(ctx, result, alias);
-            }
-        }
-        return result;
+
+    ggml_opt_context_t opt_ctx =
+        (ggml_opt_context_t)
+            userdata;
+
+    const auto found =
+        opt_ctx->
+            qat_alias_to_state.find(
+                param
+            );
+
+    if (found ==
+        opt_ctx->
+            qat_alias_to_state.end()) {
+
+        return nullptr;
     }
-    return nullptr;
+
+    const size_t i =
+        found->second;
+
+    auto & pending =
+        opt_ctx->
+            qat_pending_grads[i];
+
+    pending.push_back(
+        grad
+    );
+
+    if (pending.size() <
+        opt_ctx->
+            qat_expected_grads[i]) {
+
+        return nullptr;
+    }
+
+    //
+    // These dependency gradients must execute
+    // before the in-place QLion update changes
+    // the quantized weight.
+    //
+    if (opt_ctx->
+        qat_dependency_plan_ready) {
+
+        const auto & plan =
+            opt_ctx->
+                qat_dependency_plan[i];
+
+        for (int32_t j :
+             plan) {
+
+            GGML_ASSERT(
+                j >= 0 &&
+                j <
+                opt_ctx->gf->n_nodes
+            );
+
+            struct ggml_tensor * node =
+                opt_ctx->
+                    gb_grad->nodes[j];
+
+            struct ggml_tensor *
+                pending_grad =
+                    ggml_graph_get_grad(
+                        opt_ctx->gb_grad,
+                        node
+                    );
+
+            if (pending_grad &&
+                !(node->flags &
+                  GGML_TENSOR_FLAG_PARAM)) {
+
+                ggml_build_forward_expand(
+                    opt_ctx->gb_grad,
+                    pending_grad
+                );
+            }
+        }
+
+    } else {
+
+        //
+        // First build for this graph shape:
+        // calculate dependency set and remember node indices.
+        //
+        auto & plan =
+            opt_ctx->
+                qat_dependency_plan[i];
+
+        plan.clear();
+
+        std::map<
+            struct ggml_tensor *,
+            bool
+        > dependency_memo;
+
+        const auto & aliases =
+            opt_ctx->
+                qat_aliases[i];
+
+        for (int j = 0;
+             j <
+             opt_ctx->gf->n_nodes;
+             ++j) {
+
+            struct ggml_tensor * node =
+                opt_ctx->
+                    gb_grad->nodes[j];
+
+            struct ggml_tensor *
+                pending_grad =
+                    ggml_graph_get_grad(
+                        opt_ctx->gb_grad,
+                        node
+                    );
+
+            if (!pending_grad ||
+                (node->flags &
+                 GGML_TENSOR_FLAG_PARAM)) {
+
+                continue;
+            }
+
+            if (
+                ggml_opt_depends_on_qat_alias(
+                    pending_grad,
+                    aliases,
+                    opt_ctx->
+                        qat_forward_nodes,
+                    dependency_memo
+                )
+            ) {
+
+                plan.push_back(
+                    j
+                );
+
+                ggml_build_forward_expand(
+                    opt_ctx->gb_grad,
+                    pending_grad
+                );
+            }
+        }
+    }
+
+    struct ggml_tensor * combined =
+        pending[0];
+
+    for (size_t j = 1;
+         j < pending.size();
+         ++j) {
+
+        combined =
+            ggml_add(
+                ctx,
+                combined,
+                pending[j]
+            );
+    }
+
+    struct ggml_tensor * step;
+
+    if (combined->op ==
+        GGML_OP_OUT_PROD_ID) {
+
+        step =
+            ggml_opt_step_qlion_qat_id(
+                ctx,
+                param,
+
+                combined->src[0],
+                combined->src[1],
+                combined->src[2],
+
+                opt_ctx->
+                    qat_momentum[i],
+
+                opt_ctx->
+                    qat_residual[i],
+
+                opt_ctx->
+                    opt_step_params
+            );
+
+    } else if (
+        combined->op ==
+        GGML_OP_GET_ROWS_BACK) {
+
+        step =
+            ggml_opt_step_qlion_qat_rows(
+                ctx,
+                param,
+
+                combined->src[0],
+                combined->src[1],
+
+                opt_ctx->
+                    qat_momentum[i],
+
+                opt_ctx->
+                    qat_residual[i],
+
+                opt_ctx->
+                    opt_step_params
+            );
+
+    } else {
+
+        step =
+            ggml_opt_step_qlion_qat(
+                ctx,
+                param,
+                combined,
+
+                opt_ctx->
+                    qat_momentum[i],
+
+                opt_ctx->
+                    qat_residual[i],
+
+                opt_ctx->
+                    opt_step_params
+            );
+    }
+
+    ggml_format_name(
+        step,
+        "QLion QAT step for %s",
+        param->name
+    );
+
+    struct ggml_tensor * result =
+        step;
+
+    for (struct ggml_tensor * alias :
+         opt_ctx->qat_aliases[i]) {
+
+        if (alias != param) {
+            result =
+                ggml_cpy(
+                    ctx,
+                    result,
+                    alias
+                );
+        }
+    }
+
+    return result;
 }
 
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
@@ -618,6 +955,66 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
     const bool qlion_qat = optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    if (qlion_qat) {
+
+        const uint64_t signature =
+            ggml_opt_qat_graph_signature(
+                opt_ctx
+            );
+
+        const bool changed =
+            signature !=
+                opt_ctx->
+                    qat_dependency_signature ||
+            opt_ctx->
+                qat_dependency_plan.size() !=
+                    opt_ctx->
+                        qat_params.size();
+
+        if (changed) {
+
+            opt_ctx->
+                qat_dependency_signature =
+                    signature;
+
+            opt_ctx->
+                qat_dependency_plan_ready =
+                    false;
+
+            opt_ctx->
+                qat_dependency_plan.assign(
+                    opt_ctx->
+                        qat_params.size(),
+                    {}
+                );
+        }
+
+        //
+        // Rebuild pointer lookup every graph build.
+        // Very cheap compared with recursive dependency scan,
+        // and safe if aliases changed.
+        //
+        opt_ctx->
+            qat_alias_to_state.clear();
+
+        for (size_t state = 0;
+            state <
+            opt_ctx->
+                qat_aliases.size();
+            ++state) {
+
+            for (ggml_tensor * alias :
+                opt_ctx->
+                    qat_aliases[state]) {
+
+                opt_ctx->
+                    qat_alias_to_state[
+                        alias
+                    ] =
+                    state;
+            }
+        }
+    }
     const bool accumulate = !qlion_qat && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
         !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
 
@@ -992,6 +1389,33 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_build_backward_expand_with_callback(
             opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(),
             ggml_opt_qlion_qat_backward_callback, opt_ctx);
+        if (qlion_qat &&
+            !opt_ctx->
+                qat_dependency_plan_ready) {
+
+            opt_ctx->
+                qat_dependency_plan_ready =
+                    true;
+
+            size_t dependency_count =
+                0;
+
+            for (const auto & plan :
+                opt_ctx->
+                    qat_dependency_plan) {
+
+                dependency_count +=
+                    plan.size();
+            }
+
+            GGML_LOG_INFO(
+                "%s: cached QLion dependency plan: %zu dependencies across %zu states\n",
+                __func__,
+                dependency_count,
+                opt_ctx->
+                    qat_dependency_plan.size()
+            );
+        }
     } else {
         ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
     }
