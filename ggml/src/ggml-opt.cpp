@@ -401,8 +401,42 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
 
                 opt_ctx->qat_contexts[i] =
                     new_state_ctx;
-            }
 
+                //
+                // Tied token embedding:
+                //
+                // Keep distinct tensor metadata objects so autodiff still sees
+                // two parameter aliases, but make both aliases reference the
+                // same GPU-resident weight storage.
+                //
+                // This removes the full CUDA -> CUDA_Host synchronization after
+                // every QLion step.
+                //
+                if (
+                    strcmp(param->name, "token_embd.weight") == 0 &&
+                    canonical->buffer &&
+                    param->buffer &&
+                    ggml_backend_buffer_is_host(canonical->buffer) &&
+                    !ggml_backend_buffer_is_host(param->buffer) &&
+                    canonical->type == param->type &&
+                    ggml_are_same_shape(canonical, param) &&
+                    ggml_are_same_layout(canonical, param)
+                ) {
+
+                    GGML_LOG_INFO(
+                        "QLion QAT: binding host tied alias %s to canonical device storage (%s -> %s)\n",
+                        param->name,
+                        ggml_backend_buffer_name(canonical->buffer),
+                        ggml_backend_buffer_name(param->buffer)
+                    );
+
+                    canonical->buffer =
+                        param->buffer;
+
+                    canonical->data =
+                        param->data;
+                }
+            }
             return;
         }
     }

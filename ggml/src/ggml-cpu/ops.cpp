@@ -4631,12 +4631,13 @@ static void ggml_compute_forward_out_prod_id_f32(
     const int64_t n_slots = n_exp_used * n_tokens;
 
     // strides for src0 (a): [cols, n_exp_used, n_tokens]
-    const size_t a_nb_exp =
+    /*const size_t a_nb_exp =
         src0->ne[1] == 1
             ? 0
             : src0->nb[1];
+    */
 
-    const size_t a_nb_tok = src0->nb[2];
+    //const size_t a_nb_tok = src0->nb[2];
 
     // strides for src1 (b): [rows, n_exp_used, n_tokens]
     const size_t b_nb_exp = src1->nb[1]; // stride per expert slot
@@ -12343,10 +12344,10 @@ static void ggml_qlion_qat_update_block(
     float weight_f32[32];
     float momentum_f32[32];
     float residual_f32[32];
-    float momentum_new[32];
+    //float momentum_new[32];
     float target[32];
-    float weight_new[32];
-    float residual_new[32];
+    //float weight_new[32];
+    //float residual_new[32];
     weight_traits->to_float(weight_block, weight_f32, 32);
     momentum_traits->to_float(momentum_block, momentum_f32, 32);
     residual_traits->to_float(residual_block, residual_f32, 32);
@@ -12358,7 +12359,8 @@ static void ggml_qlion_qat_update_block(
         float m = p[1] * momentum_f32[j] + (1.0f - p[1]) * g;
         m = std::isfinite(m) ? m : 0.0f;
         m = std::max(-128.0f * 65504.0f, std::min(128.0f * 65504.0f, m));
-        momentum_new[j] = m;
+        momentum_f32[j] = m;
+        //momentum_new[j] = m;
         const float direction = m > 0.0f ? 1.0f : (m < 0.0f ? -1.0f : 0.0f);
         float value = weight_f32[j] + residual_f32[j] - p[0] * (direction + p[2] * weight_f32[j]);
         value = std::isfinite(value) ? value : weight_f32[j];
@@ -12368,20 +12370,20 @@ static void ggml_qlion_qat_update_block(
         target[j] = value;
     }
     weight_traits->from_float_ref(target, weight_block, 32);
-    weight_traits->to_float(weight_block, weight_new, 32);
+    weight_traits->to_float(weight_block, weight_f32, 32);
     float residual_absmax = 0.0f;
     for (int j = 0; j < 32; ++j) {
-        float value = target[j] - weight_new[j];
+        float value = target[j] - weight_f32[j];
         value = std::isfinite(value) ? value : 0.0f;
         value = std::max(-8.0f * 65504.0f, std::min(8.0f * 65504.0f, value));
-        residual_new[j] = value;
+        residual_f32[j] = value;
         residual_absmax = std::max(residual_absmax, std::abs(value));
     }
     if (residual_absmax > 0.0f && residual_absmax < 8.0f * 0x1p-24f) {
-        std::fill(residual_new, residual_new + 32, 0.0f);
+        std::fill(residual_f32, residual_f32 + 32, 0.0f);
     }
-    residual_traits->from_float_ref(residual_new, residual_block, 32);
-    momentum_traits->from_float_ref(momentum_new, momentum_block, 32);
+    residual_traits->from_float_ref(residual_f32, residual_block, 32);
+    momentum_traits->from_float_ref(momentum_f32, momentum_block, 32);
 }
 
 void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params, ggml_tensor * dst) {

@@ -3381,11 +3381,47 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     cparams.fused_gdn_ar = false;
     cparams.fused_gdn_ch = false;
     cparams.auto_fgdn    = false;
-    model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
-    const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
-    const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
-    GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
-    GGML_ASSERT(n_batch                    % n_ubatch == 0);
+    //
+    // Context used for THIS fine-tuning run.
+    //
+    // IMPORTANT:
+    // Do not overwrite model->hparams.n_ctx_train here.
+    // That field describes the model's original/native context length
+    // and must survive fine-tuning/export unchanged.
+    //
+    const uint32_t train_n_ctx =
+        lopt_params.n_ctx_train > 0
+            ? lopt_params.n_ctx_train
+            : n_ctx();
+
+    //
+    // Keep normalized runtime training context in the optimizer params,
+    // not in the model hparams.
+    //
+    this->opt_params.n_ctx_train =
+        train_n_ctx;
+
+    const uint32_t n_batch =
+        std::min(
+            this->n_batch(),
+            train_n_ctx
+        );
+
+    const uint32_t n_ubatch =
+        std::min(
+            this->n_ubatch(),
+            n_batch
+        );
+
+    GGML_ASSERT(
+        train_n_ctx %
+            n_batch == 0
+    );
+
+    GGML_ASSERT(
+        n_batch %
+            n_ubatch == 0
+    );
 
     // Recreate the scheduler and gf_res_prev with a training-inflated graph size before
     // creating opt_ctx, so opt_ctx captures the new (larger) scheduler pointer.
@@ -3687,16 +3723,46 @@ void llama_context::opt_epoch_iter(
                     opt_ctx_compute_cache.get();
 
             const int64_t t1_alloc = ggml_time_ms();
+
             if (confidence_weighting) {
                 int32_t n_active_ubatch = 0;
-                for (uint32_t i = 0; i < n_ubatch; ++i) {
-                    n_active_ubatch += labels_sparse[pos_ctx + pos_batch + i] >= 0;
+
+                // Count only tokens that actually belong to this ubatch.
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    n_active_ubatch +=
+                        labels_sparse[pos_ctx + pos_batch + i] >= 0;
                 }
-                const int32_t max_tokens = opt_params.critical_max_fraction < 1.0f
-                    ? (int32_t) std::floor(n_active_ubatch * opt_params.critical_max_fraction) : -1;
-                ggml_opt_set_critical_max_tokens(opt_ctx, max_tokens);
+
+                int32_t max_tokens = -1;
+
+                if (opt_params.critical_max_fraction < 1.0f &&
+                    n_active_ubatch > 0) {
+
+                    const int32_t requested_max_tokens =
+                        (int32_t) std::floor(
+                            n_active_ubatch *
+                            opt_params.critical_max_fraction);
+
+                    // max_tokens == 0 currently crashes the critical-token path.
+                    // Preserve floor behavior normally, but guarantee at least one
+                    // slot when there is at least one active token.
+                    max_tokens = std::max<int32_t>(
+                        1,
+                        requested_max_tokens);
+                }
+
+                ggml_opt_set_critical_max_tokens(
+                    opt_ctx,
+                    max_tokens);
             }
-            ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+
+            ggml_opt_prepare_alloc(
+                opt_ctx,
+                ctx_compute_opt,
+                gf,
+                res->get_inp_tokens(),
+                res->get_logits());
+
             ggml_opt_alloc(opt_ctx, train);
 
             const int64_t t2_inputs = ggml_time_ms();
@@ -3723,7 +3789,7 @@ void llama_context::opt_epoch_iter(
                     std::fill(sparse_targets_host.begin(), sparse_targets_host.end(), 0);
                     std::fill(sparse_weights_host.begin(), sparse_weights_host.end(), 0.0f);
                 }
-                for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
+                for (uint32_t pos_ubatch = 0; pos_ubatch < ubatch.n_tokens; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                     // -1 sentinel means "masked position" (prompt token, BOS separator, etc).
                     // Leave the dense label row or sparse weight at zero.
@@ -3771,7 +3837,7 @@ void llama_context::opt_epoch_iter(
                 stats_unweighted_loss += unweighted_loss;
                 stats_weighted_loss += weighted_loss;
                 bool has_active = false;
-                for (uint32_t i = 0; i < n_ubatch; ++i) {
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                     const uint32_t ilabel = pos_ctx + pos_batch + i;
                     if (labels_sparse[ilabel] < 0) continue;
                     has_active = true;
