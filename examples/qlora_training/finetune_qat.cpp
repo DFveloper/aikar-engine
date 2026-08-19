@@ -3,6 +3,63 @@
 
 #include "llama-ext.h"
 
+static int64_t train_sample_split_by_conversation(
+        const std::vector<training_sample> & samples,
+        float                                val_split,
+        int64_t                            & train_conversations_out,
+        int64_t                            & val_conversations_out) {
+
+    train_conversations_out = 0;
+    val_conversations_out   = 0;
+
+    if (samples.empty()) {
+        return 0;
+    }
+
+    std::vector<int64_t> conversation_starts;
+    conversation_starts.reserve(samples.size());
+
+    int64_t previous_id =
+        std::numeric_limits<int64_t>::min();
+
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const int64_t id =
+            samples[i].conversation_id;
+
+        if (i == 0 || id != previous_id) {
+            conversation_starts.push_back(
+                (int64_t) i);
+
+            previous_id = id;
+        }
+    }
+
+    const int64_t n_conversations =
+        (int64_t) conversation_starts.size();
+
+    const int64_t train_conversations =
+        train_split_from_val_fraction(
+            n_conversations,
+            val_split);
+
+    train_conversations_out =
+        train_conversations;
+
+    val_conversations_out =
+        n_conversations - train_conversations;
+
+    if (train_conversations <= 0) {
+        return 0;
+    }
+
+    if (train_conversations >= n_conversations) {
+        return (int64_t) samples.size();
+    }
+
+    return conversation_starts[
+        (size_t) train_conversations];
+}
+
 struct qat_model_info {
     enum ggml_type weight_type = GGML_TYPE_COUNT;
     uint64_t quantized_bytes = 0;
@@ -425,14 +482,105 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;
     }
+    int64_t train_conversations = 0;
+    int64_t val_conversations = 0;
+
+    const int64_t sample_split =
+        train_sample_split_by_conversation(
+            samples,
+            params.val_split,
+            train_conversations,
+            val_conversations);
+
+    LOG_INF(
+        "%s: conversation split: "
+        "train_conversations=%ld "
+        "val_conversations=%ld "
+        "train_samples=%ld "
+        "val_samples=%ld "
+        "total_samples=%zu\n",
+        __func__,
+        (long) train_conversations,
+        (long) val_conversations,
+        (long) sample_split,
+        (long) samples.size() - sample_split,
+        samples.size());
+
+    if (sample_split <= 0) {
+
+        LOG_ERR(
+            "%s: no training samples after val split "
+            "(samples=%zu val_split=%.3f)\n",
+            __func__,
+            samples.size(),
+            (double) params.val_split);
+
+        return 1;
+    }
+
+    if (params.val_split > 0.0f &&
+        sample_split ==
+            (int64_t) samples.size()) {
+
+        LOG_WRN(
+            "%s: validation split produced "
+            "no validation samples "
+            "(samples=%zu val_split=%.3f)\n",
+            __func__,
+            samples.size(),
+            (double) params.val_split);
+    }
     const int32_t n_ctx = llama_n_ctx(lctx);
     std::vector<float> window_rewards;
     std::vector<llama_opt_critical_token_metadata> critical_metadata;
     const bool critical_enabled = params.critical_token_mode != "none";
-    ggml_opt_dataset_t dataset = build_dataset(samples, n_ctx, window_rewards, params.train_on_prompt,
-        llama_vocab_bos(vocab), critical_enabled, &critical_metadata);
+    int64_t idata_split = 0;
+    
+    ggml_opt_dataset_t dataset =
+        build_dataset(
+            samples,
+            n_ctx,
+            window_rewards,
+
+            // NEW:
+            // Raw JSONL sample boundary.
+            sample_split,
+
+            // NEW:
+            // build_dataset() fills this with
+            // the actual number of TRAIN windows.
+            idata_split,
+
+            params.train_on_prompt,
+            llama_vocab_bos(vocab),
+            critical_enabled,
+            &critical_metadata);
+
+    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
+
     if (!dataset) {
         return 1;
+    }
+    if (idata_split <= 0 ||
+        idata_split > ndata) {
+
+        LOG_ERR(
+            "%s: invalid packed training boundary "
+            "(train_windows=%ld total_windows=%ld)\n",
+            __func__,
+            (long) idata_split,
+            (long) ndata);
+
+        return 1;
+    }
+    if (params.val_split > 0.0f &&
+        idata_split == ndata) {
+
+        LOG_WRN(
+            "%s: validation samples produced "
+            "no supervised validation windows; "
+            "validation will be skipped\n",
+            __func__);
     }
     qlora_lr_schedule schedule {
         &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio, 0, 0
@@ -460,8 +608,7 @@ int main(int argc, char ** argv) {
     if (!params.qat_resume.empty() && !qat_load_state(lctx, params.qat_resume, params.qat_quant_type, resume)) {
         return 1;
     }
-    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
-    const int64_t idata_split = train_split_from_val_fraction(ndata, params.val_split);
+//    const int64_t idata_split = train_split_from_val_fraction(ndata, params.val_split);
     if (idata_split <= 0) {
         LOG_ERR("%s: no training windows after validation split\n", __func__);
         return 1;
