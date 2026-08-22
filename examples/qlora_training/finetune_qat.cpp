@@ -3,6 +3,39 @@
 
 #include "llama-ext.h"
 
+static void truncate_samples_to_context(
+        std::vector<training_sample> & samples,
+        int32_t n_ctx,
+        int32_t requested_max_tokens) {
+    const size_t max_tokens = requested_max_tokens > 0
+        ? std::min((size_t) requested_max_tokens, (size_t) n_ctx + 1)
+        : (size_t) n_ctx + 1;
+    size_t truncated_samples = 0;
+    size_t removed_tokens = 0;
+
+    for (training_sample & sample : samples) {
+        if (sample.tokens.size() <= max_tokens) {
+            continue;
+        }
+        const size_t end = sample.tokens.size();
+        const size_t begin = end - max_tokens;
+        const size_t remove = sample.tokens.size() - (end - begin);
+        sample.tokens.erase(sample.tokens.begin() + end, sample.tokens.end());
+        sample.tokens.erase(sample.tokens.begin(), sample.tokens.begin() + begin);
+        sample.is_label.erase(sample.is_label.begin() + end, sample.is_label.end());
+        sample.is_label.erase(sample.is_label.begin(), sample.is_label.begin() + begin);
+        if (!sample.critical_weights.empty()) {
+            sample.critical_weights.erase(sample.critical_weights.begin() + end, sample.critical_weights.end());
+            sample.critical_weights.erase(sample.critical_weights.begin(), sample.critical_weights.begin() + begin);
+        }
+        ++truncated_samples;
+        removed_tokens += remove;
+    }
+
+    LOG_INF("%s: truncated_samples=%zu removed_tokens=%zu max_sample_tokens=%zu\n",
+        __func__, truncated_samples, removed_tokens, max_tokens);
+}
+
 static int64_t train_sample_split_by_conversation(
         const std::vector<training_sample> & samples,
         float                                val_split,
@@ -359,6 +392,7 @@ struct qat_callback_context {
     int64_t window_start;
     int64_t ubatches_per_window;
     int64_t last_saved_step;
+    int64_t last_observed_step;
 };
 
 static thread_local struct qat_callback_context * g_qat_callback = nullptr;
@@ -375,6 +409,11 @@ static void qat_epoch_callback(
     if (!train || !g_qat_callback) {
         return;
     }
+    const int64_t step = llama_opt_step(g_qat_callback->lctx);
+    if (step <= g_qat_callback->last_observed_step) {
+        return;
+    }
+    g_qat_callback->last_observed_step = step;
     ++g_qat_callback->schedule->step;
     if (g_qat_callback->params->verbose_loss) {
         double loss = 0.0;
@@ -383,7 +422,6 @@ static void qat_epoch_callback(
             (long) g_qat_callback->epoch, (long) ibatch, (long) llama_opt_step(g_qat_callback->lctx),
             loss, (double) g_qat_callback->schedule->current_lr);
     }
-    const int64_t step = llama_opt_step(g_qat_callback->lctx);
     const bool window_complete = ibatch > 0 && ibatch % g_qat_callback->ubatches_per_window == 0;
     if (g_qat_callback->params->save_every > 0 && window_complete &&
         step - g_qat_callback->last_saved_step >= g_qat_callback->params->save_every) {
@@ -398,9 +436,12 @@ static void qat_epoch_callback(
 static void qat_print_memory(struct llama_context * lctx, const struct qat_model_info & model_info) {
     uint64_t momentum_bytes = 0;
     uint64_t residual_bytes = 0;
+    uint64_t gradient_bytes = 0;
     for (int64_t i = 0; i < llama_opt_qat_state_count(lctx); ++i) {
         momentum_bytes += ggml_nbytes(llama_opt_qat_state_momentum(lctx, i));
         residual_bytes += ggml_nbytes(llama_opt_qat_state_residual(lctx, i));
+        struct ggml_tensor * gradient = llama_opt_qat_state_gradient_accumulator(lctx, i);
+        gradient_bytes += gradient ? ggml_nbytes(gradient) : 0;
     }
     uint64_t context_bytes = 0;
     uint64_t compute_bytes = 0;
@@ -408,11 +449,12 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
         context_bytes += item.second.context;
         compute_bytes += item.second.compute;
     }
-    LOG_INF("qat_memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu\n",
+    LOG_INF("qat_memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu gradient_q8_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu\n",
         (unsigned long long) model_info.quantized_bytes, (unsigned long long) momentum_bytes,
-        (unsigned long long) residual_bytes, (unsigned long long) model_info.nonquantized_bytes,
+        (unsigned long long) residual_bytes, (unsigned long long) gradient_bytes,
+        (unsigned long long) model_info.nonquantized_bytes,
         (unsigned long long) context_bytes, (unsigned long long) compute_bytes,
-        (unsigned long long) (model_info.quantized_bytes + momentum_bytes + residual_bytes));
+        (unsigned long long) (model_info.quantized_bytes + momentum_bytes + residual_bytes + gradient_bytes));
 }
 
 int main(int argc, char ** argv) {
@@ -441,8 +483,9 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: native QAT only supports --optimizer qlion\n", __func__);
         return 1;
     }
-    if (params.n_ctx <= 0 || params.n_batch != params.n_ctx || params.n_ubatch != params.n_ctx) {
-        LOG_ERR("%s: native QAT currently requires explicit -c N -b N -ub N to avoid a full-model accumulation buffer\n", __func__);
+    if (params.n_ctx <= 0 || params.n_batch != params.n_ctx || params.n_ubatch <= 0 ||
+        params.n_batch % params.n_ubatch != 0) {
+        LOG_ERR("%s: native QLion requires explicit -c N -b N with -ub M where N is divisible by M\n", __func__);
         return 1;
     }
     params.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -459,10 +502,12 @@ int main(int argc, char ** argv) {
     if (!qat_inspect_model(params.model.path, weight_type, model_info)) {
         return 1;
     }
-    LOG_INF("qat_memory_estimate: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu nonquantized_model=%llu persistent_qat=%llu\n",
+    const uint64_t gradient_estimate = params.n_ubatch < params.n_batch ? model_info.momentum_bytes : 0;
+    LOG_INF("qat_memory_estimate: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu gradient_q8_0=%llu nonquantized_model=%llu persistent_qat=%llu\n",
         (unsigned long long) model_info.quantized_bytes, (unsigned long long) model_info.momentum_bytes,
-        (unsigned long long) model_info.residual_bytes, (unsigned long long) model_info.nonquantized_bytes,
-        (unsigned long long) (model_info.quantized_bytes + model_info.momentum_bytes + model_info.residual_bytes));
+        (unsigned long long) model_info.residual_bytes, (unsigned long long) gradient_estimate,
+        (unsigned long long) model_info.nonquantized_bytes,
+        (unsigned long long) (model_info.quantized_bytes + model_info.momentum_bytes + model_info.residual_bytes + gradient_estimate));
 
     common_init();
     llama_backend_init();
@@ -482,6 +527,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;
     }
+    const int32_t n_ctx = llama_n_ctx(lctx);
+    truncate_samples_to_context(samples, n_ctx, params.qat_max_sample_tokens);
     int64_t train_conversations = 0;
     int64_t val_conversations = 0;
 
@@ -503,7 +550,7 @@ int main(int argc, char ** argv) {
         (long) train_conversations,
         (long) val_conversations,
         (long) sample_split,
-        (long) samples.size() - sample_split,
+        (long) (samples.size() - sample_split),
         samples.size());
 
     if (sample_split <= 0) {
@@ -530,7 +577,6 @@ int main(int argc, char ** argv) {
             samples.size(),
             (double) params.val_split);
     }
-    const int32_t n_ctx = llama_n_ctx(lctx);
     std::vector<float> window_rewards;
     std::vector<llama_opt_critical_token_metadata> critical_metadata;
     const bool critical_enabled = params.critical_token_mode != "none";
@@ -628,7 +674,7 @@ int main(int argc, char ** argv) {
     const int64_t ubatches_per_window = llama_n_ctx(lctx) / llama_n_ubatch(lctx);
     GGML_ASSERT(ubatches_per_window > 0);
     struct qat_callback_context callback_ctx {
-        lctx, model, &schedule, &params, 0, 0, ubatches_per_window, llama_opt_step(lctx)
+        lctx, model, &schedule, &params, 0, 0, ubatches_per_window, llama_opt_step(lctx), llama_opt_step(lctx)
     };
     g_qat_callback = &callback_ctx;
     if (params.shuffle_dataset) {
@@ -653,7 +699,7 @@ int main(int argc, char ** argv) {
     }
     llama_synchronize(lctx);
     llama_model_save_to_file(model, params.qat_out.c_str());
-    LOG_INF("%s: trained native %s model saved to %s\n", __func__, params.qat_quant_type.c_str(), params.qat_out.c_str());
+    LOG_INF("%s: trained native QLion %s model saved to %s\n", __func__, params.qat_quant_type.c_str(), params.qat_out.c_str());
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
     ggml_opt_dataset_free(dataset);

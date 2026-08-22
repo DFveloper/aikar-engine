@@ -3030,7 +3030,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
-        LOG_ERR("%s: qlion is only supported by llama-finetune-qat\n", __func__);
+        LOG_ERR("%s: qlion is only supported by llama-finetune-qlion\n", __func__);
         return 1;
     }
 

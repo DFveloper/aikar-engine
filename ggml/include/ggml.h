@@ -589,6 +589,7 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
+        GGML_OP_ACC_QLION_QAT,
         GGML_OP_OPT_STEP_QLION_QAT,
         GGML_OP_OPT_STEP_QLION_QAT_ID,
         GGML_OP_OPT_STEP_QLION_QAT_ROWS,
@@ -2023,6 +2024,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
+    // set the offset dims for RoPE
+    // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    GGML_API struct ggml_tensor * ggml_rope_set_offset(
+            struct ggml_tensor  * a,
+            int                   n_offs);
 
     // clamp
     // in-place, returns view(a)
@@ -2513,7 +2522,8 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
-            struct ggml_tensor  * ids);
+            struct ggml_tensor  * ids,
+            int64_t               K);
 
     // partition into non-overlapping windows with padding if needed
     // example:
@@ -2825,6 +2835,21 @@ extern "C" {
         struct ggml_tensor *  a,
         struct ggml_tensor *  grad,
         struct ggml_tensor *  sgd_params); // alpha, weight decay
+
+    GGML_API struct ggml_tensor * ggml_acc_qlion_qat(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  accumulator,
+        struct ggml_tensor *  grad,
+        bool                  reset);
+
+    GGML_API struct ggml_tensor * ggml_acc_qlion_qat_tied(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  accumulator,
+        struct ggml_tensor *  dense_a,
+        struct ggml_tensor *  dense_b,
+        struct ggml_tensor *  sparse_grad,
+        struct ggml_tensor *  sparse_ids,
+        bool                  reset);
 
     GGML_API struct ggml_tensor * ggml_opt_step_qlion_qat(
         struct ggml_context * ctx,

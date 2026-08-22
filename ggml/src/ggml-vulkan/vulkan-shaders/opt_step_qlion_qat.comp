@@ -36,18 +36,22 @@ layout (binding = 2) readonly buffer G {float grad[];};
 layout (binding = 3) readonly buffer IDS {int ids[];};
 layout (binding = 4) buffer M {block_q8_0 momentum[];};
 layout (binding = 5) buffer R {block_q4_0 residual[];};
-layout (binding = 6) readonly buffer P {float params[4];};
+layout (binding = 6) readonly buffer P {float params[5];};
 #elif ROWS
 layout (binding = 1) readonly buffer G {float grad[];};
 layout (binding = 2) readonly buffer IDS {int ids[];};
 layout (binding = 3) buffer M {block_q8_0 momentum[];};
 layout (binding = 4) buffer R {block_q4_0 residual[];};
-layout (binding = 5) readonly buffer P {float params[4];};
+layout (binding = 5) readonly buffer P {float params[5];};
+#else
+#if GRAD_Q8_0
+layout (binding = 1) readonly buffer G {block_q8_0 grad[];};
 #else
 layout (binding = 1) readonly buffer G {float grad[];};
+#endif
 layout (binding = 2) buffer M {block_q8_0 momentum[];};
 layout (binding = 3) buffer R {block_q4_0 residual[];};
-layout (binding = 4) readonly buffer P {float params[4];};
+layout (binding = 4) readonly buffer P {float params[5];};
 #endif
 
 shared float target_values[32];
@@ -73,7 +77,7 @@ uint best_mxfp4(float value, float scale) {
 
 void main() {
     init_iq_shmem(uvec3(32, 1, 1));
-    const uint ib = gl_WorkGroupID.x;
+    const uint ib = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     const uint lane = gl_LocalInvocationID.x;
     uint state_ib = ib;
 #if ROUTED
@@ -133,7 +137,11 @@ void main() {
         }
     }
 #else
+#if GRAD_Q8_0
+    float g = float(grad[ib].d) * float(grad[ib].qs[lane]);
+#else
     float g = grad[ib * 32 + lane];
+#endif
 #endif
     g = isinf(g) || isnan(g) ? 0.0 : g;
     if (params[3] > 0.0) {

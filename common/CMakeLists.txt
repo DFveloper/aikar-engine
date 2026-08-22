@@ -110,7 +110,6 @@ add_library(${TARGET}
     trie.h
     unicode.cpp
     unicode.h
-    ../examples/gguf-hash/deps/sha256/sha256.c
     jinja/lexer.cpp
     jinja/lexer.h
     jinja/parser.cpp
@@ -131,7 +130,8 @@ set_target_properties(${TARGET} PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(${TARGET} PUBLIC . ../vendor PRIVATE ../examples/gguf-hash/deps)
+target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_link_libraries     (${TARGET} PUBLIC vendor::hash vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)

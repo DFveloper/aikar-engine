@@ -3,7 +3,7 @@
 #include "ggml.h"
 #include "gguf.h"
 extern "C" {
-#include "../examples/gguf-hash/deps/sha256/sha256.h"
+#include "hash/sha256/sha256.h"
 }
 
 #include "nlohmann/json.hpp"

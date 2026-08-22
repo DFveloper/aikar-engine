@@ -905,10 +905,103 @@ qlion_qat_tied_add_sparse(
     }
 }
 
-template<bool mxfp4>
+static __global__ void acc_qlion_qat(
+        block_q8_0 * __restrict__ accumulator,
+        const float * __restrict__ grad,
+        int64_t n_blocks,
+        bool reset) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int64_t ib = (int64_t) blockIdx.x * QLION_QAT_WARPS_PER_BLOCK + warp;
+    if (ib >= n_blocks) {
+        return;
+    }
+
+    __shared__ float values[QLION_QAT_WARPS_PER_BLOCK][32];
+    const float old = reset ? 0.0f : __half2float(accumulator[ib].d) * (float) accumulator[ib].qs[lane];
+    const float g = isfinite(grad[ib * 32 + lane]) ? grad[ib * 32 + lane] : 0.0f;
+    const float value = old + g;
+    values[warp][lane] = isfinite(value) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, value)) : 0.0f;
+    __syncwarp();
+
+    if (lane == 0) {
+        float amax = 0.0f;
+        float signed_max = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            if (amax < fabsf(values[warp][i])) {
+                amax = fabsf(values[warp][i]);
+                signed_max = values[warp][i];
+            }
+        }
+        const float scale = signed_max / -128.0f;
+        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+        accumulator[ib].d = __float2half(scale);
+        for (int i = 0; i < 32; ++i) {
+            accumulator[ib].qs[i] = (int8_t) max(-128, min(127, (int) roundf(values[warp][i] * inverse)));
+        }
+    }
+}
+
+static __global__ void acc_qlion_qat_tied(
+        block_q8_0 * __restrict__ accumulator,
+        const float * __restrict__ dense_a,
+        const float * __restrict__ dense_b,
+        const float * __restrict__ sparse_grad,
+        const int32_t * __restrict__ sparse_ids,
+        int64_t n_blocks,
+        int64_t n_blocks_row,
+        int64_t rows,
+        int64_t k,
+        int64_t n_indices,
+        bool reset) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int64_t ib = (int64_t) blockIdx.x * QLION_QAT_WARPS_PER_BLOCK + warp;
+    if (ib >= n_blocks) {
+        return;
+    }
+
+    const int64_t row = ib / n_blocks_row;
+    const int64_t col = (ib % n_blocks_row) * 32 + lane;
+    const int64_t cols = n_blocks_row * 32;
+    float g = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        g += dense_a[col + cols * i] * dense_b[row + rows * i];
+    }
+    for (int64_t i = 0; i < n_indices; ++i) {
+        if (sparse_ids[i] == row) {
+            g += sparse_grad[col + cols * i];
+        }
+    }
+
+    __shared__ float values[QLION_QAT_WARPS_PER_BLOCK][32];
+    const float old = reset ? 0.0f : __half2float(accumulator[ib].d) * (float) accumulator[ib].qs[lane];
+    const float value = old + (isfinite(g) ? g : 0.0f);
+    values[warp][lane] = isfinite(value) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, value)) : 0.0f;
+    __syncwarp();
+
+    if (lane == 0) {
+        float amax = 0.0f;
+        float signed_max = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            if (amax < fabsf(values[warp][i])) {
+                amax = fabsf(values[warp][i]);
+                signed_max = values[warp][i];
+            }
+        }
+        const float scale = signed_max / -128.0f;
+        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+        accumulator[ib].d = __float2half(scale);
+        for (int i = 0; i < 32; ++i) {
+            accumulator[ib].qs[i] = (int8_t) max(-128, min(127, (int) roundf(values[warp][i] * inverse)));
+        }
+    }
+}
+
+template<bool mxfp4, bool grad_q8>
 static __global__ void opt_step_qlion_qat(
         void * __restrict__ weight_data,
-        const float * __restrict__ grad,
+        const void * __restrict__ grad,
         block_q8_0 * __restrict__ momentum,
         block_q4_0 * __restrict__ residual,
         const float * __restrict__ pars,
@@ -929,6 +1022,10 @@ static __global__ void opt_step_qlion_qat(
         return;
     }
 
+    const float g = grad_q8
+        ? __half2float(((const block_q8_0 *) grad)[ib].d) * (float) ((const block_q8_0 *) grad)[ib].qs[lane]
+        : ((const float *) grad)[ib * 32 + lane];
+
     opt_step_qlion_qat_apply<mxfp4>(
         weight_data,
         momentum,
@@ -936,10 +1033,7 @@ static __global__ void opt_step_qlion_qat(
         pars,
         ib,
         lane,
-        grad[
-            ib * 32 +
-            lane
-        ]
+        g
     );
 }
 
@@ -1648,6 +1742,32 @@ void ggml_cuda_opt_step_qlion_qat_tied(
     }
 }
 
+void ggml_cuda_acc_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * accumulator = dst->src[0];
+    const bool tied = dst->src[4] != nullptr;
+    const ggml_tensor * grad = tied ? nullptr : dst->src[1];
+    GGML_ASSERT(accumulator->type == GGML_TYPE_Q8_0);
+    const int64_t n_blocks = ggml_nelements(accumulator) / 32;
+    const int64_t grid_blocks = (n_blocks + QLION_QAT_WARPS_PER_BLOCK - 1) / QLION_QAT_WARPS_PER_BLOCK;
+    const bool reset = ggml_get_op_params_i32(dst, 0) != 0;
+    if (tied) {
+        const ggml_tensor * dense_a = dst->src[1];
+        const ggml_tensor * dense_b = dst->src[2];
+        const ggml_tensor * sparse_grad = dst->src[3];
+        const ggml_tensor * sparse_ids = dst->src[4];
+        acc_qlion_qat_tied<<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            (block_q8_0 *) accumulator->data,
+            (const float *) dense_a->data, (const float *) dense_b->data,
+            (const float *) sparse_grad->data, (const int32_t *) sparse_ids->data,
+            n_blocks, accumulator->ne[0] / 32, accumulator->ne[1], dense_a->ne[1],
+            ggml_nelements(sparse_ids), reset);
+    } else {
+        GGML_ASSERT(grad->type == GGML_TYPE_F32);
+        acc_qlion_qat<<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            (block_q8_0 *) accumulator->data, (const float *) grad->data, n_blocks, reset);
+    }
+}
+
 void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * weight = dst->src[0];
     const ggml_tensor * grad = dst->src[1];
@@ -1655,7 +1775,8 @@ void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_tensor * residual = dst->src[3];
     const ggml_tensor * pars = dst->src[4];
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(grad->type == GGML_TYPE_F32 && momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT((grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0) &&
+        momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(pars->type == GGML_TYPE_F32 && ggml_nelements(pars) == 5);
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual) && ggml_is_contiguous(pars));
@@ -1667,13 +1788,21 @@ void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor *
             1
         ) /
     QLION_QAT_WARPS_PER_BLOCK;
-    if (weight->type == GGML_TYPE_MXFP4) {
-        opt_step_qlion_qat<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
-            weight->data, (const float *) grad->data, (block_q8_0 *) momentum->data,
+    if (weight->type == GGML_TYPE_MXFP4 && grad->type == GGML_TYPE_Q8_0) {
+        opt_step_qlion_qat<true, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, grad->data, (block_q8_0 *) momentum->data,
+            (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
+    } else if (weight->type == GGML_TYPE_MXFP4) {
+        opt_step_qlion_qat<true, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, grad->data, (block_q8_0 *) momentum->data,
+            (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
+    } else if (grad->type == GGML_TYPE_Q8_0) {
+        opt_step_qlion_qat<false, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     } else {
-        opt_step_qlion_qat<false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
-            weight->data, (const float *) grad->data, (block_q8_0 *) momentum->data,
+        opt_step_qlion_qat<false, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     }
 }

@@ -165,6 +165,10 @@ if (Vulkan_FOUND)
     else()
         # For non-cross-compiling, use empty toolchain (use host compiler)
         set(HOST_CMAKE_TOOLCHAIN_FILE "")
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS
+             -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
+             -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+             -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER})
     endif()
 
     include(ExternalProject)
@@ -200,8 +204,11 @@ if (Vulkan_FOUND)
     set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
     set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
+    set (_ggml_vk_generated_shader_files ${_ggml_vk_header})
 
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
+    set_source_files_properties(${_ggml_vk_shader_files} PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_shader_files})
 
     # Because external projects do not provide source-level tracking,
     # the vulkan-shaders-gen sources need to be explicitly added to
@@ -241,8 +248,11 @@ if (Vulkan_FOUND)
             COMMENT "Generate vulkan shaders for ${file}"
         )
         target_sources(ggml-vulkan PRIVATE ${_ggml_vk_target_cpp})
+        list(APPEND _ggml_vk_generated_shader_files ${_ggml_vk_target_cpp})
     endforeach()
 
+    source_group("Vulkan shaders" FILES ${_ggml_vk_shader_files})
+    source_group("Generated Vulkan shaders" FILES ${_ggml_vk_generated_shader_files})
 else()
     message(WARNING "Vulkan not found")
 endif()

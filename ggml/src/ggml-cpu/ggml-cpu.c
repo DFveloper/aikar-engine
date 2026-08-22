@@ -105,6 +105,16 @@ struct ggml_riscv_arch_features_type {
 #endif
 #include <windows.h>
 
+#if defined(__MINGW32__) && !defined(THREAD_POWER_THROTTLING_CURRENT_VERSION)
+#define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
+#define THREAD_POWER_THROTTLING_EXECUTION_SPEED 0x1
+typedef struct _THREAD_POWER_THROTTLING_STATE {
+    ULONG Version;
+    ULONG ControlMask;
+    ULONG StateMask;
+} THREAD_POWER_THROTTLING_STATE, * PTHREAD_POWER_THROTTLING_STATE;
+#endif
+
 #if defined(_MSC_VER) && !defined(__clang__)
 #define GGML_CACHE_ALIGN __declspec(align(GGML_CACHE_LINE))
 
@@ -2125,6 +2135,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_ACC_QLION_QAT:
+            {
+                ggml_compute_forward_acc_qlion_qat(params, tensor);
+            }
+            break;
         case GGML_OP_OPT_STEP_QLION_QAT:
             {
                 ggml_compute_forward_opt_step_qlion_qat(params, tensor);
@@ -2496,6 +2511,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_ACC_QLION_QAT:
         case GGML_OP_OPT_STEP_QLION_QAT:
         case GGML_OP_OPT_STEP_QLION_QAT_ID:
         case GGML_OP_OPT_STEP_QLION_QAT_ROWS:

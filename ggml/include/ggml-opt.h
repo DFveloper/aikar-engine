@@ -210,6 +210,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_opt_qat_state_param(ggml_opt_context_t opt_ctx, int64_t index);
     GGML_API struct ggml_tensor * ggml_opt_qat_state_momentum(ggml_opt_context_t opt_ctx, int64_t index);
     GGML_API struct ggml_tensor * ggml_opt_qat_state_residual(ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor * ggml_opt_qat_state_gradient_accumulator(ggml_opt_context_t opt_ctx, int64_t index);
     GGML_API int64_t ggml_opt_step(ggml_opt_context_t opt_ctx);
     GGML_API void ggml_opt_set_step(ggml_opt_context_t opt_ctx, int64_t step);
 

@@ -6148,6 +6148,8 @@ static void ggml_compute_forward_rope_flt(
     memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
     memcpy(&sections,    (int32_t *) dst->op_params + 11, sizeof(int)*4);
 
+    const int n_offs = ((int32_t *) dst->op_params)[15];
+
     GGML_TENSOR_UNARY_OP_LOCALS
 
     //printf("ne0: %d, ne1: %d, ne2: %d, ne3: %d\n", ne0, ne1, ne2, ne3);
@@ -6163,6 +6165,10 @@ static void ggml_compute_forward_rope_flt(
 
     GGML_ASSERT(n_dims <= ne0);
     GGML_ASSERT(n_dims % 2 == 0);
+
+    GGML_ASSERT(n_offs >= 0);
+    GGML_ASSERT(n_offs % 2 == 0);
+    GGML_ASSERT(n_offs + n_dims <= ne0);
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -6189,6 +6195,7 @@ static void ggml_compute_forward_rope_flt(
 
     if (is_vision) {
         GGML_ASSERT(n_dims == ne0/2);
+        GGML_ASSERT(n_offs == 0);
     }
 
     const float * freq_factors = NULL;
@@ -6237,12 +6244,12 @@ static void ggml_compute_forward_rope_flt(
 
                 switch (mode) {
                     case GGML_ROPE_TYPE_NORMAL:
-                        rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
+                        rotate_pairs<T>(n_dims, 1, cache, src + n_offs, dst_data + n_offs, 1);
                         break;
                     case GGML_ROPE_TYPE_NEOX:
                     case GGML_ROPE_TYPE_MROPE:
                     case GGML_ROPE_TYPE_IMROPE:
-                        rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst_data);
+                        rotate_pairs<T>(n_dims, n_dims/2, cache, src + n_offs, dst_data + n_offs);
                         break;
                     case GGML_ROPE_TYPE_VISION:
                         rotate_pairs<T>(ne0, n_dims, cache, src, dst_data);
@@ -6253,7 +6260,11 @@ static void ggml_compute_forward_rope_flt(
 
                 if (!is_vision) {
                     // fill the remain channels with data from src tensor
-                    for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
+                    for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+                        if (i0 == n_offs) {
+                            i0 += n_dims - 2; // skip the rotated channels
+                            continue;
+                        }
                         const T * const src = (T *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         T * dst_data  = (T *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
 
@@ -9975,11 +9986,13 @@ static void ggml_compute_forward_ssm_scan_f32(
     const int64_t ng = src4->ne[1];
     const int64_t nt = src1->ne[2]; // number of tokens per sequence
     const int64_t ns = src1->ne[3]; // number of sequences in the batch
+    const int64_t K  = ggml_get_op_params_i32(dst, 0);
 
     // can't use ggml_nbytes because src1 is not necessarily contiguous
     const int64_t s_off = ggml_nelements(src1) * ggml_element_size(src1);
 
-    GGML_ASSERT(ggml_nelements(src1) + nc*nr*nh*ns == ggml_nelements(dst));
+    GGML_ASSERT(K >= 1);
+    GGML_ASSERT(ggml_nelements(src1) + K*nc*nr*nh*ns == ggml_nelements(dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src2->nb[0] == sizeof(float));
@@ -9988,6 +10001,7 @@ static void ggml_compute_forward_ssm_scan_f32(
     GGML_ASSERT(src5->nb[0] == sizeof(float));
     GGML_ASSERT(src6->nb[0] == sizeof(int32_t));
     GGML_ASSERT(nh % ng == 0);
+    GGML_ASSERT(src3->ne[0] == 1 || K == 1);
 
     // heads per thread
     const int dh = (nh + nth - 1)/nth;
@@ -10160,6 +10174,13 @@ static void ggml_compute_forward_ssm_scan_f32(
                         y[ii] = sumf;
 #endif
                     }
+                }
+            }
+            const int64_t slot = nt - 1 - i2;
+            if (K > 1 && slot > 0 && slot < K) {
+                float * s_snapshot = (float *) ((char *) dst->data + s_off + (slot*ns + i3)*(src0->nb[3]));
+                for (int h = ih0; h < ih1; ++h) {
+                    memcpy((char *) s_snapshot + h*src0->nb[2], (char *) s + h*src0->nb[2], src0->nb[2]);
                 }
             }
             // use the output as the source when it's not the first token-wise iteration
@@ -12386,6 +12407,66 @@ static void ggml_qlion_qat_update_block(
     momentum_traits->from_float_ref(momentum_f32, momentum_block, 32);
 }
 
+void ggml_compute_forward_acc_qlion_qat(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * accumulator = dst->src[0];
+    const bool tied = dst->src[4] != nullptr;
+    const ggml_tensor * grad = tied ? nullptr : dst->src[1];
+    GGML_ASSERT(accumulator->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(ggml_is_contiguous(accumulator));
+    if (!tied) {
+        GGML_ASSERT(grad->type == GGML_TYPE_F32 && ggml_is_contiguous(grad));
+    }
+
+    const bool reset = ggml_get_op_params_i32(dst, 0) != 0;
+    const ggml_type_traits * traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    const int64_t n_blocks = ggml_nelements(accumulator) / 32;
+    const int64_t blocks_per_thread = (n_blocks + params->nth - 1) / params->nth;
+    const int64_t block_begin = blocks_per_thread * params->ith;
+    const int64_t block_end = std::min(n_blocks, block_begin + blocks_per_thread);
+    uint8_t * accumulator_data = (uint8_t *) accumulator->data;
+    const float * grad_data = tied ? nullptr : (const float *) grad->data;
+    const ggml_tensor * dense_a = tied ? dst->src[1] : nullptr;
+    const ggml_tensor * dense_b = tied ? dst->src[2] : nullptr;
+    const ggml_tensor * sparse_grad = tied ? dst->src[3] : nullptr;
+    const ggml_tensor * sparse_ids = tied ? dst->src[4] : nullptr;
+    const int64_t n_blocks_row = tied ? accumulator->ne[0] / 32 : 0;
+    const int64_t k = tied ? dense_a->ne[1] : 0;
+    const int64_t n_indices = tied ? ggml_nelements(sparse_ids) : 0;
+
+    for (int64_t ib = block_begin; ib < block_end; ++ib) {
+        uint8_t * accumulator_block = accumulator_data + ib * traits->type_size;
+        float values[32] = {};
+        if (!reset) {
+            traits->to_float(accumulator_block, values, 32);
+        }
+        for (int lane = 0; lane < 32; ++lane) {
+            float g = 0.0f;
+            if (tied) {
+                const int64_t row = ib / n_blocks_row;
+                const int64_t col = (ib % n_blocks_row) * 32 + lane;
+                const float * a = (const float *) dense_a->data;
+                const float * b = (const float *) dense_b->data;
+                for (int64_t i = 0; i < k; ++i) {
+                    g += a[col + accumulator->ne[0] * i] * b[row + accumulator->ne[1] * i];
+                }
+                const int32_t * ids = (const int32_t *) sparse_ids->data;
+                const float * sparse = (const float *) sparse_grad->data;
+                for (int64_t i = 0; i < n_indices; ++i) {
+                    if (ids[i] == row) {
+                        g += sparse[col + accumulator->ne[0] * i];
+                    }
+                }
+            } else {
+                g = grad_data[ib * 32 + lane];
+            }
+            const float value = values[lane] + (std::isfinite(g) ? g : 0.0f);
+            values[lane] = std::max(-128.0f * 65504.0f, std::min(128.0f * 65504.0f,
+                std::isfinite(value) ? value : 0.0f));
+        }
+        traits->from_float_ref(values, accumulator_block, 32);
+    }
+}
+
 void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params, ggml_tensor * dst) {
     ggml_tensor * weight = dst->src[0];
     const ggml_tensor * grad = dst->src[1];
@@ -12394,7 +12475,7 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     const ggml_tensor * opt_params = dst->src[4];
 
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(opt_params->type == GGML_TYPE_F32);
@@ -12423,14 +12504,20 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     uint8_t * weight_data = (uint8_t *) weight->data;
     uint8_t * momentum_data = (uint8_t *) momentum->data;
     uint8_t * residual_data = (uint8_t *) residual->data;
-    const float * grad_data = (const float *) grad->data;
+    const ggml_type_traits * grad_traits = ggml_get_type_traits(grad->type);
+    const float * grad_data = grad->type == GGML_TYPE_F32 ? (const float *) grad->data : nullptr;
 
     for (int64_t ib = block_begin; ib < block_end; ++ib) {
         uint8_t * weight_block = weight_data + ib * weight_traits->type_size;
         uint8_t * momentum_block = momentum_data + ib * momentum_traits->type_size;
         uint8_t * residual_block = residual_data + ib * residual_traits->type_size;
+        float grad_block[32];
+        const float * grad_values = grad_data ? grad_data + ib * 32 : grad_block;
+        if (!grad_data) {
+            grad_traits->to_float((const uint8_t *) grad->data + ib * grad_traits->type_size, grad_block, 32);
+        }
         ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
-            weight_block, momentum_block, residual_block, grad_data + ib * 32, p);
+            weight_block, momentum_block, residual_block, grad_values, p);
     }
 }
 

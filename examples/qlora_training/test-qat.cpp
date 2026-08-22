@@ -297,14 +297,14 @@ static void test_native_backend_step(
     ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, reference.ne);
     ggml_tensor * momentum = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, reference.ne);
     ggml_tensor * residual = ggml_new_tensor_1d(ctx, GGML_TYPE_Q4_0, reference.ne);
-    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
     ggml_tensor * result = ggml_opt_step_qlion_qat(ctx, weight, grad, momentum, residual, opt_params);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
     ggml_build_forward_expand(graph, result);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     check(buffer != nullptr, "failed to allocate native QAT test tensors");
 
-    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip };
+    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip, 0.0f };
     ggml_backend_tensor_set(weight, weight_before.data(), 0, weight_before.size());
     ggml_backend_tensor_set(grad, gradient.data(), 0, gradient.size() * sizeof(float));
     ggml_backend_tensor_set(momentum, momentum_before.data(), 0, momentum_before.size());
@@ -321,6 +321,97 @@ static void test_native_backend_step(
     check(weight_after == reference.weight, "native backend weight differs from reference");
     check(momentum_after == reference.momentum, "native backend momentum differs from reference");
     check(residual_after == reference.residual, "native backend residual differs from reference");
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+static void test_native_microbatch_step(
+        enum qat_weight_format format,
+        ggml_backend_dev_t device,
+        bool required) {
+    qat_tensor_state reference = make_state(format);
+    const std::vector<uint8_t> weight_before = reference.weight;
+    const std::vector<uint8_t> momentum_before = reference.momentum;
+    const std::vector<uint8_t> residual_before = reference.residual;
+    std::vector<float> grad_a(reference.ne);
+    std::vector<float> grad_b(reference.ne);
+    for (int64_t i = 0; i < reference.ne; ++i) {
+        grad_a[i] = 0.025f * std::sin(0.13f * (float) i);
+        grad_b[i] = 0.020f * std::cos(0.17f * (float) i);
+    }
+
+    const ggml_type_traits * q8_traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    std::vector<uint8_t> expected_accumulator(ggml_row_size(GGML_TYPE_Q8_0, reference.ne));
+    std::vector<float> accumulated(reference.ne);
+    q8_traits->from_float_ref(grad_a.data(), expected_accumulator.data(), reference.ne);
+    q8_traits->to_float(expected_accumulator.data(), accumulated.data(), reference.ne);
+    for (int64_t i = 0; i < reference.ne; ++i) {
+        accumulated[i] += grad_b[i];
+    }
+    q8_traits->from_float_ref(accumulated.data(), expected_accumulator.data(), reference.ne);
+    q8_traits->to_float(expected_accumulator.data(), accumulated.data(), reference.ne);
+
+    qat_qlion_params params;
+    params.learning_rate = 0.003f;
+    params.beta = 0.85f;
+    params.weight_decay = 0.01f;
+    params.gradient_clip = 0.04f;
+    qat_step_stats stats;
+    std::string error;
+    check(qat_tensor_state_step(reference, accumulated.data(), params, stats, error), error.c_str());
+
+    ggml_backend_t backend = device ? ggml_backend_dev_init(device, nullptr) : nullptr;
+    if (!backend && !required) {
+        return;
+    }
+    check(backend != nullptr, "failed to create microbatch test backend");
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ 24 * ggml_tensor_overhead() + ggml_graph_overhead_custom(24, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_tensor * weight = ggml_new_tensor_1d(ctx, qat_weight_ggml_type(format), reference.ne);
+    ggml_set_param(weight);
+    ggml_tensor * tensor_grad_a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, reference.ne);
+    ggml_tensor * tensor_grad_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, reference.ne);
+    ggml_tensor * accumulator = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, reference.ne);
+    ggml_tensor * momentum = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, reference.ne);
+    ggml_tensor * residual = ggml_new_tensor_1d(ctx, GGML_TYPE_Q4_0, reference.ne);
+    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
+    ggml_tensor * acc_a = ggml_acc_qlion_qat(ctx, accumulator, tensor_grad_a, true);
+    ggml_tensor * acc_b = ggml_acc_qlion_qat(ctx, acc_a, tensor_grad_b, false);
+    ggml_tensor * result = ggml_opt_step_qlion_qat(ctx, weight, acc_b, momentum, residual, opt_params);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 24, false);
+    ggml_build_forward_expand(graph, result);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "failed to allocate microbatch test tensors");
+
+    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip, 0.0f };
+    std::vector<uint8_t> accumulator_zero(expected_accumulator.size(), 0);
+    ggml_backend_tensor_set(weight, weight_before.data(), 0, weight_before.size());
+    ggml_backend_tensor_set(tensor_grad_a, grad_a.data(), 0, grad_a.size() * sizeof(float));
+    ggml_backend_tensor_set(tensor_grad_b, grad_b.data(), 0, grad_b.size() * sizeof(float));
+    ggml_backend_tensor_set(accumulator, accumulator_zero.data(), 0, accumulator_zero.size());
+    ggml_backend_tensor_set(momentum, momentum_before.data(), 0, momentum_before.size());
+    ggml_backend_tensor_set(residual, residual_before.data(), 0, residual_before.size());
+    ggml_backend_tensor_set(opt_params, native_params, 0, sizeof(native_params));
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "native microbatch QAT step failed");
+
+    std::vector<uint8_t> accumulator_after(expected_accumulator.size());
+    std::vector<uint8_t> weight_after(reference.weight.size());
+    std::vector<uint8_t> momentum_after(reference.momentum.size());
+    std::vector<uint8_t> residual_after(reference.residual.size());
+    ggml_backend_tensor_get(accumulator, accumulator_after.data(), 0, accumulator_after.size());
+    ggml_backend_tensor_get(weight, weight_after.data(), 0, weight_after.size());
+    ggml_backend_tensor_get(momentum, momentum_after.data(), 0, momentum_after.size());
+    ggml_backend_tensor_get(residual, residual_after.data(), 0, residual_after.size());
+    check(accumulator_after == expected_accumulator, "native microbatch accumulator differs from reference");
+    check(weight_after == reference.weight, "native microbatch weight differs from reference");
+    check(momentum_after == reference.momentum, "native microbatch momentum differs from reference");
+    check(residual_after == reference.residual, "native microbatch residual differs from reference");
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -566,13 +657,13 @@ static void test_native_routed_update(enum qat_weight_format format, ggml_backen
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
     ggml_tensor * momentum = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, cols, rows, experts);
     ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, cols, rows, experts);
-    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
     ggml_tensor * result = ggml_opt_step_qlion_qat_id(ctx, weight, a, g, ids, momentum, residual, opt_params);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 12, false);
     ggml_build_forward_expand(graph, result);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     check(buffer != nullptr, "failed to allocate routed QAT tensors");
-    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip };
+    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip, 0.0f };
     ggml_backend_tensor_set(weight, initial_weight.data(), 0, initial_weight.size());
     ggml_backend_tensor_set(a, activations.data(), 0, activations.size() * sizeof(float));
     ggml_backend_tensor_set(g, upstream.data(), 0, upstream.size() * sizeof(float));
@@ -660,13 +751,13 @@ static void test_native_rows_update(enum qat_weight_format format, ggml_backend_
     ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, indices);
     ggml_tensor * momentum = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, cols, rows);
     ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, cols, rows);
-    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
     ggml_tensor * result = ggml_opt_step_qlion_qat_rows(ctx, weight, grad, ids, momentum, residual, opt_params);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 12, false);
     ggml_build_forward_expand(graph, result);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     check(buffer != nullptr, "failed to allocate row QAT tensors");
-    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip };
+    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip, 0.0f };
     std::vector<uint8_t> momentum_zero(ggml_nbytes(momentum), 0);
     std::vector<uint8_t> residual_zero(ggml_nbytes(residual), 0);
     ggml_backend_tensor_set(weight, initial_weight.data(), 0, initial_weight.size());
@@ -875,6 +966,8 @@ int main() {
     ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     test_native_backend_step(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_backend_step(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_microbatch_step(QAT_WEIGHT_MXFP4, cpu_device, true);
+    test_native_microbatch_step(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_MXFP4, cpu_device, true);
@@ -893,6 +986,8 @@ int main() {
         printf("Testing QAT backend: %s\n", ggml_backend_dev_name(device));
         test_native_backend_step(QAT_WEIGHT_MXFP4, device, false);
         test_native_backend_step(QAT_WEIGHT_Q4_0, device, false);
+        test_native_microbatch_step(QAT_WEIGHT_MXFP4, device, false);
+        test_native_microbatch_step(QAT_WEIGHT_Q4_0, device, false);
         test_native_moe_dx(QAT_WEIGHT_MXFP4, device, false);
         test_native_moe_dx(QAT_WEIGHT_Q4_0, device, false);
         test_native_routed_update(QAT_WEIGHT_MXFP4, device, false);

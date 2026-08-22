@@ -780,6 +780,10 @@ void process_shaders() {
         if (tname != "f16" && tname != "bf16") {
             string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         }
+        // Fused dequant+transpose variant for FA quant-KV (per-head-contiguous f16 scratch).
+        if (tname == "q8_0") {
+            string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
+        }
 
         shader = (tname == "f32" || tname == "f16" || tname == "bf16") ? "get_rows.comp" : "get_rows_quant.comp";
 
@@ -827,6 +831,8 @@ void process_shaders() {
 
     string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("cpy_transpose_02_16", "copy_transpose_02.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+    string_to_spv("cpy_transpose_02_32", "copy_transpose_02.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
 
     for (std::string t : {"q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
@@ -1072,8 +1078,12 @@ void process_shaders() {
     string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+    string_to_spv("acc_qlion_qat", "acc_qlion_qat.comp", base_dict);
+    string_to_spv("acc_qlion_qat_tied", "acc_qlion_qat.comp", merge_maps(base_dict, {{"TIED", "1"}}));
     string_to_spv("opt_step_qlion_qat_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}}));
     string_to_spv("opt_step_qlion_qat_q4_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}}));
+    string_to_spv("opt_step_qlion_qat_mxfp4_grad_q8_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}, {"GRAD_Q8_0", "1"}}));
+    string_to_spv("opt_step_qlion_qat_q4_0_grad_q8_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}, {"GRAD_Q8_0", "1"}}));
     string_to_spv("opt_step_qlion_qat_id_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}, {"ROUTED", "1"}}));
     string_to_spv("opt_step_qlion_qat_id_q4_0", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}, {"ROUTED", "1"}}));
     string_to_spv("opt_step_qlion_qat_rows_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}, {"ROWS", "1"}}));

@@ -1,0 +1,90 @@
+#version 450
+
+#if TIED
+layout(push_constant) uniform parameter {
+    uint n_blocks;
+    uint n_blocks_row;
+    uint n_rows;
+    uint k;
+    uint n_indices;
+    uint reset;
+} p;
+#else
+#include "generic_head.glsl"
+#endif
+#include "types.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) buffer A { block_q8_0 accumulator[]; };
+#if TIED
+layout(binding = 1) readonly buffer DA { float dense_a[]; };
+layout(binding = 2) readonly buffer DB { float dense_b[]; };
+layout(binding = 3) readonly buffer SG { float sparse_grad[]; };
+layout(binding = 4) readonly buffer SI { int sparse_ids[]; };
+#else
+layout(binding = 1) readonly buffer G { float grad[]; };
+#endif
+
+shared float values[32];
+
+void main() {
+    const uint ib = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint n_blocks =
+#if TIED
+        p.n_blocks;
+#else
+        p.KX;
+#endif
+    if (ib >= n_blocks) {
+        return;
+    }
+
+    const bool reset =
+#if TIED
+        p.reset != 0;
+#else
+        p.KY != 0;
+#endif
+    const float old = reset ? 0.0 : float(accumulator[ib].d) * float(accumulator[ib].qs[lane]);
+#if TIED
+    const uint row = ib / p.n_blocks_row;
+    const uint col = (ib % p.n_blocks_row) * 32 + lane;
+    const uint cols = p.n_blocks_row * 32;
+    float g = 0.0;
+    for (uint i = 0; i < p.k; ++i) {
+        g += dense_a[col + cols * i] * dense_b[row + p.n_rows * i];
+    }
+    for (uint i = 0; i < p.n_indices; ++i) {
+        if (sparse_ids[i] == int(row)) {
+            g += sparse_grad[col + cols * i];
+        }
+    }
+#else
+    const float g = isinf(grad[ib * 32 + lane]) || isnan(grad[ib * 32 + lane]) ? 0.0 : grad[ib * 32 + lane];
+#endif
+    const float value = old + g;
+    values[lane] = isinf(value) || isnan(value) ? 0.0 : clamp(value, -128.0 * 65504.0, 128.0 * 65504.0);
+    barrier();
+
+    if (lane != 0) {
+        return;
+    }
+
+    float amax = 0.0;
+    float signed_max = 0.0;
+    for (uint i = 0; i < 32; ++i) {
+        if (amax < abs(values[i])) {
+            amax = abs(values[i]);
+            signed_max = values[i];
+        }
+    }
+    const float scale = signed_max / -128.0;
+    const float inverse = scale != 0.0 ? 1.0 / scale : 0.0;
+    accumulator[ib].d = float16_t(scale);
+    for (uint i = 0; i < 32; ++i) {
+        accumulator[ib].qs[i] = int8_t(clamp(int(round(values[i] * inverse)), -128, 127));
+    }
+}

@@ -4,7 +4,7 @@ install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
-set(TARGET llama-finetune-qat)
+set(TARGET llama-finetune-qlion)
 add_executable(${TARGET} finetune_qat.cpp critical-token-sft.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
