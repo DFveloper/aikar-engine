@@ -18,8 +18,10 @@
 #include <unordered_set>
 #include <tuple>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 
 #if defined(_WIN32)
 #   ifndef NOMINMAX
@@ -99,7 +101,28 @@ enum class list_kind {
 // a narrow path uses the active code page on Windows, so every crossing between
 // a std::string (always UTF-8 here) and fs::path is converted explicitly
 static fs::path path_from_utf8(const std::string & s) {
-    return fs::u8path(s);
+#if defined(_WIN32)
+    if (s.empty()) {
+        return {};
+    }
+    if (s.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("UTF-8 path is too long");
+    }
+
+    const int input_len = static_cast<int>(s.size());
+    const int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), input_len, nullptr, 0);
+    if (wide_len <= 0) {
+        throw std::runtime_error("invalid UTF-8 path");
+    }
+
+    std::wstring wide(wide_len, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), input_len, wide.data(), wide_len) != wide_len) {
+        throw std::runtime_error("invalid UTF-8 path");
+    }
+    return fs::path(wide);
+#else
+    return fs::path(s);
+#endif
 }
 
 // '/' separators on every platform: Windows accepts them, the web UI needs them

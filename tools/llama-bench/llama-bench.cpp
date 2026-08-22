@@ -1656,7 +1656,7 @@ struct test {
         n_depth        = inst.n_depth;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
-        std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
         test_time = buf;
 
         (void) ctx;

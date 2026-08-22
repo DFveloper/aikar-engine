@@ -9,7 +9,7 @@
 #include <vector>
 #include <functional>
 
-#define DEFAULT_INTERPOLATION_MODE (GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS)
+#define DEFAULT_INTERPOLATION_MODE (static_cast<uint32_t>(GGML_SCALE_MODE_BILINEAR) | static_cast<uint32_t>(GGML_SCALE_FLAG_ANTIALIAS))
 
 struct build_vit_opts {
     ggml_tensor * attn_mask = nullptr;

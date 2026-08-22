@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.16)
 
 project(aikar-bench LANGUAGES CXX)
 
+if(NOT UNIX OR APPLE)
+    return()
+endif()
+
 add_executable(aikar-bench
     aikar-bench.cpp
 )
@@ -22,11 +26,6 @@ find_package(Threads REQUIRED)
 target_link_libraries(aikar-bench PRIVATE
     Threads::Threads
 )
-
-# Linux-only tool for now.
-if(NOT UNIX OR APPLE)
-    message(WARNING "aikar-bench is currently intended for Linux/POSIX systems")
-endif()
 
 # Keep runtime binary in the normal project binary directory if the parent
 # project already defines CMAKE_RUNTIME_OUTPUT_DIRECTORY.

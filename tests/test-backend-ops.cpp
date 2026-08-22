@@ -401,19 +401,24 @@ static std::string var_to_str(ggml_op_pool pool) {
 
 static std::string var_to_str(ggml_scale_mode mode) {
     std::string str;
-    switch (mode & 0xFF) {
+    const uint32_t mode_flags = static_cast<uint32_t>(mode);
+    switch (mode_flags & 0xFF) {
         case GGML_SCALE_MODE_NEAREST:  str = "nearest"; break;
         case GGML_SCALE_MODE_BILINEAR: str = "bilinear"; break;
         case GGML_SCALE_MODE_BICUBIC:  str = "bicubic"; break;
         default:                       str = std::to_string(mode); break;
     }
-    if (mode & GGML_SCALE_FLAG_ALIGN_CORNERS) {
+    if (mode_flags & static_cast<uint32_t>(GGML_SCALE_FLAG_ALIGN_CORNERS)) {
         str += "|align_corners";
     }
-    if (mode & GGML_SCALE_FLAG_ANTIALIAS) {
+    if (mode_flags & static_cast<uint32_t>(GGML_SCALE_FLAG_ANTIALIAS)) {
         str += "|antialias";
     }
     return str;
+}
+
+static ggml_scale_mode scale_mode_with_flag(ggml_scale_mode mode, ggml_scale_flag flag) {
+    return static_cast<ggml_scale_mode>(static_cast<uint32_t>(mode) | static_cast<uint32_t>(flag));
 }
 
 #define VAR_TO_STR(x) (#x "=" + var_to_str(x))
@@ -523,7 +528,7 @@ static std::string test_time_now() {
     }
 #endif
     char buf[32];
-    if (std::strftime(buf, sizeof(buf), "%FT%TZ", &tm_buf) == 0) {
+    if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf) == 0) {
         return "";
     }
     return buf;
@@ -10268,16 +10273,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
     //}
 
-    for (ggml_scale_mode mode : {GGML_SCALE_MODE_NEAREST, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC, ggml_scale_mode(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS)}) {
+    for (ggml_scale_mode mode : {GGML_SCALE_MODE_NEAREST, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC, scale_mode_with_flag(GGML_SCALE_MODE_BILINEAR, GGML_SCALE_FLAG_ANTIALIAS)}) {
         test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, {512, 512, 3, 2}, 2, mode));
         test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, {512, 512, 3, 2}, 2, mode, true));
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {2, 5,  7, 11}, {5, 7, 11, 13}, mode));
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {5, 7, 11, 13}, {2, 5,  7, 11}, mode));
     }
     for (ggml_scale_mode mode : {GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC}) {
-        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {2, 5, 7, 11}, {5, 7, 11, 13}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
-        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {1, 4, 3, 2}, {2, 8, 3, 2}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
-        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {4, 1, 3, 2}, {1, 1, 3, 2}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {2, 5, 7, 11}, {5, 7, 11, 13}, scale_mode_with_flag(mode, GGML_SCALE_FLAG_ALIGN_CORNERS)));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {1, 4, 3, 2}, {2, 8, 3, 2}, scale_mode_with_flag(mode, GGML_SCALE_FLAG_ALIGN_CORNERS)));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {4, 1, 3, 2}, {1, 1, 3, 2}, scale_mode_with_flag(mode, GGML_SCALE_FLAG_ALIGN_CORNERS)));
     }
 
     test_cases.emplace_back(new test_sum());

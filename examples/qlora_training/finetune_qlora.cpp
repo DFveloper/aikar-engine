@@ -846,7 +846,6 @@ static std::vector<training_sample> load_jsonl(
     size_t n_nonchat_samples = 0;
 
     size_t n_expanded_assistant_targets = 0;
-    size_t n_reasoning_targets = 0;
 
     size_t n_stripped_history_reasoning = 0;
 
@@ -1026,10 +1025,6 @@ static std::vector<training_sample> load_jsonl(
 
                         continue;
                     }
-                }
-
-                if (request.has_reasoning) {
-                    ++n_reasoning_targets;
                 }
 
                 ++n_expanded_assistant_targets;
