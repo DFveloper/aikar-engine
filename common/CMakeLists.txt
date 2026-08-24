@@ -83,6 +83,8 @@ add_library(${TARGET}
     json-schema-to-grammar.cpp
     jsonl.cpp
     jsonl.h
+    json.cpp
+    json.h
     llguidance.cpp
     log.cpp
     log.h
