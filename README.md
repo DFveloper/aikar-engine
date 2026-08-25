@@ -1,6 +1,6 @@
 # llama.cpp
 
-![llama](https://raw.githubusercontent.com/DFveloper/aikar.brand/blob/master/cover/llama-cpp/cover-aikar-engine-dark.svg)
+![llama](https://raw.githubusercontent.com/DFveloper/aikar.brand/f648be0a0b6774a6d93aa7528d9fd7034db8776b/cover/llama-cpp/cover-aikar-engine-dark.svg)
 
 <div align="center">
 
