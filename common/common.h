@@ -654,6 +654,7 @@ struct common_params {
     std::string qat_residual = "q4_0";
     std::string qat_update_granularity = "tensor";
     int32_t qat_max_sample_tokens = 0;
+    bool        preserve_thinking = true;
     bool        qat_fast_state_scale = false;
 
     // grpo training

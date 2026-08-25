@@ -521,8 +521,9 @@ int main(int argc, char ** argv) {
     }
     auto templates = common_chat_templates_init(model, params.chat_template);
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    std::vector<training_sample> samples = load_jsonl(params.train_file, model, vocab, templates.get(),
-        params.dataset_threads, params.critical_token_mode, params.critical_token_weight);
+    std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
+        params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
+        params.preserve_thinking ? 1 : 0);
     if (samples.empty()) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;

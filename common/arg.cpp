@@ -4859,6 +4859,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--preserve-thinking"},
+        {"--no-preserve-thinking"},
+        "preserve assistant reasoning in chat history when the template supports it (default: enabled)",
+        [](common_params & params, bool value) {
+            params.preserve_thinking = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--qat-fast-state-scale"},
         "reuse Q4_0/Q8_0 QAT state scales while values remain representable; faster but not bit-identical",
         [](common_params & params) {

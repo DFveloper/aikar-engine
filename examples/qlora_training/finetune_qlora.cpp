@@ -142,103 +142,6 @@ static std::string preview_text(const std::string & s, size_t max_len = 240) {
     return out;
 }
 
-static std::string qlora_model_meta_string(
-        const llama_model * model,
-        const char        * key) {
-
-    if (!model || !key) {
-        return {};
-    }
-
-    char small[256] = {};
-
-    const int32_t len =
-        llama_model_meta_val_str(
-            model,
-            key,
-            small,
-            sizeof(small));
-
-    if (len < 0) {
-        return {};
-    }
-
-    if ((size_t) len < sizeof(small)) {
-        return std::string(small);
-    }
-
-    std::vector<char> large((size_t) len + 1, 0);
-
-    if (llama_model_meta_val_str(
-            model,
-            key,
-            large.data(),
-            large.size()) < 0) {
-
-        return {};
-    }
-
-    return std::string(large.data());
-}
-
-static std::string qlora_normalize_model_tag(
-        const std::string & input) {
-
-    std::string out;
-    out.reserve(input.size());
-
-    for (unsigned char ch : input) {
-        if (std::isalnum(ch)) {
-            out += (char) std::tolower(ch);
-        }
-    }
-
-    return out;
-}
-
-static bool qlora_model_is_gemma4(
-        const llama_model * model) {
-
-    const std::string architecture =
-        qlora_model_meta_string(
-            model,
-            "general.architecture");
-
-    const std::string name =
-        qlora_model_meta_string(
-            model,
-            "general.name");
-
-    const std::string basename =
-        qlora_model_meta_string(
-            model,
-            "general.basename");
-
-    const std::string architecture_norm =
-        qlora_normalize_model_tag(architecture);
-
-    const std::string name_norm =
-        qlora_normalize_model_tag(name);
-
-    const std::string basename_norm =
-        qlora_normalize_model_tag(basename);
-
-    const bool is_gemma4 =
-        architecture_norm.find("gemma4") != std::string::npos ||
-        name_norm.find("gemma4")         != std::string::npos ||
-        basename_norm.find("gemma4")     != std::string::npos;
-
-    LOG_INF(
-        "%s: architecture=\"%s\" name=\"%s\" "
-        "gemma4_history_reasoning_strip=%s\n",
-        __func__,
-        architecture.c_str(),
-        name.c_str(),
-        is_gemma4 ? "yes" : "no");
-
-    return is_gemma4;
-}
-
 struct qlora_lr_schedule {
     const lr_opt * lr;
     std::string    type;
@@ -454,7 +357,8 @@ static std::string apply_qlora_chat_template(
         common_chat_templates              * tmpls,
         const std::vector<common_chat_msg> & messages,
         bool                                  add_generation_prompt,
-        bool                                  enable_thinking) {
+        bool                                  enable_thinking,
+        int                                   preserve_thinking) {
 
     common_chat_templates_inputs inputs;
 
@@ -468,30 +372,14 @@ static std::string apply_qlora_chat_template(
     inputs.enable_thinking =
         enable_thinking;
 
+    if (preserve_thinking >= 0) {
+        inputs.chat_template_kwargs["preserve_reasoning"] =
+            preserve_thinking ? "true" : "false";
+    }
+
     return common_chat_templates_apply(
         tmpls,
         inputs).prompt;
-}
-
-static size_t strip_previous_assistant_reasoning(
-        std::vector<common_chat_msg> & messages) {
-
-    size_t stripped = 0;
-
-    for (common_chat_msg & msg : messages) {
-        if (msg.role != "assistant") {
-            continue;
-        }
-
-        if (msg.reasoning_content.empty()) {
-            continue;
-        }
-
-        msg.reasoning_content.clear();
-        ++stripped;
-    }
-
-    return stripped;
 }
 
 static void replace_chat_message_content_with_marker(
@@ -518,9 +406,8 @@ static bool format_supervised_chat_turn(
         common_chat_templates              * tmpls,
         const std::vector<common_chat_msg> & conversation,
         size_t                                target_index,
-        bool                                  strip_gemma4_history_reasoning,
+        int                                   preserve_thinking,
         tokenization_request                & result,
-        size_t                              & stripped_reasoning_count,
         std::string                         & error) {
 
     if (target_index >= conversation.size()) {
@@ -542,19 +429,6 @@ static bool format_supervised_chat_turn(
     std::vector<common_chat_msg> prompt_messages(
         conversation.begin(),
         conversation.begin() + target_index);
-
-    // Gemma 4 special behavior:
-    //
-    // Historical assistant final answers stay in context,
-    // but historical assistant reasoning is removed.
-    //
-    // The CURRENT target is not in prompt_messages, so its
-    // reasoning can never be accidentally stripped here.
-    if (strip_gemma4_history_reasoning) {
-        stripped_reasoning_count +=
-            strip_previous_assistant_reasoning(
-                prompt_messages);
-    }
 
     const common_chat_msg & target =
         conversation[target_index];
@@ -611,7 +485,8 @@ static bool format_supervised_chat_turn(
             tmpls,
             prompt_messages,
             /*add_generation_prompt=*/true,
-            enable_thinking);
+            enable_thinking,
+            preserve_thinking);
 
     // ============================================================
     // 2. Render the real completed target.
@@ -627,7 +502,8 @@ static bool format_supervised_chat_turn(
             tmpls,
             full_messages,
             /*add_generation_prompt=*/false,
-            enable_thinking);
+            enable_thinking,
+            preserve_thinking);
 
     // ============================================================
     // 3. Easy case: generation prompt is an exact prefix.
@@ -698,7 +574,8 @@ static bool format_supervised_chat_turn(
             tmpls,
             marked_messages,
             /*add_generation_prompt=*/false,
-            enable_thinking);
+            enable_thinking,
+            preserve_thinking);
 
     // ============================================================
     // 5. Locate semantic slots in what Jinja actually emitted.
@@ -802,12 +679,12 @@ struct jsonl_token_task {
 
 static std::vector<training_sample> load_jsonl(
         const std::string       & path,
-        const llama_model       * model,
         const llama_vocab       * vocab,
         common_chat_templates   * tmpls,
         int32_t                   n_threads,
         const std::string       & critical_mode,
-        float                     critical_default_weight) {
+        float                     critical_default_weight,
+        int                       preserve_thinking) {
 
     struct pending_sample {
         tokenization_request request;
@@ -837,17 +714,12 @@ static std::vector<training_sample> load_jsonl(
         return {};
     }
 
-    const bool gemma4 =
-        qlora_model_is_gemma4(model);
-
     std::vector<pending_sample> pending;
 
     size_t n_chat_conversations = 0;
     size_t n_nonchat_samples = 0;
 
     size_t n_expanded_assistant_targets = 0;
-
-    size_t n_stripped_history_reasoning = 0;
 
     // =========================================================
     // Phase 1:
@@ -986,9 +858,8 @@ static std::vector<training_sample> load_jsonl(
                         tmpls,
                         messages,
                         target_index,
-                        gemma4,
+                        preserve_thinking,
                         request,
-                        n_stripped_history_reasoning,
                         format_error)) {
 
                     LOG_WRN(
@@ -1392,8 +1263,7 @@ static std::vector<training_sample> load_jsonl(
         "expanded_assistant_targets=%zu "
         "nonchat=%zu "
         "reasoning_targets=%zu "
-        "gemma4=%s "
-        "stripped_history_reasoning=%zu "
+        "preserve_thinking=%s "
         "tokenizer_workers=%zu)\n",
         __func__,
         samples.size(),
@@ -1402,8 +1272,7 @@ static std::vector<training_sample> load_jsonl(
         n_expanded_assistant_targets,
         n_nonchat_samples,
         n_valid_reasoning_targets,
-        gemma4 ? "yes" : "no",
-        n_stripped_history_reasoning,
+        preserve_thinking < 0 ? "template-default" : preserve_thinking ? "yes" : "no",
         n_workers);
 
     return samples;
@@ -3175,8 +3044,8 @@ int main(int argc, char ** argv) {
         return rc;
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    auto samples = load_jsonl(params.train_file, model, vocab, tmpls.get(), params.dataset_threads,
-                              params.critical_token_mode, params.critical_token_weight);
+    auto samples = load_jsonl(params.train_file, vocab, tmpls.get(), params.dataset_threads,
+                              params.critical_token_mode, params.critical_token_weight, -1);
     if (samples.empty()) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;
