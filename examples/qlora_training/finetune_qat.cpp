@@ -2,6 +2,8 @@
 #include "finetune_qlora.cpp"
 
 #include "llama-ext.h"
+#include "llama-impl.h"
+#include "llama-model-saver.h"
 
 static void truncate_samples_to_context(
         std::vector<training_sample> & samples,
@@ -366,16 +368,109 @@ static bool qat_load_state(
     return true;
 }
 
+static bool qat_validate_saved_metadata(const std::string & source_path, const std::string & output_path) {
+    struct ggml_context * source_data = nullptr;
+    struct ggml_context * output_data = nullptr;
+    struct gguf_init_params source_params = { true, &source_data };
+    struct gguf_init_params output_params = { true, &output_data };
+    struct gguf_context * source = gguf_init_from_file(source_path.c_str(), source_params);
+    struct gguf_context * output = gguf_init_from_file(output_path.c_str(), output_params);
+    if (!source || !output) {
+        LOG_ERR("%s: cannot reopen saved model metadata\n", __func__);
+        if (source) {
+            gguf_free(source);
+        }
+        if (output) {
+            gguf_free(output);
+        }
+        ggml_free(source_data);
+        ggml_free(output_data);
+        return false;
+    }
+
+    bool valid = true;
+    for (int64_t i = 0; i < gguf_get_n_kv(source); ++i) {
+        const char * key = gguf_get_key(source, i);
+        if (strcmp(key, "split.no") == 0 || strcmp(key, "split.count") == 0 || strcmp(key, "split.tensors.count") == 0) {
+            continue;
+        }
+        const int64_t output_key = gguf_find_key(output, key);
+        if (output_key < 0 || gguf_get_kv_type(source, i) != gguf_get_kv_type(output, output_key) ||
+            gguf_kv_to_str(source, i) != gguf_kv_to_str(output, output_key)) {
+            LOG_ERR("%s: saved metadata mismatch for %s\n", __func__, key);
+            valid = false;
+            break;
+        }
+        if (gguf_get_kv_type(source, i) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_type(source, i) != gguf_get_arr_type(output, output_key)) {
+            LOG_ERR("%s: saved metadata array type mismatch for %s\n", __func__, key);
+            valid = false;
+            break;
+        }
+    }
+
+    if (valid) {
+        LOG_INF("%s: preserved source metadata (%ld keys)\n", __func__, (long) gguf_get_n_kv(source));
+    }
+    gguf_free(source);
+    gguf_free(output);
+    ggml_free(source_data);
+    ggml_free(output_data);
+    return valid;
+}
+
+static bool qat_save_model(
+        const struct llama_model * model,
+        const std::string        & source_path,
+        const std::string        & output_path) {
+    struct ggml_context * source_data = nullptr;
+    struct gguf_init_params init_params = { true, &source_data };
+    struct gguf_context * source = gguf_init_from_file(source_path.c_str(), init_params);
+    if (!source) {
+        LOG_ERR("%s: cannot open source metadata from %s\n", __func__, source_path.c_str());
+        return false;
+    }
+
+    llama_model_saver saver(model);
+    gguf_set_kv(saver.gguf_ctx, source);
+    gguf_remove_key(saver.gguf_ctx, "split.no");
+    gguf_remove_key(saver.gguf_ctx, "split.count");
+    gguf_remove_key(saver.gguf_ctx, "split.tensors.count");
+    saver.add_tensors_from_model();
+
+    const bool saved = gguf_write_to_file(saver.gguf_ctx, output_path.c_str(), false);
+    gguf_free(source);
+    ggml_free(source_data);
+
+    if (!saved) {
+        LOG_ERR("%s: failed to save %s\n", __func__, output_path.c_str());
+        return false;
+    }
+    return qat_validate_saved_metadata(source_path, output_path);
+}
+
+static std::string qat_normalize_chat_template(std::string source) {
+    string_replace_all(source, "\r\n", "\n");
+    string_replace_all(source, "\r", "\n");
+    if (!source.empty() && source.back() == '\n') {
+        source.pop_back();
+    }
+    return source;
+}
+
 static bool qat_save_checkpoint(
         struct llama_context * lctx,
         struct llama_model * model,
+        const std::string & source_path,
         const std::string & path,
         int64_t epoch,
         int64_t window,
         int64_t schedule_step,
         const std::string & quant_type) {
     llama_synchronize(lctx);
-    llama_model_save_to_file(model, path.c_str());
+    if (!qat_save_model(model, source_path, path)) {
+        return false;
+    }
     if (!qat_save_state(lctx, path, epoch, window, schedule_step, quant_type)) {
         return false;
     }
@@ -427,7 +522,7 @@ static void qat_epoch_callback(
         step - g_qat_callback->last_saved_step >= g_qat_callback->params->save_every) {
         g_qat_callback->last_saved_step = step;
         const std::string path = g_qat_callback->params->qat_out + ".step" + std::to_string(step) + ".gguf";
-        qat_save_checkpoint(g_qat_callback->lctx, g_qat_callback->model, path,
+        qat_save_checkpoint(g_qat_callback->lctx, g_qat_callback->model, g_qat_callback->params->model.path, path,
             g_qat_callback->epoch, g_qat_callback->window_start + ibatch / g_qat_callback->ubatches_per_window,
             g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type);
     }
@@ -520,6 +615,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
     auto templates = common_chat_templates_init(model, params.chat_template);
+    if (!params.chat_template.empty() && common_chat_templates_source(templates.get()) != qat_normalize_chat_template(params.chat_template)) {
+        LOG_ERR("%s: chat template override was not applied\n", __func__);
+        return 1;
+    }
+    LOG_INF("%s: dataset chat template=%s\n", __func__, params.chat_template.empty() ? "model metadata" : "command-line override");
     const llama_vocab * vocab = llama_model_get_vocab(model);
     std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
         params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
@@ -699,7 +799,9 @@ int main(int argc, char ** argv) {
         ggml_opt_result_reset(result_eval);
     }
     llama_synchronize(lctx);
-    llama_model_save_to_file(model, params.qat_out.c_str());
+    if (!qat_save_model(model, params.model.path, params.qat_out)) {
+        return 1;
+    }
     LOG_INF("%s: trained native QLion %s model saved to %s\n", __func__, params.qat_quant_type.c_str(), params.qat_out.c_str());
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);

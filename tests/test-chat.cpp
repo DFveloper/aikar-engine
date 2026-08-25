@@ -6597,6 +6597,22 @@ static void test_template_generation_prompt() {
         check(tmpls, continuation_content(),   "<|turn>model\n<|channel>thought\nI'm thinking<channel|>Hello, ");
         check(tmpls, continuation_reasoning(), "<|turn>model\n<|channel>thought\nI'm");
 
+        common_chat_msg assistant_history;
+        assistant_history.role = "assistant";
+        assistant_history.reasoning_content = "Previous reasoning";
+        assistant_history.content = "Previous answer";
+
+        common_chat_templates_inputs preserve_inputs;
+        preserve_inputs.messages = { message_user, assistant_history, message_user };
+        preserve_inputs.add_generation_prompt = true;
+        preserve_inputs.chat_template_kwargs["preserve_reasoning"] = "true";
+        auto preserve_params = common_chat_templates_apply(tmpls.get(), preserve_inputs);
+        assert_contains(preserve_params.prompt, "Previous reasoning");
+
+        preserve_inputs.chat_template_kwargs["preserve_reasoning"] = "false";
+        auto discard_params = common_chat_templates_apply(tmpls.get(), preserve_inputs);
+        assert_not_contains(discard_params.prompt, "Previous reasoning");
+
         // Special case when last message is a tool response
         test_case_options after_tool_call = continuation_reasoning();
         after_tool_call.messages          = { system_msg, message_user, tool_call_msg, tool_msg, message_assist_prefill_reasoning };

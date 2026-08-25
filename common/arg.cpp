@@ -115,9 +115,6 @@ common_arg & common_arg::set_preset_only() {
 }
 
 bool common_arg::in_example(enum llama_example ex) {
-    if (ex == LLAMA_EXAMPLE_FINETUNE_QAT && examples.find(LLAMA_EXAMPLE_FINETUNE_QLORA) != examples.end()) {
-        return true;
-    }
     return examples.find(ex) != examples.end();
 }
 
@@ -3009,7 +3006,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
         // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
-    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_excludes({LLAMA_EXAMPLE_FINETUNE_QAT}));
     add_opt(common_arg(
         {"--lora-scaled"}, "FNAME:SCALE,...",
         "path to LoRA adapter with user defined scaling (format: FNAME:SCALE,...)\n"
@@ -3024,7 +3021,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
         // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
-    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_excludes({LLAMA_EXAMPLE_FINETUNE_QAT}));
     add_opt(common_arg(
         {"--control-vector"}, "FNAME",
         "add a control vector\nnote: use comma-separated values to add multiple control vectors",
@@ -3718,7 +3715,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_jinja = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD,
-                    LLAMA_EXAMPLE_FINETUNE_QLORA}).set_env("LLAMA_ARG_JINJA"));
+                    LLAMA_EXAMPLE_FINETUNE_QLORA,
+                    LLAMA_EXAMPLE_FINETUNE_QAT}).set_env("LLAMA_ARG_JINJA"));
     add_opt(common_arg(
         {"--reasoning-format"}, "FORMAT",
         "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
@@ -3801,7 +3799,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.chat_template = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD,
-                    LLAMA_EXAMPLE_FINETUNE_QLORA}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
+                    LLAMA_EXAMPLE_FINETUNE_QLORA,
+                    LLAMA_EXAMPLE_FINETUNE_QAT}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
     add_opt(common_arg(
         {"--chat-template-file"}, "JINJA_TEMPLATE_FILE",
         string_format(
@@ -3814,7 +3813,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.chat_template = read_file(value);
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER,
-                    LLAMA_EXAMPLE_FINETUNE_QLORA}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
+                    LLAMA_EXAMPLE_FINETUNE_QLORA,
+                    LLAMA_EXAMPLE_FINETUNE_QAT}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
     add_opt(common_arg(
         {"--skip-chat-parsing"},
         {"--no-skip-chat-parsing"},
@@ -4587,27 +4587,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         { "-lr", "--learning-rate" }, "ALPHA",
         string_format("adamw or sgd optimizer alpha (default: %.2g); note: sgd alpha recommended ~10x (no momentum)", (double) params.lr.lr0),
         [](common_params & params, const std::string & value) { params.lr.lr0 = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg({ "-lr-min", "--learning-rate-min" }, "ALPHA",
         string_format("(if >0) final learning rate after decay (if -decay-epochs is set, default=%.2g)",
             (double) params.lr.lr_min),
         [](common_params & params, const std::string & value) { params.lr.lr_min = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"-decay-epochs", "--learning-rate-decay-epochs"}, "ALPHA",
         string_format("(if >0) decay learning rate to -lr-min after this many epochs (exponential decay, default=%.2g)", (double) params.lr.decay_epochs),
         [](common_params & params, const std::string & value) { params.lr.decay_epochs = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"-wd", "--weight-decay"}, "WD",
         string_format("adamw or sgd optimizer weight decay (0 is off; recommend very small e.g. 1e-9) (default: %.2g).", (double) params.lr.wd),
         [](common_params & params, const std::string & value) { params.lr.wd = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"-val-split", "--val-split"}, "FRACTION",
         string_format("fraction of data to use as validation set for training (default: %.2g).", (double) params.val_split),
         [](common_params & params, const std::string & value) { params.val_split = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     // qlora flags
     add_opt(common_arg(
         {"--lora-rank"}, "N",
@@ -4638,7 +4638,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--train-file"}, "FNAME",
         "JSONL training dataset (fields: messages|prompt+response|text)",
         [](common_params & params, const std::string & value) { params.train_file = value; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"-dthr", "--dataset-threads"}, "N",
         "JSONL loading worker threads (default: physical CPU core count)",
@@ -4648,12 +4648,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.dataset_threads = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--save-every"}, "N",
-        "save adapter checkpoint every N dataset windows during training (default: 0 = only at end)",
+        ex == LLAMA_EXAMPLE_FINETUNE_QAT
+            ? "save model checkpoint every N optimizer steps (default: 0 = only at end)"
+            : "save adapter checkpoint every N dataset windows during training (default: 0 = only at end)",
         [](common_params & params, int value) { params.save_every = value; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--freeze-layers"}, "N",
         "freeze first N transformer layers — no LoRA adapters allocated for blk.0..blk.N-1 (default: 0 = train all layers)",
@@ -4663,7 +4665,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--grad-checkpoint"}, "N",
         "gradient checkpointing interval to reduce peak activation VRAM (0 = disabled, default: 0)",
         [](common_params & params, int value) { params.grad_checkpoint_interval = value; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--lora-qat"}, "TYPE",
         "LoRA fake quantization: none, q3_k, q4_k, q4_0, mxfp4, q6_k, q8_0 (default: none)",
@@ -4681,27 +4683,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"--lr-scheduler"}, "TYPE",
-        "QLoRA learning-rate scheduler: constant or cosine (default: constant)",
+        "learning-rate scheduler: constant or cosine (default: constant)",
         [](common_params & params, const std::string & value) {
             if (value != "constant" && value != "cosine") {
                 throw std::invalid_argument("--lr-scheduler must be constant or cosine");
             }
             params.lr_scheduler = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--warmup-steps"}, "N",
-        "QLoRA linear learning-rate warmup steps (default: 0)",
+        "linear learning-rate warmup steps (default: 0)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--warmup-steps must be non-negative");
             }
             params.warmup_steps = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--warmup-init-ratio"}, "RATIO",
-        "QLoRA initial warmup learning rate as a fraction of peak LR (default: 0.1)",
+        "initial warmup learning rate as a fraction of peak LR (default: 0.1)",
         [](common_params & params, const std::string & value) {
             const float ratio = std::stof(value);
             if (!(ratio > 0.0f && ratio <= 1.0f)) {
@@ -4709,22 +4711,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.warmup_init_ratio = ratio;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--verbose-loss"},
         "print one structured SFT loss line per dataset window",
         [](common_params & params) { params.verbose_loss = true; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--train-on-prompt"},
         "compute loss on prompt tokens too, not just the response (default: response-only loss)",
         [](common_params & params) { params.train_on_prompt = true; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--shuffle-dataset"},
         "shuffle dataset windows at the start of each epoch (default: sequential order)",
         [](common_params & params) { params.shuffle_dataset = true; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--critical-token-mode"}, "MODE",
         "Critical-Token SFT mode: none, spans, confidence, or hybrid (default: none)",
@@ -4734,7 +4736,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.critical_token_mode = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--critical-token-weight"}, "F",
         "weight W for selected tokens; weighted loss is sum(w*nll)/sum(w) (default: 3.0)",
@@ -4745,7 +4747,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.critical_token_weight = weight;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--critical-confidence-threshold"}, "F",
         "select supervised targets with correct-token probability below F (default: 0.25)",
@@ -4756,7 +4758,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.critical_confidence_threshold = threshold;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--critical-weight-shape"}, "SHAPE",
         "confidence weighting: constant or linear from 1 at threshold to W at zero (default: constant)",
@@ -4766,7 +4768,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.critical_weight_shape = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--critical-warmup-steps"}, "N",
         "optimizer steps over which extra critical weight increases linearly (default: 0)",
@@ -4776,7 +4778,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.critical_warmup_steps = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--critical-max-fraction"}, "F",
         "maximum automatically selected fraction of supervised tokens per microbatch (default: 1.0)",
@@ -4787,7 +4789,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.critical_max_fraction = fraction;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--critical-stats-every"}, "N",
         "print Critical-Token SFT diagnostics every N optimizer steps (default: 10)",
@@ -4797,7 +4799,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.critical_stats_every = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--qat-out"}, "FNAME",
         "native QAT output model GGUF path (default: qat-model.gguf)",
@@ -4865,7 +4867,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.preserve_thinking = value;
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--qat-fast-state-scale"},
         "reuse Q4_0/Q8_0 QAT state scales while values remain representable; faster but not bit-identical",
@@ -4902,7 +4904,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-epochs", "--epochs"}, "N",
         string_format("optimizer max # of epochs (default: %d)", params.lr.epochs),
         [](common_params & params, int epochs) { params.lr.epochs = epochs; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"-opt", "--optimizer"}, ex == LLAMA_EXAMPLE_FINETUNE_QAT
             ? "qlion" : "sgd|adamw|adamw_f16|adamw_q8_0|adamw_q6_k|adamw_iq4_nl",
@@ -4915,7 +4917,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid --optimizer");
             }
         }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--check"},
         string_format("check rather than generate results (default: %s)", params.check ? "true" : "false"),

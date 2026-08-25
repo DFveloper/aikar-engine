@@ -3045,7 +3045,8 @@ int main(int argc, char ** argv) {
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
     auto samples = load_jsonl(params.train_file, vocab, tmpls.get(), params.dataset_threads,
-                              params.critical_token_mode, params.critical_token_weight, -1);
+                              params.critical_token_mode, params.critical_token_weight,
+                              params.preserve_thinking ? 1 : 0);
     if (samples.empty()) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;

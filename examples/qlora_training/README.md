@@ -31,9 +31,9 @@ One update decodes a 32-value block from each state, applies the QLion update, r
 
 Use `--quant-type q4_0` for an unmixed Q4_0 input model. Periodic checkpoints contain an ordinary inference GGUF plus a sibling `.qat-state.gguf` file with Q8_0 momentum, Q4_0 residual, optimizer step, scheduler step, epoch, and dataset window. Checkpoints are saved at the first packed-context boundary after `--save-every` optimizer steps so resume does not need an in-progress gradient or activation state. Resume with `--qat-resume checkpoint.gguf`. The final `--qat-out` file contains only inference weights.
 
-QLion enables `--preserve-thinking` by default. For chat templates that support preserved reasoning, prior assistant reasoning remains in the training context for every model architecture. Use `--no-preserve-thinking` to disable it.
+Both trainers enable `--preserve-thinking` by default. For chat templates that support preserved reasoning, prior assistant reasoning remains in the training context for every model architecture. Use `--no-preserve-thinking` to disable it.
 
-Both trainers accept `--chat-template-file template.jinja`. The file overrides the template stored in model metadata and is used by every dataset worker.
+Both trainers accept `--chat-template-file template.jinja`. The file overrides the template used by every dataset worker. QLion keeps the input GGUF metadata and original chat template when it saves checkpoints and the final model.
 
 QLion requires `-b == -c` and `-b` divisible by `-ub`. When `-ub < -b`, gradients are accumulated in Q8_0 and one optimizer update is applied per packed context. This adds 8.5 bits per trainable weight instead of the 32 bits required by an F32 accumulator. Small nonquantized tensors such as normalization weights remain in their model format and are currently frozen.
 
