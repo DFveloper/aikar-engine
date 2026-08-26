@@ -181,7 +181,7 @@ int main(int argc, char ** argv) {
         try {
             const std::string raw = read_text_file(line);
             if (raw.empty()) { printf("ERR badreq\n"); fflush(stdout); continue; }
-            const nlohmann::ordered_json req = nlohmann::ordered_json::parse(raw);
+            const common_json req = common_json::parse(raw);
             seed     = req.value("seed", 0);
             n_blocks = req.value("n_blocks", 1);
             std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(req.at("messages"));
