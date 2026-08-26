@@ -867,25 +867,68 @@ static bool ggml_opt_depends_on_qat_alias(
         const std::vector<struct ggml_tensor *> & aliases,
         const std::set<struct ggml_tensor *> & forward_nodes,
         std::map<struct ggml_tensor *, bool> & memo) {
-    if (std::find(aliases.begin(), aliases.end(), tensor) != aliases.end()) {
-        return true;
-    }
-    if (forward_nodes.find(tensor) != forward_nodes.end()) {
-        return false;
-    }
-    const auto cached = memo.find(tensor);
-    if (cached != memo.end()) {
-        return cached->second;
-    }
-    bool result = false;
-    for (struct ggml_tensor * src : tensor->src) {
-        if (src && ggml_opt_depends_on_qat_alias(src, aliases, forward_nodes, memo)) {
+    const auto known_result = [&](struct ggml_tensor * current, bool & result) {
+        if (std::find(aliases.begin(), aliases.end(), current) != aliases.end()) {
             result = true;
-            break;
+            return true;
+        }
+        if (forward_nodes.find(current) != forward_nodes.end()) {
+            result = false;
+            return true;
+        }
+        const auto cached = memo.find(current);
+        if (cached != memo.end()) {
+            result = cached->second;
+            return true;
+        }
+        return false;
+    };
+
+    bool result = false;
+    if (known_result(tensor, result)) {
+        return result;
+    }
+
+    struct frame {
+        struct ggml_tensor * tensor;
+        int next_src;
+        bool depends;
+    };
+
+    std::vector<frame> stack = { { tensor, 0, false } };
+    std::set<struct ggml_tensor *> active = { tensor };
+    while (!stack.empty()) {
+        frame & current = stack.back();
+        if (!current.depends && current.next_src < GGML_MAX_SRC) {
+            struct ggml_tensor * src = current.tensor->src[current.next_src++];
+            if (!src) {
+                continue;
+            }
+            if (known_result(src, result)) {
+                current.depends = result;
+                continue;
+            }
+            if (active.find(src) != active.end()) {
+                continue;
+            }
+            active.insert(src);
+            stack.push_back({ src, 0, false });
+            continue;
+        }
+
+        result = current.depends;
+        memo[current.tensor] = result;
+        active.erase(current.tensor);
+        stack.pop_back();
+        if (stack.empty()) {
+            return result;
+        }
+        if (result) {
+            stack.back().depends = true;
         }
     }
-    memo[tensor] = result;
-    return result;
+
+    GGML_ABORT("unreachable");
 }
 
 static inline void ggml_opt_qat_hash_mix(

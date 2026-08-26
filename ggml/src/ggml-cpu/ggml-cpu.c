@@ -2157,9 +2157,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             break;
         case GGML_OP_OPT_STEP_QLION_QAT_TIED:
             {
-                GGML_ABORT(
-                    "OPT_STEP_QLION_QAT_TIED requires CUDA/ROCm backend"
-                );
+                ggml_compute_forward_opt_step_qlion_qat_tied(params, tensor);
             }
             break;
         case GGML_OP_NONE:

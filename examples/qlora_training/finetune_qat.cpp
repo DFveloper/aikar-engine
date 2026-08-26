@@ -787,8 +787,13 @@ int main(int argc, char ** argv) {
         const int64_t start = params.lr.epoch == resume.epoch ? resume.window : 0;
         callback_ctx.epoch = params.lr.epoch;
         callback_ctx.window_start = start;
-        llama_opt_epoch_range(lctx, dataset, result_train, result_eval, start, idata_split,
-            qat_epoch_callback, ggml_opt_epoch_callback_progress_bar, params.shuffle_dataset);
+        try {
+            llama_opt_epoch_range(lctx, dataset, result_train, result_eval, start, idata_split,
+                qat_epoch_callback, ggml_opt_epoch_callback_progress_bar, params.shuffle_dataset);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: QAT epoch failed: %s\n", __func__, e.what());
+            return 1;
+        }
         fprintf(stderr, "\n");
         double train_loss = 0.0;
         double train_unc = 0.0;

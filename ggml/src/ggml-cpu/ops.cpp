@@ -12517,6 +12517,69 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     }
 }
 
+void ggml_compute_forward_opt_step_qlion_qat_tied(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * dense_a = dst->src[1];
+    const ggml_tensor * dense_b = dst->src[2];
+    const ggml_tensor * sparse_grad = dst->src[3];
+    const ggml_tensor * sparse_ids = dst->src[4];
+    ggml_tensor * momentum = dst->src[5];
+    ggml_tensor * residual = dst->src[6];
+    const ggml_tensor * opt_params = dst->src[7];
+
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(dense_a->type == GGML_TYPE_F32 && dense_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(sparse_grad->type == GGML_TYPE_F32 && sparse_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(opt_params->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(dense_a) && ggml_is_contiguous(dense_b));
+    GGML_ASSERT(ggml_is_contiguous(sparse_grad) && ggml_is_contiguous(sparse_ids));
+    GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
+
+    const ggml_type_traits * weight_traits = ggml_get_type_traits(weight->type);
+    const ggml_type_traits * momentum_traits = ggml_get_type_traits(momentum->type);
+    const ggml_type_traits * residual_traits = ggml_get_type_traits(residual->type);
+    const float * p = ggml_get_data_f32(opt_params);
+    const float * a = (const float *) dense_a->data;
+    const float * b = (const float *) dense_b->data;
+    const float * sparse = (const float *) sparse_grad->data;
+    const int32_t * ids = (const int32_t *) sparse_ids->data;
+    const int64_t cols = weight->ne[0];
+    const int64_t rows = weight->ne[1];
+    const int64_t k = dense_a->ne[1];
+    const int64_t n_indices = ggml_nelements(sparse_ids);
+    const int64_t n_blocks_row = cols / 32;
+    const int64_t n_blocks = ggml_nelements(weight) / 32;
+    const int64_t blocks_per_thread = (n_blocks + params->nth - 1) / params->nth;
+    const int64_t block_begin = blocks_per_thread * params->ith;
+    const int64_t block_end = std::min(n_blocks, block_begin + blocks_per_thread);
+
+    for (int64_t ib = block_begin; ib < block_end; ++ib) {
+        const int64_t row = ib / n_blocks_row;
+        const int64_t col = (ib % n_blocks_row) * 32;
+        float grad_block[32] = {};
+        for (int64_t i = 0; i < k; ++i) {
+            const float bv = b[row + rows * i];
+            for (int lane = 0; lane < 32; ++lane) {
+                grad_block[lane] += a[col + lane + cols * i] * bv;
+            }
+        }
+        for (int64_t i = 0; i < n_indices; ++i) {
+            if (ids[i] != row) {
+                continue;
+            }
+            for (int lane = 0; lane < 32; ++lane) {
+                grad_block[lane] += sparse[col + lane + cols * i];
+            }
+        }
+        ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
+            (uint8_t *) weight->data + ib * weight_traits->type_size,
+            (uint8_t *) momentum->data + ib * momentum_traits->type_size,
+            (uint8_t *) residual->data + ib * residual_traits->type_size,
+            grad_block, p);
+    }
+}
+
 void ggml_compute_forward_opt_step_qlion_qat_id(const ggml_compute_params * params, ggml_tensor * dst) {
     ggml_tensor * weight = dst->src[0];
     const ggml_tensor * activations = dst->src[1];
