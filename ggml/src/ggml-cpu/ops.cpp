@@ -7,10 +7,40 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "quants.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+
+void ggml_compute_forward_turbo_wht(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src->ne[0] % 128 == 0);
+
+    const int64_t groups = ggml_nelements(src)/128;
+    const int64_t group_start = groups*params->ith/params->nth;
+    const int64_t group_end = groups*(params->ith + 1)/params->nth;
+    const int inverse = ggml_get_op_params_i32(dst, 0);
+
+    const float * input = (const float *) src->data;
+    float * output = (float *) dst->data;
+
+    for (int64_t group = group_start; group < group_end; ++group) {
+        memcpy(output + group*128, input + group*128, 128*sizeof(float));
+        if (inverse) {
+            ggml_turbo_wht_inverse_f32(output + group*128, 128);
+        } else {
+            ggml_turbo_wht_forward_f32(output + group*128, 128);
+        }
+    }
+}
 
 // ggml_compute_forward_dup
 
@@ -680,6 +710,8 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5960,6 +5992,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:

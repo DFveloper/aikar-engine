@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "llama.h"
 
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 static void print_usage(int, char ** argv) {
@@ -72,7 +74,7 @@ int main(int argc, char ** argv) {
     common_params params;
 
     common_init();
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_DEBUG, print_usage)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
         return 1;
     }
     if (params.n_predict <= 0) {
@@ -95,6 +97,9 @@ int main(int argc, char ** argv) {
     ref_params.type_v     = GGML_TYPE_F16;
     ref_params.type_k_swa = GGML_TYPE_F16;
     ref_params.type_v_swa = GGML_TYPE_F16;
+    ref_params.kv_hadamard_k        = false;
+    ref_params.kv_hadamard_v        = false;
+    ref_params.kv_hadamard_explicit = false;
 
     llama_context * ctx_ref = llama_init_from_model(model, ref_params);
     if (ctx_ref == nullptr) {
@@ -103,7 +108,24 @@ int main(int argc, char ** argv) {
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    std::vector<llama_token> prompt = common_tokenize(ctx_ref, params.prompt, llama_vocab_get_add_bos(vocab));
+    std::string prompt_text = params.prompt;
+    if (!params.chat_template.empty()) {
+        auto templates = common_chat_templates_init(model, params.chat_template);
+        common_chat_templates_inputs inputs;
+        if (!params.system_prompt.empty()) {
+            common_chat_msg system;
+            system.role = "system";
+            system.content = params.system_prompt;
+            inputs.messages.push_back(std::move(system));
+        }
+        common_chat_msg user;
+        user.role = "user";
+        user.content = params.prompt;
+        inputs.messages.push_back(std::move(user));
+        inputs.add_generation_prompt = true;
+        prompt_text = common_chat_templates_apply(templates.get(), inputs).prompt;
+    }
+    std::vector<llama_token> prompt = common_tokenize(ctx_ref, prompt_text, llama_vocab_get_add_bos(vocab));
     if (prompt.empty()) {
         fprintf(stderr, "prompt has no tokens\n");
         llama_free(ctx_ref);

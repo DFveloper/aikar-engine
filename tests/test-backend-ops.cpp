@@ -2485,7 +2485,7 @@ struct test_set_rows : public test_case {
 
     double max_nmse_err() override {
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
-            type_dst == GGML_TYPE_IQ4_NL ||
+            type_dst == GGML_TYPE_IQ4_NL || type_dst == GGML_TYPE_TURBO3_0 || type_dst == GGML_TYPE_TURBO4_0 ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
@@ -2498,7 +2498,7 @@ struct test_set_rows : public test_case {
             if (type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1) {
                 err_estimate /= 2.0f;
             }
-            if (type_dst == GGML_TYPE_Q8_0) {
+            if (type_dst == GGML_TYPE_Q8_0 || type_dst == GGML_TYPE_TURBO3_0 || type_dst == GGML_TYPE_TURBO4_0) {
                 err_estimate /= 8.0f;
             }
             err_estimate *= err_estimate;
@@ -2518,6 +2518,37 @@ struct test_set_rows : public test_case {
             return std::max(test_case::max_nmse_err(backend), 2e-7);
         }
         return test_case::max_nmse_err(backend);
+    }
+};
+
+// GGML_OP_TURBO_WHT
+struct test_turbo_wht : public test_case {
+    const bool inverse;
+
+    explicit test_turbo_wht(bool inverse) : inverse(inverse) {}
+
+    std::string vars() override {
+        return VARS_TO_STR1(inverse);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 3, 2, 1);
+        ggml_set_name(src, "src");
+        ggml_tensor * out = ggml_turbo_wht(ctx, src, inverse);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 1e-10;
     }
 };
 
@@ -8940,6 +8971,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_I64, { 256, 11, 2, 3 }, { 2, 3 }, 7));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_I32, { 256, 11, 2, 3 }, { 2, 3 }, 7));
+    test_cases.emplace_back(new test_turbo_wht(false));
+    test_cases.emplace_back(new test_turbo_wht(true));
 
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -10487,6 +10522,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    for (int hs : {128, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));

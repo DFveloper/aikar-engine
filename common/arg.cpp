@@ -311,6 +311,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2456,6 +2458,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v_set = true;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--k-cache-hadamard"},
+        "apply a normalized Hadamard transform before conventional K-cache quantization; not valid with TurboQuant cache types",
+        [](common_params & params) {
+            params.cache_hadamard_k = true;
+            params.cache_hadamard_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_K_CACHE_HADAMARD"));
+    add_opt(common_arg(
+        {"--v-cache-hadamard"},
+        "apply a normalized Hadamard transform before conventional V-cache quantization; not valid with TurboQuant cache types",
+        [](common_params & params) {
+            params.cache_hadamard_v = true;
+            params.cache_hadamard_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_V_CACHE_HADAMARD"));
     add_opt(common_arg(
         {"-ctlk", "--cache-type-k-local"}, "TYPE",
         string_format(

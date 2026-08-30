@@ -853,6 +853,11 @@ void process_shaders() {
             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         }
     }
+    for (std::string dst : {"turbo3_0", "turbo4_0"}) {
+        const std::string data_a = "DATA_A_" + to_uppercase(dst);
+        string_to_spv("set_rows_f32_" + dst + "_i32", "set_rows_turbo.comp", {{data_a, "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}});
+        string_to_spv("set_rows_f32_" + dst + "_i64", "set_rows_turbo.comp", {{data_a, "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}});
+    }
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
@@ -1040,6 +1045,7 @@ void process_shaders() {
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("fwht_f32", "fwht.comp", {});
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
+    string_to_spv("turbo_wht", "turbo_wht.comp", {});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

@@ -147,6 +147,11 @@ static int test_vec_dot_q(bool verbose) {
             continue;
         }
 
+        if (type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0) {
+            printf("Testing %s (rotated-domain KV codec tested separately)\n", ggml_type_name(type));
+            continue;
+        }
+
         const ggml_type ei = (ggml_type)i;
 
         printf("Testing %s\n", ggml_type_name((ggml_type) i));

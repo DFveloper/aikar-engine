@@ -145,6 +145,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -250,6 +252,7 @@ private:
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
     bool attn_rot_v = false;
+    bool attn_rot_k_required = false;
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1

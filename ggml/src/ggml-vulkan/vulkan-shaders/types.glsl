@@ -195,6 +195,39 @@ struct block_q8_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+#define QUANT_K_TURBO3_0 128
+#define QUANT_R_TURBO3_0 1
+
+struct block_turbo3_0
+{
+    float16_t norm;
+    uint8_t qs[32];
+    uint8_t signs[16];
+};
+
+#if defined(DATA_A_TURBO3_0)
+#define QUANT_K QUANT_K_TURBO3_0
+#define QUANT_R QUANT_R_TURBO3_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo3_0
+#endif
+
+#define QUANT_K_TURBO4_0 128
+#define QUANT_R_TURBO4_0 1
+
+struct block_turbo4_0
+{
+    float16_t norm;
+    uint8_t qs[64];
+};
+
+#if defined(DATA_A_TURBO4_0)
+#define QUANT_K QUANT_K_TURBO4_0
+#define QUANT_R QUANT_R_TURBO4_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo4_0
+#endif
+
 #define QUANT_K_Q1_0 128
 #define QUANT_R_Q1_0 1
 

@@ -120,6 +120,12 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
+    virtual void set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) {
+        (void) k;
+        (void) v;
+        (void) explicit_policy;
+    }
+
     //
     // state write/read
     //

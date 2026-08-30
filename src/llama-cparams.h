@@ -52,6 +52,9 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    bool kv_hadamard_k;
+    bool kv_hadamard_v;
+    bool kv_hadamard_explicit;
     bool pipeline_parallel;
     enum llama_lora_qat_type lora_qat_type = LLAMA_LORA_QAT_TYPE_NONE;
 

@@ -1,0 +1,51 @@
+#version 450
+
+// Algorithm constants follow TheTom/llama-cpp-turboquant commit df7f5472949ce37cdc6a2155ef6b8836a8c10bac (MIT).
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint inverse;
+} p;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) writeonly buffer D { float data_d[]; };
+
+shared float values[128];
+
+const float signs_1[128] = float[128](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1);
+
+const float signs_2[128] = float[128](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1);
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint group = gl_WorkGroupID.z*262144 + gl_WorkGroupID.y*512 + gl_WorkGroupID.x;
+    const uint index = group*128 + tid;
+    if (index >= p.ne) {
+        return;
+    }
+
+    values[tid] = data_a[index]*(p.inverse != 0 ? signs_2[tid] : signs_1[tid]);
+    barrier();
+
+    [[unroll]] for (uint step = 1; step < 128; step <<= 1) {
+        const float a = values[tid & ~(2*step - 1) | (tid & (step - 1))];
+        const float b = values[(tid & ~(2*step - 1) | (tid & (step - 1))) + step];
+        barrier();
+        values[tid] = (tid & step) == 0 ? a + b : a - b;
+        barrier();
+    }
+
+    data_d[index] = values[tid]*0.08838834764831845*(p.inverse != 0 ? signs_1[tid] : signs_2[tid]);
+}

@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO3_0 = 43, // runtime-only TurboQuant 3-bit KV cache
+        GGML_TYPE_TURBO4_0 = 44, // runtime-only TurboQuant 4-bit KV cache
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision
@@ -572,6 +574,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_TURBO_WHT,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2651,6 +2654,12 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // Signed normalized Walsh-Hadamard transform used by TurboQuant KV cache.
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            bool                  inverse);
 
     // DSA lightning indexer
     //

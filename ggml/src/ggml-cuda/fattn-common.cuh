@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "turbo-quant.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
@@ -173,6 +174,37 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
         sum += __half2float(K_q4_0[ib].d) * (sumi*Q_ds.x - (8/QI8_1)*Q_ds.y);
     }
 
+    return sum;
+}
+
+template<int D, int nthreads, bool turbo4>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    GGML_UNUSED(Q_v);
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k0 = 0; k0 < D/(int) sizeof(int); k0 += nthreads) {
+        const int kq = k0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int ib = (4*kq)/128;
+        const int iq = (4*kq)%128;
+        const int q_packed = Q_q8[k0/nthreads];
+        const int8_t * q = (const int8_t *) &q_packed;
+        const float q_scale = ((const float2 *) Q_ds_v)[k0/nthreads].x;
+        if constexpr (turbo4) {
+            const block_turbo4_0 * K = (const block_turbo4_0 *) K_c;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sum += turbo4_dequant_cuda(K + ib, iq + i)*(float) q[i]*q_scale;
+            }
+        } else {
+            const block_turbo3_0 * K = (const block_turbo3_0 *) K_c;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sum += turbo3_dequant_cuda(K + ib, iq + i)*(float) q[i]*q_scale;
+            }
+        }
+    }
     return sum;
 }
 
@@ -617,6 +649,37 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <typename T, int ne, bool turbo4>
+static __device__ __forceinline__ void dequantize_V_turbo(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne == 4, "bad ne");
+    const int64_t ib = i0/128;
+    const int iq = i0%128;
+
+    if constexpr (std::is_same_v<T, half>) {
+        half * out = (half *) dst;
+#pragma unroll
+        for (int i = 0; i < ne; ++i) {
+            if constexpr (turbo4) {
+                out[i] = __float2half(turbo4_dequant_cuda((const block_turbo4_0 *) vx + ib, iq + i));
+            } else {
+                out[i] = __float2half(turbo3_dequant_cuda((const block_turbo3_0 *) vx + ib, iq + i));
+            }
+        }
+    } else if constexpr (std::is_same_v<T, float>) {
+        float * out = (float *) dst;
+#pragma unroll
+        for (int i = 0; i < ne; ++i) {
+            if constexpr (turbo4) {
+                out[i] = turbo4_dequant_cuda((const block_turbo4_0 *) vx + ib, iq + i);
+            } else {
+                out[i] = turbo3_dequant_cuda((const block_turbo3_0 *) vx + ib, iq + i);
+            }
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -633,6 +696,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+        return vec_dot_fattn_vec_KQ_turbo<D, nthreads, false>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        return vec_dot_fattn_vec_KQ_turbo<D, nthreads, true>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -655,6 +722,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+        return dequantize_V_turbo<T, ne, false>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
+        return dequantize_V_turbo<T, ne, true>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

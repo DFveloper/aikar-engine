@@ -17,6 +17,10 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static bool is_turbo_kv_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -214,6 +218,13 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
+            const auto dev_type = ggml_backend_dev_type(dev);
+            const char * backend_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+            const bool turbo_backend = dev_type == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                    strcmp(backend_name, "CUDA") == 0 || strcmp(backend_name, "Vulkan") == 0;
+            if ((is_turbo_kv_type(type_k) || is_turbo_kv_type(type_v)) && !turbo_backend) {
+                throw std::runtime_error(std::string("TurboQuant KV cache is unsupported on backend ") + backend_name);
+            }
             buft = ggml_backend_dev_buffer_type(dev);
 
             if (lazy && getenv("GGML_CUDA_DISABLE_VOLTA_LAZY_KV") == nullptr) {
@@ -307,11 +318,23 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+        size_t memory_f16_k = 0;
+        size_t memory_f16_v = 0;
+        for (const auto & layer : layers) {
+            memory_f16_k += layer.k ? ggml_nelements(layer.k)*sizeof(ggml_fp16_t) : 0;
+            memory_f16_v += layer.v ? ggml_nelements(layer.v)*sizeof(ggml_fp16_t) : 0;
+        }
+        const size_t memory_size = memory_size_k + memory_size_v;
+        const size_t memory_f16 = memory_f16_k + memory_f16_v;
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+                (float) memory_size / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        LLAMA_LOG_INFO("%s: FP16 equivalent = %.2f MiB, compression ratio = %.3fx (K %.3fx, V %.3fx)\n", __func__,
+                (double) memory_f16/(1024.0*1024.0), memory_size ? (double) memory_f16/memory_size : 0.0,
+                memory_size_k ? (double) memory_f16_k/memory_size_k : 0.0,
+                memory_size_v ? (double) memory_f16_v/memory_size_v : 0.0);
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -321,6 +344,7 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
+        attn_rot_k_required = other->attn_rot_k_required;
     } else {
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
         const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
@@ -332,6 +356,7 @@ llama_kv_cache::llama_kv_cache(
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
+            !is_turbo_kv_type(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
@@ -339,12 +364,14 @@ llama_kv_cache::llama_kv_cache(
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
+            attn_rot_k_required = true;
         }
 
         attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
+            !is_turbo_kv_type(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;
     }
 
@@ -374,6 +401,18 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+void llama_kv_cache::set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) {
+    if (!explicit_policy) {
+        return;
+    }
+
+    attn_rot_k = attn_rot_k_required || k;
+    attn_rot_v = v;
+
+    LLAMA_LOG_INFO("%s: explicit KV Hadamard policy: K = %s, V = %s\n", __func__,
+            attn_rot_k ? "true" : "false", attn_rot_v ? "true" : "false");
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1874,7 +1913,16 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                                 : hparams.rope_type;
     ggml_tensor * tmp;
 
-    if (ggml_is_quantized(cur->type)) {
+    if (is_turbo_kv_type(cur->type)) {
+        tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
+        tmp = ggml_turbo_wht(ctx, tmp, true);
+
+        tmp = ggml_rope_ext(ctx, tmp,
+                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+
+        tmp = ggml_cpy(ctx, tmp, cur);
+    } else if (ggml_is_quantized(cur->type)) {
         // dequantize to f32 -> RoPE -> quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 

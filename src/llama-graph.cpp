@@ -24,6 +24,10 @@
 #include <string>
 #include <unordered_set>
 
+static bool is_turbo_kv_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
 void llm_graph_input_moe_mask::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
     std::vector<float> values(n_expert, 0.0f);
@@ -2648,6 +2652,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    if (is_turbo_kv_type(k->type)) {
+        GGML_ASSERT(q->ne[0] % 128 == 0);
+        if (!ggml_is_contiguous(q)) {
+            q = ggml_cont(ctx0, q);
+        }
+        q = ggml_turbo_wht(ctx0, q, false);
+    }
+
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
@@ -2683,6 +2695,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
         ggml_flash_attn_ext_set_causal(cur, cparams.causal_attn);
+
+        if (is_turbo_kv_type(v->type)) {
+            if (!ggml_is_contiguous(cur)) {
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_turbo_wht(ctx0, cur, true);
+        }
 
         if (v_mla) {
 #if 0
@@ -2749,6 +2768,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
+
+        if (is_turbo_kv_type(v->type)) {
+            if (!ggml_is_contiguous(kqv)) {
+                kqv = ggml_cont(ctx0, kqv);
+            }
+            kqv = ggml_turbo_wht(ctx0, kqv, true);
+        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {

@@ -324,6 +324,31 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16, GGML_TYPE_TURBO4_0)
+
     FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 
     GGML_ABORT("fatal error");
@@ -351,6 +376,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             return true;
         default:
             return false;
@@ -368,6 +395,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
+        V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -427,7 +456,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            if (!gqa_opt_applies && !turbo_kv) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -444,13 +473,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    const bool turbo_or_f16_k = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_F16;
+    const bool turbo_or_f16_v = V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_F16;
+    if (K->type != V->type && !(turbo_or_f16_k && turbo_or_f16_v)) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (turbo_kv) {
+        if ((K->type != GGML_TYPE_TURBO3_0 && K->type != GGML_TYPE_TURBO4_0 && K->type != GGML_TYPE_F16) ||
+            (V->type != GGML_TYPE_TURBO3_0 && V->type != GGML_TYPE_TURBO4_0 && V->type != GGML_TYPE_F16) ||
+            (Q->ne[0] != 128 && Q->ne[0] != 256 && Q->ne[0] != 512) || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_VEC;
     }
 
     if (mask && mask->ne[2] != 1) {

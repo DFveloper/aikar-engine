@@ -1591,6 +1591,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
+void llama_kv_cache_dsv4::set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) {
+    kv_raw->set_kv_hadamard_policy(k, v, explicit_policy);
+    kv_csa->set_kv_hadamard_policy(k, v, explicit_policy);
+    kv_hca->set_kv_hadamard_policy(k, v, explicit_policy);
+    kv_lid->set_kv_hadamard_policy(k, v, explicit_policy);
+}
+
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 

@@ -272,6 +272,9 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_hadamard_k = params.kv_hadamard_k;
+    cparams.kv_hadamard_v = params.kv_hadamard_v;
+    cparams.kv_hadamard_explicit = params.kv_hadamard_explicit;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -312,6 +315,8 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: K cache Hadamard      = %s%s\n", __func__, cparams.kv_hadamard_k ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : " (auto)");
+    LLAMA_LOG_INFO("%s: V cache Hadamard      = %s%s\n", __func__, cparams.kv_hadamard_v ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : " (auto)");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -396,6 +401,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (memory) {
+            memory->set_kv_hadamard_policy(cparams.kv_hadamard_k, cparams.kv_hadamard_v, cparams.kv_hadamard_explicit);
+        }
     }
 
     // init backends
@@ -4007,6 +4015,9 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_hadamard_k               =*/ false,
+        /*.kv_hadamard_v               =*/ false,
+        /*.kv_hadamard_explicit        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4038,6 +4049,93 @@ llama_context * llama_init_from_model(
     }
     if (params.type_v_swa == GGML_TYPE_COUNT) {
         params.type_v_swa = params.type_v;
+    }
+
+    const auto is_turbo_kv_type = [](ggml_type type) {
+        return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+    };
+
+    if (params.kv_hadamard_explicit) {
+        const char * attn_rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
+        if (attn_rot_disable && atoi(attn_rot_disable) != 0) {
+            LLAMA_LOG_ERROR("%s: explicit KV Hadamard options cannot be used with LLAMA_ATTN_ROT_DISABLE=1\n", __func__);
+            return nullptr;
+        }
+
+        const ggml_type types_k[] = { params.type_k, params.type_k_swa };
+        const ggml_type types_v[] = { params.type_v, params.type_v_swa };
+
+        if (params.kv_hadamard_k) {
+            for (ggml_type type : types_k) {
+                if (is_turbo_kv_type(type)) {
+                    LLAMA_LOG_ERROR("%s: --k-cache-hadamard cannot be combined with K cache type %s because TurboQuant already applies its own transform\n",
+                            __func__, ggml_type_name(type));
+                    return nullptr;
+                }
+                if (!ggml_is_quantized(type)) {
+                    LLAMA_LOG_ERROR("%s: --k-cache-hadamard requires a quantized conventional K cache, got %s\n",
+                            __func__, ggml_type_name(type));
+                    return nullptr;
+                }
+            }
+        }
+
+        if (params.kv_hadamard_v) {
+            for (ggml_type type : types_v) {
+                if (is_turbo_kv_type(type)) {
+                    LLAMA_LOG_ERROR("%s: --v-cache-hadamard cannot be combined with V cache type %s because TurboQuant already applies its own transform\n",
+                            __func__, ggml_type_name(type));
+                    return nullptr;
+                }
+                if (!ggml_is_quantized(type)) {
+                    LLAMA_LOG_ERROR("%s: --v-cache-hadamard requires a quantized conventional V cache, got %s\n",
+                            __func__, ggml_type_name(type));
+                    return nullptr;
+                }
+            }
+        }
+
+        const auto hadamard_shape_supported = [](uint32_t n) {
+            return n >= 64 && n % 64 == 0;
+        };
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            const uint32_t current_k = model->hparams.n_embd_head_k(il);
+            const uint32_t current_v = model->hparams.n_embd_head_v(il);
+
+            if (params.kv_hadamard_k && !hadamard_shape_supported(current_k)) {
+                LLAMA_LOG_ERROR("%s: --k-cache-hadamard requires K head dimensions that are multiples of 64 (layer %u has %u)\n",
+                        __func__, il, current_k);
+                return nullptr;
+            }
+            if (params.kv_hadamard_v && !hadamard_shape_supported(current_v)) {
+                LLAMA_LOG_ERROR("%s: --v-cache-hadamard requires V head dimensions that are multiples of 64 (layer %u has %u)\n",
+                        __func__, il, current_v);
+                return nullptr;
+            }
+        }
+    }
+
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) &&
+            (is_turbo_kv_type(params.type_k) || is_turbo_kv_type(params.type_v) ||
+             is_turbo_kv_type(params.type_k_swa) || is_turbo_kv_type(params.type_v_swa))) {
+        LLAMA_LOG_ERROR("%s: TurboQuant KV cache does not support MLA cache layouts\n", __func__);
+        return nullptr;
+    }
+
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        const ggml_type type_k = model->hparams.is_swa(il) ? params.type_k_swa : params.type_k;
+        const ggml_type type_v = model->hparams.is_swa(il) ? params.type_v_swa : params.type_v;
+
+        if (is_turbo_kv_type(type_k) && model->hparams.n_embd_head_k(il) % 128 != 0) {
+            LLAMA_LOG_ERROR("%s: K cache type %s requires n_embd_head_k to be a multiple of 128 (layer %u has %u)\n",
+                    __func__, ggml_type_name(type_k), il, model->hparams.n_embd_head_k(il));
+            return nullptr;
+        }
+        if (is_turbo_kv_type(type_v) && model->hparams.n_embd_head_v(il) % 128 != 0) {
+            LLAMA_LOG_ERROR("%s: V cache type %s requires n_embd_head_v to be a multiple of 128 (layer %u has %u)\n",
+                    __func__, ggml_type_name(type_v), il, model->hparams.n_embd_head_v(il));
+            return nullptr;
+        }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

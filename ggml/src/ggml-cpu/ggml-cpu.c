@@ -221,6 +221,47 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+static void ggml_vec_dot_turbo_f32(
+        enum ggml_type type,
+        int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx,
+        const float * GGML_RESTRICT y) {
+    GGML_ASSERT(n % 128 == 0);
+
+    const struct ggml_type_traits * traits = ggml_get_type_traits(type);
+    const char * x = (const char *) vx;
+    float decoded[128];
+    float sum = 0.0f;
+
+    for (int i = 0; i < n; i += 128) {
+        traits->to_float(x, decoded, 128);
+        float block_sum;
+        ggml_vec_dot_f32(128, &block_sum, 0, decoded, 0, y + i, 0, 1);
+        sum += block_sum;
+        x += traits->type_size;
+    }
+
+    *s = sum;
+}
+
+static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    ggml_vec_dot_turbo_f32(GGML_TYPE_TURBO3_0, n, s, vx, (const float *) vy);
+}
+
+static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    ggml_vec_dot_turbo_f32(GGML_TYPE_TURBO4_0, n, s, vx, (const float *) vy);
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -303,6 +344,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_nvfp4,
         .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot                  = ggml_vec_dot_turbo3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+        .vec_dot                  = ggml_vec_dot_turbo4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -2079,6 +2132,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2300,6 +2357,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_TURBO_WHT:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:

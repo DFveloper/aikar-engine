@@ -103,6 +103,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsa::memory_breakdow
     return mb;
 }
 
+void llama_kv_cache_dsa::set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) {
+    kv_mla->set_kv_hadamard_policy(k, v, explicit_policy);
+    kv_lid->set_kv_hadamard_policy(k, v, explicit_policy);
+}
+
 llama_memory_context_ptr llama_kv_cache_dsa::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
