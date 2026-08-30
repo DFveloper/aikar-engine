@@ -578,12 +578,24 @@ class LlamaHfVocab(Vocab):
                 "You can install it with `pip install transformers`."
             ) from e
 
+        tokenizer_kwargs: dict[str, Any] = {}
+        fname_tokenizer_config = base_path / 'tokenizer_config.json'
+        if fname_tokenizer_config.is_file():
+            with open(fname_tokenizer_config, encoding='utf-8') as f:
+                tokenizer_config = json.load(f)
+            extra_special_tokens = tokenizer_config.get('extra_special_tokens')
+            if isinstance(extra_special_tokens, list):
+                tokenizer_kwargs['extra_special_tokens'] = {
+                    f'extra_token_{i}': token for i, token in enumerate(extra_special_tokens)
+                }
+
         # Allow the tokenizer to default to slow or fast versions.
         # Explicitly set tokenizer to use local paths.
         self.tokenizer = AutoTokenizer.from_pretrained(
             base_path,
             cache_dir=base_path,
             local_files_only=True,
+            **tokenizer_kwargs,
         )
         assert self.tokenizer.is_fast  # assume tokenizer.json is used  # ty: ignore[unresolved-attribute]
 

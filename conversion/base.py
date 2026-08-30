@@ -159,6 +159,7 @@ class ModelBase:
         self.model_name = model_name
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
         self._is_nvfp4 = False
+        self._nvfp4_weight_names: set[str] = set()
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
@@ -485,18 +486,40 @@ class ModelBase:
             elif quant_method == "compressed-tensors":
                 quant_format = quant_config["format"]
                 groups = quant_config["config_groups"]
-                nvfp4_compressed_tensors = (
-                    quant_format == "nvfp4-pack-quantized"
-                    or quant_format == "mixed-precision"
-                    and bool(groups)
-                    and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
+                group_formats = {g.get("format") for g in groups.values() if isinstance(g, dict)}
+                nvfp4_compressed_tensors = quant_format == "nvfp4-pack-quantized" or (
+                    quant_format == "mixed-precision" and "nvfp4-pack-quantized" in group_formats
                 )
+                mixed_nvfp4_fp8 = quant_format == "mixed-precision" and group_formats == {
+                    "nvfp4-pack-quantized", "float-quantized",
+                }
 
-                if len(groups) > 1 and not nvfp4_compressed_tensors:
+                if len(groups) > 1 and not mixed_nvfp4_fp8:
                     raise NotImplementedError("Can't handle multiple config groups for compressed-tensors yet")
-                weight_config = tuple(groups.values())[0]["weights"]
 
-                if quant_format == "float-quantized" or quant_format == "int-quantized" or quant_format == "naive-quantized":
+                if mixed_nvfp4_fp8:
+                    fp8_groups = [g for g in groups.values() if isinstance(g, dict) and g.get("format") == "float-quantized"]
+                    if not all(g.get("weights", {}).get("type") == "float" and g.get("weights", {}).get("num_bits") == 8 for g in fp8_groups):
+                        raise NotImplementedError("Only FP8 and NVFP4 mixed compressed-tensors checkpoints are supported")
+                    for name in self.model_tensors.keys():
+                        if not name.endswith(".weight_scale"):
+                            continue
+                        weight_name = name.removesuffix("_scale")
+                        if weight_name not in self.model_tensors:
+                            tensors_to_remove.append(name)
+                            continue
+                        w = self.model_tensors[weight_name]
+                        s = self.model_tensors[name]
+                        self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
+                        tensors_to_remove.append(name)
+                        if self._fp8_as_q8:
+                            self._fp8_dequantized.add(weight_name)
+                else:
+                    weight_config = tuple(groups.values())[0]["weights"]
+
+                if mixed_nvfp4_fp8:
+                    pass
+                elif quant_format == "float-quantized" or quant_format == "int-quantized" or quant_format == "naive-quantized":
                     block_size = weight_config.get("block_structure", None)
                     strategy = weight_config.get("strategy")
                     assert strategy == "channel" or strategy == "block"
@@ -742,6 +765,8 @@ class ModelBase:
         for name in self.model_tensors.keys():
             if not name.endswith(".weight"):
                 continue
+            if self._nvfp4_weight_names and name not in self._nvfp4_weight_names:
+                continue
             scale_name = name.replace(".weight", ".weight_scale")
             scale2_name = name.replace(".weight", ".weight_scale_2")
             input_scale_name = name.replace(".weight", ".input_scale")
@@ -854,11 +879,10 @@ class ModelBase:
 
         # Some models use per-tensor quant_algo (e.g. "MIXED_PRECISION" with
         # per-layer NVFP4/FP8) instead of a single global "NVFP4" value.
+        quant_group_formats = {g.get("format") for g in quant_groups.values() if isinstance(g, dict)}
         nvfp4_compressed_tensors = quant_method == "compressed-tensors" and (
             quant_format == "nvfp4-pack-quantized"
-            or quant_format == "mixed-precision"
-            and bool(quant_groups)
-            and all(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
+            or quant_format == "mixed-precision" and "nvfp4-pack-quantized" in quant_group_formats
         )
         if quant_algo != "NVFP4":
             if nvfp4_compressed_tensors:
@@ -887,6 +911,7 @@ class ModelBase:
                         weight_name = name.removesuffix("_packed")
                         if weight_name not in self.model_tensors:
                             self.model_tensors[weight_name] = self.model_tensors.pop(name)
+                            self._nvfp4_weight_names.add(weight_name)
                     elif name.endswith(".weight_global_scale"):
                         scale2_name = name.replace(".weight_global_scale", ".weight_scale_2")
                         if scale2_name not in self.model_tensors:

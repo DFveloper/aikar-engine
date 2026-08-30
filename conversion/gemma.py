@@ -846,7 +846,7 @@ class Gemma4Model(Gemma3Model):
             r = self.model_tensors.pop(name)
             for e, w2 in enumerate(w2_targets):
                 s = self.model_tensors[w2]
-                self.model_tensors[w2] = lambda s=s, r=r, i=e: s() * r()[i]
+                self.model_tensors[w2] = lambda s=s, r=r, i=e: LazyTorchTensor.to_eager(s()) * LazyTorchTensor.to_eager(r())[i]
         super()._generate_nvfp4_tensors()
 
     @classmethod
@@ -857,6 +857,7 @@ class Gemma4Model(Gemma3Model):
             name = name + ".weight"
         if ".experts." in name and not name.endswith((
             ".weight", ".weight_scale", ".weight_scale_2", ".input_scale",
+            ".weight_packed", ".weight_global_scale", ".input_global_scale",
             "w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale",
         )):
             name += ".weight"
