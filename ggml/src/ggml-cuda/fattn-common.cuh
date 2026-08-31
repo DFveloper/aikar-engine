@@ -1043,7 +1043,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const int max_parallel_blocks = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1243,6 +1244,10 @@ void launch_fattn(
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
             }
+        }
+
+        if (max_parallel_blocks > 0) {
+            parallel_blocks = std::min(parallel_blocks, max_parallel_blocks);
         }
 
         blocks_num.x = ntiles_x;

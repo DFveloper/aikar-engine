@@ -566,8 +566,9 @@ void ggml_cuda_flash_attn_ext_vec_case_volta_d512_q8(ggml_backend_cuda_context &
     }
     const int nwarps = nthreads / WARP_SIZE;
     constexpr size_t nbytes_shared = 0;
+    constexpr int max_parallel_blocks = cols_per_block == 4 ? 4 : 0;
     launch_fattn<D, cols_per_block, gqa_heads_per_block>(
-        ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, false, false, false);
+        ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, false, false, false, WARP_SIZE, max_parallel_blocks);
 }
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
@@ -581,9 +582,14 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
         const ggml_tensor * K = dst->src[1];
         if (cc == GGML_CUDA_CC_VOLTA) {
             constexpr int gqa_threshold = 12288;
-            if (K->ne[1] >= gqa_threshold) {
-                ggml_cuda_flash_attn_ext_vec_case_volta_d512_q8<
-                    D, cols_per_block, 2, type_K, type_V, use_logit_softcap>(ctx, dst);
+            if constexpr (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
+                if (K->ne[1] >= gqa_threshold) {
+                    ggml_cuda_flash_attn_ext_vec_case_volta_d512_q8<
+                        D, cols_per_block, 2, type_K, type_V, use_logit_softcap>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_vec_case_volta_d512_q8<
+                        D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
+                }
             } else {
                 ggml_cuda_flash_attn_ext_vec_case_volta_d512_q8<
                     D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
@@ -629,6 +635,23 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
             }
             return;
+        }
+
+        if constexpr (D == 512 &&
+                (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0) &&
+                (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0)) {
+            constexpr int min_prefill_q = 256;
+            if (Q->ne[1] >= min_prefill_q && Q->ne[3] == 1) {
+                constexpr int cols_per_block = 4;
+                if (logit_softcap == 0.0f) {
+                    constexpr bool use_logit_softcap = false;
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+                } else {
+                    constexpr bool use_logit_softcap = true;
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+                }
+                return;
+            }
         }
 
         constexpr int cols_per_block = 2;
