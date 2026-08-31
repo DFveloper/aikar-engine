@@ -352,12 +352,7 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
-        attn_rot_k =
-            !attn_rot_disable &&
-            n_embd_head_k_all > 0 &&
-            ggml_is_quantized(type_k) &&
-            !is_turbo_kv_type(type_k) &&
-            hparams.n_embd_head_k() % 64 == 0;
+        attn_rot_k = false;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
@@ -367,52 +362,62 @@ llama_kv_cache::llama_kv_cache(
             attn_rot_k_required = true;
         }
 
-        attn_rot_v =
-            !attn_rot_disable &&
-            n_embd_head_v_all > 0 &&
-            ggml_is_quantized(type_v) &&
-            !is_turbo_kv_type(type_v) &&
-            hparams.n_embd_head_v() % 64 == 0;
+        attn_rot_v = false;
     }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
-    // pre-compute the haramard matrices and keep them in host memory
-    // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
-    if (attn_rot_k || attn_rot_v) {
-        for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
-            attn_rot_hadamard[n] = std::vector<float>(n*n);
-
-            ggml_init_params params = {
-                /* .mem_size   = */ 1*ggml_tensor_overhead(),
-                /* .mem_buffer = */ nullptr,
-                /* .no_alloc   = */ true,
-            };
-
-            ggml_context_ptr ctx { ggml_init(params) };
-
-            ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
-            tmp->data = attn_rot_hadamard[n].data();
-
-            ggml_gen_hadamard(tmp);
-        }
-    }
+    init_attn_rot_hadamard();
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
-void llama_kv_cache::set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) {
+void llama_kv_cache::set_kv_hadamard_policy(bool k, bool v, bool k_swa, bool v_swa, bool explicit_policy) {
+    GGML_UNUSED(k_swa);
+    GGML_UNUSED(v_swa);
+
     if (!explicit_policy) {
         return;
     }
 
     attn_rot_k = attn_rot_k_required || k;
     attn_rot_v = v;
+    init_attn_rot_hadamard();
 
     LLAMA_LOG_INFO("%s: explicit KV Hadamard policy: K = %s, V = %s\n", __func__,
             attn_rot_k ? "true" : "false", attn_rot_v ? "true" : "false");
+}
+
+void llama_kv_cache::init_attn_rot_hadamard() {
+    if (!attn_rot_k && !attn_rot_v) {
+        return;
+    }
+
+    const int64_t n_embd_head_max = std::max(n_embd_head_k_all, n_embd_head_v_all);
+    GGML_ASSERT(n_embd_head_max >= 64);
+
+    for (int64_t n = 64; n <= n_embd_head_max; n *= 2) {
+        if (attn_rot_hadamard.count(n)) {
+            continue;
+        }
+
+        attn_rot_hadamard[n] = std::vector<float>(n*n);
+
+        ggml_init_params params = {
+            /* .mem_size   = */ 1*ggml_tensor_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+
+        ggml_context_ptr ctx { ggml_init(params) };
+
+        ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
+        tmp->data = attn_rot_hadamard[n].data();
+
+        ggml_gen_hadamard(tmp);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {

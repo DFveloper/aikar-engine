@@ -87,7 +87,7 @@ static std::vector<float> make_distribution(int id) {
     return values;
 }
 
-static bool test_codec(ggml_type type, double min_cosine, double max_norm_error) {
+static bool test_codec(ggml_type type, double min_cosine, double max_norm_error, bool transformed = true) {
     const ggml_type_traits * traits = ggml_get_type_traits(type);
     bool ok = true;
 
@@ -98,7 +98,9 @@ static bool test_codec(ggml_type type, double min_cosine, double max_norm_error)
 
         traits->from_float_ref(input.data(), packed.data(), input.size());
         traits->to_float(packed.data(), output.data(), output.size());
-        ggml_turbo_wht_inverse_f32(output.data(), output.size());
+        if (transformed) {
+            ggml_turbo_wht_inverse_f32(output.data(), output.size());
+        }
 
         const metrics result = measure(input, output);
         const bool finite = std::isfinite(result.mse) && std::isfinite(result.max_error) && std::isfinite(result.cosine);
@@ -229,10 +231,13 @@ static bool test_packed_size() {
     ggml_context * ctx = ggml_init(params);
     bool ok = true;
 
-    for (const auto & item : { std::pair{ GGML_TYPE_TURBO3_0, size_t(50) }, std::pair{ GGML_TYPE_TURBO4_0, size_t(66) } }) {
+    for (const auto & item : {
+            std::pair{ GGML_TYPE_TURBO3_0, size_t(100) },
+            std::pair{ GGML_TYPE_TURBO4_0, size_t(132) },
+            std::pair{ GGML_TYPE_MXFP4, size_t(136) } }) {
         ggml_tensor * tensor = ggml_new_tensor_2d(ctx, item.first, 256, 7);
-        const size_t expected = 2*item.second*7;
-        const bool type_ok = ggml_row_size(item.first, 128) == item.second && ggml_nbytes(tensor) == expected;
+        const size_t expected = item.second*7;
+        const bool type_ok = ggml_row_size(item.first, 256) == item.second && ggml_nbytes(tensor) == expected;
         std::printf("%s packed size: expected=%zu tensor=%zu %s\n",
                 ggml_type_name(item.first), expected, ggml_nbytes(tensor), type_ok ? "ok" : "FAILED");
         ok = type_ok && ok;
@@ -313,12 +318,23 @@ static bool test_backend_set_rows(ggml_backend_t backend, const char * label, gg
     if (ok) {
         std::vector<uint8_t> packed(ggml_nbytes(out));
         ggml_backend_tensor_get(out, packed.data(), 0, packed.size());
+        bool packed_match = true;
+        if (type == GGML_TYPE_MXFP4) {
+            std::vector<uint8_t> reference(packed.size(), 0);
+            const ggml_type_traits * traits = ggml_get_type_traits(type);
+            for (int src_row = 0; src_row < 7; ++src_row) {
+                traits->from_float_ref(input.data() + src_row*256, reference.data() + row_ids[src_row]*ggml_row_size(type, 256), 256);
+            }
+            packed_match = packed == reference;
+        }
         std::vector<float> reconstructed(input.size());
         const ggml_type_traits * traits = ggml_get_type_traits(type);
         for (int src_row = 0; src_row < 7; ++src_row) {
             const int dst_row = row_ids[src_row];
             traits->to_float(packed.data() + dst_row*ggml_row_size(type, 256), reconstructed.data() + dst_row*256, 256);
-            ggml_turbo_wht_inverse_f32(reconstructed.data() + dst_row*256, 256);
+            if (type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0) {
+                ggml_turbo_wht_inverse_f32(reconstructed.data() + dst_row*256, 256);
+            }
         }
         std::vector<float> reordered(input.size());
         for (int src_row = 0; src_row < 7; ++src_row) {
@@ -326,9 +342,10 @@ static bool test_backend_set_rows(ggml_backend_t backend, const char * label, gg
         }
         const metrics result = measure(reordered, reconstructed);
         const double min_cosine = type == GGML_TYPE_TURBO3_0 ? 0.94 : 0.98;
-        ok = result.cosine > min_cosine && result.norm_error < 0.01;
-        std::printf("%s %s SET_ROWS: cosine=%.7f norm_err=%g %s\n",
-            label, ggml_type_name(type), result.cosine, result.norm_error, ok ? "ok" : "FAILED");
+        const double max_norm_error = type == GGML_TYPE_MXFP4 ? 0.10 : 0.01;
+        ok = packed_match && result.cosine > min_cosine && result.norm_error < max_norm_error;
+        std::printf("%s %s SET_ROWS: cosine=%.7f norm_err=%g packed=%s %s\n",
+            label, ggml_type_name(type), result.cosine, result.norm_error, packed_match ? "match" : "different", ok ? "ok" : "FAILED");
     }
 
     if (buffer != nullptr) {
@@ -456,6 +473,7 @@ static bool test_backend_kind(const char * prefix) {
         ok = test_backend_wht(backend, name) && ok;
         ok = test_backend_set_rows(backend, name, GGML_TYPE_TURBO3_0) && ok;
         ok = test_backend_set_rows(backend, name, GGML_TYPE_TURBO4_0) && ok;
+        ok = test_backend_set_rows(backend, name, GGML_TYPE_MXFP4) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0) && ok;
@@ -464,11 +482,20 @@ static bool test_backend_kind(const char * prefix) {
         ok = test_backend_attention(backend, name, GGML_TYPE_F16, GGML_TYPE_TURBO3_0) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_F16) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_F16, GGML_TYPE_TURBO4_0) && ok;
+        ok = test_backend_attention(backend, name, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4) && ok;
+        ok = test_backend_attention(backend, name, GGML_TYPE_MXFP4, GGML_TYPE_F16) && ok;
+        ok = test_backend_attention(backend, name, GGML_TYPE_F16, GGML_TYPE_MXFP4) && ok;
+        ok = test_backend_attention(backend, name, GGML_TYPE_MXFP4, GGML_TYPE_TURBO3_0) && ok;
+        ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_MXFP4) && ok;
+        ok = test_backend_attention(backend, name, GGML_TYPE_MXFP4, GGML_TYPE_TURBO4_0) && ok;
+        ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_MXFP4) && ok;
         if (std::strcmp(prefix, "CUDA") == 0) {
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 512) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, 512) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 512, 16384) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, 512, 16384) && ok;
+            ok = test_backend_attention(backend, name, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, 512) && ok;
+            ok = test_backend_attention(backend, name, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, 512, 16384) && ok;
         }
         ggml_backend_free(backend);
         if (std::strcmp(prefix, "CUDA") == 0) {
@@ -488,6 +515,7 @@ int main() {
     ok = test_wht_round_trip() && ok;
     ok = test_codec(GGML_TYPE_TURBO3_0, 0.94, 0.01) && ok;
     ok = test_codec(GGML_TYPE_TURBO4_0, 0.98, 0.01) && ok;
+    ok = test_codec(GGML_TYPE_MXFP4, 0.98, 0.10, false) && ok;
     ok = test_normalized_hadamard_attention() && ok;
     ok = test_transformed_attention(GGML_TYPE_TURBO3_0) && ok;
     ok = test_transformed_attention(GGML_TYPE_TURBO4_0) && ok;
@@ -496,8 +524,8 @@ int main() {
     ok = test_backend_kind("CUDA") && ok;
     ok = test_backend_kind("Vulkan") && ok;
 
-    if (ggml_row_size(GGML_TYPE_TURBO3_0, 128) != 50 || ggml_row_size(GGML_TYPE_TURBO4_0, 128) != 66) {
-        std::fprintf(stderr, "TurboQuant packed size mismatch\n");
+    if (ggml_row_size(GGML_TYPE_TURBO3_0, 128) != 50 || ggml_row_size(GGML_TYPE_TURBO4_0, 128) != 66 || ggml_row_size(GGML_TYPE_MXFP4, 32) != 17) {
+        std::fprintf(stderr, "KV packed size mismatch\n");
         ok = false;
     }
 

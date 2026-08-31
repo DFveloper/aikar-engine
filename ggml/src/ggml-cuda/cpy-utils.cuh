@@ -190,6 +190,37 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK_MXFP4; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    const int exponent = amax > 0.0f ? int(floorf(log2f(amax))) - 2 + 127 : 0;
+    y->e = (uint8_t) max(0, min(255, exponent));
+    const float d = ggml_cuda_e8m0_to_fp32(y->e)*0.5f;
+
+    for (int j = 0; j < QK_MXFP4/2; ++j) {
+        int q0 = 0;
+        int q1 = 0;
+        float err0 = fabsf(d*kvalues_mxfp4[0] - x[j]);
+        float err1 = fabsf(d*kvalues_mxfp4[0] - x[QK_MXFP4/2 + j]);
+        for (int q = 1; q < 16; ++q) {
+            const float current0 = fabsf(d*kvalues_mxfp4[q] - x[j]);
+            const float current1 = fabsf(d*kvalues_mxfp4[q] - x[QK_MXFP4/2 + j]);
+            if (current0 < err0) {
+                q0 = q;
+                err0 = current0;
+            }
+            if (current1 < err1) {
+                q1 = q;
+                err1 = current1;
+            }
+        }
+        y->qs[j] = q0 | (q1 << 4);
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

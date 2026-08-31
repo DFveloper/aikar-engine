@@ -577,8 +577,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
 
     if constexpr (D == 512 &&
             ((type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) ||
-             ((type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0) &&
-              (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0)))) {
+             ((type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_MXFP4) &&
+              (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_MXFP4)))) {
         const ggml_tensor * K = dst->src[1];
         if (cc == GGML_CUDA_CC_VOLTA) {
             constexpr int gqa_threshold = 12288;
@@ -638,8 +638,8 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         }
 
         if constexpr (D == 512 &&
-                (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0) &&
-                (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0)) {
+                (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_MXFP4) &&
+                (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_MXFP4)) {
             constexpr int min_prefill_q = 256;
             if (Q->ne[1] >= min_prefill_q && Q->ne[3] == 1) {
                 constexpr int cols_per_block = 4;
@@ -727,3 +727,17 @@ extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_F16, GGML_TYPE_TURBO4_0);
+
+#define EXTERN_DECL_FATTN_VEC_MXFP4(D)                                      \
+    extern DECL_FATTN_VEC_CASE(D, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);        \
+    extern DECL_FATTN_VEC_CASE(D, GGML_TYPE_MXFP4, GGML_TYPE_F16);          \
+    extern DECL_FATTN_VEC_CASE(D, GGML_TYPE_F16, GGML_TYPE_MXFP4);          \
+    extern DECL_FATTN_VEC_CASE(D, GGML_TYPE_MXFP4, GGML_TYPE_TURBO3_0);     \
+    extern DECL_FATTN_VEC_CASE(D, GGML_TYPE_TURBO3_0, GGML_TYPE_MXFP4);     \
+    extern DECL_FATTN_VEC_CASE(D, GGML_TYPE_MXFP4, GGML_TYPE_TURBO4_0);     \
+    extern DECL_FATTN_VEC_CASE(D, GGML_TYPE_TURBO4_0, GGML_TYPE_MXFP4);
+
+EXTERN_DECL_FATTN_VEC_MXFP4(128)
+EXTERN_DECL_FATTN_VEC_MXFP4(256)
+EXTERN_DECL_FATTN_VEC_MXFP4(512)
+#undef EXTERN_DECL_FATTN_VEC_MXFP4

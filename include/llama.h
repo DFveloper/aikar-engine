@@ -409,6 +409,9 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool kv_hadamard_k;        // apply normalized Hadamard transform to conventional quantized K cache
         bool kv_hadamard_v;        // apply normalized Hadamard transform to conventional quantized V cache
+        bool kv_hadamard_k_swa;    // apply the transform to the sliding-window K cache
+        bool kv_hadamard_v_swa;    // apply the transform to the sliding-window V cache
+        bool kv_hadamard_separate; // use separate global and sliding-window policies
         bool kv_hadamard_explicit; // use the explicit per-side transform policy
 
         // [EXPERIMENTAL]

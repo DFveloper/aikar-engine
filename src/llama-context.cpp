@@ -274,6 +274,8 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.kv_hadamard_k = params.kv_hadamard_k;
     cparams.kv_hadamard_v = params.kv_hadamard_v;
+    cparams.kv_hadamard_k_swa = params.kv_hadamard_separate ? params.kv_hadamard_k_swa : params.kv_hadamard_k;
+    cparams.kv_hadamard_v_swa = params.kv_hadamard_separate ? params.kv_hadamard_v_swa : params.kv_hadamard_v;
     cparams.kv_hadamard_explicit = params.kv_hadamard_explicit;
 
     // initialized later
@@ -315,8 +317,10 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
-    LLAMA_LOG_INFO("%s: K cache Hadamard      = %s%s\n", __func__, cparams.kv_hadamard_k ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : " (auto)");
-    LLAMA_LOG_INFO("%s: V cache Hadamard      = %s%s\n", __func__, cparams.kv_hadamard_v ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : " (auto)");
+    LLAMA_LOG_INFO("%s: global K Hadamard     = %s%s\n", __func__, cparams.kv_hadamard_k ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : "");
+    LLAMA_LOG_INFO("%s: global V Hadamard     = %s%s\n", __func__, cparams.kv_hadamard_v ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : "");
+    LLAMA_LOG_INFO("%s: local K Hadamard      = %s%s\n", __func__, cparams.kv_hadamard_k_swa ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : "");
+    LLAMA_LOG_INFO("%s: local V Hadamard      = %s%s\n", __func__, cparams.kv_hadamard_v_swa ? "true" : "false", cparams.kv_hadamard_explicit ? " (explicit)" : "");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -402,7 +406,8 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
         if (memory) {
-            memory->set_kv_hadamard_policy(cparams.kv_hadamard_k, cparams.kv_hadamard_v, cparams.kv_hadamard_explicit);
+            memory->set_kv_hadamard_policy(cparams.kv_hadamard_k, cparams.kv_hadamard_v,
+                    cparams.kv_hadamard_k_swa, cparams.kv_hadamard_v_swa, cparams.kv_hadamard_explicit);
         }
     }
 
@@ -4017,6 +4022,9 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.kv_hadamard_k               =*/ false,
         /*.kv_hadamard_v               =*/ false,
+        /*.kv_hadamard_k_swa           =*/ false,
+        /*.kv_hadamard_v_swa           =*/ false,
+        /*.kv_hadamard_separate        =*/ false,
         /*.kv_hadamard_explicit        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
@@ -4051,6 +4059,11 @@ llama_context * llama_init_from_model(
         params.type_v_swa = params.type_v;
     }
 
+    if (!params.kv_hadamard_separate) {
+        params.kv_hadamard_k_swa = params.kv_hadamard_k;
+        params.kv_hadamard_v_swa = params.kv_hadamard_v;
+    }
+
     const auto is_turbo_kv_type = [](ggml_type type) {
         return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
     };
@@ -4062,37 +4075,28 @@ llama_context * llama_init_from_model(
             return nullptr;
         }
 
-        const ggml_type types_k[] = { params.type_k, params.type_k_swa };
-        const ggml_type types_v[] = { params.type_v, params.type_v_swa };
-
-        if (params.kv_hadamard_k) {
-            for (ggml_type type : types_k) {
-                if (is_turbo_kv_type(type)) {
-                    LLAMA_LOG_ERROR("%s: --k-cache-hadamard cannot be combined with K cache type %s because TurboQuant already applies its own transform\n",
-                            __func__, ggml_type_name(type));
-                    return nullptr;
-                }
-                if (!ggml_is_quantized(type)) {
-                    LLAMA_LOG_ERROR("%s: --k-cache-hadamard requires a quantized conventional K cache, got %s\n",
-                            __func__, ggml_type_name(type));
-                    return nullptr;
-                }
+        const auto validate_hadamard_type = [&](bool enabled, ggml_type type, const char * option, const char * side) {
+            if (!enabled) {
+                return true;
             }
-        }
-
-        if (params.kv_hadamard_v) {
-            for (ggml_type type : types_v) {
-                if (is_turbo_kv_type(type)) {
-                    LLAMA_LOG_ERROR("%s: --v-cache-hadamard cannot be combined with V cache type %s because TurboQuant already applies its own transform\n",
-                            __func__, ggml_type_name(type));
-                    return nullptr;
-                }
-                if (!ggml_is_quantized(type)) {
-                    LLAMA_LOG_ERROR("%s: --v-cache-hadamard requires a quantized conventional V cache, got %s\n",
-                            __func__, ggml_type_name(type));
-                    return nullptr;
-                }
+            if (is_turbo_kv_type(type)) {
+                LLAMA_LOG_ERROR("%s: %s cannot be combined with %s cache type %s because TurboQuant already applies its own transform\n",
+                        __func__, option, side, ggml_type_name(type));
+                return false;
             }
+            if (!ggml_is_quantized(type)) {
+                LLAMA_LOG_ERROR("%s: %s requires a quantized conventional %s cache, got %s\n",
+                        __func__, option, side, ggml_type_name(type));
+                return false;
+            }
+            return true;
+        };
+
+        if (!validate_hadamard_type(params.kv_hadamard_k, params.type_k, "--k-cache-hadamard-global", "K") ||
+            !validate_hadamard_type(params.kv_hadamard_v, params.type_v, "--v-cache-hadamard-global", "V") ||
+            !validate_hadamard_type(params.kv_hadamard_k_swa, params.type_k_swa, "--k-cache-hadamard-local", "K") ||
+            !validate_hadamard_type(params.kv_hadamard_v_swa, params.type_v_swa, "--v-cache-hadamard-local", "V")) {
+            return nullptr;
         }
 
         const auto hadamard_shape_supported = [](uint32_t n) {
@@ -4102,14 +4106,20 @@ llama_context * llama_init_from_model(
             const uint32_t current_k = model->hparams.n_embd_head_k(il);
             const uint32_t current_v = model->hparams.n_embd_head_v(il);
 
-            if (params.kv_hadamard_k && !hadamard_shape_supported(current_k)) {
-                LLAMA_LOG_ERROR("%s: --k-cache-hadamard requires K head dimensions that are multiples of 64 (layer %u has %u)\n",
-                        __func__, il, current_k);
+            const bool is_swa = model->hparams.is_swa(il);
+            const bool hadamard_k = is_swa ? params.kv_hadamard_k_swa : params.kv_hadamard_k;
+            const bool hadamard_v = is_swa ? params.kv_hadamard_v_swa : params.kv_hadamard_v;
+            const char * option_k = is_swa ? "--k-cache-hadamard-local" : "--k-cache-hadamard-global";
+            const char * option_v = is_swa ? "--v-cache-hadamard-local" : "--v-cache-hadamard-global";
+
+            if (hadamard_k && !hadamard_shape_supported(current_k)) {
+                LLAMA_LOG_ERROR("%s: %s requires K head dimensions that are multiples of 64 (layer %u has %u)\n",
+                        __func__, option_k, il, current_k);
                 return nullptr;
             }
-            if (params.kv_hadamard_v && !hadamard_shape_supported(current_v)) {
-                LLAMA_LOG_ERROR("%s: --v-cache-hadamard requires V head dimensions that are multiples of 64 (layer %u has %u)\n",
-                        __func__, il, current_v);
+            if (hadamard_v && !hadamard_shape_supported(current_v)) {
+                LLAMA_LOG_ERROR("%s: %s requires V head dimensions that are multiples of 64 (layer %u has %u)\n",
+                        __func__, option_v, il, current_v);
                 return nullptr;
             }
         }

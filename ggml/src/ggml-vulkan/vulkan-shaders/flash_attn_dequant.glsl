@@ -29,6 +29,8 @@ layout (binding = 1) readonly buffer K_PACKED_Q8_0 { block_q8_0_packed16 data[];
 layout (binding = 2) readonly buffer V_PACKED_Q8_0 { block_q8_0_packed16 data[]; } v_packed_q8_0;
 layout (binding = 1) readonly buffer K_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } k_packed_iq4_nl;
 layout (binding = 2) readonly buffer V_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } v_packed_iq4_nl;
+layout (binding = 1) readonly buffer K_PACKED_MXFP4 { block_mxfp4 data[]; } k_packed_mxfp4;
+layout (binding = 2) readonly buffer V_PACKED_MXFP4 { block_mxfp4 data[]; } v_packed_mxfp4;
 
 layout (binding = 1) readonly buffer K_PACKED_BF16 { u16vec4 data[]; } k_packed_bf16;
 layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_bf16;
@@ -119,6 +121,20 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
                             kvalues_iq4nl[q.z], kvalues_iq4nl[q.w]);                              \
 }
 
+#define FA_DEQUANT4_MXFP4(BUF) {                                                                  \
+    const float c[16] = float[16](0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,                       \
+                                  0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);               \
+    const uint shift = (iqs & 0x10u) >> 2;                                                       \
+    const uint qidx = iqs & 0x0fu;                                                               \
+    const u8vec4 q = u8vec4(BUF.data[a_offset + ib].qs[qidx + 0u],                              \
+                            BUF.data[a_offset + ib].qs[qidx + 1u],                              \
+                            BUF.data[a_offset + ib].qs[qidx + 2u],                              \
+                            BUF.data[a_offset + ib].qs[qidx + 3u]);                             \
+    const FLOAT_TYPE d = FLOAT_TYPE(e8m0_to_fp32(BUF.data[a_offset + ib].e)*0.5);                \
+    return d*FLOAT_TYPEV4(c[(q.x >> shift) & 0x0fu], c[(q.y >> shift) & 0x0fu],                  \
+                           c[(q.z >> shift) & 0x0fu], c[(q.w >> shift) & 0x0fu]);                \
+}
+
 #define FA_DEQUANT4_BF16(BUF) \
     return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
 
@@ -157,6 +173,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
             case FA_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(k_packed_iq4_nl)
+            case FA_TYPE_MXFP4: FA_DEQUANT4_MXFP4(k_packed_mxfp4)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
             case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(k_packed_turbo3_0)
             case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(k_packed_turbo4_0)
@@ -170,6 +187,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
             case FA_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(v_packed_iq4_nl)
+            case FA_TYPE_MXFP4: FA_DEQUANT4_MXFP4(v_packed_mxfp4)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
             case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0)
             case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(v_packed_turbo4_0)

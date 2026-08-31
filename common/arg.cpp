@@ -311,6 +311,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_MXFP4,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
 };
@@ -2460,7 +2461,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--k-cache-hadamard"},
-        "apply a normalized Hadamard transform before conventional K-cache quantization; not valid with TurboQuant cache types",
+        "apply a normalized Hadamard transform to both local and global conventional K caches; not valid with TurboQuant cache types",
         [](common_params & params) {
             params.cache_hadamard_k = true;
             params.cache_hadamard_explicit = true;
@@ -2468,12 +2469,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_K_CACHE_HADAMARD"));
     add_opt(common_arg(
         {"--v-cache-hadamard"},
-        "apply a normalized Hadamard transform before conventional V-cache quantization; not valid with TurboQuant cache types",
+        "apply a normalized Hadamard transform to both local and global conventional V caches; not valid with TurboQuant cache types",
         [](common_params & params) {
             params.cache_hadamard_v = true;
             params.cache_hadamard_explicit = true;
         }
     ).set_env("LLAMA_ARG_V_CACHE_HADAMARD"));
+    add_opt(common_arg(
+        {"--k-cache-hadamard-local"},
+        "apply a normalized Hadamard transform to the local conventional K cache only",
+        [](common_params & params) {
+            params.cache_hadamard_k_local = true;
+            params.cache_hadamard_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_K_CACHE_HADAMARD_LOCAL"));
+    add_opt(common_arg(
+        {"--v-cache-hadamard-local"},
+        "apply a normalized Hadamard transform to the local conventional V cache only",
+        [](common_params & params) {
+            params.cache_hadamard_v_local = true;
+            params.cache_hadamard_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_V_CACHE_HADAMARD_LOCAL"));
+    add_opt(common_arg(
+        {"--k-cache-hadamard-global"},
+        "apply a normalized Hadamard transform to the global conventional K cache only",
+        [](common_params & params) {
+            params.cache_hadamard_k_global = true;
+            params.cache_hadamard_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_K_CACHE_HADAMARD_GLOBAL"));
+    add_opt(common_arg(
+        {"--v-cache-hadamard-global"},
+        "apply a normalized Hadamard transform to the global conventional V cache only",
+        [](common_params & params) {
+            params.cache_hadamard_v_global = true;
+            params.cache_hadamard_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_V_CACHE_HADAMARD_GLOBAL"));
     add_opt(common_arg(
         {"-ctlk", "--cache-type-k-local"}, "TYPE",
         string_format(

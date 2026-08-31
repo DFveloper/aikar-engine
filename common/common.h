@@ -603,6 +603,10 @@ struct common_params {
     bool cache_type_v_set = false;
     bool cache_hadamard_k = false;
     bool cache_hadamard_v = false;
+    bool cache_hadamard_k_local = false;
+    bool cache_hadamard_v_local = false;
+    bool cache_hadamard_k_global = false;
+    bool cache_hadamard_v_global = false;
     bool cache_hadamard_explicit = false;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

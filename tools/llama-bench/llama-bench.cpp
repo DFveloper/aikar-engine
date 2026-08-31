@@ -339,6 +339,10 @@ struct cmd_params {
     std::vector<ggml_type>           type_v_global;
     bool                             cache_hadamard_k;
     bool                             cache_hadamard_v;
+    bool                             cache_hadamard_k_local;
+    bool                             cache_hadamard_v_local;
+    bool                             cache_hadamard_k_global;
+    bool                             cache_hadamard_v_global;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -389,6 +393,10 @@ static const cmd_params cmd_params_defaults = {
     /* type_v_global        */ {},
     /* cache_hadamard_k     */ false,
     /* cache_hadamard_v     */ false,
+    /* cache_hadamard_k_local  */ false,
+    /* cache_hadamard_v_local  */ false,
+    /* cache_hadamard_k_global */ false,
+    /* cache_hadamard_v_global */ false,
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -464,8 +472,12 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ctlv, --cache-type-v-local <t>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -ctgk, --cache-type-k-global <t>                  (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctgv, --cache-type-v-global <t>                  (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
-    printf("  --k-cache-hadamard                                apply Hadamard rotation to conventional quantized K cache\n");
-    printf("  --v-cache-hadamard                                apply Hadamard rotation to conventional quantized V cache\n");
+    printf("  --k-cache-hadamard                                apply Hadamard rotation to local and global conventional K caches\n");
+    printf("  --v-cache-hadamard                                apply Hadamard rotation to local and global conventional V caches\n");
+    printf("  --k-cache-hadamard-local                          apply Hadamard rotation to the local conventional K cache only\n");
+    printf("  --v-cache-hadamard-local                          apply Hadamard rotation to the local conventional V cache only\n");
+    printf("  --k-cache-hadamard-global                         apply Hadamard rotation to the global conventional K cache only\n");
+    printf("  --v-cache-hadamard-global                         apply Hadamard rotation to the global conventional V cache only\n");
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -518,6 +530,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
+    if (s == "mxfp4") {
+        return GGML_TYPE_MXFP4;
+    }
     if (s == "turbo3") {
         return GGML_TYPE_TURBO3_0;
     }
@@ -547,6 +562,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.offline              = cmd_params_defaults.offline;
     params.cache_hadamard_k     = cmd_params_defaults.cache_hadamard_k;
     params.cache_hadamard_v     = cmd_params_defaults.cache_hadamard_v;
+    params.cache_hadamard_k_local  = cmd_params_defaults.cache_hadamard_k_local;
+    params.cache_hadamard_v_local  = cmd_params_defaults.cache_hadamard_v_local;
+    params.cache_hadamard_k_global = cmd_params_defaults.cache_hadamard_k_global;
+    params.cache_hadamard_v_global = cmd_params_defaults.cache_hadamard_v_global;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -775,6 +794,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.cache_hadamard_k = true;
             } else if (arg == "--v-cache-hadamard") {
                 params.cache_hadamard_v = true;
+            } else if (arg == "--k-cache-hadamard-local") {
+                params.cache_hadamard_k_local = true;
+            } else if (arg == "--v-cache-hadamard-local") {
+                params.cache_hadamard_v_local = true;
+            } else if (arg == "--k-cache-hadamard-global") {
+                params.cache_hadamard_k_global = true;
+            } else if (arg == "--v-cache-hadamard-global") {
+                params.cache_hadamard_v_global = true;
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1323,6 +1350,8 @@ struct cmd_params_instance {
     ggml_type          type_v_swa;
     bool               cache_hadamard_k;
     bool               cache_hadamard_v;
+    bool               cache_hadamard_k_swa;
+    bool               cache_hadamard_v_swa;
     int                n_threads;
     std::string        cpu_mask;
     bool               cpu_strict;
@@ -1415,7 +1444,10 @@ struct cmd_params_instance {
         cparams.type_v_swa      = type_v_swa;
         cparams.kv_hadamard_k   = cache_hadamard_k;
         cparams.kv_hadamard_v   = cache_hadamard_v;
-        cparams.kv_hadamard_explicit = cache_hadamard_k || cache_hadamard_v;
+        cparams.kv_hadamard_k_swa = cache_hadamard_k_swa;
+        cparams.kv_hadamard_v_swa = cache_hadamard_v_swa;
+        cparams.kv_hadamard_separate = true;
+        cparams.kv_hadamard_explicit = cache_hadamard_k || cache_hadamard_v || cache_hadamard_k_swa || cache_hadamard_v_swa;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
@@ -1495,8 +1527,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_v                = */ tv.first,
                 /* .type_k_swa            = */ tk.second,
                 /* .type_v_swa            = */ tv.second,
-                /* .cache_hadamard_k       = */ params.cache_hadamard_k,
-                /* .cache_hadamard_v       = */ params.cache_hadamard_v,
+                /* .cache_hadamard_k       = */ params.cache_hadamard_k || params.cache_hadamard_k_global,
+                /* .cache_hadamard_v       = */ params.cache_hadamard_v || params.cache_hadamard_v_global,
+                /* .cache_hadamard_k_swa   = */ params.cache_hadamard_k || params.cache_hadamard_k_local,
+                /* .cache_hadamard_v_swa   = */ params.cache_hadamard_v || params.cache_hadamard_v_local,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1535,8 +1569,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_v                = */ tv.first,
                 /* .type_k_swa            = */ tk.second,
                 /* .type_v_swa            = */ tv.second,
-                /* .cache_hadamard_k       = */ params.cache_hadamard_k,
-                /* .cache_hadamard_v       = */ params.cache_hadamard_v,
+                /* .cache_hadamard_k       = */ params.cache_hadamard_k || params.cache_hadamard_k_global,
+                /* .cache_hadamard_v       = */ params.cache_hadamard_v || params.cache_hadamard_v_global,
+                /* .cache_hadamard_k_swa   = */ params.cache_hadamard_k || params.cache_hadamard_k_local,
+                /* .cache_hadamard_v_swa   = */ params.cache_hadamard_v || params.cache_hadamard_v_local,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1575,8 +1611,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_v                = */ tv.first,
                 /* .type_k_swa            = */ tk.second,
                 /* .type_v_swa            = */ tv.second,
-                /* .cache_hadamard_k       = */ params.cache_hadamard_k,
-                /* .cache_hadamard_v       = */ params.cache_hadamard_v,
+                /* .cache_hadamard_k       = */ params.cache_hadamard_k || params.cache_hadamard_k_global,
+                /* .cache_hadamard_v       = */ params.cache_hadamard_v || params.cache_hadamard_v_global,
+                /* .cache_hadamard_k_swa   = */ params.cache_hadamard_k || params.cache_hadamard_k_local,
+                /* .cache_hadamard_v_swa   = */ params.cache_hadamard_v || params.cache_hadamard_v_local,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1626,6 +1664,8 @@ struct test {
     ggml_type                type_v_swa;
     bool                     cache_hadamard_k;
     bool                     cache_hadamard_v;
+    bool                     cache_hadamard_k_swa;
+    bool                     cache_hadamard_v_swa;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1669,6 +1709,8 @@ struct test {
         type_v_swa     = inst.type_v_swa;
         cache_hadamard_k = inst.cache_hadamard_k;
         cache_hadamard_v = inst.cache_hadamard_v;
+        cache_hadamard_k_swa = inst.cache_hadamard_k_swa;
+        cache_hadamard_v_swa = inst.cache_hadamard_v_swa;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1739,7 +1781,7 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "type_k_swa",    "type_v_swa",
-            "cache_hadamard_k", "cache_hadamard_v", "n_gpu_layers",
+            "cache_hadamard_k", "cache_hadamard_v", "cache_hadamard_k_swa", "cache_hadamard_v_swa", "n_gpu_layers",
             "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
@@ -1762,6 +1804,7 @@ struct test {
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
             field == "cache_hadamard_k" || field == "cache_hadamard_v" ||
+            field == "cache_hadamard_k_swa" || field == "cache_hadamard_v_swa" ||
             field == "embeddings" || field == "no_host") {
             return BOOL;
         }
@@ -1832,6 +1875,8 @@ struct test {
                                             ggml_type_name(type_v_swa),
                                             std::to_string(cache_hadamard_k),
                                             std::to_string(cache_hadamard_v),
+                                            std::to_string(cache_hadamard_k_swa),
+                                            std::to_string(cache_hadamard_v_swa),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
@@ -2140,11 +2185,17 @@ struct markdown_printer : public printer {
         if (has_v_policy) {
             fields.emplace_back("type_v_swa");
         }
-        if (params.cache_hadamard_k) {
+        if (params.cache_hadamard_k || params.cache_hadamard_k_global) {
             fields.emplace_back("cache_hadamard_k");
         }
-        if (params.cache_hadamard_v) {
+        if (params.cache_hadamard_v || params.cache_hadamard_v_global) {
             fields.emplace_back("cache_hadamard_v");
+        }
+        if (params.cache_hadamard_k || params.cache_hadamard_k_local) {
+            fields.emplace_back("cache_hadamard_k_swa");
+        }
+        if (params.cache_hadamard_v || params.cache_hadamard_v_local) {
+            fields.emplace_back("cache_hadamard_v_swa");
         }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");

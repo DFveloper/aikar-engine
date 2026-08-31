@@ -177,6 +177,35 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
     return sum;
 }
 
+static __device__ __forceinline__ float mxfp4_dequant_cuda(const block_mxfp4 * blocks, int i) {
+    const block_mxfp4 & block = blocks[i/QK_MXFP4];
+    const int iq = i % QK_MXFP4;
+    const uint8_t packed = block.qs[iq % (QK_MXFP4/2)];
+    const int code = iq < QK_MXFP4/2 ? packed & 0x0f : packed >> 4;
+    return ggml_cuda_e8m0_to_fp32(block.e)*0.5f*kvalues_mxfp4[code];
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    GGML_UNUSED(Q_v);
+    const block_mxfp4 * K = (const block_mxfp4 *) K_c;
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k0 = 0; k0 < D/(int) sizeof(int); k0 += nthreads) {
+        const int kq = k0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int q_packed = Q_q8[k0/nthreads];
+        const int8_t * q = (const int8_t *) &q_packed;
+        const float q_scale = ((const float2 *) Q_ds_v)[k0/nthreads].x;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sum += mxfp4_dequant_cuda(K, 4*kq + i)*(float) q[i]*q_scale;
+        }
+    }
+    return sum;
+}
+
 template<int D, int nthreads, bool turbo4>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -680,6 +709,16 @@ static __device__ __forceinline__ void dequantize_V_turbo(const void * __restric
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_mxfp4 * blocks = (const block_mxfp4 *) vx;
+    T * out = (T *) dst;
+#pragma unroll
+    for (int i = 0; i < ne; ++i) {
+        out[i] = ggml_cuda_cast<T>(mxfp4_dequant_cuda(blocks, i0 + i));
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -694,6 +733,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP4) {
+        return vec_dot_fattn_vec_KQ_mxfp4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
@@ -720,6 +761,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP4) {
+        return dequantize_V_mxfp4<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {

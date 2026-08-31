@@ -99,9 +99,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_msa::memory_breakdow
     return mb;
 }
 
-void llama_kv_cache_msa::set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) {
-    kv_base->set_kv_hadamard_policy(k, v, explicit_policy);
-    kv_idx->set_kv_hadamard_policy(k, v, explicit_policy);
+void llama_kv_cache_msa::set_kv_hadamard_policy(bool k, bool v, bool k_swa, bool v_swa, bool explicit_policy) {
+    kv_base->set_kv_hadamard_policy(k, v, k_swa, v_swa, explicit_policy);
+    kv_idx->set_kv_hadamard_policy(k, v, k_swa, v_swa, explicit_policy);
 }
 
 llama_memory_context_ptr llama_kv_cache_msa::init_batch(

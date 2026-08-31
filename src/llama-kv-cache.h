@@ -145,7 +145,7 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    void set_kv_hadamard_policy(bool k, bool v, bool explicit_policy) override;
+    void set_kv_hadamard_policy(bool k, bool v, bool k_swa, bool v_swa, bool explicit_policy) override;
 
     // state write/load
 
@@ -223,6 +223,8 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    void init_attn_rot_hadamard();
+
     const llama_model & model;
     const llama_hparams & hparams;
 

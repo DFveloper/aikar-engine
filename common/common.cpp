@@ -1762,8 +1762,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
-    cparams.kv_hadamard_k     = params.cache_hadamard_k;
-    cparams.kv_hadamard_v     = params.cache_hadamard_v;
+    const bool has_hadamard_policy = params.cache_hadamard_k_local || params.cache_hadamard_v_local ||
+        params.cache_hadamard_k_global || params.cache_hadamard_v_global;
+    cparams.kv_hadamard_k     = params.cache_hadamard_k || params.cache_hadamard_k_global;
+    cparams.kv_hadamard_v     = params.cache_hadamard_v || params.cache_hadamard_v_global;
+    cparams.kv_hadamard_k_swa = params.cache_hadamard_k || params.cache_hadamard_k_local;
+    cparams.kv_hadamard_v_swa = params.cache_hadamard_v || params.cache_hadamard_v_local;
+    cparams.kv_hadamard_separate = has_hadamard_policy;
     cparams.kv_hadamard_explicit = params.cache_hadamard_explicit;
 
     const bool has_k_policy = params.cache_type_k_local != GGML_TYPE_COUNT || params.cache_type_k_global != GGML_TYPE_COUNT;

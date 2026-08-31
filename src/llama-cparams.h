@@ -54,6 +54,8 @@ struct llama_cparams {
     bool kv_unified;
     bool kv_hadamard_k;
     bool kv_hadamard_v;
+    bool kv_hadamard_k_swa;
+    bool kv_hadamard_v_swa;
     bool kv_hadamard_explicit;
     bool pipeline_parallel;
     enum llama_lora_qat_type lora_qat_type = LLAMA_LORA_QAT_TYPE_NONE;
