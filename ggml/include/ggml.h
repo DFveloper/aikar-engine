@@ -2508,6 +2508,14 @@ extern "C" {
             struct ggml_tensor  * forward,
             struct ggml_tensor  * grad);
 
+    enum ggml_flash_attn_back_grad {
+        GGML_FLASH_ATTN_BACK_GRAD_Q     = 1 << 0,
+        GGML_FLASH_ATTN_BACK_GRAD_K     = 1 << 1,
+        GGML_FLASH_ATTN_BACK_GRAD_V     = 1 << 2,
+        GGML_FLASH_ATTN_BACK_GRAD_SINKS = 1 << 3,
+        GGML_FLASH_ATTN_BACK_GRAD_VALID = 1 << 30,
+    };
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2813,6 +2821,14 @@ extern "C" {
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
 
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * targets,
+            struct ggml_tensor  * weights);
+
+    // Returns one unweighted negative log-likelihood value per logits row.
+    // The result is intended for no-gradient weighting decisions.
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse_per_row(
             struct ggml_context * ctx,
             struct ggml_tensor  * logits,
             struct ggml_tensor  * targets,

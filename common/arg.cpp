@@ -4681,6 +4681,57 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.lora_out = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
+        {"--mtp-mode"}, "MODE",
+        "MTP training mode: off, joint, or only (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "joint" && value != "only") {
+                throw std::invalid_argument("--mtp-mode must be off, joint, or only");
+            }
+            params.mtp_mode = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--mtp-model"}, "FNAME",
+        "Gemma MTP assistant GGUF used with the target --model",
+        [](common_params & params, const std::string & value) { params.mtp_model = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--mtp-lora-out"}, "FNAME",
+        string_format("MTP LoRA adapter GGUF path (default: %s)", params.mtp_lora_out.c_str()),
+        [](common_params & params, const std::string & value) { params.mtp_lora_out = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--mtp-lora-targets"}, "SUBSTRINGS",
+        string_format("comma-separated MTP LoRA targets (default: %s)", params.mtp_lora_targets.c_str()),
+        [](common_params & params, const std::string & value) { params.mtp_lora_targets = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--mtp-lora-rank"}, "N",
+        string_format("MTP LoRA rank (default: %d)", params.mtp_lora_rank),
+        [](common_params & params, int value) {
+            if (value <= 0) throw std::invalid_argument("--mtp-lora-rank must be positive");
+            params.mtp_lora_rank = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--mtp-lora-alpha"}, "F",
+        "MTP LoRA alpha (default: rank)",
+        [](common_params & params, const std::string & value) { params.mtp_lora_alpha = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--mtp-ubatch"}, "N",
+        string_format("MTP microbatch size (default: %d)", params.mtp_ubatch),
+        [](common_params & params, int value) {
+            if (value <= 0) throw std::invalid_argument("--mtp-ubatch must be positive");
+            params.mtp_ubatch = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--mtp-learning-rate"}, "ALPHA",
+        "MTP AdamW learning rate (0 uses --learning-rate)",
+        [](common_params & params, const std::string & value) { params.mtp_learning_rate = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--resume"}, "FNAME",
         "resume QLoRA training from a checkpoint GGUF created by --save-every",
         [](common_params & params, const std::string & value) { params.lora_resume = value; }
@@ -4716,6 +4767,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--grad-checkpoint"}, "N",
         "gradient checkpointing interval to reduce peak activation VRAM (0 = disabled, default: 0)",
         [](common_params & params, int value) { params.grad_checkpoint_interval = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--kv-cache-training"},
+        "train with the selected KV cache types and Hadamard policy instead of forcing F32 KV; use -ctk/-ctv or local/global cache options",
+        [](common_params & params) { params.kv_cache_training = true; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--lora-qat"}, "TYPE",

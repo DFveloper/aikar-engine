@@ -6459,6 +6459,30 @@ struct ggml_tensor * ggml_cross_entropy_loss_sparse(
     return result;
 }
 
+struct ggml_tensor * ggml_cross_entropy_loss_sparse_per_row(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * targets,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(targets->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(targets) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nrows(logits));
+
+    logits  = ggml_is_contiguous(logits)  ? logits  : ggml_cont(ctx, logits);
+    targets = ggml_is_contiguous(targets) ? targets : ggml_cont(ctx, targets);
+    weights = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx, weights);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nrows(logits));
+    result->op     = GGML_OP_CROSS_ENTROPY_LOSS;
+    result->src[0] = logits;
+    result->src[1] = targets;
+    result->src[2] = weights;
+    result->op_params[0] = 1;
+    return result;
+}
+
 struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * grad,
@@ -8009,6 +8033,12 @@ static void ggml_compute_backward(
 
             if (src0_needs_grads || src1_needs_grads || src2_needs_grads || src4_needs_grads) {
                 struct ggml_tensor * back = ggml_flash_attn_ext_back(ctx, tensor, grad);
+                ggml_set_op_params_i32(back, 5,
+                        GGML_FLASH_ATTN_BACK_GRAD_VALID |
+                        (src0_needs_grads ? GGML_FLASH_ATTN_BACK_GRAD_Q : 0) |
+                        (src1_needs_grads ? GGML_FLASH_ATTN_BACK_GRAD_K : 0) |
+                        (src2_needs_grads ? GGML_FLASH_ATTN_BACK_GRAD_V : 0) |
+                        (src4_needs_grads ? GGML_FLASH_ATTN_BACK_GRAD_SINKS : 0));
 
                 size_t offset = 0;
                 if (src0_needs_grads) {

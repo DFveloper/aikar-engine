@@ -9743,11 +9743,18 @@ void ggml_compute_forward_flash_attn_ext(
     }
 }
 
-static float ggml_flash_attn_back_load(const ggml_tensor * tensor, const char * ptr) {
+static float ggml_flash_attn_back_load(const ggml_tensor * tensor, const char * row, int64_t i) {
     switch (tensor->type) {
-        case GGML_TYPE_F32:  return *(const float *) ptr;
-        case GGML_TYPE_F16:  return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ptr);
-        case GGML_TYPE_BF16: return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) ptr);
+        case GGML_TYPE_F32:  return ((const float *) row)[i];
+        case GGML_TYPE_F16:  return GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i]);
+        case GGML_TYPE_BF16: return GGML_BF16_TO_FP32(((const ggml_bf16_t *) row)[i]);
+        case GGML_TYPE_Q4_0: {
+            const block_q4_0 & block = ((const block_q4_0 *) row)[i/QK4_0];
+            const int iq = i % QK4_0;
+            const uint8_t packed = block.qs[iq % (QK4_0/2)];
+            const int q = iq < QK4_0/2 ? packed & 0x0f : packed >> 4;
+            return GGML_CPU_FP16_TO_FP32(block.d)*(q - 8);
+        }
         default: GGML_ABORT("unsupported flash attention backward type: %s", ggml_type_name(tensor->type));
     }
 }
@@ -9763,8 +9770,8 @@ static void ggml_compute_forward_flash_attn_back_ext(
     const ggml_tensor * sinks = dst->src[5];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32 && d->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16);
-    GGML_ASSERT(v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_BF16);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_BF16 || v->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
     const int64_t DK  = q->ne[0];
@@ -9850,7 +9857,7 @@ static void ggml_compute_forward_flash_attn_back_ext(
                     const char * pk = (const char *) k->data + ik*k->nb[1] + ikh*k->nb[2] + ib*k->nb[3];
                     float dot = 0.0f;
                     for (int64_t id = 0; id < DK; ++id) {
-                        dot += pq[id]*ggml_flash_attn_back_load(k, pk + id*k->nb[0]);
+                        dot += pq[id]*ggml_flash_attn_back_load(k, pk, id);
                     }
                     float score = dot*scale;
                     if (logit_softcap != 0.0f) {
@@ -9876,7 +9883,7 @@ static void ggml_compute_forward_flash_attn_back_ext(
                     const char * pv = (const char *) v->data + ik*v->nb[1] + ikh*v->nb[2] + ib*v->nb[3];
                     float dp = 0.0f;
                     for (int64_t id = 0; id < DV; ++id) {
-                        dp += pd[id]*ggml_flash_attn_back_load(v, pv + id*v->nb[0]);
+                        dp += pd[id]*ggml_flash_attn_back_load(v, pv, id);
                         grad_v[id + ik*gv1 + ikh*gv2 + ib*gv3] += probs[ik]*pd[id];
                     }
                     logits[ik] = dp;
@@ -9898,7 +9905,7 @@ static void ggml_compute_forward_flash_attn_back_ext(
                     if (logit_softcap != 0.0f) {
                         float dot = 0.0f;
                         for (int64_t id = 0; id < DK; ++id) {
-                            dot += pq[id]*ggml_flash_attn_back_load(k, pk + id*k->nb[0]);
+                            dot += pq[id]*ggml_flash_attn_back_load(k, pk, id);
                         }
                         const float t = tanhf(dot*scale/logit_softcap);
                         derivative *= 1.0f - t*t;
@@ -9906,7 +9913,7 @@ static void ggml_compute_forward_flash_attn_back_ext(
                     const float ds = probs[ik]*(logits[ik] - mean)*derivative;
                     float * pgk = grad_k + ik*gk1 + ikh*gk2 + ib*gk3;
                     for (int64_t id = 0; id < DK; ++id) {
-                        const float kval = ggml_flash_attn_back_load(k, pk + id*k->nb[0]);
+                        const float kval = ggml_flash_attn_back_load(k, pk, id);
                         pgq[id] += ds*kval;
                         pgk[id] += ds*pq[id];
                     }
@@ -12068,6 +12075,49 @@ static void ggml_compute_forward_cross_entropy_loss_sparse_f32(
     }
 }
 
+static void ggml_compute_forward_cross_entropy_loss_sparse_per_row_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * logits  = dst->src[0];
+    const ggml_tensor * targets = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(targets->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(targets));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+
+    const int64_t nc = logits->ne[0];
+    const int64_t nr = ggml_nrows(logits);
+    const int ith = params->ith;
+    const int nth = params->nth;
+    float * st = (float *) params->wdata + ith*nc;
+
+    const int64_t dr = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+    const int32_t * target_data = (const int32_t *) targets->data;
+    const float * weight_data = (const float *) weights->data;
+    float * result = (float *) dst->data;
+
+    for (int64_t row = ir0; row < ir1; ++row) {
+        const int32_t target = target_data[row];
+        if (target < 0 || weight_data[row] == 0.0f) {
+            result[row] = 0.0f;
+            continue;
+        }
+        GGML_ASSERT(target < nc);
+
+        const float * row_logits = (const float *) logits->data + row*nc;
+        float max = -INFINITY;
+        ggml_vec_max_f32(nc, &max, row_logits);
+        const ggml_float sum_softmax = ggml_vec_log_soft_max_f32(nc, st, row_logits, max);
+        result[row] = sum_softmax - st[target];
+    }
+}
+
 void ggml_compute_forward_cross_entropy_loss(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -12076,6 +12126,10 @@ void ggml_compute_forward_cross_entropy_loss(
     const ggml_tensor * src1 = dst->src[1];
 
     if (src1->type == GGML_TYPE_I32) {
+        if (dst->op_params[0] != 0) {
+            ggml_compute_forward_cross_entropy_loss_sparse_per_row_f32(params, dst);
+            return;
+        }
         ggml_compute_forward_cross_entropy_loss_sparse_f32(params, dst);
         return;
     }

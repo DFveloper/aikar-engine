@@ -112,6 +112,7 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     const auto * model_other = llama_get_model(cparams.ctx_other);
 
     ggml_tensor * x = ggml_get_rows(ctx0, model_other->tok_embd, inp_tokens);
+    x = ggml_cpy_no_grad(ctx0, x, ggml_dup_tensor(ctx0, x));
     x = ggml_scale(ctx0, x, sqrtf((float) n_embd_backbone));
     cb(x, "inp_embd_target", -1);
 

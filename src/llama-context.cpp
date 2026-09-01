@@ -3520,8 +3520,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             break;
         }
     }
-    opt_params.sparse_labels = native_training_kernels_supported &&
-        lopt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
+    opt_params.sparse_labels = native_training_kernels_supported;
     opt_params.fused_backward = native_training_kernels_supported;
     cparams.lora_qat_type                = lopt_params.lora_qat_type;
     opt_ctx = ggml_opt_init(opt_params);
@@ -3582,9 +3581,15 @@ void llama_context::opt_epoch_iter(
         float                            reward_scale,
         ggml_opt_epoch_callback          callback,
         bool                             train,
+        bool                             train_mtp,
         int64_t                          idata_in_loop,
         int64_t                          ndata_in_loop,
-        int64_t                          t_loop_start) {
+        int64_t                          t_loop_start,
+        const llama_context             * source_ctx,
+        const struct ggml_tensor        * source_embd,
+        size_t                           source_embd_offset,
+        int32_t                          position_offset,
+        bool                             clear_memory) {
     GGML_ASSERT(opt_ctx);
     const uint32_t n_ctx    = (uint32_t)tokens.size();
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
@@ -3614,13 +3619,15 @@ void llama_context::opt_epoch_iter(
     std::vector<int32_t> sparse_targets_host(n_ubatch);
     std::vector<float> sparse_weights_host(n_ubatch);
 
-    memory->clear(true);
+    if (clear_memory) {
+        memory->clear(true);
+    }
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
             batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
-            batch.pos     [pos_batch]    = pos_ctx + pos_batch;
+            batch.pos     [pos_batch]    = position_offset + pos_ctx + pos_batch;
             batch.n_seq_id[pos_batch]    = 1;
             batch.seq_id  [pos_batch][0] = 0;
             batch.logits  [pos_batch]    = true;
@@ -3671,6 +3678,8 @@ void llama_context::opt_epoch_iter(
             res->reset();
 
             auto * gf = model.build_graph(gparams);
+
+            const bool target_backward = train && opt_params.train_target;
 
             // Allocate the tensor metadata context once, then reset it each iteration.
             // ggml_reset() is much cheaper than ggml_free()+ggml_init() — it just resets the
@@ -3777,10 +3786,33 @@ void llama_context::opt_epoch_iter(
                 res->get_inp_tokens(),
                 res->get_logits());
 
-            ggml_opt_alloc(opt_ctx, train);
+            // MTP-only training still needs this forward graph for h_nextn, but
+            // it must not try to build a target backward graph with no params.
+            ggml_opt_alloc(opt_ctx, target_backward);
 
             const int64_t t2_inputs = ggml_time_ms();
             res->set_inputs(&ubatch);
+            if (source_embd) {
+                struct ggml_tensor * inp_embd = res->get_inp_embd();
+                GGML_ASSERT(source_ctx && inp_embd);
+                GGML_ASSERT(source_embd->ne[0] == inp_embd->ne[0]);
+                GGML_ASSERT(source_embd_offset + ubatch.n_tokens <= source_embd->ne[1]);
+
+                struct ggml_tensor source_view = *source_embd;
+                source_view.ne[1] = ubatch.n_tokens;
+                source_view.data = (char *) source_embd->data + source_embd_offset*source_embd->nb[1];
+                GGML_ASSERT(source_view.type == inp_embd->type);
+                GGML_ASSERT(source_view.ne[0] == inp_embd->ne[0]);
+                GGML_ASSERT(source_view.nb[0] == inp_embd->nb[0]);
+                GGML_ASSERT(source_view.nb[1] == inp_embd->nb[1]);
+                source_view.nb[2] = inp_embd->nb[2];
+                source_view.nb[3] = inp_embd->nb[3];
+
+                ggml_backend_t backend_src = ggml_backend_sched_get_tensor_backend(source_ctx->sched.get(), (struct ggml_tensor *) source_embd);
+                ggml_backend_t backend_dst = ggml_backend_sched_get_tensor_backend(sched.get(), inp_embd);
+                GGML_ASSERT(backend_src && backend_dst);
+                ggml_backend_tensor_copy_async(backend_src, backend_dst, &source_view, inp_embd);
+            }
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 struct ggml_tensor * sparse_targets = ggml_opt_sparse_targets(opt_ctx);
@@ -3841,6 +3873,26 @@ void llama_context::opt_epoch_iter(
             const int64_t t3_eval = ggml_time_ms();
             ggml_opt_eval(opt_ctx, result);
 
+            if (train_mtp && opt_mtp_context) {
+                const struct ggml_tensor * h_nextn = res->get_h_nextn();
+                const uint32_t n_mtp_ubatch = opt_mtp_context->n_ubatch();
+                GGML_ASSERT(h_nextn && n_mtp_ubatch > 0 && ubatch.n_tokens % n_mtp_ubatch == 0);
+
+                GGML_ASSERT(model.tok_embd);
+                const int32_t target_tok_embd_flags = model.tok_embd->flags;
+                model.tok_embd->flags &= ~GGML_TENSOR_FLAG_PARAM;
+
+                for (uint32_t pos_mtp = 0; pos_mtp < ubatch.n_tokens; pos_mtp += n_mtp_ubatch) {
+                    const uint32_t ilabel = pos_ctx + pos_batch + pos_mtp;
+                    std::vector<llama_token> mtp_tokens(tokens.begin() + ilabel, tokens.begin() + ilabel + n_mtp_ubatch);
+                    std::vector<llama_token> mtp_labels(labels_sparse.begin() + ilabel, labels_sparse.begin() + ilabel + n_mtp_ubatch);
+                    opt_mtp_context->opt_epoch_mtp_batch(mtp_tokens, mtp_labels, this, h_nextn, pos_mtp,
+                            position_offset + ilabel, pos_mtp == 0);
+                }
+
+                model.tok_embd->flags = target_tok_embd_flags;
+            }
+
             if (critical_stats_due) {
                 ggml_backend_tensor_get(ggml_opt_critical_selected(opt_ctx), stats_selected.data(), 0, n_ubatch*sizeof(float));
                 ggml_backend_tensor_get(ggml_opt_critical_effective_weights(opt_ctx), stats_effective.data(), 0, n_ubatch*sizeof(float));
@@ -3896,6 +3948,24 @@ void llama_context::opt_epoch_iter(
                 stats_loss_units > 0 ? stats_weighted_loss / stats_loss_units : 0.0,
                 (double) opt_params.critical_confidence_threshold, (double) stats_warmup_scale);
     }
+}
+
+void llama_context::opt_epoch_mtp_batch(
+        const std::vector<llama_token> & tokens,
+        const std::vector<llama_token> & labels_sparse,
+        const llama_context             * source_ctx,
+        const struct ggml_tensor        * source_embd,
+        size_t                           source_embd_offset,
+        int32_t                          position_offset,
+        bool                             clear_memory) {
+    GGML_ASSERT(tokens.size() == labels_sparse.size());
+    GGML_ASSERT(tokens.size() == n_ubatch());
+
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    opt_epoch_iter(nullptr, nullptr, tokens, labels_sparse, nullptr, batch, 1.0f, nullptr,
+            true, false, 0, 0, 0, source_ctx, source_embd, source_embd_offset,
+            position_offset, clear_memory);
+    llama_batch_free(batch);
 }
 
 // Optional per-window reward weights for reward-weighted SFT.
@@ -3958,7 +4028,7 @@ void llama_context::opt_epoch(
             ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data(), n_ctx*sizeof(critical_metadata[0]), idata);
         }
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, critical_enabled ? &critical_metadata : nullptr, batch, reward,
-            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_train, train, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
     t_loop_start = ggml_time_us();
@@ -3972,7 +4042,7 @@ void llama_context::opt_epoch(
             ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data(), n_ctx*sizeof(critical_metadata[0]), idata);
         }
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, critical_enabled ? &critical_metadata : nullptr, batch, 1.0f,
-            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_eval, train, false, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
     llama_batch_free(batch);
@@ -4801,6 +4871,13 @@ void llama_context::opt_set_step(int64_t step) {
     ggml_opt_set_step(opt_ctx, step);
 }
 
+void llama_context::opt_set_mtp_context(llama_context * ctx_mtp) {
+    GGML_ASSERT(ctx_mtp);
+    GGML_ASSERT(ctx_mtp->opt_ctx);
+    GGML_ASSERT(ctx_mtp->get_cparams().ctx_other == this);
+    opt_mtp_context = ctx_mtp;
+}
+
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
 }
@@ -4849,6 +4926,10 @@ int64_t llama_opt_step(struct llama_context * ctx) {
 
 void llama_opt_set_step(struct llama_context * ctx, int64_t step) {
     ctx->opt_set_step(step);
+}
+
+void llama_opt_set_mtp_context(struct llama_context * ctx, struct llama_context * ctx_mtp) {
+    ctx->opt_set_mtp_context(ctx_mtp);
 }
 
 void llama_opt_dataset_shuffle(

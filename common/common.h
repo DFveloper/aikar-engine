@@ -638,6 +638,14 @@ struct common_params {
     int32_t lora_freeze_layers     = 0;     // do not apply LoRA to the first N transformer layers
     int32_t grad_checkpoint_interval = 0;  // gradient checkpointing interval to reduce peak VRAM (0 = disabled)
     int32_t optimizer_restart_every = 0;   // reset optimizer state every N epochs (0 = disabled)
+    std::string mtp_mode           = "off"; // off, joint, only
+    std::string mtp_model          = "";
+    std::string mtp_lora_out       = "mtp-adapter.gguf";
+    std::string mtp_lora_targets   = "nextn.pre_projection,nextn.post_projection,attn_q,attn_output,ffn_gate,ffn_up,ffn_down";
+    int32_t     mtp_lora_rank      = 16;
+    float       mtp_lora_alpha     = 0.0f;
+    int32_t     mtp_ubatch         = 64;
+    float       mtp_learning_rate  = 0.0f;
     std::string lora_qat             = "none"; // none, q3_k, q4_k, q4_0, mxfp4, q6_k, q8_0
     std::string lr_scheduler         = "constant"; // constant, cosine
     int32_t warmup_steps             = 0;   // linear learning-rate warmup in logical training steps
@@ -663,6 +671,7 @@ struct common_params {
     int32_t qat_max_sample_tokens = 0;
     bool        preserve_thinking = true;
     bool        qat_fast_state_scale = false;
+    bool        kv_cache_training = false; // retain selected KV cache quantization during training
 
     // grpo training
     bool    grpo_mode              = false; // enable GRPO IPC training loop

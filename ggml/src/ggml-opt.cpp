@@ -1766,7 +1766,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             break;
         }
         case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: {
-            if (opt_ctx->sparse_labels && !opt_ctx->critical_token_weighting) {
+            if (opt_ctx->sparse_labels) {
                 const int64_t nrows = ggml_nrows(opt_ctx->outputs);
                 opt_ctx->sparse_targets = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
                 opt_ctx->sparse_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
@@ -1774,12 +1774,94 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 ggml_set_input(opt_ctx->sparse_weights);
                 ggml_set_name(opt_ctx->sparse_targets, "sparse_targets");
                 ggml_set_name(opt_ctx->sparse_weights, "sparse_weights");
+                struct ggml_tensor * loss_weights = opt_ctx->sparse_weights;
+                if (opt_ctx->critical_token_weighting) {
+                    opt_ctx->critical_span_weights   = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+                    opt_ctx->critical_reward_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+                    opt_ctx->critical_warmup_scale   = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, 1);
+                    ggml_set_input(opt_ctx->critical_span_weights);
+                    ggml_set_input(opt_ctx->critical_reward_weights);
+                    ggml_set_input(opt_ctx->critical_warmup_scale);
+                    ggml_set_name(opt_ctx->critical_span_weights, "critical_span_weights");
+                    ggml_set_name(opt_ctx->critical_reward_weights, "critical_reward_weights");
+                    ggml_set_name(opt_ctx->critical_warmup_scale, "critical_warmup_scale");
+
+                    struct ggml_tensor * active = ggml_step(ctx_results, opt_ctx->sparse_weights);
+                    struct ggml_tensor * critical_weights = opt_ctx->critical_span_weights;
+                    if (opt_ctx->critical_confidence_weighting) {
+                        struct ggml_tensor * target_nll = ggml_cross_entropy_loss_sparse_per_row(
+                                ctx_results, opt_ctx->outputs, opt_ctx->sparse_targets, opt_ctx->sparse_weights);
+                        target_nll = ggml_cpy_no_grad(ctx_results, target_nll, ggml_dup_tensor(ctx_results, target_nll));
+                        struct ggml_tensor * target_probabilities = ggml_exp(ctx_results, ggml_scale(ctx_results, target_nll, -1.0f));
+                        struct ggml_tensor * selected = ggml_step(ctx_results,
+                                ggml_scale_bias(ctx_results, target_probabilities, -1.0f, opt_ctx->critical_confidence_threshold));
+                        selected = ggml_mul(ctx_results, selected, active);
+                        if (opt_ctx->critical_max_tokens >= 0 && opt_ctx->critical_max_tokens < nrows) {
+                            if (opt_ctx->critical_max_tokens == 0) {
+                                selected = ggml_scale(ctx_results, selected, 0.0f);
+                            } else {
+                                struct ggml_tensor * sort_values = ggml_add(ctx_results, target_probabilities,
+                                        ggml_scale_bias(ctx_results, active, -2.0f, 2.0f));
+                                struct ggml_tensor * indices = ggml_argsort(ctx_results, sort_values, GGML_SORT_ORDER_ASC);
+                                indices = ggml_view_1d(ctx_results, indices, opt_ctx->critical_max_tokens, 0);
+                                struct ggml_tensor * mask = ggml_reshape_2d(ctx_results, ggml_scale(ctx_results, active, 0.0f), 1, nrows);
+                                struct ggml_tensor * ones = ggml_view_1d(ctx_results, active, opt_ctx->critical_max_tokens, 0);
+                                ones = ggml_reshape_2d(ctx_results, ggml_scale_bias(ctx_results, ones, 0.0f, 1.0f), 1, opt_ctx->critical_max_tokens);
+                                mask = ggml_set_rows(ctx_results, mask, ones, indices);
+                                selected = ggml_mul(ctx_results, selected, ggml_reshape_1d(ctx_results, mask, nrows));
+                            }
+                        }
+                        opt_ctx->critical_selected = selected;
+
+                        struct ggml_tensor * confidence_weights;
+                        if (opt_ctx->critical_weight_linear) {
+                            struct ggml_tensor * interpolation = ggml_scale_bias(ctx_results, target_probabilities,
+                                    -1.0f / opt_ctx->critical_confidence_threshold, 1.0f);
+                            confidence_weights = ggml_scale_bias(ctx_results,
+                                    ggml_mul(ctx_results, interpolation, selected), opt_ctx->critical_token_weight - 1.0f, 1.0f);
+                            confidence_weights = ggml_clamp(ctx_results, confidence_weights, 1.0f, opt_ctx->critical_token_weight);
+                        } else {
+                            confidence_weights = ggml_scale_bias(ctx_results, selected, opt_ctx->critical_token_weight - 1.0f, 1.0f);
+                        }
+                        critical_weights = ggml_add(ctx_results, opt_ctx->critical_span_weights,
+                                ggml_relu(ctx_results, ggml_sub(ctx_results, confidence_weights, opt_ctx->critical_span_weights)));
+                    } else {
+                        opt_ctx->critical_selected = ggml_scale(ctx_results, active, 0.0f);
+                    }
+                    critical_weights = ggml_scale_bias(ctx_results,
+                            ggml_mul(ctx_results, ggml_scale_bias(ctx_results, critical_weights, 1.0f, -1.0f),
+                                ggml_repeat(ctx_results, opt_ctx->critical_warmup_scale, critical_weights)), 1.0f, 1.0f);
+                    struct ggml_tensor * effective_weights = ggml_mul(ctx_results, active,
+                            ggml_mul(ctx_results, opt_ctx->critical_reward_weights, critical_weights));
+                    opt_ctx->critical_effective_weights = effective_weights;
+                    struct ggml_tensor * weight_sum = ggml_clamp(ctx_results, ggml_sum(ctx_results, effective_weights), 1e-12f, FLT_MAX);
+                    loss_weights = ggml_scale(ctx_results,
+                            ggml_div(ctx_results, effective_weights, ggml_repeat(ctx_results, weight_sum, effective_weights)), (float) nrows);
+
+                    struct ggml_tensor * active_sum = ggml_clamp(ctx_results, ggml_sum(ctx_results, active), 1e-12f, FLT_MAX);
+                    struct ggml_tensor * unweighted_weights = ggml_scale(ctx_results,
+                            ggml_div(ctx_results, active, ggml_repeat(ctx_results, active_sum, active)), (float) nrows);
+                    opt_ctx->critical_unweighted_loss = ggml_cross_entropy_loss_sparse(
+                            ctx_results, opt_ctx->outputs, opt_ctx->sparse_targets, unweighted_weights);
+                    if (opt_ctx->opt_period > 1) {
+                        opt_ctx->critical_unweighted_loss = ggml_scale(ctx_results, opt_ctx->critical_unweighted_loss, 1.0f / opt_ctx->opt_period);
+                    }
+                    ggml_set_name(opt_ctx->critical_unweighted_loss, "critical_unweighted_loss_sparse");
+                }
                 opt_ctx->loss = ggml_cross_entropy_loss_sparse(
-                    ctx_results, opt_ctx->outputs, opt_ctx->sparse_targets, opt_ctx->sparse_weights);
-                ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse");
+                    ctx_results, opt_ctx->outputs, opt_ctx->sparse_targets, loss_weights);
+                ggml_set_name(opt_ctx->loss, opt_ctx->critical_token_weighting ? "loss_cross_entropy_sparse_critical" : "loss_cross_entropy_sparse");
                 if (opt_ctx->opt_period > 1) {
                     opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
-                    ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse_scaled");
+                    ggml_set_name(opt_ctx->loss, opt_ctx->critical_token_weighting ? "loss_cross_entropy_sparse_critical_scaled" : "loss_cross_entropy_sparse_scaled");
+                }
+                if (opt_ctx->critical_token_weighting) {
+                    ggml_set_output(opt_ctx->critical_selected);
+                    ggml_set_output(opt_ctx->critical_effective_weights);
+                    ggml_set_output(opt_ctx->critical_unweighted_loss);
+                    ggml_build_forward_expand(opt_ctx->gf, opt_ctx->critical_selected);
+                    ggml_build_forward_expand(opt_ctx->gf, opt_ctx->critical_effective_weights);
+                    ggml_build_forward_expand(opt_ctx->gf, opt_ctx->critical_unweighted_loss);
                 }
                 opt_ctx->loss_per_datapoint = true;
                 break;
@@ -1923,7 +2005,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD) {
             return;
         }
-    } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_FORWARD) {
+    } else if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         return;

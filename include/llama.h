@@ -1723,6 +1723,10 @@ extern "C" {
         const int64_t                      * critical_step;
         int32_t                              critical_stats_every;
 
+        // Run the target backward/optimizer graph. Disable for MTP-only training;
+        // the target forward graph still produces hidden states for the MTP model.
+        bool                                 train_target = true;
+
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1735,6 +1739,7 @@ extern "C" {
     LLAMA_API struct ggml_tensor * llama_opt_qat_state_gradient_accumulator(struct llama_context * lctx, int64_t index);
     LLAMA_API int64_t llama_opt_step(struct llama_context * lctx);
     LLAMA_API void llama_opt_set_step(struct llama_context * lctx, int64_t step);
+    LLAMA_API void llama_opt_set_mtp_context(struct llama_context * lctx, struct llama_context * lctx_mtp);
 
     // Shuffle the first idata dataset entries with the optimizer RNG, or all entries if idata is negative.
     LLAMA_API void llama_opt_dataset_shuffle(

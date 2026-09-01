@@ -41,6 +41,36 @@ Without microbatching, raw persistent state is 17.25 bits per weight for MXFP4 a
 
 The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). Only freshly-allocated F32 LoRA A/B tensors are trained. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
 
+## Gemma MTP assistant training
+
+`llama-finetune-qlora` and `llama-finetune-qlion` can train a Gemma 4 MTP assistant GGUF alongside the target `--model`. The target forward pass exposes its `h_nextn` tensor directly to the assistant context on the selected backend; no hidden-state copy is staged through CPU memory. Use `joint` to train the target and assistant together, or `only` to leave the target frozen and train only the assistant LoRA.
+
+```bash
+./build/bin/llama-finetune-qlion \
+  --model base-Q4_0.gguf --quant-type q4_0 --optimizer qlion \
+  --mtp-mode joint --mtp-model base-MTP-BF16.gguf \
+  --mtp-lora-out mtp-adapter.gguf --mtp-lora-rank 16 --mtp-ubatch 64 \
+  --train-file train.jsonl -c 512 -b 512 -ub 512
+```
+
+`--mtp-ubatch` must divide the target `-ub`. The assistant is saved as a separate LoRA GGUF because its weights belong to the MTP GGUF, not the target model. MTP training is unavailable with GRPO.
+
+## KV quantization targets during training
+
+Training defaults to F32 K/V cache for maximum compatibility. Pass `--kv-cache-training` to retain the same K/V cache target options accepted by `llama-server`, including `q4_0` with normalized Hadamard transforms and `turbo3_0`/`turbo4_0`:
+
+```bash
+  --kv-cache-training --flash-attn on \
+  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --k-cache-hadamard --v-cache-hadamard
+
+  # or TurboQuant (do not add Hadamard flags)
+  --kv-cache-training --flash-attn on \
+  --cache-type-k turbo3_0 --cache-type-v turbo4_0
+```
+
+Quantized V training uses the CUDA FlashAttention backward path; K/V are dequantized in-kernel and are not staged through CPU memory. TurboQuant already includes its transform, so the context validation rejects it together with either Hadamard flag.
+
 **Status:** Working. Phase 1 (QLoRA SFT) and Phase 2 (Reward-Weighted SFT) are implemented and functional. Training speed is currently limited by full backprop through quantized weights — see [Known Limitations](#known-limitations).
 
 ---
@@ -473,7 +503,7 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 - `params.use_mmap = false` — forced; mmap'd tensors can't have data written back
 - `params.flash_attn_type = DISABLED` — no backward impl for flash attention
 - `params.warmup = false` — warmup runs inference with PARAM tensors → segfault
-- `params.cache_type_k = F32` — training requires F32 KV (or BF16 with `--cache-type-k bf16`)
+- KV is F32 by default; `--kv-cache-training` preserves the selected server-compatible K/V quantization and Hadamard policy
 - LoRA A/B tensors are marked `PARAM` via `ggml_set_param` on the tensors loaded by `llama_adapter_lora_init`, not on the pre-init scratch tensors in `lt.buf`
 - The adapter GGUF is pre-saved and loaded via `params.lora_adapters` BEFORE `common_init_from_params` so that `sched_reserve` includes LoRA graph nodes in its sizing
 

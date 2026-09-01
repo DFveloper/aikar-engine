@@ -207,6 +207,7 @@ struct llama_context {
     struct ggml_tensor * opt_qat_state_gradient_accumulator(int64_t index) const;
     int64_t opt_step() const;
     void opt_set_step(int64_t step);
+    void opt_set_mtp_context(llama_context * ctx_mtp);
     void opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
@@ -230,9 +231,24 @@ struct llama_context {
             float                            reward_scale,
             ggml_opt_epoch_callback          callback,
             bool                             train,
+            bool                             train_mtp,
             int64_t                          idata_in_loop,
             int64_t                          ndata_in_loop,
-            int64_t                          t_loop_start);
+            int64_t                          t_loop_start,
+            const llama_context             * source_ctx = nullptr,
+            const struct ggml_tensor        * source_embd = nullptr,
+            size_t                           source_embd_offset = 0,
+            int32_t                          position_offset = 0,
+            bool                             clear_memory = true);
+
+    void opt_epoch_mtp_batch(
+            const std::vector<llama_token> & tokens,
+            const std::vector<llama_token> & labels_sparse,
+            const llama_context             * source_ctx,
+            const struct ggml_tensor        * source_embd,
+            size_t                           source_embd_offset,
+            int32_t                          position_offset,
+            bool                             clear_memory);
 
 private:
     //
@@ -379,6 +395,7 @@ private:
     // Saved init arguments used to recreate opt_ctx on optimizer reset.
     struct llama_model * opt_model = nullptr;
     struct llama_opt_params opt_params {};
+    llama_context * opt_mtp_context = nullptr;
 
     //
     // Dynamic training still rebuilds tensor metadata,

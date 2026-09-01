@@ -10453,6 +10453,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_grad(true, 2.0f, 1.5f));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, false, false));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_Q4_0, false, true));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.

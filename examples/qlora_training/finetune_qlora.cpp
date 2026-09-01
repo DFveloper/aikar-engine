@@ -43,6 +43,7 @@
 #include "jsonl.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "gguf.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -73,6 +74,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <set>
 #include <sstream>
@@ -104,6 +106,114 @@ static std::vector<std::string> split_csv(const std::string & s) {
         if (!tok.empty()) out.push_back(tok);
     }
     return out;
+}
+
+static std::string format_duration_seconds(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0) {
+        return "unknown";
+    }
+    const int64_t total = (int64_t) std::llround(seconds);
+    const int64_t hours = total / 3600;
+    const int64_t mins = (total % 3600) / 60;
+    const int64_t secs = total % 60;
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%02ld:%02ld:%02ld", (long) hours, (long) mins, (long) secs);
+    return buffer;
+}
+
+static std::string format_progress_bar(size_t completed, size_t total, size_t width = 30) {
+    const size_t filled = total > 0 ? std::min(width, completed * width / total) : width;
+    return std::string(filled, '=') + (filled < width ? ">" : "") +
+           std::string(width - filled - (filled < width ? 1 : 0), '.');
+}
+
+class loop_eta_progress {
+public:
+    loop_eta_progress(const char * phase, size_t total) : phase(phase), total(total),
+            started(std::chrono::steady_clock::now()), next_report(started + std::chrono::seconds(5)) {
+        LOG_INF("data_progress: phase=%s started total=%zu\n", phase, total);
+    }
+
+    void update(size_t completed, bool force = false) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now < next_report) {
+            return;
+        }
+        next_report = now + std::chrono::seconds(5);
+        const double elapsed = std::chrono::duration<double>(now - started).count();
+        const double rate = elapsed > 0.0 ? completed / elapsed : 0.0;
+        const double eta = rate > 0.0 ? (total - std::min(completed, total)) / rate : INFINITY;
+        LOG_INF("data_progress: phase=%s [%s] %zu/%zu (%.1f%%) rate=%.1f/s elapsed=%s eta=%s\n",
+                phase, format_progress_bar(completed, total).c_str(), completed, total,
+                total > 0 ? 100.0 * completed / total : 100.0, rate,
+                format_duration_seconds(elapsed).c_str(), format_duration_seconds(eta).c_str());
+    }
+
+    void finish() {
+        update(total, true);
+    }
+
+private:
+    const char * phase;
+    size_t total;
+    std::chrono::steady_clock::time_point started;
+    std::chrono::steady_clock::time_point next_report;
+};
+
+static void parallel_for_with_eta(
+        common_jsonl_worker_pool                         & pool,
+        size_t                                             n_tasks,
+        size_t                                             n_workers,
+        const char                                       * phase,
+        const std::function<void(size_t, size_t)>         & fn) {
+    std::atomic<size_t> completed { 0 };
+    std::mutex progress_mutex;
+    std::condition_variable progress_cv;
+    bool finished = false;
+    const auto started = std::chrono::steady_clock::now();
+
+    LOG_INF("load_jsonl: phase=%s started total=%zu workers=%zu\n", phase, n_tasks, n_workers);
+
+    std::thread reporter([&] {
+        std::unique_lock<std::mutex> lock(progress_mutex);
+        while (!progress_cv.wait_for(lock, std::chrono::seconds(5), [&] { return finished; })) {
+            const size_t done = completed.load(std::memory_order_relaxed);
+            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            const double rate = elapsed > 0.0 ? done / elapsed : 0.0;
+            const double eta = rate > 0.0 ? (n_tasks - done) / rate : INFINITY;
+            LOG_INF("load_jsonl: phase=%s [%s] %zu/%zu (%.1f%%) rate=%.1f/s elapsed=%s eta=%s workers=%zu\n",
+                    phase, format_progress_bar(done, n_tasks).c_str(), done, n_tasks,
+                    n_tasks > 0 ? 100.0 * done / n_tasks : 100.0, rate,
+                    format_duration_seconds(elapsed).c_str(), format_duration_seconds(eta).c_str(), n_workers);
+        }
+    });
+
+    try {
+        pool.parallel_for(n_tasks, [&](size_t i, size_t worker_index) {
+            fn(i, worker_index);
+            completed.fetch_add(1, std::memory_order_relaxed);
+        });
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            finished = true;
+        }
+        progress_cv.notify_one();
+        reporter.join();
+        throw;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        finished = true;
+    }
+    progress_cv.notify_one();
+    reporter.join();
+
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    LOG_INF("load_jsonl: phase=%s [%s] complete=%zu/%zu elapsed=%s average_rate=%.1f/s workers=%zu\n",
+            phase, format_progress_bar(n_tasks, n_tasks).c_str(), completed.load(std::memory_order_relaxed), n_tasks,
+            format_duration_seconds(elapsed).c_str(), elapsed > 0.0 ? n_tasks / elapsed : 0.0, n_workers);
 }
 
 static int64_t train_split_from_val_fraction(int64_t ndata, float val_split) {
@@ -258,39 +368,6 @@ struct tokenization_request {
     size_t reasoning_bytes = 0;
 };
 
-struct jsonl_load_result {
-    tokenization_request request;
-    training_sample      sample;
-    bool                 parsed = false;
-    bool                 valid = false;
-};
-
-struct jsonl_line_state {
-    nlohmann::json data;
-    std::vector<const nlohmann::json *> message_data;
-    std::vector<common_chat_msg> messages;
-    std::vector<common_chat_msg> prompt_messages;
-    std::vector<std::string> chatml_messages;
-    std::vector<llama_token> prompt_tokens;
-    std::vector<llama_token> response_tokens;
-    std::string last_assistant_content;
-    std::string last_assistant_reasoning;
-
-    std::string prompt_text;
-    std::string full_text;
-    std::string response_text;
-
-    bool enable_thinking = false;
-    size_t last_assistant_index = std::numeric_limits<size_t>::max();
-    float reward = 1.0f;
-    int lineno = 0;
-    bool json_valid = false;
-    bool is_chat = false;
-    bool parallel_messages = false;
-    bool prepared = false;
-    std::atomic<bool> failed { false };
-};
-
 static bool critical_mode_uses_spans(const std::string & mode) {
     return mode == "spans" || mode == "hybrid";
 }
@@ -402,13 +479,51 @@ static void replace_chat_message_content_with_marker(
     }
 }
 
+static size_t chat_message_size_estimate(const common_chat_msg & message) {
+    size_t size = message.role.size() + message.content.size() + message.reasoning_content.size() + 64;
+    for (const common_chat_msg_content_part & part : message.content_parts) {
+        size += part.text.size() + 32;
+    }
+    return size;
+}
+
+static size_t supervised_context_begin(
+        const std::vector<common_chat_msg> & conversation,
+        size_t                                target_index,
+        size_t                                max_context_tokens) {
+    if (max_context_tokens == 0) {
+        return 0;
+    }
+
+    // Bound both bytes and message count. Some templates scan preceding messages
+    // inside their message loop, so hundreds of tiny turns otherwise become
+    // quadratic even though only a short suffix can survive token truncation.
+    const size_t max_context_bytes = std::max<size_t>(16 * 1024, max_context_tokens * 32);
+    const size_t max_context_messages = std::clamp<size_t>(max_context_tokens / 64, 4, 16);
+    size_t begin = target_index;
+    size_t context_bytes = 0;
+    size_t context_messages = 0;
+    while (begin > 0 && context_bytes < max_context_bytes && context_messages < max_context_messages) {
+        --begin;
+        context_bytes += chat_message_size_estimate(conversation[begin]);
+        ++context_messages;
+    }
+
+    while (begin > 0 && conversation[begin].role != "user" && conversation[begin].role != "system") {
+        --begin;
+    }
+    return begin;
+}
+
 static bool format_supervised_chat_turn(
         common_chat_templates              * tmpls,
         const std::vector<common_chat_msg> & conversation,
         size_t                                target_index,
         int                                   preserve_thinking,
+        size_t                                max_context_tokens,
         tokenization_request                & result,
-        std::string                         & error) {
+        std::string                         & error,
+        size_t                              * messages_skipped = nullptr) {
 
     if (target_index >= conversation.size()) {
         error = "target assistant index is out of range";
@@ -426,8 +541,13 @@ static bool format_supervised_chat_turn(
     // Everything after the current assistant target is excluded.
     // ---------------------------------------------------------
 
+    const size_t context_begin = supervised_context_begin(conversation, target_index, max_context_tokens);
+    if (messages_skipped) {
+        *messages_skipped = context_begin;
+    }
+
     std::vector<common_chat_msg> prompt_messages(
-        conversation.begin(),
+        conversation.begin() + context_begin,
         conversation.begin() + target_index);
 
     const common_chat_msg & target =
@@ -480,13 +600,16 @@ static bool format_supervised_chat_turn(
     // 1. Render prompt exclusively through chat_template.jinja.
     // ============================================================
 
-    result.prompt =
-        apply_qlora_chat_template(
-            tmpls,
-            prompt_messages,
-            /*add_generation_prompt=*/true,
-            enable_thinking,
-            preserve_thinking);
+    const bool has_prompt_messages = !prompt_messages.empty();
+    if (has_prompt_messages) {
+        result.prompt =
+            apply_qlora_chat_template(
+                tmpls,
+                prompt_messages,
+                /*add_generation_prompt=*/true,
+                enable_thinking,
+                preserve_thinking);
+    }
 
     // ============================================================
     // 2. Render the real completed target.
@@ -509,7 +632,7 @@ static bool format_supervised_chat_turn(
     // 3. Easy case: generation prompt is an exact prefix.
     // ============================================================
 
-    if (full_text.rfind(result.prompt, 0) == 0) {
+    if (has_prompt_messages && full_text.rfind(result.prompt, 0) == 0) {
         result.response =
             full_text.substr(
                 result.prompt.size());
@@ -606,12 +729,10 @@ static bool format_supervised_chat_turn(
 
     if (result.has_reasoning &&
         reasoning_marker_pos == std::string::npos) {
-
-        error =
-            "chat_template.jinja did not render "
-            "the assistant reasoning slot";
-
-        return false;
+        // The template may intentionally omit reasoning for this message type.
+        // Keep the final answer trainable instead of dropping the whole target.
+        result.has_reasoning = false;
+        result.reasoning_bytes = 0;
     }
 
     // ============================================================
@@ -661,20 +782,19 @@ static bool format_supervised_chat_turn(
     return true;
 }
 
-struct jsonl_message_task {
-    size_t line_index;
-    size_t first_message;
-    size_t message_count;
-};
-
 struct jsonl_render_task {
     size_t line_index;
-    bool render_prompt;
+    size_t target_index;
+    size_t target_ordinal;
+    bool final_target;
 };
 
-struct jsonl_token_task {
-    size_t line_index;
-    int part;
+struct jsonl_chat_line {
+    std::vector<common_chat_msg> messages;
+    std::vector<size_t> assistant_indices;
+    nlohmann::json critical_record;
+    float reward = 1.0f;
+    int lineno = 0;
 };
 
 static std::vector<training_sample> load_jsonl(
@@ -684,11 +804,13 @@ static std::vector<training_sample> load_jsonl(
         int32_t                   n_threads,
         const std::string       & critical_mode,
         float                     critical_default_weight,
-        int                       preserve_thinking) {
+        int                       preserve_thinking,
+        size_t                    max_sample_tokens = 0) {
 
     struct pending_sample {
         tokenization_request request;
         int                  lineno = 0;
+        bool                 valid = false;
     };
 
     struct tokenized_sample {
@@ -713,319 +835,172 @@ static std::vector<training_sample> load_jsonl(
 
         return {};
     }
+    const size_t n_input_lines = lines.size();
+
+    std::vector<std::vector<pending_sample>> pending_by_line(lines.size());
+    std::vector<std::unique_ptr<jsonl_chat_line>> chat_lines(lines.size());
+    std::atomic<size_t> n_chat_conversations { 0 };
+    std::atomic<size_t> n_nonchat_samples { 0 };
+    std::atomic<size_t> n_expanded_assistant_targets { 0 };
+    const size_t n_parse_workers = common_jsonl_worker_count(n_threads, lines.size());
+    std::vector<size_t> line_order(lines.size());
+    std::iota(line_order.begin(), line_order.end(), 0);
+    std::stable_sort(line_order.begin(), line_order.end(), [&](size_t a, size_t b) {
+        return lines[a].text.size() > lines[b].text.size();
+    });
+
+    {
+        common_jsonl_worker_pool pool(n_parse_workers);
+        parallel_for_with_eta(pool, lines.size(), n_parse_workers, "parse", [&](size_t task_index, size_t) {
+            const size_t line_index = line_order[task_index];
+            const common_jsonl_line & input = lines[line_index];
+            nlohmann::json data;
+            try {
+                data = nlohmann::json::parse(input.text);
+            } catch (const std::exception & e) {
+                LOG_WRN("%s: skipping invalid JSON on line %ld: %s\n", __func__, (long) input.number, e.what());
+                return;
+            }
+
+            float reward = 1.0f;
+            try {
+                if (data.contains("reward")) reward = data.at("reward").get<float>();
+                else if (data.contains("score")) reward = data.at("score").get<float>();
+            } catch (const std::exception & e) {
+                LOG_WRN("%s: invalid reward on line %ld: %s\n", __func__, (long) input.number, e.what());
+                return;
+            }
+
+            if (data.contains("messages")) {
+                ++n_chat_conversations;
+                auto parsed = std::make_unique<jsonl_chat_line>();
+                parsed->reward = reward;
+                parsed->lineno = (int) input.number;
+                try {
+                    const nlohmann::json & raw_messages = data.at("messages");
+                    if (!raw_messages.is_array()) {
+                        LOG_WRN("%s: messages is not an array on line %ld\n", __func__, (long) input.number);
+                        return;
+                    }
+                    parsed->messages.reserve(raw_messages.size());
+                    for (const nlohmann::json & raw : raw_messages) {
+                        parsed->messages.push_back(common_jsonl_parse_chat_message(raw, COMMON_JSONL_CHAT_PARSE_STRICT_REASONING));
+                    }
+                } catch (const std::exception & e) {
+                    LOG_WRN("%s: invalid chat messages on line %ld: %s\n", __func__, (long) input.number, e.what());
+                    return;
+                }
+                for (size_t i = 0; i < parsed->messages.size(); ++i) {
+                    if (parsed->messages[i].role == "assistant") parsed->assistant_indices.push_back(i);
+                }
+                if (parsed->assistant_indices.empty()) return;
+                if (critical_mode_uses_spans(critical_mode) && data.contains("critical_spans")) {
+                    parsed->critical_record["critical_spans"] = data["critical_spans"];
+                }
+                pending_by_line[line_index].resize(parsed->assistant_indices.size());
+                chat_lines[line_index] = std::move(parsed);
+                return;
+            }
+
+            tokenization_request request;
+            try {
+                if (data.contains("prompt") && data.contains("response")) {
+                    request.prompt = data.at("prompt").get<std::string>();
+                    request.response = data.at("response").get<std::string>();
+                } else if (data.contains("text")) {
+                    request.response = data.at("text").get<std::string>();
+                } else {
+                    LOG_WRN("%s: unknown format on line %ld, skipping\n", __func__, (long) input.number);
+                    return;
+                }
+                request.annotated_response = request.response;
+                request.reward = reward;
+                request.conversation_id = (int64_t) input.number;
+                request.target_assistant_ordinal = 0;
+                if (critical_mode_uses_spans(critical_mode)) {
+                    std::string span_error;
+                    if (!critical_token_parse_spans(data, request.annotated_response, critical_default_weight, request.critical_spans, span_error)) {
+                        LOG_WRN("%s: invalid critical_spans on line %ld: %s\n", __func__, (long) input.number, span_error.c_str());
+                        return;
+                    }
+                }
+            } catch (const std::exception & e) {
+                LOG_WRN("%s: invalid non-chat sample on line %ld: %s\n", __func__, (long) input.number, e.what());
+                return;
+            }
+            pending_by_line[line_index].push_back({ std::move(request), (int) input.number, true });
+            ++n_nonchat_samples;
+        });
+    }
+
+    std::vector<jsonl_render_task> render_tasks;
+    for (size_t line_index = 0; line_index < chat_lines.size(); ++line_index) {
+        if (!chat_lines[line_index]) continue;
+        const jsonl_chat_line & parsed = *chat_lines[line_index];
+        for (size_t ordinal = 0; ordinal < parsed.assistant_indices.size(); ++ordinal) {
+            render_tasks.push_back({ line_index, parsed.assistant_indices[ordinal], ordinal,
+                ordinal + 1 == parsed.assistant_indices.size() });
+        }
+    }
+    std::stable_sort(render_tasks.begin(), render_tasks.end(), [](const jsonl_render_task & a, const jsonl_render_task & b) {
+        return a.target_index > b.target_index;
+    });
+
+    lines.clear();
+    lines.shrink_to_fit();
+
+    std::atomic<size_t> n_cropped_targets { 0 };
+    std::atomic<size_t> n_skipped_messages { 0 };
+    const size_t n_render_workers = common_jsonl_worker_count(n_threads, render_tasks.size());
+    {
+        common_jsonl_worker_pool pool(n_render_workers);
+        parallel_for_with_eta(pool, render_tasks.size(), n_render_workers, "render-targets", [&](size_t task_index, size_t) {
+            const jsonl_render_task & task = render_tasks[task_index];
+            const jsonl_chat_line & parsed = *chat_lines[task.line_index];
+            tokenization_request request;
+            request.reward = parsed.reward;
+            request.conversation_id = parsed.lineno;
+            request.target_assistant_ordinal = (int32_t) task.target_ordinal;
+            std::string format_error;
+            size_t messages_skipped = 0;
+            try {
+                if (!format_supervised_chat_turn(tmpls, parsed.messages, task.target_index, preserve_thinking,
+                        max_sample_tokens, request, format_error, &messages_skipped)) {
+                    LOG_WRN("%s: formatting failed on line %d assistant=%zu: %s\n",
+                            __func__, parsed.lineno, task.target_ordinal, format_error.c_str());
+                    return;
+                }
+            } catch (const std::exception & e) {
+                LOG_WRN("%s: template exception on line %d assistant=%zu: %s\n",
+                        __func__, parsed.lineno, task.target_ordinal, e.what());
+                return;
+            }
+            if (task.final_target && critical_mode_uses_spans(critical_mode)) {
+                std::string span_error;
+                if (!critical_token_parse_spans(parsed.critical_record, request.annotated_response,
+                        critical_default_weight, request.critical_spans, span_error)) {
+                    LOG_WRN("%s: invalid critical_spans on line %d: %s\n", __func__, parsed.lineno, span_error.c_str());
+                    return;
+                }
+            }
+            if (messages_skipped > 0) {
+                ++n_cropped_targets;
+                n_skipped_messages.fetch_add(messages_skipped);
+            }
+            pending_by_line[task.line_index][task.target_ordinal] = { std::move(request), parsed.lineno, true };
+            ++n_expanded_assistant_targets;
+        });
+    }
 
     std::vector<pending_sample> pending;
-
-    size_t n_chat_conversations = 0;
-    size_t n_nonchat_samples = 0;
-
-    size_t n_expanded_assistant_targets = 0;
-
-    // =========================================================
-    // Phase 1:
-    // Parse each JSONL conversation and EXPAND assistant turns.
-    // =========================================================
-
-    for (size_t line_index = 0;
-         line_index < lines.size();
-         ++line_index) {
-
-        const common_jsonl_line & input =
-            lines[line_index];
-
-        nlohmann::json data;
-
-        try {
-            data =
-                nlohmann::json::parse(
-                    input.text);
-        } catch (const std::exception & e) {
-            LOG_WRN(
-                "%s: skipping invalid JSON "
-                "on line %ld: %s\n",
-                __func__,
-                (long) input.number,
-                e.what());
-
-            continue;
+    pending.reserve(n_expanded_assistant_targets.load() + n_nonchat_samples.load());
+    for (std::vector<pending_sample> & line_pending : pending_by_line) {
+        for (pending_sample & sample : line_pending) {
+            if (sample.valid) pending.push_back(std::move(sample));
         }
-
-        float reward = 1.0f;
-
-        try {
-            if (data.contains("reward")) {
-                reward =
-                    data.at("reward").get<float>();
-            } else if (data.contains("score")) {
-                reward =
-                    data.at("score").get<float>();
-            }
-        } catch (const std::exception & e) {
-            LOG_WRN(
-                "%s: invalid reward on line %ld: %s\n",
-                __func__,
-                (long) input.number,
-                e.what());
-
-            continue;
-        }
-
-        // -----------------------------------------------------
-        // CHAT FORMAT
-        // -----------------------------------------------------
-
-        if (data.contains("messages")) {
-            ++n_chat_conversations;
-
-            std::vector<common_chat_msg> messages;
-
-            try {
-                const nlohmann::json & raw_messages =
-                    data.at("messages");
-
-                if (!raw_messages.is_array()) {
-                    LOG_WRN(
-                        "%s: messages is not an array on line %ld\n",
-                        __func__,
-                        (long) input.number);
-                    continue;
-                }
-
-                messages.reserve(raw_messages.size());
-
-                for (const nlohmann::json & raw :
-                        raw_messages) {
-
-                    messages.push_back(
-                        common_jsonl_parse_chat_message(
-                            raw,
-                            COMMON_JSONL_CHAT_PARSE_STRICT_REASONING));
-                }
-
-            } catch (const std::exception & e) {
-                LOG_WRN(
-                    "%s: invalid chat messages on line %ld: %s\n",
-                    __func__,
-                    (long) input.number,
-                    e.what());
-
-                continue;
-            }
-
-            std::vector<size_t> assistant_indices;
-
-            for (size_t mi = 0;
-                mi < messages.size();
-                ++mi) {
-
-                if (messages[mi].role == "assistant") {
-                    assistant_indices.push_back(mi);
-                }
-            }
-
-            if (assistant_indices.empty()) {
-                continue;
-            }
-
-            const size_t final_assistant_index =
-                assistant_indices.back();
-
-            // =========================================================
-            // IMPORTANT: this loop must remain open until pending.push_back
-            // =========================================================
-
-            for (size_t ordinal = 0;
-                ordinal < assistant_indices.size();
-                ++ordinal) {
-
-                const size_t target_index =
-                    assistant_indices[ordinal];
-
-                tokenization_request request;
-
-                request.reward =
-                    reward;
-
-                request.conversation_id =
-                    (int64_t) input.number;
-
-                request.target_assistant_ordinal =
-                    (int32_t) ordinal;
-
-                std::string format_error;
-
-                if (!format_supervised_chat_turn(
-                        tmpls,
-                        messages,
-                        target_index,
-                        preserve_thinking,
-                        request,
-                        format_error)) {
-
-                    LOG_WRN(
-                        "%s: formatting failed on line %ld "
-                        "assistant=%zu: %s\n",
-                        __func__,
-                        (long) input.number,
-                        ordinal,
-                        format_error.c_str());
-
-                    continue;
-                }
-
-                if (critical_mode_uses_spans(
-                        critical_mode) &&
-                    target_index ==
-                        final_assistant_index) {
-
-                    std::string span_error;
-
-                    if (!critical_token_parse_spans(
-                            data,
-                            request.annotated_response,
-                            critical_default_weight,
-                            request.critical_spans,
-                            span_error)) {
-
-                        LOG_WRN(
-                            "%s: invalid critical_spans "
-                            "on line %ld: %s\n",
-                            __func__,
-                            (long) input.number,
-                            span_error.c_str());
-
-                        continue;
-                    }
-                }
-
-                ++n_expanded_assistant_targets;
-
-                pending.push_back({
-                    std::move(request),
-                    (int) input.number
-                });
-
-            } // ← assistant target loop closes HERE
-
-            continue;
-
-        } // ← messages branch closes HERE
-
-        // -----------------------------------------------------
-        // LEGACY prompt/response
-        // -----------------------------------------------------
-
-        if (data.contains("prompt") &&
-            data.contains("response")) {
-
-            try {
-                tokenization_request request;
-
-                request.prompt =
-                    data.at("prompt").get<std::string>();
-
-                request.response =
-                    data.at("response").get<std::string>();
-
-                request.annotated_response =
-                    request.response;
-
-                request.reward =
-                    reward;
-
-                request.conversation_id =
-                    (int64_t) input.number;
-
-                request.target_assistant_ordinal = 0;
-
-                if (critical_mode_uses_spans(
-                        critical_mode)) {
-
-                    std::string span_error;
-
-                    if (!critical_token_parse_spans(
-                            data,
-                            request.annotated_response,
-                            critical_default_weight,
-                            request.critical_spans,
-                            span_error)) {
-
-                        LOG_WRN(
-                            "%s: invalid critical_spans "
-                            "on line %ld: %s\n",
-                            __func__,
-                            (long) input.number,
-                            span_error.c_str());
-
-                        continue;
-                    }
-                }
-
-                pending.push_back({
-                    std::move(request),
-                    (int) input.number
-                });
-
-                ++n_nonchat_samples;
-
-            } catch (const std::exception & e) {
-                LOG_WRN(
-                    "%s: invalid prompt/response "
-                    "on line %ld: %s\n",
-                    __func__,
-                    (long) input.number,
-                    e.what());
-            }
-
-            continue;
-        }
-
-        // -----------------------------------------------------
-        // Plain text
-        // -----------------------------------------------------
-
-        if (data.contains("text")) {
-            try {
-                tokenization_request request;
-
-                request.response =
-                    data.at("text").get<std::string>();
-
-                request.annotated_response =
-                    request.response;
-
-                request.reward =
-                    reward;
-
-                request.conversation_id =
-                    (int64_t) input.number;
-
-                request.target_assistant_ordinal = 0;
-
-                pending.push_back({
-                    std::move(request),
-                    (int) input.number
-                });
-
-                ++n_nonchat_samples;
-
-            } catch (const std::exception & e) {
-                LOG_WRN(
-                    "%s: invalid text sample "
-                    "on line %ld: %s\n",
-                    __func__,
-                    (long) input.number,
-                    e.what());
-            }
-
-            continue;
-        }
-
-        LOG_WRN(
-            "%s: unknown format on line %ld, skipping\n",
-            __func__,
-            (long) input.number);
     }
+    LOG_INF("%s: context crop: targets=%zu skipped_messages=%zu max_sample_tokens=%zu\n",
+            __func__, n_cropped_targets.load(), n_skipped_messages.load(), max_sample_tokens);
 
     if (pending.empty()) {
         LOG_ERR(
@@ -1053,8 +1028,11 @@ static std::vector<training_sample> load_jsonl(
         common_jsonl_worker_pool pool(
             n_workers);
 
-        pool.parallel_for(
+        parallel_for_with_eta(
+            pool,
             pending.size(),
+            n_workers,
+            "tokenize",
             [&](size_t i, size_t) {
 
                 const tokenization_request & request =
@@ -1103,9 +1081,13 @@ static std::vector<training_sample> load_jsonl(
 
     size_t n_valid_reasoning_targets = 0;
 
+    loop_eta_progress construct_progress("construct-samples", pending.size());
+
     for (size_t i = 0;
          i < pending.size();
          ++i) {
+
+        construct_progress.update(i);
 
         if (!tokenized[i].valid) {
             continue;
@@ -1257,6 +1239,8 @@ static std::vector<training_sample> load_jsonl(
             std::move(sample));
     }
 
+    construct_progress.finish();
+
     LOG_INF(
         "%s: loaded %zu training samples from %zu JSONL lines "
         "(chat_conversations=%zu "
@@ -1267,10 +1251,10 @@ static std::vector<training_sample> load_jsonl(
         "tokenizer_workers=%zu)\n",
         __func__,
         samples.size(),
-        lines.size(),
-        n_chat_conversations,
-        n_expanded_assistant_targets,
-        n_nonchat_samples,
+        n_input_lines,
+        n_chat_conversations.load(),
+        n_expanded_assistant_targets.load(),
+        n_nonchat_samples.load(),
         n_valid_reasoning_targets,
         preserve_thinking < 0 ? "template-default" : preserve_thinking ? "yes" : "no",
         n_workers);
@@ -1299,9 +1283,14 @@ static packed_dataset_partition pack_dataset_partition(
 
     packed_dataset_partition out;
 
+    const char * progress_phase = sample_begin == 0 ? "pack-train" : "pack-validation";
+    loop_eta_progress pack_progress(progress_phase, sample_end - sample_begin);
+
     for (size_t si = sample_begin;
          si < sample_end;
          ++si) {
+
+        pack_progress.update(si - sample_begin);
 
         const training_sample & s = samples[si];
 
@@ -1358,6 +1347,8 @@ static packed_dataset_partition pack_dataset_partition(
             }
         }
     }
+
+    pack_progress.finish();
 
     if (out.tokens.empty()) {
         return out;
@@ -1565,11 +1556,16 @@ static ggml_opt_dataset_t build_dataset(
 
     auto write_partition =
         [&](const packed_dataset_partition & part,
-            int64_t                         window_base) {
+            int64_t                         window_base,
+            const char                    * phase) {
+
+        loop_eta_progress write_progress(phase, part.window_offsets.size());
 
         for (size_t wi = 0;
              wi < part.window_offsets.size();
              ++wi) {
+
+            write_progress.update(wi);
 
             const int64_t dst_window =
                 window_base + (int64_t) wi;
@@ -1669,6 +1665,8 @@ static ggml_opt_dataset_t build_dataset(
                 reward_sum /
                 (float) reward_count;
         }
+
+        write_progress.finish();
     };
 
     // ------------------------------------------------------------
@@ -1682,11 +1680,13 @@ static ggml_opt_dataset_t build_dataset(
 
     write_partition(
         train,
-        0);
+        0,
+        "write-train-windows");
 
     write_partition(
         val,
-        idata_split_out);
+        idata_split_out,
+        "write-validation-windows");
 
     // ------------------------------------------------------------
     // 7. Diagnostics
@@ -2066,6 +2066,12 @@ static bool lora_param_filter(const struct ggml_tensor * t, void * /*ud*/) {
     return false;
 }
 
+static bool lora_param_filter_none(const struct ggml_tensor * t, void * userdata) {
+    GGML_UNUSED(t);
+    GGML_UNUSED(userdata);
+    return false;
+}
+
 static enum llama_lora_qat_type lora_qat_type_from_string(const std::string & type) {
     if (type == "q3_k") return LLAMA_LORA_QAT_TYPE_Q3_K;
     if (type == "q4_k") return LLAMA_LORA_QAT_TYPE_Q4_K;
@@ -2228,7 +2234,7 @@ static bool load_checkpoint_state(
     return true;
 }
 
-static void save_adapter(
+static bool save_adapter(
         const lora_tensors & lt,
         const std::string  & out_path,
         const std::string  & arch,
@@ -2270,7 +2276,7 @@ static void save_adapter(
     if (!fout.is_open()) {
         LOG_ERR("%s: cannot open %s for writing\n", __func__, real_path.c_str());
         gguf_free(gctx);
-        return;
+        return false;
     }
 
     // Write meta placeholder
@@ -2303,7 +2309,13 @@ static void save_adapter(
     fout.close();
     gguf_free(gctx);
 
+    if (!fout) {
+        LOG_ERR("%s: failed while writing %s\n", __func__, real_path.c_str());
+        return false;
+    }
+
     LOG_INF("%s: adapter saved to %s\n", __func__, real_path.c_str());
+    return true;
 }
 
 struct adapter_stats {
@@ -2348,11 +2360,19 @@ static adapter_stats adapter_get_stats(const lora_tensors & lt) {
 // ---------------------------------------------------------------------------
 
 struct save_ctx {
+    llama_context      * target_ctx;
     const lora_tensors * lt;
     const std::string  * lora_out;
     const std::string  * arch;
     const std::string  * base_model_path;
     float                lora_alpha;
+    bool                 save_target;
+    llama_context      * mtp_ctx;
+    const lora_tensors * mtp_lt;
+    const std::string  * mtp_lora_out;
+    const std::string  * mtp_arch;
+    const std::string  * mtp_model_path;
+    float                mtp_alpha;
     int32_t              save_every;     // 0 = disabled
     int32_t              ubatch_per_ctx;
     int64_t              window_offset;  // completed windows before this epoch call
@@ -2427,10 +2447,6 @@ static void save_every_callback(
     if (!train || !g_save_ctx || g_save_ctx->save_every <= 0) return;
     const int64_t window = g_save_ctx->window_offset + ibatch / g_save_ctx->ubatch_per_ctx;
     if (window > 0 && window != g_save_ctx->last_saved && window % g_save_ctx->save_every == 0) {
-        g_save_ctx->last_saved = window;
-        const std::string ckpt = *g_save_ctx->lora_out
-            + ".epoch" + std::to_string(g_save_ctx->epoch)
-            + ".ckpt" + std::to_string(window) + ".gguf";
         checkpoint_state state;
         state.mode            = "sft";
         state.epoch           = g_save_ctx->epoch;
@@ -2439,10 +2455,39 @@ static void save_every_callback(
         state.context_length  = g_save_ctx->context_length;
         state.shuffle         = g_save_ctx->shuffle;
         state.schedule_step   = g_save_ctx->schedule->step;
-        save_adapter(*g_save_ctx->lt, ckpt, *g_save_ctx->arch, g_save_ctx->lora_alpha,
-                     *g_save_ctx->base_model_path, &state);
+
+        bool saved = true;
+        if (g_save_ctx->save_target) {
+            const std::string ckpt = *g_save_ctx->lora_out
+                + ".epoch" + std::to_string(g_save_ctx->epoch)
+                + ".ckpt" + std::to_string(window) + ".gguf";
+            llama_synchronize(g_save_ctx->target_ctx);
+            saved = save_adapter(*g_save_ctx->lt, ckpt, *g_save_ctx->arch, g_save_ctx->lora_alpha,
+                                 *g_save_ctx->base_model_path, &state) && saved;
+            if (saved) {
+                LOG_INF("save_every_callback: target checkpoint saved -> %s (window %ld)\n",
+                        ckpt.c_str(), (long) window);
+            }
+        }
+        if (g_save_ctx->mtp_ctx) {
+            const std::string ckpt = *g_save_ctx->mtp_lora_out
+                + ".epoch" + std::to_string(g_save_ctx->epoch)
+                + ".ckpt" + std::to_string(window) + ".gguf";
+            llama_synchronize(g_save_ctx->mtp_ctx);
+            const bool mtp_saved = save_adapter(*g_save_ctx->mtp_lt, ckpt, *g_save_ctx->mtp_arch,
+                g_save_ctx->mtp_alpha, *g_save_ctx->mtp_model_path, &state);
+            saved = mtp_saved && saved;
+            if (mtp_saved) {
+                LOG_INF("save_every_callback: MTP checkpoint saved -> %s (window %ld)\n",
+                        ckpt.c_str(), (long) window);
+            }
+        }
         fprintf(stderr, "\n");
-        LOG_INF("save_every_callback: checkpoint saved -> %s (window %ld)\n", ckpt.c_str(), (long)window);
+        if (saved) {
+            g_save_ctx->last_saved = window;
+        } else {
+            LOG_ERR("save_every_callback: checkpoint set failed at window %ld\n", (long) window);
+        }
     }
 }
 
@@ -2883,6 +2928,147 @@ static int run_grpo_mode(
 }
 
 // ---------------------------------------------------------------------------
+struct mtp_training_state {
+    llama_model_ptr model;
+    llama_context_ptr ctx;
+    llama_adapter_lora_ptr adapter;
+    lora_tensors tensors;
+    lr_opt lr;
+    qlora_lr_schedule schedule {};
+    int64_t * schedule_step = nullptr;
+    std::string arch;
+    float alpha = 0.0f;
+};
+
+static ggml_opt_optimizer_params mtp_opt_lr_pars(void * userdata) {
+    mtp_training_state & state = *(mtp_training_state *) userdata;
+    state.schedule.step = *state.schedule_step;
+    return qlora_opt_lr_pars(&state.schedule);
+}
+
+static bool mtp_read_arch(const std::string & path, std::string & arch) {
+    struct ggml_context * ctx_meta = nullptr;
+    struct gguf_init_params params = { true, &ctx_meta };
+    struct gguf_context * ctx_gguf = gguf_init_from_file(path.c_str(), params);
+    if (!ctx_gguf) {
+        LOG_ERR("%s: failed to open MTP model GGUF %s\n", __func__, path.c_str());
+        return false;
+    }
+    const int kid = gguf_find_key(ctx_gguf, "general.architecture");
+    if (kid >= 0) {
+        arch = gguf_get_val_str(ctx_gguf, kid);
+    }
+    gguf_free(ctx_gguf);
+    ggml_free(ctx_meta);
+    return !arch.empty();
+}
+
+static bool mtp_init_training(
+        common_params       & params,
+        llama_context       * ctx_target,
+        qlora_lr_schedule   & target_schedule,
+        mtp_training_state  & state) {
+    if (params.mtp_mode == "off") {
+        return true;
+    }
+    if (params.mtp_model.empty()) {
+        LOG_ERR("%s: --mtp-model is required when --mtp-mode is not off\n", __func__);
+        return false;
+    }
+    const uint32_t target_ubatch = llama_n_ubatch(ctx_target);
+    if (params.mtp_ubatch > (int32_t) target_ubatch || target_ubatch % params.mtp_ubatch != 0) {
+        LOG_ERR("%s: --mtp-ubatch must divide the target microbatch (%u)\n", __func__, target_ubatch);
+        return false;
+    }
+    if (!mtp_read_arch(params.mtp_model, state.arch)) {
+        return false;
+    }
+
+    state.alpha = params.mtp_lora_alpha > 0.0f ? params.mtp_lora_alpha : (float) params.mtp_lora_rank;
+    std::mt19937 rng(43);
+    state.tensors = alloc_lora_tensors(params.mtp_model, split_csv(params.mtp_lora_targets), params.mtp_lora_rank, rng, 0);
+    if (state.tensors.ab.empty()) {
+        return false;
+    }
+
+    const std::string init_path = params.mtp_lora_out + ".init.gguf";
+    if (!save_adapter(state.tensors, init_path, state.arch, state.alpha, params.mtp_model)) {
+        return false;
+    }
+
+    auto mparams = common_model_params_to_llama(params);
+    state.model.reset(llama_model_load_from_file(params.mtp_model.c_str(), mparams));
+    if (!state.model) {
+        LOG_ERR("%s: failed to load MTP model %s\n", __func__, params.mtp_model.c_str());
+        return false;
+    }
+    state.adapter.reset(llama_adapter_lora_init(state.model.get(), init_path.c_str()));
+    std::remove(expand_tilde(init_path).c_str());
+    if (!state.adapter) {
+        LOG_ERR("%s: failed to load MTP LoRA adapter\n", __func__);
+        return false;
+    }
+
+    auto cparams = common_context_params_to_llama(params);
+    cparams.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    cparams.ctx_other = ctx_target;
+    cparams.n_ctx     = llama_n_ctx(ctx_target);
+    cparams.n_batch   = llama_n_batch(ctx_target);
+    cparams.n_ubatch  = params.mtp_ubatch;
+    state.ctx.reset(llama_init_from_model(state.model.get(), cparams));
+    if (!state.ctx) {
+        LOG_ERR("%s: failed to create MTP training context\n", __func__);
+        return false;
+    }
+
+    llama_adapter_lora * adapter = state.adapter.get();
+    float scale = 1.0f;
+    llama_set_adapters_lora(state.ctx.get(), &adapter, 1, &scale);
+    state.tensors.ab.clear();
+    for (auto & item : state.adapter->ab_map) {
+        ggml_set_param(item.second.a);
+        ggml_set_param(item.second.b);
+        state.tensors.ab[item.first] = { item.second.a, item.second.b };
+    }
+
+    state.lr = params.lr;
+    if (params.mtp_learning_rate > 0.0f) {
+        state.lr.lr0 = params.mtp_learning_rate;
+        if (params.lr_scheduler == "cosine" && state.lr.lr_min > state.lr.lr0) {
+            state.lr.lr_min = 0.0f;
+        }
+    }
+    state.schedule = { &state.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio,
+        target_schedule.total_steps, target_schedule.step };
+    state.schedule_step = &target_schedule.step;
+
+    struct llama_opt_params opt_params {
+        /*.n_ctx_train              =*/ llama_n_ctx(ctx_target),
+        /*.param_filter             =*/ lora_param_filter,
+        /*.param_filter_ud          =*/ nullptr,
+        /*.get_opt_pars             =*/ mtp_opt_lr_pars,
+        /*.get_opt_pars_ud          =*/ &state,
+        /*.optimizer_type           =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*.lora_qat_type            =*/ LLAMA_LORA_QAT_TYPE_NONE,
+        /*.grad_checkpoint_interval =*/ 0,
+        /*.critical_token_mode      =*/ LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE,
+        /*.critical_token_weight    =*/ 1.0f,
+        /*.critical_confidence_threshold =*/ 0.25f,
+        /*.critical_weight_shape    =*/ LLAMA_OPT_CRITICAL_WEIGHT_SHAPE_CONSTANT,
+        /*.critical_warmup_steps    =*/ 0,
+        /*.critical_max_fraction    =*/ 1.0f,
+        /*.critical_step            =*/ &target_schedule.step,
+        /*.critical_stats_every     =*/ 0,
+        /*.train_target             =*/ true,
+    };
+    llama_opt_init(state.ctx.get(), state.model.get(), opt_params);
+    llama_opt_set_mtp_context(ctx_target, state.ctx.get());
+    LOG_INF("%s: enabled MTP LoRA mode=%s rank=%d alpha=%.1f ubatch=%d lr=%.6g\n",
+            __func__, params.mtp_mode.c_str(), params.mtp_lora_rank, state.alpha,
+            params.mtp_ubatch, (double) state.lr.lr0);
+    return true;
+}
+
 #ifndef LLAMA_FINETUNE_QLORA_SHARED_ONLY
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -2900,6 +3086,10 @@ int main(int argc, char ** argv) {
 
     if (!params.grpo_mode && params.train_file.empty()) {
         LOG_ERR("%s: --train-file is required (or use --grpo-mode for IPC training)\n", __func__);
+        return 1;
+    }
+    if (params.mtp_mode != "off" && params.grpo_mode) {
+        LOG_ERR("%s: MTP training is not available with --grpo-mode\n", __func__);
         return 1;
     }
 
@@ -2924,13 +3114,19 @@ int main(int argc, char ** argv) {
 
     // Force settings required for training
     params.load_mode    = LLAMA_LOAD_MODE_NONE;
-    params.cache_type_k = GGML_TYPE_F32;
-    params.cache_type_v = GGML_TYPE_F32;
+    if (!params.kv_cache_training) {
+        params.cache_type_k = GGML_TYPE_F32;
+        params.cache_type_v = GGML_TYPE_F32;
+    } else {
+        LOG_INF("%s: KV cache training target: K=%s V=%s hadamard_k=%d hadamard_v=%d\n",
+                __func__, ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
+                params.cache_hadamard_k, params.cache_hadamard_v);
+    }
     // Warmup runs inference with PARAM-flagged tensors which causes a segfault;
     // training never benefits from warmup, so disable it unconditionally.
     params.warmup       = false;
-    // Flash attention has no backward implementation; force standard attention for training.
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // Keep the requested FlashAttention policy. CUDA backward supports the quantized
+    // KV formats used by --kv-cache-training, and quantized V requires FA.
 
     float lora_alpha = (params.lora_alpha > 0.0f)
         ? params.lora_alpha : (float) params.lora_rank;
@@ -3016,8 +3212,13 @@ int main(int argc, char ** argv) {
             return 1;
         }
         for (auto & kv : loaded->ab_map) {
-            ggml_set_param(kv.second.a);  // lora_a → trainable
-            ggml_set_param(kv.second.b);  // lora_b → trainable
+            if (params.mtp_mode == "only") {
+                kv.second.a->flags &= ~GGML_TENSOR_FLAG_PARAM;
+                kv.second.b->flags &= ~GGML_TENSOR_FLAG_PARAM;
+            } else {
+                ggml_set_param(kv.second.a);
+                ggml_set_param(kv.second.b);
+            }
         }
         // Point lt.ab at the live device tensors so save_adapter writes
         // the trained weights (not the original init tensors).
@@ -3074,7 +3275,7 @@ int main(int argc, char ** argv) {
     // Initialize optimizer - our custom param filter restricts training to lora_a/b.
     struct llama_opt_params lopt_params {
         /*.n_ctx_train              =*/0,
-        /*.param_filter             =*/lora_param_filter,
+        /*.param_filter             =*/params.mtp_mode == "only" ? lora_param_filter_none : lora_param_filter,
         /*.param_filter_ud          =*/nullptr,
         /*.get_opt_pars             =*/qlora_opt_lr_pars,
         /*.get_opt_pars_ud          =*/&schedule,
@@ -3089,6 +3290,7 @@ int main(int argc, char ** argv) {
         /*.critical_max_fraction    =*/params.critical_max_fraction,
         /*.critical_step            =*/&schedule.step,
         /*.critical_stats_every     =*/params.critical_stats_every,
+        /*.train_target             =*/params.mtp_mode != "only",
     };
     llama_opt_init(ctx, model, lopt_params);
 
@@ -3205,6 +3407,11 @@ int main(int argc, char ** argv) {
     }
     schedule.step = schedule_step;
 
+    mtp_training_state mtp;
+    if (!mtp_init_training(params, ctx, schedule, mtp)) {
+        return 1;
+    }
+
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
 
@@ -3212,7 +3419,11 @@ int main(int argc, char ** argv) {
     const int32_t ubatch_per_ctx = (n_ubatch > 0) ? (n_ctx / n_ubatch) : 1;
 
     save_ctx sctx {
-        &lt, &params.lora_out, &arch, &params.model.path, lora_alpha,
+        ctx, &lt, &params.lora_out, &arch, &params.model.path, lora_alpha,
+        params.mtp_mode != "only",
+        mtp.ctx.get(), mtp.ctx ? &mtp.tensors : nullptr,
+        &params.mtp_lora_out, mtp.ctx ? &mtp.arch : nullptr, &params.mtp_model,
+        mtp.alpha,
         params.save_every, ubatch_per_ctx, 0, 0, 0, idata_split, n_ctx,
         params.shuffle_dataset, params.verbose_loss, &schedule
     };
@@ -3247,8 +3458,10 @@ int main(int argc, char ** argv) {
             (long) schedule.total_steps,
             (long) schedule.step, (double) params.lr.lr0, (double) std::max(0.0f, params.lr.lr_min));
     if (params.save_every > 0) {
-        LOG_INF("%s: will save checkpoint every %d windows → %s.ckptN.gguf\n",
-                __func__, params.save_every, params.lora_out.c_str());
+        LOG_INF("%s: will save checkpoint every %d windows: target=%s MTP=%s\n",
+                __func__, params.save_every,
+                params.mtp_mode != "only" ? params.lora_out.c_str() : "disabled",
+                mtp.ctx ? params.mtp_lora_out.c_str() : "disabled");
     }
 
     ggml_opt_epoch_callback cb_train = save_every_callback;
@@ -3306,14 +3519,24 @@ int main(int argc, char ** argv) {
     llama_opt_set_reward_weights(nullptr, 0);
 
     // Save final trained adapter
-    save_adapter(lt, params.lora_out, arch, lora_alpha, params.model.path);
+    bool final_save_ok = true;
+    if (params.mtp_mode != "only") {
+        final_save_ok = save_adapter(lt, params.lora_out, arch, lora_alpha, params.model.path);
+    }
+    if (mtp.ctx) {
+        llama_synchronize(mtp.ctx.get());
+        final_save_ok = save_adapter(mtp.tensors, params.mtp_lora_out, mtp.arch, mtp.alpha,
+            params.mtp_model) && final_save_ok;
+    }
 
     // Free scratch buffers only when we allocated them (not in resume path)
     if (lt.buf) ggml_backend_buffer_free(lt.buf);
     if (lt.ctx) ggml_free(lt.ctx);
+    if (mtp.tensors.buf) ggml_backend_buffer_free(mtp.tensors.buf);
+    if (mtp.tensors.ctx) ggml_free(mtp.tensors.ctx);
     ggml_opt_dataset_free(dataset);
     llama_backend_free();
 
-    return 0;
+    return final_save_ok ? 0 : 1;
 }
 #endif

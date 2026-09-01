@@ -153,6 +153,37 @@ static __global__ void cross_entropy_loss_sparse_f32(
     }
 }
 
+static __global__ void cross_entropy_loss_sparse_per_row_f32(
+        const float * __restrict__ logits,
+        const int32_t * __restrict__ targets,
+        const float * __restrict__ weights,
+        float * __restrict__ dst,
+        const int nclasses) {
+    logits += int64_t(blockIdx.x)*nclasses;
+    const int32_t target = targets[blockIdx.x];
+    if (target < 0 || weights[blockIdx.x] == 0.0f) {
+        if (threadIdx.x == 0) {
+            dst[blockIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    float max_logit = -INFINITY;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        max_logit = fmaxf(max_logit, logits[i]);
+    }
+    max_logit = warp_reduce_max(max_logit);
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        sum += expf(logits[i] - max_logit);
+    }
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        dst[blockIdx.x] = logf(sum) + max_logit - logits[target];
+    }
+}
+
 static __global__ void cross_entropy_loss_sparse_back_f32(
         const float * __restrict__ grad,
         const float * __restrict__ logits,
@@ -225,6 +256,13 @@ void ggml_cuda_cross_entropy_loss(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (src1->type == GGML_TYPE_I32) {
         const ggml_tensor * weights = dst->src[2];
         GGML_ASSERT(weights->type == GGML_TYPE_F32);
+        if (dst->op_params[0] != 0) {
+            cross_entropy_loss_sparse_per_row_f32<<<blocks_num, blocks_dim, 0, stream>>>(
+                src0_d, (const int32_t *) src1->data, (const float *) weights->data,
+                dst_d, ne00);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         cross_entropy_loss_sparse_f32<<<blocks_num, blocks_dim, 0, stream>>>(
             src0_d, (const int32_t *) src1->data, (const float *) weights->data,
             dst_tmp.ptr, ne00, nrows);

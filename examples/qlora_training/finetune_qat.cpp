@@ -480,7 +480,9 @@ static bool qat_save_checkpoint(
 
 struct qat_callback_context {
     struct llama_context * lctx;
+    struct llama_context * mtp_lctx;
     struct llama_model * model;
+    mtp_training_state * mtp;
     qlora_lr_schedule * schedule;
     const common_params * params;
     int64_t epoch;
@@ -504,7 +506,9 @@ static void qat_epoch_callback(
     if (!train || !g_qat_callback) {
         return;
     }
-    const int64_t step = llama_opt_step(g_qat_callback->lctx);
+    struct llama_context * step_lctx =
+        g_qat_callback->params->mtp_mode == "only" ? g_qat_callback->mtp_lctx : g_qat_callback->lctx;
+    const int64_t step = llama_opt_step(step_lctx);
     if (step <= g_qat_callback->last_observed_step) {
         return;
     }
@@ -514,17 +518,45 @@ static void qat_epoch_callback(
         double loss = 0.0;
         ggml_opt_result_loss(result, &loss, nullptr);
         LOG_INF("qat_loss: epoch=%ld window=%ld step=%ld loss=%.8f lr=%.9g\n",
-            (long) g_qat_callback->epoch, (long) ibatch, (long) llama_opt_step(g_qat_callback->lctx),
+            (long) g_qat_callback->epoch, (long) ibatch, (long) step,
             loss, (double) g_qat_callback->schedule->current_lr);
     }
     const bool window_complete = ibatch > 0 && ibatch % g_qat_callback->ubatches_per_window == 0;
     if (g_qat_callback->params->save_every > 0 && window_complete &&
         step - g_qat_callback->last_saved_step >= g_qat_callback->params->save_every) {
-        g_qat_callback->last_saved_step = step;
-        const std::string path = g_qat_callback->params->qat_out + ".step" + std::to_string(step) + ".gguf";
-        qat_save_checkpoint(g_qat_callback->lctx, g_qat_callback->model, g_qat_callback->params->model.path, path,
-            g_qat_callback->epoch, g_qat_callback->window_start + ibatch / g_qat_callback->ubatches_per_window,
-            g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type);
+        const int64_t window = g_qat_callback->window_start + ibatch / g_qat_callback->ubatches_per_window;
+        bool saved = true;
+        if (g_qat_callback->params->mtp_mode != "only") {
+            const std::string path = g_qat_callback->params->qat_out + ".step" + std::to_string(step) + ".gguf";
+            saved = qat_save_checkpoint(g_qat_callback->lctx, g_qat_callback->model,
+                g_qat_callback->params->model.path, path, g_qat_callback->epoch, window,
+                g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type);
+        }
+        if (g_qat_callback->mtp_lctx) {
+            checkpoint_state state;
+            state.mode            = "sft";
+            state.epoch           = g_qat_callback->epoch + 1;
+            state.window          = window;
+            state.step            = step;
+            state.dataset_windows = g_qat_callback->schedule->total_steps /
+                std::max<unsigned>(1u, g_qat_callback->params->lr.epochs);
+            state.context_length  = llama_n_ctx(g_qat_callback->lctx);
+            state.shuffle         = g_qat_callback->params->shuffle_dataset;
+            state.schedule_step   = g_qat_callback->schedule->step;
+            const std::string path = g_qat_callback->params->mtp_lora_out
+                + ".step" + std::to_string(step) + ".gguf";
+            llama_synchronize(g_qat_callback->mtp_lctx);
+            saved = save_adapter(g_qat_callback->mtp->tensors, path, g_qat_callback->mtp->arch,
+                g_qat_callback->mtp->alpha, g_qat_callback->params->mtp_model, &state) && saved;
+        }
+        if (saved) {
+            g_qat_callback->last_saved_step = step;
+            LOG_INF("%s: checkpoint set saved at step %ld window %ld\n",
+                __func__, (long) step, (long) window);
+        } else {
+            LOG_ERR("%s: checkpoint set failed at step %ld window %ld\n",
+                __func__, (long) step, (long) window);
+        }
     }
 }
 
@@ -584,10 +616,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
     params.load_mode = LLAMA_LOAD_MODE_NONE;
-    params.cache_type_k = GGML_TYPE_F32;
-    params.cache_type_v = GGML_TYPE_F32;
+    if (!params.kv_cache_training) {
+        params.cache_type_k = GGML_TYPE_F32;
+        params.cache_type_v = GGML_TYPE_F32;
+    } else {
+        LOG_INF("%s: KV cache training target: K=%s V=%s hadamard_k=%d hadamard_v=%d\n",
+                __func__, ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
+                params.cache_hadamard_k, params.cache_hadamard_v);
+    }
     params.warmup = false;
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // Keep the requested FlashAttention policy; quantized V cache training requires it.
     params.no_extra_bufts = true;
     if (!params.qat_resume.empty()) {
         params.model.path = params.qat_resume;
@@ -621,14 +659,17 @@ int main(int argc, char ** argv) {
     }
     LOG_INF("%s: dataset chat template=%s\n", __func__, params.chat_template.empty() ? "model metadata" : "command-line override");
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_ctx = llama_n_ctx(lctx);
+    const size_t render_max_tokens = params.qat_max_sample_tokens > 0
+        ? std::min((size_t) params.qat_max_sample_tokens, (size_t) n_ctx + 1)
+        : (size_t) n_ctx + 1;
     std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
         params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
-        params.preserve_thinking ? 1 : 0);
+        params.preserve_thinking ? 1 : 0, render_max_tokens);
     if (samples.empty()) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;
     }
-    const int32_t n_ctx = llama_n_ctx(lctx);
     truncate_samples_to_context(samples, n_ctx, params.qat_max_sample_tokens);
     int64_t train_conversations = 0;
     int64_t val_conversations = 0;
@@ -737,15 +778,16 @@ int main(int argc, char ** argv) {
         params.qat_fast_state_scale
     };
     struct llama_opt_params opt_params {
-        0, qat_param_filter, &weight_type, qat_opt_lr_pars, &qat_lr_ctx,
+        0, params.mtp_mode == "only" ? lora_param_filter_none : qat_param_filter, &weight_type, qat_opt_lr_pars, &qat_lr_ctx,
         GGML_OPT_OPTIMIZER_TYPE_QLION_QAT, LLAMA_LORA_QAT_TYPE_NONE,
         params.grad_checkpoint_interval, critical_token_mode_from_string(params.critical_token_mode),
         params.critical_token_weight, params.critical_confidence_threshold,
         critical_weight_shape_from_string(params.critical_weight_shape), params.critical_warmup_steps,
         params.critical_max_fraction, &schedule.step, params.critical_stats_every,
+        params.mtp_mode != "only",
     };
     llama_opt_init(lctx, model, opt_params);
-    if (llama_opt_qat_state_count(lctx) == 0) {
+    if (params.mtp_mode != "only" && llama_opt_qat_state_count(lctx) == 0) {
         LOG_ERR("%s: the training graph contains no trainable %s tensors\n", __func__, ggml_type_name(weight_type));
         return 1;
     }
@@ -770,12 +812,18 @@ int main(int argc, char ** argv) {
     }
     schedule.total_steps = idata_split * params.lr.epochs;
     schedule.step = resume.schedule_step;
+    mtp_training_state mtp;
+    if (!mtp_init_training(params, lctx, schedule, mtp)) {
+        return 1;
+    }
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval = ggml_opt_result_init();
     const int64_t ubatches_per_window = llama_n_ctx(lctx) / llama_n_ubatch(lctx);
     GGML_ASSERT(ubatches_per_window > 0);
     struct qat_callback_context callback_ctx {
-        lctx, model, &schedule, &params, 0, 0, ubatches_per_window, llama_opt_step(lctx), llama_opt_step(lctx)
+        lctx, mtp.ctx.get(), model, &mtp, &schedule, &params, 0, 0, ubatches_per_window,
+        llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx),
+        llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx)
     };
     g_qat_callback = &callback_ctx;
     if (params.shuffle_dataset) {
@@ -798,19 +846,32 @@ int main(int argc, char ** argv) {
         double train_loss = 0.0;
         double train_unc = 0.0;
         ggml_opt_result_loss(result_train, &train_loss, &train_unc);
+        const int64_t optimizer_step = llama_opt_step(
+            params.mtp_mode == "only" ? mtp.ctx.get() : lctx);
         LOG_INF("qat_epoch: epoch=%d/%d loss=%.8f uncertainty=%.8f optimizer_step=%ld\n",
-            params.lr.epoch + 1, params.lr.epochs, train_loss, train_unc, (long) llama_opt_step(lctx));
+            params.lr.epoch + 1, params.lr.epochs, train_loss, train_unc, (long) optimizer_step);
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_eval);
     }
     llama_synchronize(lctx);
-    if (!qat_save_model(model, params.model.path, params.qat_out)) {
-        return 1;
+    bool final_save_ok = true;
+    if (params.mtp_mode != "only") {
+        if (!qat_save_model(model, params.model.path, params.qat_out)) {
+            final_save_ok = false;
+        } else {
+            LOG_INF("%s: trained native QLion %s model saved to %s\n", __func__, params.qat_quant_type.c_str(), params.qat_out.c_str());
+        }
     }
-    LOG_INF("%s: trained native QLion %s model saved to %s\n", __func__, params.qat_quant_type.c_str(), params.qat_out.c_str());
+    if (mtp.ctx) {
+        llama_synchronize(mtp.ctx.get());
+        final_save_ok = save_adapter(mtp.tensors, params.mtp_lora_out, mtp.arch, mtp.alpha,
+            params.mtp_model) && final_save_ok;
+        if (mtp.tensors.buf) ggml_backend_buffer_free(mtp.tensors.buf);
+        if (mtp.tensors.ctx) ggml_free(mtp.tensors.ctx);
+    }
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
     ggml_opt_dataset_free(dataset);
     llama_backend_free();
-    return 0;
+    return final_save_ok ? 0 : 1;
 }
