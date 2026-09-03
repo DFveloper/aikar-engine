@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cinttypes>
 #include <cstring>
@@ -53,6 +54,7 @@ struct ggml_opt_context {
     struct ggml_tensor * labels  = nullptr;
     struct ggml_tensor * sparse_targets = nullptr;
     struct ggml_tensor * sparse_weights = nullptr;
+    struct ggml_tensor * accuracy_targets = nullptr;
     struct ggml_tensor * critical_span_weights   = nullptr;
     struct ggml_tensor * critical_reward_weights = nullptr;
     struct ggml_tensor * critical_warmup_scale   = nullptr;
@@ -63,6 +65,7 @@ struct ggml_opt_context {
     struct ggml_tensor * loss     = nullptr;
     struct ggml_tensor * pred     = nullptr;
     struct ggml_tensor * ncorrect = nullptr;
+    struct ggml_tensor * nvalid   = nullptr;
 
     struct ggml_cgraph * gf      = nullptr;
     struct ggml_cgraph * gb_grad = nullptr;
@@ -568,8 +571,11 @@ static void ggml_opt_step_adamw_quantized(ggml_opt_context_t opt_ctx, const ggml
 
 struct ggml_opt_result {
     int64_t              ndata    = 0;
+    int64_t              nvalid   = 0;
     std::vector<float>   loss;
     std::vector<int32_t> pred;
+    std::vector<int64_t> nvalid_batch;
+    std::vector<int64_t> ncorrect_batch;
     int64_t              ncorrect = 0;
 
     int64_t opt_period         = -1;
@@ -1770,10 +1776,13 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 const int64_t nrows = ggml_nrows(opt_ctx->outputs);
                 opt_ctx->sparse_targets = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
                 opt_ctx->sparse_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+                opt_ctx->accuracy_targets = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
                 ggml_set_input(opt_ctx->sparse_targets);
                 ggml_set_input(opt_ctx->sparse_weights);
+                ggml_set_input(opt_ctx->accuracy_targets);
                 ggml_set_name(opt_ctx->sparse_targets, "sparse_targets");
                 ggml_set_name(opt_ctx->sparse_weights, "sparse_weights");
+                ggml_set_name(opt_ctx->accuracy_targets, "accuracy_targets");
                 struct ggml_tensor * loss_weights = opt_ctx->sparse_weights;
                 if (opt_ctx->critical_token_weighting) {
                     opt_ctx->critical_span_weights   = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
@@ -1992,10 +2001,21 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
 
-        struct ggml_tensor * target_classes = opt_ctx->sparse_targets
-            ? opt_ctx->sparse_targets
+        struct ggml_tensor * target_classes = opt_ctx->accuracy_targets
+            ? opt_ctx->accuracy_targets
             : ggml_argmax(ctx_results, opt_ctx->labels);
-        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, target_classes);
+        if (opt_ctx->sparse_weights) {
+            struct ggml_tensor * active = ggml_step(ctx_results, opt_ctx->sparse_weights);
+            opt_ctx->nvalid = ggml_sum(ctx_results, active);
+            ggml_set_name(opt_ctx->nvalid, "nvalid");
+            ggml_set_output(opt_ctx->nvalid);
+            ggml_build_forward_expand(opt_ctx->gf, opt_ctx->nvalid);
+
+            opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, target_classes);
+        } else {
+            opt_ctx->nvalid = nullptr;
+            opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, target_classes);
+        }
         ggml_set_name(opt_ctx->ncorrect, "ncorrect");
         ggml_set_output(opt_ctx->ncorrect);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->ncorrect);
@@ -2632,6 +2652,10 @@ struct ggml_tensor * ggml_opt_sparse_weights(ggml_opt_context_t opt_ctx) {
     return opt_ctx->sparse_weights;
 }
 
+struct ggml_tensor * ggml_opt_accuracy_targets(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->accuracy_targets;
+}
+
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {
     return opt_ctx->loss;
 }
@@ -2688,8 +2712,11 @@ void ggml_opt_result_free(ggml_opt_result_t result) {
 
 void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->ndata = 0;
+    result->nvalid = 0;
     result->loss.clear();
     result->pred.clear();
+    result->nvalid_batch.clear();
+    result->ncorrect_batch.clear();
     result->ncorrect = 0;
 }
 
@@ -2739,14 +2766,14 @@ void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
 }
 
 void ggml_opt_result_accuracy(ggml_opt_result_t result, double * accuracy, double * unc) {
-    *accuracy = result->ncorrect >= 0 ? double(result->ncorrect) / double(result->ndata) : NAN;
+    *accuracy = result->ncorrect >= 0 && result->nvalid > 0 ? double(result->ncorrect) / double(result->nvalid) : NAN;
 
     if (!unc) {
         return;
     }
 
-    *unc = result->ncorrect >= 0 && result->ndata >= 2 ?
-        sqrt((*accuracy) * (1.0 - (*accuracy)) / double(result->ndata - 1)) : NAN;
+    *unc = result->ncorrect >= 0 && result->nvalid >= 2 ?
+        sqrt((*accuracy) * (1.0 - (*accuracy)) / double(result->nvalid - 1)) : NAN;
 }
 
 // ====== Computation ======
@@ -2945,7 +2972,24 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         std::vector<int32_t> pred(ndata);
         ggml_backend_tensor_get(opt_ctx->pred, pred.data(), 0, ggml_nbytes(opt_ctx->pred));
         result->pred.insert(result->pred.end(), pred.begin(), pred.end());
+
+        if (opt_ctx->sparse_targets && opt_ctx->sparse_weights && opt_ctx->nvalid && opt_ctx->ncorrect) {
+            float nvalid_f32 = 0.0f;
+            int64_t ncorrect_with_mask = 0;
+            ggml_backend_tensor_get(opt_ctx->nvalid, &nvalid_f32, 0, ggml_nbytes(opt_ctx->nvalid));
+            ggml_backend_tensor_get(opt_ctx->ncorrect, &ncorrect_with_mask, 0, ggml_nbytes(opt_ctx->ncorrect));
+            const int64_t nvalid_batch = std::max<int64_t>(0, std::min<int64_t>(ndata, llround(nvalid_f32)));
+            const int64_t ncorrect_batch = std::max<int64_t>(0,
+                    std::min<int64_t>(nvalid_batch, ncorrect_with_mask));
+            result->nvalid += nvalid_batch;
+            result->ncorrect += ncorrect_batch;
+            result->nvalid_batch.push_back(nvalid_batch);
+            result->ncorrect_batch.push_back(ncorrect_batch);
+            return;
+        }
     }
+
+    result->nvalid += ndata;
 
     if (!opt_ctx->ncorrect || result->ncorrect < 0) {
         result->ncorrect = -1;
@@ -2957,6 +3001,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     int64_t ncorrect;
     ggml_backend_tensor_get(opt_ctx->ncorrect, &ncorrect, 0, ggml_nbytes(opt_ctx->ncorrect));
     result->ncorrect += ncorrect;
+    result->nvalid_batch.push_back(ndata);
+    result->ncorrect_batch.push_back(ncorrect);
 }
 
 // ====== High-Level Functions ======
@@ -3047,11 +3093,79 @@ void ggml_opt_epoch_callback_progress_bar(
 
     double loss;
     double loss_unc;
-    ggml_opt_result_loss(result, &loss, &loss_unc);
-
     double accuracy;
     double accuracy_unc;
-    ggml_opt_result_accuracy(result, &accuracy, &accuracy_unc);
+    int64_t ema_n = 0;
+    if (const char * value = std::getenv("GGML_OPT_EMA_N")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && parsed > 0) {
+            ema_n = parsed;
+        }
+    }
+
+    if (ema_n > 0 && !result->loss.empty()) {
+        const double alpha = 2.0 / (double(ema_n) + 1.0);
+        double loss_mean = 0.0;
+        double loss_var = 0.0;
+        double accuracy_mean = 0.0;
+        double accuracy_var = 0.0;
+        double accuracy_weight_ema = 0.0;
+        double accuracy_correct_ema = 0.0;
+        double accuracy_square_ema = 0.0;
+        bool have_loss = false;
+        bool have_accuracy = false;
+        const size_t history_limit = size_t(ema_n) * 20;
+        const size_t history_start = result->loss.size() > history_limit ?
+            result->loss.size() - history_limit : 0;
+        for (size_t i = history_start; i < result->loss.size(); ++i) {
+            const double sample = result->loss_per_datapoint ?
+                double(result->loss[i]) * result->opt_period : double(result->loss[i]);
+            if (!have_loss) {
+                loss_mean = sample;
+                have_loss = true;
+            } else {
+                const double delta = sample - loss_mean;
+                loss_mean += alpha * delta;
+                loss_var = (1.0 - alpha) * (loss_var + alpha * delta * delta);
+            }
+
+            if (i >= result->nvalid_batch.size() || result->nvalid_batch[i] <= 0 ||
+                    result->ncorrect_batch[i] < 0) {
+                continue;
+            }
+            const double sample_accuracy = double(result->ncorrect_batch[i]) / result->nvalid_batch[i];
+            const double sample_weight = double(result->nvalid_batch[i]);
+            if (!have_accuracy) {
+                accuracy_mean = sample_accuracy;
+                accuracy_weight_ema = sample_weight;
+                accuracy_correct_ema = double(result->ncorrect_batch[i]);
+                accuracy_square_ema = sample_weight * sample_accuracy * sample_accuracy;
+                have_accuracy = true;
+            } else {
+                // Decay step history as usual, but weight every step by its
+                // supervised-token count. This is equivalent to maintaining
+                // EMA(correct tokens) / EMA(supervised tokens), so a window
+                // with only a few labels cannot influence accuracy as much as
+                // a densely supervised window.
+                accuracy_weight_ema = (1.0 - alpha) * accuracy_weight_ema + alpha * sample_weight;
+                accuracy_correct_ema = (1.0 - alpha) * accuracy_correct_ema +
+                    alpha * double(result->ncorrect_batch[i]);
+                accuracy_square_ema = (1.0 - alpha) * accuracy_square_ema +
+                    alpha * sample_weight * sample_accuracy * sample_accuracy;
+                accuracy_mean = accuracy_correct_ema / accuracy_weight_ema;
+                accuracy_var = std::max(0.0,
+                    accuracy_square_ema / accuracy_weight_ema - accuracy_mean * accuracy_mean);
+            }
+        }
+        loss = loss_mean;
+        loss_unc = sqrt(loss_var);
+        accuracy = have_accuracy ? accuracy_mean : NAN;
+        accuracy_unc = have_accuracy ? sqrt(accuracy_var) : NAN;
+    } else {
+        ggml_opt_result_loss(result, &loss, &loss_unc);
+        ggml_opt_result_accuracy(result, &accuracy, &accuracy_unc);
+    }
 
     const int64_t t_ibatch_us = ggml_time_us() - t_start_us;
     int64_t t_ibatch_s = t_ibatch_us / 1000000;
@@ -3067,10 +3181,18 @@ void ggml_opt_epoch_callback_progress_bar(
     const int64_t t_eta_m = t_eta_s / 60;
     t_eta_s -= t_eta_m * 60;
 
-    fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss=%.5lf±%.5lf acc=%.2lf±%.2lf%% "
-            "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
-            idata, idata_max, loss, loss_unc, 100.0*accuracy, 100.0*accuracy_unc,
-            t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
+    if (ema_n > 0) {
+        fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss_ema%" PRId64 "=%.5lf±%.5lf "
+                "acc_ema%" PRId64 "=%.2lf±%.2lf%% t=%02" PRId64 ":%02" PRId64 ":%02" PRId64
+                " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
+                idata, idata_max, ema_n, loss, loss_unc, ema_n, 100.0*accuracy, 100.0*accuracy_unc,
+                t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
+    } else {
+        fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss=%.5lf±%.5lf acc=%.2lf±%.2lf%% "
+                "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
+                idata, idata_max, loss, loss_unc, 100.0*accuracy, 100.0*accuracy_unc,
+                t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
+    }
     if (ibatch == ibatch_max) {
         fprintf(stderr, "\n");
     }

@@ -29,9 +29,11 @@ One update decodes a 32-value block from each state, applies the QLion update, r
   -lr 1e-6 -lr-min 1e-7 --lr-scheduler cosine --epochs 1
 ```
 
-Use `--quant-type q4_0` for an unmixed Q4_0 input model. Periodic checkpoints contain an ordinary inference GGUF plus a sibling `.qat-state.gguf` file with Q8_0 momentum, Q4_0 residual, optimizer step, scheduler step, epoch, and dataset window. Checkpoints are saved at the first packed-context boundary after `--save-every` optimizer steps so resume does not need an in-progress gradient or activation state. Resume with `--qat-resume checkpoint.gguf`. The final `--qat-out` file contains only inference weights.
+Use `--quant-type q4_0` for an unmixed Q4_0 input model. With a cosine schedule, `--lr-decay-steps N` makes the learning rate reach `-lr-min` at logical step N instead of stretching decay over the entire run. Periodic checkpoints contain an ordinary inference GGUF plus a sibling `.qat-state.gguf` file with Q8_0 momentum, Q4_0 residual, optimizer step, scheduler step, epoch, and dataset window. Checkpoints are saved at the first packed-context boundary after `--save-every` optimizer steps so resume does not need an in-progress gradient or activation state. `--save-first-at N` adds one earlier checkpoint for a fresh native QAT run; subsequent checkpoints retain the `--save-every` interval. Resume with `--qat-resume checkpoint.gguf`. The final `--qat-out` file contains only inference weights.
 
 Both trainers enable `--preserve-thinking` by default. For chat templates that support preserved reasoning, prior assistant reasoning remains in the training context for every model architecture. Use `--no-preserve-thinking` to disable it.
+
+When `GGML_OPT_EMA_N` is enabled, displayed accuracy is computed as EMA(correct supervised tokens) divided by EMA(supervised tokens). Each step is therefore weighted by its supervised-token count instead of every packed window contributing equally.
 
 Both trainers accept `--chat-template-file template.jinja`. The file overrides the template used by every dataset worker. QLion keeps the input GGUF metadata and original chat template when it saves checkpoints and the final model.
 
@@ -168,6 +170,7 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--lora-out` | `adapter.gguf` | Output adapter GGUF path (supports `~`) |
 | `--resume` | *(none)* | Resume weights and training position from a `--save-every` checkpoint |
 | `--save-every` | `0` | Save checkpoint every N dataset windows (0 = end only) |
+| `--lr-decay-steps` | `0` | Step where cosine reaches `-lr-min` (0 = end of full run) |
 | `--freeze-layers` | `0` | Skip LoRA on first N transformer layers (blk.0..N-1); backward already pruned automatically |
 | `--grad-checkpoint` | `0` | Mark every Nth forward node persistent to reduce activation VRAM; good values: 32–64 |
 | `--train-on-prompt` | off | Compute loss on prompt tokens too (default: response-only loss) |

@@ -635,12 +635,14 @@ struct common_params {
     std::string train_file         = "";              // JSONL training dataset path
     int32_t dataset_threads        = 0;               // dataset loading workers (0 = physical CPU cores)
     int32_t save_every             = 0;     // save checkpoint every N optimizer steps (0 = disabled)
+    int32_t save_first_at          = 0;     // save an initial checkpoint after N optimizer steps (0 = disabled)
     int32_t lora_freeze_layers     = 0;     // do not apply LoRA to the first N transformer layers
     int32_t grad_checkpoint_interval = 0;  // gradient checkpointing interval to reduce peak VRAM (0 = disabled)
     int32_t optimizer_restart_every = 0;   // reset optimizer state every N epochs (0 = disabled)
     std::string mtp_mode           = "off"; // off, joint, only
     std::string mtp_model          = "";
     std::string mtp_lora_out       = "mtp-adapter.gguf";
+    std::string mtp_lora_resume    = ""; // optional MTP LoRA checkpoint to resume
     std::string mtp_lora_targets   = "nextn.pre_projection,nextn.post_projection,attn_q,attn_output,ffn_gate,ffn_up,ffn_down";
     int32_t     mtp_lora_rank      = 16;
     float       mtp_lora_alpha     = 0.0f;
@@ -649,6 +651,7 @@ struct common_params {
     std::string lora_qat             = "none"; // none, q3_k, q4_k, q4_0, mxfp4, q6_k, q8_0
     std::string lr_scheduler         = "constant"; // constant, cosine
     int32_t warmup_steps             = 0;   // linear learning-rate warmup in logical training steps
+    int32_t lr_decay_steps           = 0;   // cosine reaches lr_min at this logical step (0 = total training steps)
     float   warmup_init_ratio        = 0.1f; // initial warmup learning rate as a fraction of peak learning rate
     bool    verbose_loss           = false; // print one structured loss line per SFT window
     bool    train_on_prompt        = false; // include prompt tokens in training loss (default: response tokens only)

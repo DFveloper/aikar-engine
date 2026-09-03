@@ -12342,10 +12342,15 @@ static void ggml_compute_forward_opt_step_adamw_f32(
         float       * v = (float       *) ((char       *) src0_grad_v->data + offset);
 
         for (int i00 = 0; i00 < ne00; ++i00) {
-            const float gi = (gclip > 0.0f) ? fmaxf(-gclip, fminf(gclip, g[i00])) : g[i00];
+            float gi = std::isfinite(g[i00]) ? g[i00] : 0.0f;
+            if (gclip > 0.0f) {
+                gi = fmaxf(-gclip, fminf(gclip, gi));
+            }
 
-            m[i00] = m[i00]*beta1 +       gi*(1.0f - beta1);
-            v[i00] = v[i00]*beta2 + gi*gi*(1.0f - beta2);
+            const float m_old = std::isfinite(m[i00]) ? m[i00] : 0.0f;
+            const float v_old = std::isfinite(v[i00]) && v[i00] >= 0.0f ? v[i00] : 0.0f;
+            m[i00] = m_old*beta1 +       gi*(1.0f - beta1);
+            v[i00] = v_old*beta2 + gi*gi*(1.0f - beta2);
 
             const float mh =       m[i00]*beta1h;
             const float vh = sqrtf(v[i00]*beta2h) + eps;
@@ -12353,7 +12358,10 @@ static void ggml_compute_forward_opt_step_adamw_f32(
             // The weight decay is applied independently of the Adam momenta m and v.
             // This is NOT equivalent to l2 regularization that adds w[i00]*w[i00] to the loss.
             // See: https://arxiv.org/pdf/1711.05101v3.pdf
-            w[i00] = w[i00] * keep - alpha * mh / vh;
+            const float update = alpha * mh / vh;
+            if (std::isfinite(w[i00]) && std::isfinite(update)) {
+                w[i00] = w[i00] * keep - update;
+            }
         }
     }
 }

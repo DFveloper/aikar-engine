@@ -490,6 +490,7 @@ struct qat_callback_context {
     int64_t ubatches_per_window;
     int64_t last_saved_step;
     int64_t last_observed_step;
+    bool    first_save_pending;
 };
 
 static thread_local struct qat_callback_context * g_qat_callback = nullptr;
@@ -522,8 +523,12 @@ static void qat_epoch_callback(
             loss, (double) g_qat_callback->schedule->current_lr);
     }
     const bool window_complete = ibatch > 0 && ibatch % g_qat_callback->ubatches_per_window == 0;
-    if (g_qat_callback->params->save_every > 0 && window_complete &&
-        step - g_qat_callback->last_saved_step >= g_qat_callback->params->save_every) {
+    const bool first_save_due = g_qat_callback->first_save_pending &&
+        g_qat_callback->params->save_first_at > 0 &&
+        step >= g_qat_callback->params->save_first_at;
+    const bool periodic_save_due = g_qat_callback->params->save_every > 0 &&
+        step - g_qat_callback->last_saved_step >= g_qat_callback->params->save_every;
+    if (window_complete && (first_save_due || periodic_save_due)) {
         const int64_t window = g_qat_callback->window_start + ibatch / g_qat_callback->ubatches_per_window;
         bool saved = true;
         if (g_qat_callback->params->mtp_mode != "only") {
@@ -551,6 +556,7 @@ static void qat_epoch_callback(
         }
         if (saved) {
             g_qat_callback->last_saved_step = step;
+            g_qat_callback->first_save_pending = false;
             LOG_INF("%s: checkpoint set saved at step %ld window %ld\n",
                 __func__, (long) step, (long) window);
         } else {
@@ -771,7 +777,8 @@ int main(int argc, char ** argv) {
             __func__);
     }
     qlora_lr_schedule schedule {
-        &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio, 0, 0
+        &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio,
+        params.lr_decay_steps, 0, 0
     };
     qat_opt_lr_context qat_lr_ctx {
         &schedule,
@@ -810,8 +817,32 @@ int main(int argc, char ** argv) {
         ++resume.epoch;
         resume.window = 0;
     }
+    if (params.lr.epochs > 0 && idata_split > INT64_MAX / params.lr.epochs) {
+        LOG_ERR("%s: total training step count overflows int64\n", __func__);
+        return 1;
+    }
     schedule.total_steps = idata_split * params.lr.epochs;
+    if (schedule.total_steps <= 0 || params.warmup_steps > schedule.total_steps) {
+        LOG_ERR("%s: invalid schedule: warmup_steps=%d total_steps=%ld\n",
+                __func__, params.warmup_steps, (long) schedule.total_steps);
+        return 1;
+    }
     schedule.step = resume.schedule_step;
+    if (params.lr_scheduler == "cosine" && params.lr_decay_steps > 0 &&
+        params.lr_decay_steps <= params.warmup_steps) {
+        LOG_ERR("%s: --lr-decay-steps %d must exceed --warmup-steps %d\n",
+                __func__, params.lr_decay_steps, params.warmup_steps);
+        return 1;
+    }
+    LOG_INF("%s: lr scheduler=%s warmup_steps=%d decay_steps=%ld total_steps=%ld start_step=%ld lr=%.3g lr_min=%.3g\n",
+            __func__, params.lr_scheduler.c_str(), params.warmup_steps,
+            (long) (params.lr_decay_steps > 0 ? std::min<int64_t>(params.lr_decay_steps, schedule.total_steps) : schedule.total_steps),
+            (long) schedule.total_steps, (long) schedule.step,
+            (double) params.lr.lr0, (double) std::max(0.0f, params.lr.lr_min));
+    if (params.save_first_at > schedule.step) {
+        LOG_INF("%s: first checkpoint will be saved at or after optimizer step %d\n",
+                __func__, params.save_first_at);
+    }
     mtp_training_state mtp;
     if (!mtp_init_training(params, lctx, schedule, mtp)) {
         return 1;
@@ -823,7 +854,8 @@ int main(int argc, char ** argv) {
     struct qat_callback_context callback_ctx {
         lctx, mtp.ctx.get(), model, &mtp, &schedule, &params, 0, 0, ubatches_per_window,
         llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx),
-        llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx)
+        llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx),
+        params.save_first_at > schedule.step
     };
     g_qat_callback = &callback_ctx;
     if (params.shuffle_dataset) {

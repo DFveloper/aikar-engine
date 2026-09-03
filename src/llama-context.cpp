@@ -3617,6 +3617,7 @@ void llama_context::opt_epoch_iter(
     std::vector<float> stats_selected(critical_stats_due ? n_ubatch : 0);
     std::vector<float> stats_effective(critical_stats_due ? n_ubatch : 0);
     std::vector<int32_t> sparse_targets_host(n_ubatch);
+    std::vector<int32_t> accuracy_targets_host(n_ubatch);
     std::vector<float> sparse_weights_host(n_ubatch);
 
     if (clear_memory) {
@@ -3817,6 +3818,7 @@ void llama_context::opt_epoch_iter(
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 struct ggml_tensor * sparse_targets = ggml_opt_sparse_targets(opt_ctx);
                 struct ggml_tensor * sparse_weights = ggml_opt_sparse_weights(opt_ctx);
+                struct ggml_tensor * accuracy_targets = ggml_opt_accuracy_targets(opt_ctx);
                 GGML_ASSERT(labels || (sparse_targets && sparse_weights));
                 if (labels) {
                     GGML_ASSERT(labels->ne[1] == n_ubatch);
@@ -3833,6 +3835,7 @@ void llama_context::opt_epoch_iter(
                 }
                 if (sparse_targets) {
                     std::fill(sparse_targets_host.begin(), sparse_targets_host.end(), 0);
+                    std::fill(accuracy_targets_host.begin(), accuracy_targets_host.end(), -1);
                     std::fill(sparse_weights_host.begin(), sparse_weights_host.end(), 0.0f);
                 }
                 for (uint32_t pos_ubatch = 0; pos_ubatch < ubatch.n_tokens; ++pos_ubatch) {
@@ -3846,6 +3849,7 @@ void llama_context::opt_epoch_iter(
                         ggml_backend_tensor_set(labels, &active_label_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                     } else {
                         sparse_targets_host[pos_ubatch] = labels_sparse[ilabel];
+                        accuracy_targets_host[pos_ubatch] = labels_sparse[ilabel];
                         sparse_weights_host[pos_ubatch] = active_label_scale;
                     }
                     if (critical_metadata) {
@@ -3855,6 +3859,8 @@ void llama_context::opt_epoch_iter(
                 }
                 if (sparse_targets) {
                     ggml_backend_tensor_set(sparse_targets, sparse_targets_host.data(), 0, n_ubatch*sizeof(int32_t));
+                    GGML_ASSERT(accuracy_targets);
+                    ggml_backend_tensor_set(accuracy_targets, accuracy_targets_host.data(), 0, n_ubatch*sizeof(int32_t));
                     ggml_backend_tensor_set(sparse_weights, sparse_weights_host.data(), 0, n_ubatch*sizeof(float));
                 }
                 if (critical_metadata) {

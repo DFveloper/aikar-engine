@@ -22,9 +22,14 @@ static __global__ void opt_step_adamw_f32(
     const float beta2h = pars[6];
     const float gclip  = pars[7]; // element-wise gradient clip (0 = disabled)
 
-    const float gi = (gclip > 0.0f) ? fmaxf(-gclip, fminf(gclip, g[i])) : g[i];
-    const float gmi = g_m[i]*beta1 +    gi*(1.0f - beta1);
-    const float gvi = g_v[i]*beta2 + gi*gi*(1.0f - beta2);
+    float gi = isfinite(g[i]) ? g[i] : 0.0f;
+    if (gclip > 0.0f) {
+        gi = fmaxf(-gclip, fminf(gclip, gi));
+    }
+    const float m_old = isfinite(g_m[i]) ? g_m[i] : 0.0f;
+    const float v_old = isfinite(g_v[i]) && g_v[i] >= 0.0f ? g_v[i] : 0.0f;
+    const float gmi = m_old*beta1 +    gi*(1.0f - beta1);
+    const float gvi = v_old*beta2 + gi*gi*(1.0f - beta2);
 
     g_m[i] = gmi;
     g_v[i] = gvi;
@@ -32,7 +37,10 @@ static __global__ void opt_step_adamw_f32(
     const float mh =       gmi*beta1h;
     const float vh = sqrtf(gvi*beta2h) + eps;
 
-    x[i] = x[i]*(1.0f - alpha*wd) - alpha*mh/vh;
+    const float update = alpha*mh/vh;
+    if (isfinite(x[i]) && isfinite(update)) {
+        x[i] = x[i]*(1.0f - alpha*wd) - update;
+    }
 }
 
 static void opt_step_adamw_f32_cuda(

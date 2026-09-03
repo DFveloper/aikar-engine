@@ -257,6 +257,7 @@ struct qlora_lr_schedule {
     std::string    type;
     int64_t        warmup_steps;
     float          warmup_init_ratio;
+    int64_t        decay_steps;
     int64_t        total_steps;
     int64_t        step;
     float          current_lr = 0.0f;
@@ -273,7 +274,11 @@ struct qlora_lr_schedule {
         }
 
         const float lr_min = std::max(0.0f, lr->lr_min);
-        const double progress = (double) (step - warmup_steps) / (double) (total_steps - warmup_steps);
+        const int64_t cosine_end = decay_steps > 0 ? std::min(decay_steps, total_steps) : total_steps;
+        if (cosine_end <= warmup_steps) {
+            return lr_min;
+        }
+        const double progress = (double) (step - warmup_steps) / (double) (cosine_end - warmup_steps);
         const double cosine = 0.5 * (1.0 + std::cos(std::acos(-1.0) * std::min(1.0, progress)));
         return lr_min + (lr_base - lr_min) * (float) cosine;
     }
@@ -2697,6 +2702,12 @@ static int run_grpo_mode(
                 __func__, params.warmup_steps, n_steps);
         return 1;
     }
+    if (params.lr_scheduler == "cosine" && params.lr_decay_steps > 0 &&
+        params.lr_decay_steps <= params.warmup_steps) {
+        LOG_ERR("%s: --lr-decay-steps %d must exceed --warmup-steps %d\n",
+                __func__, params.lr_decay_steps, params.warmup_steps);
+        return 1;
+    }
     if (params.lr.lr0 <= 0.0f || (params.lr_scheduler == "cosine" && params.lr.lr_min > params.lr.lr0)) {
         LOG_ERR("%s: learning-rate must be positive and cosine requires learning-rate-min <= learning-rate\n", __func__);
         return 1;
@@ -2710,7 +2721,8 @@ static int run_grpo_mode(
         return 1;
     }
     qlora_lr_schedule schedule {
-        &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio, n_steps, schedule_step
+        &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio,
+        params.lr_decay_steps, n_steps, schedule_step
     };
 
     std::mt19937 rng(params.sampling.seed != LLAMA_DEFAULT_SEED
@@ -2985,15 +2997,18 @@ static bool mtp_init_training(
     }
 
     state.alpha = params.mtp_lora_alpha > 0.0f ? params.mtp_lora_alpha : (float) params.mtp_lora_rank;
-    std::mt19937 rng(43);
-    state.tensors = alloc_lora_tensors(params.mtp_model, split_csv(params.mtp_lora_targets), params.mtp_lora_rank, rng, 0);
-    if (state.tensors.ab.empty()) {
-        return false;
-    }
-
-    const std::string init_path = params.mtp_lora_out + ".init.gguf";
-    if (!save_adapter(state.tensors, init_path, state.arch, state.alpha, params.mtp_model)) {
-        return false;
+    std::string adapter_path = params.mtp_lora_resume;
+    const bool resume_adapter = !adapter_path.empty();
+    if (!resume_adapter) {
+        std::mt19937 rng(43);
+        state.tensors = alloc_lora_tensors(params.mtp_model, split_csv(params.mtp_lora_targets), params.mtp_lora_rank, rng, 0);
+        if (state.tensors.ab.empty()) {
+            return false;
+        }
+        adapter_path = params.mtp_lora_out + ".init.gguf";
+        if (!save_adapter(state.tensors, adapter_path, state.arch, state.alpha, params.mtp_model)) {
+            return false;
+        }
     }
 
     auto mparams = common_model_params_to_llama(params);
@@ -3002,11 +3017,17 @@ static bool mtp_init_training(
         LOG_ERR("%s: failed to load MTP model %s\n", __func__, params.mtp_model.c_str());
         return false;
     }
-    state.adapter.reset(llama_adapter_lora_init(state.model.get(), init_path.c_str()));
-    std::remove(expand_tilde(init_path).c_str());
+    state.adapter.reset(llama_adapter_lora_init(state.model.get(), adapter_path.c_str()));
+    if (!resume_adapter) {
+        std::remove(expand_tilde(adapter_path).c_str());
+    }
     if (!state.adapter) {
-        LOG_ERR("%s: failed to load MTP LoRA adapter\n", __func__);
+        LOG_ERR("%s: failed to load MTP LoRA adapter %s\n", __func__, adapter_path.c_str());
         return false;
+    }
+    if (resume_adapter) {
+        LOG_INF("%s: resumed MTP LoRA weights from %s; optimizer state starts fresh\n",
+                __func__, adapter_path.c_str());
     }
 
     auto cparams = common_context_params_to_llama(params);
@@ -3039,7 +3060,7 @@ static bool mtp_init_training(
         }
     }
     state.schedule = { &state.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio,
-        target_schedule.total_steps, target_schedule.step };
+        target_schedule.decay_steps, target_schedule.total_steps, target_schedule.step };
     state.schedule_step = &target_schedule.step;
 
     struct llama_opt_params opt_params {
@@ -3269,7 +3290,8 @@ int main(int argc, char ** argv) {
     }
 
     qlora_lr_schedule schedule {
-        &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio, 0, 0
+        &params.lr, params.lr_scheduler, params.warmup_steps, params.warmup_init_ratio,
+        params.lr_decay_steps, 0, 0
     };
 
     // Initialize optimizer - our custom param filter restricts training to lora_a/b.
@@ -3317,6 +3339,12 @@ int main(int argc, char ** argv) {
     if (params.warmup_steps > schedule.total_steps) {
         LOG_ERR("%s: --warmup-steps %d exceeds total training steps %ld\n",
                 __func__, params.warmup_steps, (long) schedule.total_steps);
+        return 1;
+    }
+    if (params.lr_scheduler == "cosine" && params.lr_decay_steps > 0 &&
+        params.lr_decay_steps <= params.warmup_steps) {
+        LOG_ERR("%s: --lr-decay-steps %d must exceed --warmup-steps %d\n",
+                __func__, params.lr_decay_steps, params.warmup_steps);
         return 1;
     }
     if (params.lr.lr0 <= 0.0f || (params.lr_scheduler == "cosine" && params.lr.lr_min > params.lr.lr0)) {
@@ -3453,8 +3481,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: dataset: %ld windows × %d ubatches = %ld steps per epoch  (n_ctx=%d n_ubatch=%d stride=%d)\n",
             __func__, (long)total_windows, ubatch_per_ctx, (long)(idata_split * ubatch_per_ctx),
             n_ctx, n_ubatch, n_ctx / 2);
-    LOG_INF("%s: lr scheduler=%s warmup_steps=%d warmup_init_ratio=%.3g total_steps=%ld start_step=%ld lr=%.3g lr_min=%.3g\n",
+    LOG_INF("%s: lr scheduler=%s warmup_steps=%d warmup_init_ratio=%.3g decay_steps=%ld total_steps=%ld start_step=%ld lr=%.3g lr_min=%.3g\n",
             __func__, params.lr_scheduler.c_str(), params.warmup_steps, (double) params.warmup_init_ratio,
+            (long) (params.lr_decay_steps > 0 ? std::min<int64_t>(params.lr_decay_steps, schedule.total_steps) : schedule.total_steps),
             (long) schedule.total_steps,
             (long) schedule.step, (double) params.lr.lr0, (double) std::max(0.0f, params.lr.lr_min));
     if (params.save_every > 0) {

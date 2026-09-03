@@ -4701,6 +4701,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.mtp_lora_out = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--mtp-lora-resume"}, "FNAME",
+        "resume MTP LoRA weights from an adapter checkpoint (optimizer state starts fresh)",
+        [](common_params & params, const std::string & value) { params.mtp_lora_resume = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--mtp-lora-targets"}, "SUBSTRINGS",
         string_format("comma-separated MTP LoRA targets (default: %s)", params.mtp_lora_targets.c_str()),
         [](common_params & params, const std::string & value) { params.mtp_lora_targets = value; }
@@ -4759,6 +4764,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.save_every = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--save-first-at"}, "N",
+        "save the first native QAT checkpoint after N optimizer steps (default: 0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("--save-first-at must be non-negative");
+            params.save_first_at = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--freeze-layers"}, "N",
         "freeze first N transformer layers — no LoRA adapters allocated for blk.0..blk.N-1 (default: 0 = train all layers)",
         [](common_params & params, int value) { params.lora_freeze_layers = value; }
@@ -4806,6 +4819,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("--warmup-steps must be non-negative");
             }
             params.warmup_steps = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--lr-decay-steps"}, "N",
+        "logical step where cosine decay reaches learning-rate-min (default: 0 = total training steps)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--lr-decay-steps must be non-negative");
+            }
+            params.lr_decay_steps = value;
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
