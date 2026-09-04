@@ -1,75 +1,81 @@
 #version 450
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#include "generic_head.glsl"
+#include "types.glsl"
 
-layout(push_constant) uniform parameter {
-    uint nclasses;
-    uint nrows;
-} p;
+#extension GL_EXT_control_flow_attributes : enable
 
-layout(binding = 0) readonly  buffer GRAD   { float grad[]; };
-layout(binding = 1) readonly  buffer LOGITS { float logits[]; };
-layout(binding = 2) readonly  buffer LABELS { float labels[]; };
-layout(binding = 3) writeonly buffer DST    { float dst[]; };
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-shared float reduction[256];
+layout (binding = 0) readonly buffer G {A_TYPE data_g[];};
+layout (binding = 1) readonly buffer X {B_TYPE data_x[];};
+layout (binding = 2) readonly buffer Y {B_TYPE data_y[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
 
-void main() {
-    const uint lid = gl_LocalInvocationID.x;
-    const uint row = gl_WorkGroupID.y;
-    const uint base = row*p.nclasses;
+shared FLOAT_TYPE tmp[BLOCK_SIZE];
 
-    float labels_sum = 0.0;
-    for (uint col = lid; col < p.nclasses; col += 256) {
-        labels_sum += labels[base + col];
-    }
-    reduction[lid] = labels_sum;
+FLOAT_TYPE wg_reduce_max(FLOAT_TYPE v) {
+    const uint tid = gl_LocalInvocationID.x;
+    tmp[tid] = v;
     barrier();
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            reduction[lid] += reduction[lid + stride];
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            tmp[tid] = max(tmp[tid], tmp[tid + s]);
         }
         barrier();
     }
-    labels_sum = reduction[0];
-    if (labels_sum == 0.0) {
-        for (uint col = lid; col < p.nclasses; col += 256) {
-            dst[base + col] = 0.0;
+    v = tmp[0];
+    barrier();
+    return v;
+}
+
+FLOAT_TYPE wg_reduce_sum(FLOAT_TYPE v) {
+    const uint tid = gl_LocalInvocationID.x;
+    tmp[tid] = v;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            tmp[tid] += tmp[tid + s];
         }
+        barrier();
+    }
+    v = tmp[0];
+    barrier();
+    return v;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.KY) {
         return;
     }
 
-    float max_logit = -1.0/0.0;
-    for (uint col = lid; col < p.nclasses; col += 256) {
-        max_logit = max(max_logit, logits[base + col]);
-    }
-    reduction[lid] = max_logit;
-    barrier();
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            reduction[lid] = max(reduction[lid], reduction[lid + stride]);
-        }
-        barrier();
-    }
-    max_logit = reduction[0];
+    const uint off = row * p.KX;
+    const FLOAT_TYPE d_by_nrows = FLOAT_TYPE(data_g[0]) / FLOAT_TYPE(p.KY);
 
-    float sum_exp = 0.0;
-    for (uint col = lid; col < p.nclasses; col += 256) {
-        sum_exp += exp(logits[base + col] - max_logit);
+    FLOAT_TYPE labels_sum = FLOAT_TYPE(0.0f);
+    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+        labels_sum += FLOAT_TYPE(data_y[off + i]);
     }
-    reduction[lid] = sum_exp;
-    barrier();
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            reduction[lid] += reduction[lid + stride];
-        }
-        barrier();
-    }
+    labels_sum = wg_reduce_sum(labels_sum);
 
-    const float inv_sum = 1.0/reduction[0];
-    const float scale = grad[0]/float(p.nrows);
-    for (uint col = lid; col < p.nclasses; col += 256) {
-        const float prob = exp(logits[base + col] - max_logit)*inv_sum;
-        dst[base + col] = (prob*labels_sum - labels[base + col])*scale;
+    FLOAT_TYPE max_logit = FLOAT_TYPE(uintBitsToFloat(0xFF800000));
+    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+        max_logit = max(max_logit, FLOAT_TYPE(data_x[off + i]));
+    }
+    max_logit = wg_reduce_max(max_logit);
+
+    FLOAT_TYPE sum_exp = FLOAT_TYPE(0.0f);
+    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+        sum_exp += exp(FLOAT_TYPE(data_x[off + i]) - max_logit);
+    }
+    const FLOAT_TYPE inv_sum = FLOAT_TYPE(1.0f) / wg_reduce_sum(sum_exp);
+
+    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+        const FLOAT_TYPE sm = exp(FLOAT_TYPE(data_x[off + i]) - max_logit) * inv_sum;
+        data_d[off + i] = D_TYPE((sm * labels_sum - FLOAT_TYPE(data_y[off + i])) * d_by_nrows);
     }
 }

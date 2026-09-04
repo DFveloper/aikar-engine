@@ -38,6 +38,9 @@ enum class tensor_category {
     OTHER
 };
 
+// max amount of tensor data kept in memory while quantizing a single tensor
+static const size_t LLAMA_QUANT_MAX_BUF_SIZE = 8ull*1024*1024*1024;
+
 static void zeros(std::ofstream & file, size_t n) {
     char zero = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -211,31 +214,26 @@ struct tensor_metadata {
 //
 
 static void llama_tensor_dequantize_impl(
-    ggml_tensor * tensor, std::vector<no_init<float>> & output, std::vector<std::thread> & workers,
+    ggml_type type, const void * data, float * f32_output, std::vector<std::thread> & workers,
     const size_t nelements, const int nthread
 ) {
-    if (output.size() < nelements) {
-        output.resize(nelements);
-    }
-    float * f32_output = (float *) output.data();
-
-    const ggml_type_traits * qtype = ggml_get_type_traits(tensor->type);
-    if (ggml_is_quantized(tensor->type)) {
+    const ggml_type_traits * qtype = ggml_get_type_traits(type);
+    if (ggml_is_quantized(type)) {
         if (qtype->to_float == NULL) {
-            throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(tensor->type)));
+            throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(type)));
         }
-    } else if (tensor->type != GGML_TYPE_F16 &&
-               tensor->type != GGML_TYPE_BF16) {
-        throw std::runtime_error(format("cannot dequantize/convert tensor type %s", ggml_type_name(tensor->type)));
+    } else if (type != GGML_TYPE_F16 &&
+               type != GGML_TYPE_BF16) {
+        throw std::runtime_error(format("cannot dequantize/convert tensor type %s", ggml_type_name(type)));
     }
 
     if (nthread < 2) {
-        if (tensor->type == GGML_TYPE_F16) {
-            ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor->data, f32_output, nelements);
-        } else if (tensor->type == GGML_TYPE_BF16) {
-            ggml_bf16_to_fp32_row((ggml_bf16_t *)tensor->data, f32_output, nelements);
-        } else if (ggml_is_quantized(tensor->type)) {
-            qtype->to_float(tensor->data, f32_output, nelements);
+        if (type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *)data, f32_output, nelements);
+        } else if (type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *)data, f32_output, nelements);
+        } else if (ggml_is_quantized(type)) {
+            qtype->to_float(data, f32_output, nelements);
         } else {
             GGML_ABORT("fatal error"); // unreachable
         }
@@ -243,14 +241,14 @@ static void llama_tensor_dequantize_impl(
     }
 
     size_t block_size;
-    if (tensor->type == GGML_TYPE_F16 ||
-        tensor->type == GGML_TYPE_BF16) {
+    if (type == GGML_TYPE_F16 ||
+        type == GGML_TYPE_BF16) {
         block_size = 1;
     } else {
-        block_size = (size_t)ggml_blck_size(tensor->type);
+        block_size = (size_t)ggml_blck_size(type);
     }
 
-    size_t block_size_bytes = ggml_type_size(tensor->type);
+    size_t block_size_bytes = ggml_type_size(type);
 
     GGML_ASSERT(nelements % block_size == 0);
     size_t nblocks = nelements / block_size;
@@ -265,16 +263,16 @@ static void llama_tensor_dequantize_impl(
         size_t thr_elems = thr_blocks * block_size; // number of elements for this thread
         size_t thr_block_bytes = thr_blocks * block_size_bytes; // number of input bytes for this thread
 
-        auto compute = [qtype] (ggml_type typ, uint8_t * inbuf, float * outbuf, int nels) {
+        auto compute = [qtype] (ggml_type typ, const uint8_t * inbuf, float * outbuf, int nels) {
             if (typ == GGML_TYPE_F16) {
-                ggml_fp16_to_fp32_row((ggml_fp16_t *)inbuf, outbuf, nels);
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *)inbuf, outbuf, nels);
             } else if (typ == GGML_TYPE_BF16) {
-                ggml_bf16_to_fp32_row((ggml_bf16_t *)inbuf, outbuf, nels);
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *)inbuf, outbuf, nels);
             } else {
                 qtype->to_float(inbuf, outbuf, nels);
             }
         };
-        workers.emplace_back(compute, tensor->type, (uint8_t *) tensor->data + in_buff_offs, f32_output + out_buff_offs, thr_elems);
+        workers.emplace_back(compute, type, (const uint8_t *) data + in_buff_offs, f32_output + out_buff_offs, thr_elems);
         in_buff_offs += thr_block_bytes;
         out_buff_offs += thr_elems;
     }
@@ -404,6 +402,12 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_MXFP4:   return_type = GGML_TYPE_F16;    break;
             default:
+                if (qk_k <= 32) {
+                    // the target is already a 32-block type, so there is no smaller block to demote to
+                    // the check below turns it into F16, as a 256-block type does when its fallback does not fit
+                    return_type = target_type;
+                    break;
+                }
                 throw std::runtime_error(format("no tensor type fallback is defined for type %s",
                                                 ggml_type_name(target_type)));
         }
@@ -473,19 +477,6 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
             }
-        }
-    } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
-        // MoE   tensors -> MXFP4
-        // other tensors -> Q8_0
-        // MLA projection tensors are also 3D, so match expert tensor roles explicitly.
-        const bool is_bailingmoe3_expert = arch == LLM_ARCH_BAILINGMOE3 &&
-            (category == tensor_category::FFN_UP ||
-             category == tensor_category::FFN_GATE ||
-             category == tensor_category::FFN_DOWN);
-        if (tensor->ne[2] > 1 && (arch != LLM_ARCH_BAILINGMOE3 || is_bailingmoe3_expert)) {
-            new_type = GGML_TYPE_MXFP4;
-        } else {
-            new_type = GGML_TYPE_Q8_0;
         }
     } else if (category == tensor_category::TOKEN_EMBD) {
         if (qs.params->token_embedding_type < GGML_TYPE_COUNT) {
@@ -684,7 +675,21 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
-        return params->token_embedding_type;
+        // per_layer_token_embd follows --token-embedding-type by default, but it is a large
+        // separate table, so let an explicit --tensor-type name it
+        bool named = false;
+        if (std::strcmp(tensor->name, "per_layer_token_embd.weight") == 0) {
+            const std::string tensor_name(tensor->name);
+            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+                if (std::regex_search(tensor_name, pattern)) {
+                    named = true;
+                    break;
+                }
+            }
+        }
+        if (!named) {
+            return params->token_embedding_type;
+        }
     }
     if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
         return params->output_tensor_type;
@@ -727,12 +732,28 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 // quantization implementation
 //
 
-static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+// quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
+// note: chunks never cross an expert boundary since each expert has its own imatrix slice
+static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+    const size_t row_size = ggml_row_size(new_type, n_per_row);
+
+    auto imatrix_for_row = [=](int64_t row_global) {
+        return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
+    };
+
     if (nthread < 2) {
         // single-thread
-        size_t new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
-        if (!ggml_validate_row_data(new_type, new_data, new_size)) {
-            throw std::runtime_error("quantized data validation failed");
+        size_t new_size = 0;
+        for (int64_t row = 0; row < nrows;) {
+            const int64_t row_global = first_row + row;
+            const int64_t this_nrow  = std::min(nrows - row, nrows_per_expert - row_global % nrows_per_expert);
+            void * this_data = (char *) new_data + row * row_size;
+            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
+            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
+                throw std::runtime_error("quantized data validation failed");
+            }
+            new_size += this_size;
+            row += this_nrow;
         }
         return new_size;
     }
@@ -742,26 +763,29 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
     size_t new_size = 0;
     bool valid = true;
     auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
-            nrows, n_per_row, imatrix]() {
+            first_row, nrows, nrows_per_expert, n_per_row, row_size, imatrix_for_row]() {
         const int64_t nrows_per_chunk = chunk_size / n_per_row;
         size_t local_size = 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
-            int64_t first_row = counter; counter += nrows_per_chunk;
-            if (first_row >= nrows) {
+            if (counter >= nrows) {
                 if (local_size > 0) {
                     new_size += local_size;
                 }
                 break;
             }
+            const int64_t row        = counter;
+            const int64_t row_global = first_row + row;
+            // stop at the expert boundary
+            const int64_t this_nrow  = std::min(std::min(nrows - row, nrows_per_chunk), nrows_per_expert - row_global % nrows_per_expert);
+            counter += this_nrow;
             lock.unlock();
-            const int64_t this_nrow = std::min(nrows - first_row, nrows_per_chunk);
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data, new_data, first_row * n_per_row, this_nrow, n_per_row, imatrix);
+
+            void * this_data = (char *) new_data + row * row_size;
+            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
             local_size += this_size;
 
             // validate the quantized data
-            const size_t row_size  = ggml_row_size(new_type, n_per_row);
-            void * this_data = (char *) new_data + first_row * row_size;
             if (!ggml_validate_row_data(new_type, this_data, this_size)) {
                 std::unique_lock<std::mutex> lock(mutex);
                 valid = false;
@@ -1096,6 +1120,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
 
+    const size_t max_buf_size = params->max_buf_size ? params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE;
+
     int cur_split = -1;
     std::ofstream fout;
     auto close_ofstream = [&]() {
@@ -1146,15 +1172,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         const size_t tensor_size = ggml_nbytes(tensor);
 
-        if (!params->dry_run) {
-            if (!ml.use_mmap) {
-                if (read_data.size() < tensor_size) {
-                    read_data.resize(tensor_size);
-                }
-                tensor->data = read_data.data();
+        // read a byte range of the current tensor
+        auto load_range = [&](size_t offs, size_t size) -> const void * {
+            if (!ml.use_mmap && read_data.size() < size) {
+                read_data.resize(size);
             }
-            ml.load_data_for(tensor);
-        }
+            return ml.load_data_range(weight, offs, size, read_data.data());
+        };
 
         LLAMA_LOG_INFO("[%4d/%4d] %-36s - [%s], type = %6s, ",
                ++idx, ml.n_tensors,
@@ -1169,7 +1193,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // in then there's nothing to do.
         bool quantize = cur_type != new_type;
 
-        void * new_data;
         size_t new_size;
 
         if (params->dry_run) {
@@ -1193,9 +1216,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         } else {
             // no --dry-run, perform quantization
             if (!quantize) {
-                new_data = tensor->data;
                 new_size = tensor_size;
                 LLAMA_LOG_INFO("size = %8.3f MiB\n", tensor_size/1024.0/1024.0);
+                // copy in slabs of whole rows, so that each slab can be validated
+                const size_t row_size   = ggml_row_size(tensor->type, tensor->ne[0]);
+                const size_t slab_size  = std::max<size_t>(row_size, (max_buf_size/row_size)*row_size);
+
+                for (size_t offs = 0; offs < tensor_size; offs += slab_size) {
+                    const size_t size = std::min(slab_size, tensor_size - offs);
+                    fout.write((const char *) load_range(offs, size), size);
+                }
             } else {
                 const float * imatrix = nullptr;
                 if (imatrix_data) {
@@ -1236,52 +1266,50 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 fflush(stdout);
 
                 const int64_t n_per_row = tensor->ne[0];
-                const int64_t nrows = tensor->ne[1];
-                const int64_t n_matrices = tensor->ne[2] * tensor->ne[3];
-                const size_t row_size_new = ggml_row_size(new_type, n_per_row);
-                const size_t new_size_expected = row_size_new * nrows * n_matrices;
+                const int64_t nrows_per_expert = tensor->ne[1];
+                const int64_t nrows_total = ggml_nrows(tensor);
 
-                if (work.size() < new_size_expected) {
-                    work.resize(new_size_expected);
-                }
-                new_data = work.data();
+                const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
+                const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
+                const size_t new_size_expected = row_size_dst * nrows_total;
+
+                // process the rows in slabs, so that the buffers stay below max_buf_size
+                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float));
+                const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
 
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
-                const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
-                auto quantize_rows = [&](const float * f32_data, void * data_new, int64_t rows, const float * imatrix_data) {
-                    const int64_t nelements_chunk = rows * n_per_row;
-                    const int64_t nchunk = (nelements_chunk + chunk_size - 1)/chunk_size;
-                    const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
-                    return llama_tensor_quantize_impl(new_type, f32_data, data_new, chunk_size, rows, n_per_row, imatrix_data, workers, nthread_use);
-                };
-
+                // process rows across all experts in one pass to keep all threads busy
                 new_size = 0;
-                if (tensor->type == GGML_TYPE_F32) {
-                    for (int64_t i_matrix = 0; i_matrix < n_matrices; ++i_matrix) {
-                        const float * f32_data = (const float *) tensor->data + i_matrix * nelements_matrix;
-                        void * data_new = (char *) new_data + row_size_new * i_matrix * nrows;
-                        const float * imatrix_data = imatrix ? imatrix + i_matrix * n_per_row : nullptr;
-                        new_size += quantize_rows(f32_data, data_new, nrows, imatrix_data);
-                    }
-                } else {
-                    static const size_t f32_chunk_size = 64 * 1024 * 1024;
-                    const int64_t nrows_per_chunk = std::max((int64_t) 1, (int64_t) (f32_chunk_size / sizeof(float)) / n_per_row);
-                    const size_t row_size_old = ggml_row_size(tensor->type, n_per_row);
+                for (int64_t ir = 0; ir < nrows_total; ir += nrows_slab) {
+                    const int64_t nrows_cur = std::min(nrows_slab, nrows_total - ir);
+                    const int64_t nelements_cur = nrows_cur * n_per_row;
 
-                    for (int64_t i_matrix = 0; i_matrix < n_matrices; ++i_matrix) {
-                        const float * imatrix_data = imatrix ? imatrix + i_matrix * n_per_row : nullptr;
-                        for (int64_t first_row = 0; first_row < nrows; first_row += nrows_per_chunk) {
-                            const int64_t rows = std::min(nrows - first_row, nrows_per_chunk);
-                            ggml_tensor tensor_chunk = *tensor;
-                            tensor_chunk.data = (char *) tensor->data + row_size_old * (i_matrix * nrows + first_row);
-                            llama_tensor_dequantize_impl(&tensor_chunk, f32_conv_buf, workers, rows * n_per_row, nthread);
+                    const void * src = load_range(ir*row_size_src, nrows_cur*row_size_src);
 
-                            void * data_new = (char *) new_data + row_size_new * (i_matrix * nrows + first_row);
-                            new_size += quantize_rows((const float *) f32_conv_buf.data(), data_new, rows, imatrix_data);
+                    const float * f32_data;
+                    if (tensor->type == GGML_TYPE_F32) {
+                        f32_data = (const float *) src;
+                    } else {
+                        if (f32_conv_buf.size() < (size_t) nelements_cur) {
+                            f32_conv_buf.resize(nelements_cur);
                         }
+                        llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
+                        f32_data = (const float *) f32_conv_buf.data();
                     }
+
+                    if (work.size() < nrows_cur*row_size_dst) {
+                        work.resize(nrows_cur*row_size_dst);
+                    }
+
+                    const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
+                    const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+
+                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
+
+                    fout.write((const char *) work.data(), size_cur);
+                    new_size += size_cur;
                 }
                 GGML_ASSERT(new_size == new_size_expected);
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
@@ -1292,10 +1320,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // update the gguf metadata as we go
             gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
             GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);
-            gguf_set_tensor_data(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_data);
 
-            // write tensor data + padding
-            fout.write((const char *) new_data, new_size);
+            // tensor data is already written, add the padding
             zeros(fout, GGML_PAD(new_size, align) - new_size);
 
             // unmap the tensor to free memory
@@ -1342,7 +1368,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
     };
 
     return result;

@@ -4,7 +4,7 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 21)
+set(GGML_VERSION_MINOR 22)
 set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
@@ -242,6 +242,8 @@ option(GGML_METAL_EMBED_LIBRARY             "ggml: embed Metal library"         
 set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
                                             "ggml: metal minimum macOS version")
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
+set   (GGML_METAL_TARGET_OS "macos" CACHE STRING
+                                            "ggml: metal -mtargetos OS name (macos, ios, xros, tvos)")
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)

@@ -173,7 +173,7 @@ void llama_model_diffusion_gemma::load_arch_hparams(llama_model_loader & ml) {
     hparams.f_attention_scale = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
 
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    hparams.n_embd_head_k_swa);
@@ -194,8 +194,6 @@ void llama_model_diffusion_gemma::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_diffusion_gemma::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
-
-    const int64_t n_ff_exp = hparams.n_ff_exp;
 
     if (n_embd_head_k != n_embd_head_v) {
         throw std::runtime_error("DiffusionGemma requires n_embd_head_k == n_embd_head_v");
@@ -223,6 +221,7 @@ void llama_model_diffusion_gemma::load_arch_tensors(llama_model_loader &) {
     int rope_freqs_flag = 0;
 
     for (int i = 0; i < n_layer; ++i) {
+        const int64_t n_ff_exp = hparams.n_ff_exp(i);
         auto & layer = layers[i];
         const int64_t n_head      = hparams.n_head(i);
         const int64_t n_embd_head = hparams.n_embd_head_k(i);

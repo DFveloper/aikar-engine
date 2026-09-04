@@ -83,6 +83,7 @@ int main(int argc, char ** argv) {
         /*critical_max_fraction    =*/1.0f,
         /*critical_step            =*/nullptr,
         /*critical_stats_every     =*/0,
+        /*train_target             =*/true,
     };
     llama_opt_init(ctx, model, lopt_params);
 

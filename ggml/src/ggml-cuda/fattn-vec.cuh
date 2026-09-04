@@ -568,7 +568,7 @@ void ggml_cuda_flash_attn_ext_vec_case_volta_d512_q8(ggml_backend_cuda_context &
     constexpr size_t nbytes_shared = 0;
     constexpr int max_parallel_blocks = cols_per_block == 4 ? 4 : 0;
     launch_fattn<D, cols_per_block, gqa_heads_per_block>(
-        ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, false, false, false, WARP_SIZE, max_parallel_blocks);
+        ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, false, false, false, false, WARP_SIZE, max_parallel_blocks);
 }
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
@@ -606,7 +606,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
     launch_fattn<D, cols_per_block, gqa_heads_per_block>(
-        ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+        ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
