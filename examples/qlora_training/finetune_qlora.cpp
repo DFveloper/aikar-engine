@@ -446,7 +446,17 @@ static std::string apply_qlora_chat_template(
 
     inputs.messages = messages;
     inputs.add_generation_prompt = add_generation_prompt;
+    // A recorded assistant tool call is part of the supervised completion.
+    // Do not put ordinary SFT conversations into a template's tool mode:
+    // some templates use a different assistant channel when tool_choice is
+    // auto.  Enable it only for conversations that actually contain calls.
     inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+    for (const common_chat_msg & message : messages) {
+        if (!message.tool_calls.empty()) {
+            inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+            break;
+        }
+    }
 
     inputs.reasoning_format =
         COMMON_REASONING_FORMAT_DEEPSEEK;
@@ -488,6 +498,9 @@ static size_t chat_message_size_estimate(const common_chat_msg & message) {
     size_t size = message.role.size() + message.content.size() + message.reasoning_content.size() + 64;
     for (const common_chat_msg_content_part & part : message.content_parts) {
         size += part.text.size() + 32;
+    }
+    for (const common_chat_tool_call & call : message.tool_calls) {
+        size += call.id.size() + call.name.size() + call.arguments.size() + 64;
     }
     return size;
 }
@@ -3054,6 +3067,11 @@ static bool mtp_init_training(
     }
 
     state.lr = params.lr;
+    // MTP is initialized before the target training loop assigns
+    // params.lr.epoch.  Do not inherit that indeterminate field: apart from
+    // misleading `epoch <garbage> lr=...` logs it can affect epoch-based
+    // schedules in the MTP optimizer.
+    state.lr.epoch = 0;
     if (params.mtp_learning_rate > 0.0f) {
         state.lr.lr0 = params.mtp_learning_rate;
         if (params.lr_scheduler == "cosine" && state.lr.lr_min > state.lr.lr0) {

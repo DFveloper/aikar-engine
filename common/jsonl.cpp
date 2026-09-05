@@ -87,6 +87,9 @@ common_chat_msg parse_chat_message(const Json & data, common_jsonl_chat_parse_mo
     if (common_chat_role_from_string(message.role) == COMMON_CHAT_ROLE_UNKNOWN) {
         throw std::runtime_error("unsupported role: " + message.role);
     }
+    // Keep the JSONL training format aligned with the OpenAI-compatible chat
+    // schema used by the runtime.  In particular, an assistant tool-call turn
+    // is valid with no text payload: its supervised payload is `tool_calls`.
     message.content = required_string(data, "content", message.role != "assistant");
     message.reasoning_content = required_string(data, "reasoning", false);
     if (data.contains("reasoning_content")) {
@@ -96,8 +99,31 @@ common_chat_msg parse_chat_message(const Json & data, common_jsonl_chat_parse_mo
     if (message.role != "assistant" && !message.reasoning_content.empty()) {
         throw std::runtime_error("reasoning is supported only for assistant messages");
     }
-    if (message.role == "assistant" && message.content.empty() && message.reasoning_content.empty()) {
-        throw std::runtime_error("assistant message must contain 'content' or 'reasoning'");
+    if (data.contains("tool_calls")) {
+        if (message.role != "assistant") throw std::runtime_error("tool_calls are supported only for assistant messages");
+        if (!data.at("tool_calls").is_array()) throw std::runtime_error("tool_calls must be an array");
+        for (const auto & raw_call : data.at("tool_calls")) {
+            if (!raw_call.is_object() || raw_call.value("type", "") != "function" ||
+                    !raw_call.contains("function") || !raw_call.at("function").is_object()) {
+                throw std::runtime_error("tool_calls entries must be OpenAI function calls");
+            }
+            const auto & function = raw_call.at("function");
+            common_chat_tool_call call;
+            call.id = raw_call.value("id", "");
+            call.name = required_string(function, "name", true);
+            if (!function.contains("arguments")) throw std::runtime_error("tool call function missing 'arguments'");
+            const auto & arguments = function.at("arguments");
+            call.arguments = arguments.is_string() ? arguments.template get<std::string>() : arguments.dump();
+            message.tool_calls.push_back(std::move(call));
+        }
+    }
+    message.tool_name = required_string(data, "name", false);
+    message.tool_call_id = required_string(data, "tool_call_id", false);
+    if (message.role == "tool" && message.tool_call_id.empty()) {
+        throw std::runtime_error("tool message missing 'tool_call_id'");
+    }
+    if (message.role == "assistant" && message.content.empty() && message.reasoning_content.empty() && message.tool_calls.empty()) {
+        throw std::runtime_error("assistant message must contain 'content', 'reasoning', or 'tool_calls'");
     }
     return message;
 }
