@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,12 @@ struct tensor_transformation {
     struct ggml_tensor * in;
     struct ggml_tensor * out;
     bool is_copy;
+    std::vector<size_t> adapter_indices;
+};
+
+struct tensor_type_option {
+    std::regex pattern;
+    ggml_type type;
 };
 
 static std::string get_kv_str(struct gguf_context * ctx_gguf, const std::string & key) {
@@ -301,6 +308,7 @@ struct lora_merge_ctx {
 
     int n_threads;
     ggml_type out_type; // requested output tensor type (e.g. Q4_0, F16, F32...)
+    const std::vector<tensor_type_option> & tensor_types;
     ggml_backend_t backend = nullptr;
     ggml_gallocr_t allocr = nullptr;
     std::vector<uint8_t> read_buf;
@@ -314,8 +322,9 @@ struct lora_merge_ctx {
             std::vector<common_adapter_lora_info> & lora_files,
             std::string & outfile,
             ggml_type target_out_type,
+            const std::vector<tensor_type_option> & tensor_types,
             int n_threads) :
-            base_model(base_fname, 0), n_threads(n_threads), out_type(target_out_type), fout(outfile, std::ios::binary) {
+            base_model(base_fname, 0), n_threads(n_threads), out_type(target_out_type), tensor_types(tensor_types), fout(outfile, std::ios::binary) {
 
         fout.exceptions(std::ofstream::failbit);
 
@@ -354,16 +363,24 @@ struct lora_merge_ctx {
         }
     }
 
-    // F32 base tensors are kept as F32 in the output (matches upstream
-    // behavior); everything else follows the user-requested output type.
-    ggml_type get_out_tensor_type(struct ggml_tensor * t) {
-        if (t->type == GGML_TYPE_F32) {
+    ggml_type get_out_tensor_type(struct ggml_tensor * t, const std::string & name) {
+        ggml_type type = out_type;
+        bool has_override = false;
+        for (const auto & option : tensor_types) {
+            if (std::regex_search(name, option.pattern)) {
+                type = option.type;
+                has_override = true;
+                break;
+            }
+        }
+        if (!has_override && t->type == GGML_TYPE_F32) {
             return GGML_TYPE_F32;
         }
-        if (t->ne[0] % ggml_blck_size(out_type) != 0) {
-            return t->type;
+        if (t->ne[0] % ggml_blck_size(type) != 0) {
+            throw std::runtime_error("tensor " + name + " cannot use type " + ggml_type_name(type) +
+                                     ": row size is not divisible by block size");
         }
-        return out_type;
+        return type;
     }
 
     void run_merge() {
@@ -373,36 +390,31 @@ struct lora_merge_ctx {
         gguf_remove_key(ctx_out, LLM_KV_SPLIT_COUNT);
         gguf_remove_key(ctx_out, LLM_KV_SPLIT_TENSORS_COUNT);
 
-        if (adapters.size() > 1) {
-            for (size_t i = 1; i < adapters.size(); ++i) {
-                if (adapters[0]->tensors.size() != adapters[i]->tensors.size()) {
-                    throw std::runtime_error("Subset adapters merging not supported.");
-                }
-            }
-        }
-
         std::vector<tensor_transformation> trans;
         for (auto & it : base_model.tensors) {
-            bool t_a = true;
-            bool t_b = true;
-            for (auto & adapter : adapters) {
-                t_a &= nullptr != adapter->get_tensor(it.first + ".lora_a");
-                t_b &= nullptr != adapter->get_tensor(it.first + ".lora_b");
+            std::vector<size_t> adapter_indices;
+            for (size_t i = 0; i < adapters.size(); ++i) {
+                const bool has_a = adapters[i]->get_tensor(it.first + ".lora_a") != nullptr;
+                const bool has_b = adapters[i]->get_tensor(it.first + ".lora_b") != nullptr;
+                if (has_a != has_b) {
+                    throw std::runtime_error("tensor " + it.first + " missing lora_a or lora_b in adapter " + std::to_string(i));
+                }
+                if (has_a) {
+                    adapter_indices.push_back(i);
+                }
             }
             auto base_tensor = it.second.tensor;
-            if (!t_a && !t_b) {
+            if (adapter_indices.empty()) {
                 struct ggml_tensor * cpy_tensor = ggml_dup_tensor(ctx_out_ggml, base_tensor);
                 ggml_set_name(cpy_tensor, base_tensor->name);
-                trans.push_back({cpy_tensor, cpy_tensor, true});
+                trans.push_back({cpy_tensor, cpy_tensor, true, {}});
                 gguf_add_tensor(ctx_out, cpy_tensor);
-            } else if (t_a && t_b) {
-                struct ggml_tensor * out_tensor = ggml_new_tensor(
-                    ctx_out_ggml, get_out_tensor_type(base_tensor), GGML_MAX_DIMS, base_tensor->ne);
-                ggml_set_name(out_tensor, base_tensor->name);
-                trans.push_back({base_tensor, out_tensor, false});
-                gguf_add_tensor(ctx_out, out_tensor);
             } else {
-                throw std::runtime_error("tensor " + it.first + " missing lora_a or lora_b");
+                struct ggml_tensor * out_tensor = ggml_new_tensor(
+                    ctx_out_ggml, get_out_tensor_type(base_tensor, it.first), GGML_MAX_DIMS, base_tensor->ne);
+                ggml_set_name(out_tensor, base_tensor->name);
+                trans.push_back({base_tensor, out_tensor, false, std::move(adapter_indices)});
+                gguf_add_tensor(ctx_out, out_tensor);
             }
         }
 
@@ -414,7 +426,7 @@ struct lora_merge_ctx {
         size_t n_merged = 0;
         for (auto & it : trans) {
             if (!it.is_copy) {
-                merge_tensor(it.in, it.out);
+                merge_tensor(it.in, it.out, it.adapter_indices);
                 n_merged++;
             } else {
                 copy_tensor(it.in);
@@ -440,26 +452,26 @@ struct lora_merge_ctx {
         zeros(fout, GGML_PAD(len, GGUF_DEFAULT_ALIGNMENT) - len);
     }
 
-    void merge_tensor(struct ggml_tensor * base, struct ggml_tensor * out) {
+    void merge_tensor(struct ggml_tensor * base, struct ggml_tensor * out, const std::vector<size_t> & adapter_indices) {
         std::string name_base(base->name);
         std::string name_lora_a = name_base + ".lora_a";
         std::string name_lora_b = name_base + ".lora_b";
 
         printf("%s : %s [%s]\n", __func__, base->name, ggml_ne_string(base).c_str());
 
-        std::vector<struct ggml_tensor *> inp_a(adapters.size());
-        std::vector<struct ggml_tensor *> inp_b(adapters.size());
+        std::vector<struct ggml_tensor *> inp_a(adapter_indices.size());
+        std::vector<struct ggml_tensor *> inp_b(adapter_indices.size());
         struct ggml_init_params params {
-            /*.mem_size   =*/ ggml_tensor_overhead() * (2 + adapters.size() * 2),
+            /*.mem_size   =*/ ggml_tensor_overhead() * (2 + adapter_indices.size() * 2),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
         struct ggml_context * ctx = ggml_init(params);
 
         struct ggml_tensor * inp_base = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, base->ne);
-        for (size_t i = 0; i < adapters.size(); ++i) {
-            auto t_a = adapters[i]->get_tensor(name_lora_a);
-            auto t_b = adapters[i]->get_tensor(name_lora_b);
+        for (size_t i = 0; i < adapter_indices.size(); ++i) {
+            auto t_a = adapters[adapter_indices[i]]->get_tensor(name_lora_a);
+            auto t_b = adapters[adapter_indices[i]]->get_tensor(name_lora_b);
             inp_a[i] = ggml_dup_tensor(ctx, t_a);
             inp_b[i] = ggml_dup_tensor(ctx, t_b);
         }
@@ -476,10 +488,10 @@ struct lora_merge_ctx {
             ggml_backend_tensor_set(inp_base, read_buf.data(), 0, ggml_nbytes(inp_base));
         }
 
-        for (size_t i = 0; i < adapters.size(); ++i) {
-            adapters[i]->read_tensor_data(name_lora_a, read_buf);
+        for (size_t i = 0; i < adapter_indices.size(); ++i) {
+            adapters[adapter_indices[i]]->read_tensor_data(name_lora_a, read_buf);
             ggml_backend_tensor_set(inp_a[i], read_buf.data(), 0, ggml_nbytes(inp_a[i]));
-            adapters[i]->read_tensor_data(name_lora_b, read_buf);
+            adapters[adapter_indices[i]]->read_tensor_data(name_lora_b, read_buf);
             ggml_backend_tensor_set(inp_b[i], read_buf.data(), 0, ggml_nbytes(inp_b[i]));
         }
 
@@ -500,7 +512,7 @@ struct lora_merge_ctx {
             // produces F32 or plain-float output. Quantized output types
             // are handled after the graph is computed, see below.
             struct ggml_tensor * cur = inp_base;
-            for (size_t i = 0; i < adapters.size(); ++i) {
+            for (size_t i = 0; i < adapter_indices.size(); ++i) {
                 struct ggml_tensor * delta;
                 bool is_tok_embd = string_starts_with(name_base, "token_embd");
                 if (is_tok_embd) {
@@ -512,9 +524,9 @@ struct lora_merge_ctx {
                         ggml_cont(ctx0, ggml_transpose(ctx0, ggml_cast(ctx0, inp_a[i], GGML_TYPE_F32))),
                         ggml_cast(ctx0, inp_b[i], GGML_TYPE_F32));
                 }
-                const float alpha = adapters[i]->alpha;
+                const float alpha = adapters[adapter_indices[i]]->alpha;
                 const float rank  = (float) inp_b[i]->ne[0];
-                const float scale = alpha ? adapters[i]->scale * alpha / rank : adapters[i]->scale;
+                const float scale = alpha ? adapters[adapter_indices[i]]->scale * alpha / rank : adapters[adapter_indices[i]]->scale;
                 delta = ggml_scale(ctx0, delta, scale);
                 cur = ggml_add(ctx0, delta, cur);
             }
@@ -590,6 +602,8 @@ static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
     printf("\n  %s -m base-model.gguf --lora lora-file.gguf -o merged-model.gguf --type q4_0\n", argv[0]);
     printf("\n  %s -m base-model.gguf --lora lora-file.gguf -o merged-model.gguf --qat q4_0\n", argv[0]);
+    printf("\n  --tensor-type REGEX=TYPE       set the output type for matching merged tensors\n");
+    printf("  --tensor-type-file FILE        read whitespace-separated REGEX=TYPE entries\n");
     printf("\n--type accepts any ggml tensor type that can be produced from F32, e.g.:\n  ");
     auto names = list_supported_type_names();
     for (size_t i = 0; i < names.size(); ++i) {
@@ -598,15 +612,58 @@ static void print_usage(int, char ** argv) {
     printf("\n");
 }
 
-// Pulls "--type <value>" out of argv (if present) and returns argv/argc
-// with it stripped, so downstream common_params_parse() doesn't choke on
-// an option it doesn't know about. Returns the requested type via out_type.
-static std::vector<std::string> extract_type_arg(int argc, char ** argv, ggml_type & out_type) {
+static void add_tensor_type_option(
+        const std::string & value,
+        std::vector<tensor_type_option> & tensor_types) {
+    const size_t separator = value.find('=');
+    if (separator == std::string::npos || separator == 0 || separator + 1 == value.size()) {
+        throw std::runtime_error("invalid tensor type option '" + value + "', expected REGEX=TYPE");
+    }
+
+    const std::string name = value.substr(0, separator);
+    const std::string type_name = value.substr(separator + 1);
+    ggml_type type;
+    if (!ggml_type_from_name(type_name, type) || !is_valid_output_type(type)) {
+        throw std::runtime_error("invalid tensor type '" + type_name + "' in option '" + value + "'");
+    }
+
+    try {
+        tensor_types.push_back({std::regex(name), type});
+    } catch (const std::regex_error & err) {
+        throw std::runtime_error("invalid tensor regex '" + name + "': " + err.what());
+    }
+}
+
+static void add_tensor_type_file(
+        const std::string & path,
+        std::vector<tensor_type_option> & tensor_types) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        throw std::runtime_error("failed to open tensor type file: " + path);
+    }
+
+    std::string value;
+    while (file >> value) {
+        add_tensor_type_option(value, tensor_types);
+    }
+    if (file.bad()) {
+        throw std::runtime_error("failed to read tensor type file: " + path);
+    }
+}
+
+static std::vector<std::string> extract_export_args(
+        int argc,
+        char ** argv,
+        ggml_type & out_type,
+        std::vector<tensor_type_option> & tensor_types) {
     std::vector<std::string> filtered;
     filtered.reserve(argc);
 
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--type") == 0) {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for --type");
+            }
             std::string type_str = argv[i + 1];
             if (!ggml_type_from_name(type_str, out_type)) {
                 throw std::runtime_error("unknown --type '" + type_str + "', see --help for the supported list");
@@ -615,10 +672,13 @@ static std::vector<std::string> extract_type_arg(int argc, char ** argv, ggml_ty
                 throw std::runtime_error("--type '" + type_str + "' cannot be produced from F32 data "
                                           "(no from_float converter), see --help for the supported list");
             }
-            i++; // skip the value too
+            i++;
             continue;
         }
-        if (strcmp(argv[i], "--qat") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--qat") == 0) {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for --qat");
+            }
             const std::string type_str = argv[i + 1];
             if (type_str == "q3_k") {
                 out_type = GGML_TYPE_Q3_K;
@@ -632,6 +692,20 @@ static std::vector<std::string> extract_type_arg(int argc, char ** argv, ggml_ty
             i++;
             continue;
         }
+        if (strcmp(argv[i], "--tensor-type") == 0) {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for --tensor-type");
+            }
+            add_tensor_type_option(argv[++i], tensor_types);
+            continue;
+        }
+        if (strcmp(argv[i], "--tensor-type-file") == 0) {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for --tensor-type-file");
+            }
+            add_tensor_type_file(argv[++i], tensor_types);
+            continue;
+        }
         filtered.push_back(argv[i]);
     }
     return filtered;
@@ -643,10 +717,11 @@ int main(int argc, char ** argv) {
     common_params params;
     params.out_file = "ggml-lora-merged.gguf";
     ggml_type target_out_type = GGML_TYPE_F16; // default kept for backward compatibility
+    std::vector<tensor_type_option> tensor_types;
 
     std::vector<std::string> filtered_args;
     try {
-        filtered_args = extract_type_arg(argc, argv, target_out_type);
+        filtered_args = extract_export_args(argc, argv, target_out_type, tensor_types);
     } catch (const std::exception & err) {
         fprintf(stderr, "%s\n", err.what());
         print_usage(argc, argv);
@@ -668,7 +743,8 @@ int main(int argc, char ** argv) {
 
     g_verbose = (params.verbosity > 1);
     try {
-        lora_merge_ctx ctx(params.model.path, params.lora_adapters, params.out_file, target_out_type, params.cpuparams.n_threads);
+        lora_merge_ctx ctx(
+            params.model.path, params.lora_adapters, params.out_file, target_out_type, tensor_types, params.cpuparams.n_threads);
         ctx.run_merge();
     } catch (const std::exception & err) {
         fprintf(stderr, "%s\n", err.what());

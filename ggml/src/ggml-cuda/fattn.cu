@@ -124,14 +124,19 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_should_use_sparse(const int device,
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
     const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
-    const bool volta_sparse_shape = Q->ne[1] == 1 &&
+    const bool q8_kv = K->type == GGML_TYPE_Q8_KV && V->type == GGML_TYPE_Q8_KV;
+    const bool volta_q8_sparse_shape = Q->ne[1] == 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        gqa_ratio == 2 && dst->src[4] == nullptr;
+    const bool volta_f16_sparse_shape = Q->ne[1] == 1 &&
         ((Q->ne[0] == 512 && V->ne[0] == 512 && gqa_ratio % 8 == 0) ||
          (Q->ne[0] == 576 && V->ne[0] == 512 && gqa_ratio % 16 == 0));
-    const bool mma_sparse_available = turing_mma_available(cc) || (volta_mma_available(cc) && volta_sparse_shape);
+    const bool mma_sparse_available = q8_kv ? cc == GGML_CUDA_CC_VOLTA && volta_q8_sparse_shape :
+        Q->ne[0] != 256 && (turing_mma_available(cc) || (volta_mma_available(cc) && volta_f16_sparse_shape));
+    const bool sparse_kv_length = q8_kv ? K->ne[1] >= std::max<int64_t>(1024, n_kv_max) : K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
     return GGML_CUDA_CC_IS_NVIDIA(cc) && mma_sparse_available &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
+        sparse_kv_length;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -145,14 +150,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
+    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2) || (DKQ == 256 && DV == 256)) {
         if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
             if (volta_mma_available(cc)) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 32>(ctx, dst);
                 return;
             }
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
-            return;
+            if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
+                return;
+            }
         }
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -665,6 +672,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (K->type == GGML_TYPE_Q8_KV && V->type == GGML_TYPE_Q8_KV) {
+        if (ggml_cuda_flash_attn_ext_mma_f16_should_use_sparse(device, dst)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         static const char * disable_q8_kv_tile_env = getenv("GGML_CUDA_DISABLE_Q8_KV_TILE");
         static const bool disable_q8_kv_tile = disable_q8_kv_tile_env != nullptr && std::atoi(disable_q8_kv_tile_env) != 0;
         if (!disable_q8_kv_tile && cc == GGML_CUDA_CC_VOLTA && Q->ne[1] > 1) {
