@@ -85,6 +85,10 @@ for type_k in TYPES_KV:
             if type_k == "GGML_TYPE_Q8_0" and type_v == "GGML_TYPE_Q8_0":
                 f.write(f"DECL_FATTN_VEC_CASE(512, {type_k}, {type_v});\n")
 
+with open("fattn-vec-instance-q8_kv-q8_kv.cu", "w") as f:
+    f.write(SOURCE_FATTN_VEC.format(type_k="GGML_TYPE_Q8_KV", type_v="GGML_TYPE_Q8_KV"))
+    f.write("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV);\n")
+
 for type_k in TYPES_KV_EXT:
     for type_v in TYPES_KV_EXT:
         if type_k == "GGML_TYPE_F16" and type_v == "GGML_TYPE_F16":
