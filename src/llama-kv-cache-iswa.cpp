@@ -96,8 +96,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
-    const bool lazy_base = unified && kv_size >= 65536 &&
-        type_k_base == type_v_base && (type_k_base == GGML_TYPE_Q8_0 || type_k_base == GGML_TYPE_F16);
+    const bool lazy_base = unified && kv_size >= 65536 && type_k_base == type_v_base &&
+        (type_k_base == GGML_TYPE_Q8_0 || type_k_base == GGML_TYPE_Q8_KV || type_k_base == GGML_TYPE_F16);
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k_base, type_v_base,
@@ -106,8 +106,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
-    const bool lazy_swa = unified && kv_size >= 65536 &&
-        type_k_swa == type_v_swa && (type_k_swa == GGML_TYPE_Q8_0 || type_k_swa == GGML_TYPE_F16);
+    const bool lazy_swa = unified && kv_size >= 65536 && type_k_swa == type_v_swa &&
+        (type_k_swa == GGML_TYPE_Q8_0 || type_k_swa == GGML_TYPE_Q8_KV || type_k_swa == GGML_TYPE_F16);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k_swa, type_v_swa,

@@ -268,6 +268,9 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
             jtool_calls.push_back(tc);
         }
     }
+    if (!tool_responses.empty()) {
+        jmsg["tool_responses"] = tool_responses;
+    }
 
     return jmsg;
 }
@@ -399,6 +402,7 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
 
             auto has_content    = message.contains("content");
             auto has_tool_calls = message.contains("tool_calls");
+            auto has_tool_responses = message.contains("tool_responses");
             if (has_content) {
                 const auto & content = message.at("content");
                 if (content.is_string()) {
@@ -453,9 +457,15 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                     msg.tool_calls.push_back(tc);
                 }
             }
-            if (!has_content && !has_tool_calls) {
+            if (has_tool_responses) {
+                if (!message.at("tool_responses").is_array()) {
+                    throw std::invalid_argument("Expected 'tool_responses' to be an array: " + message.dump());
+                }
+                msg.tool_responses = message.at("tool_responses");
+            }
+            if (!has_content && !has_tool_calls && !has_tool_responses) {
                 throw std::invalid_argument(
-                    "Expected 'content' or 'tool_calls' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
+                    "Expected 'content', 'tool_calls', or 'tool_responses' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
                     "https://github.com/ggml-org/llama.cpp/issues/12279)");
             }
             if (message.contains("reasoning_content")) {

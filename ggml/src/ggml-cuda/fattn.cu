@@ -471,6 +471,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV)
+
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
@@ -544,6 +547,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_KV:
         case GGML_TYPE_BF16:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_TURBO3_0:
@@ -630,7 +634,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies && !packed_kv) {
+            if (!gqa_opt_applies && !packed_kv && K->type != GGML_TYPE_Q8_KV) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -666,6 +670,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (K->type == GGML_TYPE_Q8_KV && V->type == GGML_TYPE_Q8_KV) {
+        static const char * disable_q8_kv_tile_env = getenv("GGML_CUDA_DISABLE_Q8_KV_TILE");
+        static const bool disable_q8_kv_tile = disable_q8_kv_tile_env != nullptr && std::atoi(disable_q8_kv_tile_env) != 0;
+        if (!disable_q8_kv_tile && cc == GGML_CUDA_CC_VOLTA && Q->ne[1] > 1) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        return BEST_FATTN_KERNEL_VEC;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -776,8 +789,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
+            need_f16_K = K->type != GGML_TYPE_Q8_KV;
+            need_f16_V = V->type != GGML_TYPE_Q8_KV;
             break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;
@@ -795,7 +808,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

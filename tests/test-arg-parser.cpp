@@ -101,6 +101,22 @@ static void test(void) {
         assert(draft.n_outputs_max_per_seq == 1);
     }
 
+    {
+        common_params base;
+        base.cache_type_k = GGML_TYPE_Q4_0;
+        base.cache_type_v = GGML_TYPE_Q4_0;
+
+        auto draft = common_base_params_to_speculative(base);
+        assert(draft.cache_type_k == GGML_TYPE_Q4_0);
+        assert(draft.cache_type_v == GGML_TYPE_Q4_0);
+
+        base.speculative.draft.cache_type_k = GGML_TYPE_Q8_0;
+        base.speculative.draft.cache_type_k_set = true;
+        draft = common_base_params_to_speculative(base);
+        assert(draft.cache_type_k == GGML_TYPE_Q8_0);
+        assert(draft.cache_type_v == GGML_TYPE_Q4_0);
+    }
+
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {
@@ -259,6 +275,17 @@ static void test(void) {
         assert(cparams.type_v == GGML_TYPE_Q8_0);
         assert(cparams.type_k_swa == GGML_TYPE_Q8_0);
         assert(cparams.type_v_swa == GGML_TYPE_Q8_0);
+    }
+
+    {
+        common_params kv_params;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "q8_kv", "-ctv", "Q8_KV"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        const llama_context_params cparams = common_context_params_to_llama(kv_params);
+        assert(cparams.type_k == GGML_TYPE_Q8_KV);
+        assert(cparams.type_v == GGML_TYPE_Q8_KV);
+        assert(cparams.type_k_swa == GGML_TYPE_Q8_KV);
+        assert(cparams.type_v_swa == GGML_TYPE_Q8_KV);
     }
 
     for (const std::vector<std::string> & args : {

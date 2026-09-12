@@ -114,12 +114,14 @@ struct server_batch {
 
     struct token {
         int32_t id_slot;
+        int32_t seq_group;
         llama_token token;
         llama_pos pos;
         bool output;
         bool is_prompt; // for stats tracking
     };
     std::vector<token> tokens;
+    std::vector<std::vector<llama_seq_id>> seq_groups;
     int32_t n_tokens_alloc = 0;
     int32_t n_embd = 0;
 
@@ -145,10 +147,10 @@ struct server_batch {
         }
     }
 
-    void init(int32_t n_tokens_alloc, int32_t n_embd) {
+    void init(int32_t n_tokens_alloc, int32_t n_embd, int32_t n_seq_max) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
-        batch = llama_batch_init(n_tokens_alloc, 0, 1);
+        batch = llama_batch_init(n_tokens_alloc, 0, n_seq_max);
         tokens_ptr = batch.token;
         tokens.reserve(n_tokens_alloc);
     }
@@ -159,7 +161,23 @@ struct server_batch {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output, is_prompt });
+        tokens.push_back({ id_slot, -1, token, pos, output, is_prompt });
+        return true;
+    }
+
+    bool add(int32_t id_slot, const std::vector<llama_seq_id> & seq_ids, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+        GGML_ASSERT(seq_ids.size() > 1);
+        GGML_ASSERT(!has_embd);
+        if ((int32_t) tokens.size() >= n_tokens_alloc) {
+            return false;
+        }
+
+        auto it = std::find(seq_groups.begin(), seq_groups.end(), seq_ids);
+        if (it == seq_groups.end()) {
+            seq_groups.push_back(seq_ids);
+            it = std::prev(seq_groups.end());
+        }
+        tokens.push_back({ id_slot, (int32_t) std::distance(seq_groups.begin(), it), token, pos, output, is_prompt });
         return true;
     }
 
@@ -168,7 +186,7 @@ struct server_batch {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt });
+        tokens.push_back({ id_slot, -1, LLAMA_TOKEN_NULL, pos, output, is_prompt });
         has_embd = true;
         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
         return true;
@@ -176,6 +194,7 @@ struct server_batch {
 
     void clear() {
         tokens.clear();
+        seq_groups.clear();
         embd.clear();
         common_batch_clear(batch);
         slot_batched      = nullptr;
@@ -204,7 +223,11 @@ struct server_batch {
         common_batch_clear(batch);
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
-            common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
+            if (t.seq_group >= 0) {
+                common_batch_add(batch, t.token, t.pos, seq_groups[t.seq_group], t.output);
+            } else {
+                common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
+            }
         }
         if (has_embd) {
             batch.token = nullptr; // will be restored on clear()
@@ -293,6 +316,10 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+
+    int32_t prefix_leader_id = -1;
+    int32_t prefix_leader_task_id = -1;
+    size_t prefix_share_end = 0;
 
     server_prompt prompt;
 
@@ -396,6 +423,9 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+        prefix_leader_id = -1;
+        prefix_leader_task_id = -1;
+        prefix_share_end = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -1359,7 +1389,7 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            batch.init(std::max(n_batch, params_base.n_parallel), n_embd, params_base.n_parallel);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -1836,6 +1866,47 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        if (!slot.task->is_child() && slot.task->params.cache_prompt && !slot.can_speculate() &&
+                slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.task->tokens.has_mtmd &&
+                slot.task->n_tokens() > 1 && slot.task->n_tokens() < slot.n_ctx) {
+            server_slot * leader = nullptr;
+            size_t lcp_best = 0;
+            const size_t own_lcp = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+
+            for (auto & other : slots) {
+                if (&other == &slot || !other.is_processing() || !other.task || other.task->is_child() ||
+                        other.prefix_leader_id >= 0 || !other.task->params.cache_prompt || other.can_speculate() ||
+                        other.task->type != SERVER_TASK_TYPE_COMPLETION || other.task->tokens.has_mtmd ||
+                        !are_lora_equal(slot.lora, other.lora) || slot.alora_invocation_start != other.alora_invocation_start) {
+                    continue;
+                }
+
+                const size_t lcp = slot.task->tokens.get_common_prefix(other.task->tokens);
+                if (lcp >= 32 && lcp > own_lcp && lcp > lcp_best) {
+                    leader = &other;
+                    lcp_best = lcp;
+                }
+            }
+
+            if (leader) {
+                slot.prompt_clear();
+                slot.prefix_leader_id = leader->id;
+                slot.prefix_leader_task_id = leader->task->id;
+                slot.prefix_share_end = lcp_best;
+                slot.state = SLOT_STATE_WAIT_OTHER;
+                slot.stats.update_prompt_start();
+
+                if (slot.task->params.stream) {
+                    if (slot.task->params.return_progress) {
+                        send_partial_response(slot, {}, true);
+                    } else {
+                        send_partial_response(slot, {}, false, true);
+                    }
+                }
+                SLT_INF(slot, "sharing %zu prompt tokens with slot %d\n", lcp_best, leader->id);
+            }
+        }
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2905,6 +2976,47 @@ private:
     }
 
     void pre_decode() {
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_WAIT_OTHER || slot.prefix_leader_id < 0) {
+                continue;
+            }
+
+            server_slot * leader = get_slot_by_id(slot.prefix_leader_id);
+            if (!leader || !leader->is_processing() || !leader->task ||
+                    leader->task->id != slot.prefix_leader_task_id || !leader->can_batch_with(slot) ||
+                    leader->alora_invocation_start != slot.alora_invocation_start) {
+                slot.prefix_leader_id = -1;
+                slot.prefix_leader_task_id = -1;
+                slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                continue;
+            }
+
+            const size_t committed = std::min(slot.prefix_share_end,
+                    (size_t) (leader->stats.n_prompt_cached + leader->stats.n_prompt_processed));
+            const size_t copy_limit = std::min(committed, (size_t) slot.task->n_tokens() - 1);
+            const size_t copied = slot.prompt.n_tokens();
+            if (copy_limit > copied) {
+                slot.mem.seq_cp(leader->id, slot.id, copied, copy_limit);
+                llama_tokens prefix;
+                prefix.reserve(copy_limit - copied);
+                for (size_t i = copied; i < copy_limit; ++i) {
+                    prefix.push_back(slot.task->tokens[i]);
+                }
+                slot.prompt.tokens.insert(prefix);
+                const size_t n_new = copy_limit - copied;
+                slot.stats.n_prompt_cached += n_new;
+                metrics.add_prompt_cached(n_new);
+                SLT_DBG(slot, "copied %zu committed prefix tokens from slot %d\n", n_new, leader->id);
+            }
+
+            const size_t share_target = std::min(slot.prefix_share_end, (size_t) slot.task->n_tokens() - 1);
+            if ((size_t) slot.prompt.n_tokens() >= share_target) {
+                slot.prefix_leader_id = -1;
+                slot.prefix_leader_task_id = -1;
+                slot.state = SLOT_STATE_PROCESSING_PROMPT;
+            }
+        }
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3537,12 +3649,43 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
-                            cur_tok,
-                            /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
+                        std::vector<llama_seq_id> seq_ids = { slot.id };
+                        std::vector<server_slot *> prefix_followers;
+                        const size_t token_idx = slot.prompt.n_tokens();
+                        for (auto & other : slots) {
+                            if (other.state == SLOT_STATE_WAIT_OTHER && other.prefix_leader_id == slot.id &&
+                                    (size_t) other.prompt.n_tokens() == token_idx && token_idx < other.prefix_share_end &&
+                                    other.task->tokens[token_idx] == cur_tok) {
+                                seq_ids.push_back(other.id);
+                                prefix_followers.push_back(&other);
+                            }
+                        }
+
+                        add_ok &= seq_ids.size() > 1
+                                ? batch.add(slot.id, seq_ids, cur_tok, slot.prompt.tokens.pos_next(), slot.need_embd(), true)
+                                : batch.add(slot.id, cur_tok, slot.prompt.tokens.pos_next(), slot.need_embd(), true);
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        const int32_t shared_i_batch = batch.size() - 1;
+                        for (server_slot * follower : prefix_followers) {
+                            follower->prompt.tokens.push_back(cur_tok);
+                            follower->stats.n_prompt_cached++;
+                            metrics.add_prompt_cached(1);
+
+                            if (follower->prompt.n_tokens() == follower->task->n_tokens()) {
+                                batch.set_output(shared_i_batch, true);
+                                follower->state = SLOT_STATE_DONE_PROMPT;
+                                follower->prefix_leader_id = -1;
+                                follower->prefix_leader_task_id = -1;
+                                follower->stats.n_gen = 0;
+                                follower->i_batch = shared_i_batch;
+                                follower->init_sampler();
+                            } else if ((size_t) follower->prompt.n_tokens() >= follower->prefix_share_end) {
+                                follower->state = SLOT_STATE_PROCESSING_PROMPT;
+                                follower->prefix_leader_id = -1;
+                                follower->prefix_leader_task_id = -1;
+                            }
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3814,6 +3957,12 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (prompt_cache && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt) {
+                    if (slot.prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
+                    }
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);

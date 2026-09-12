@@ -1491,9 +1491,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // Training can request input offload to avoid copying every embedding batch.
+    pimpl->dev_input = params.offload_input && n_gpu_layers > n_layer_all
+        ? get_layer_buft_list(0)
+        : llama_model::impl::layer_dev { cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -2737,6 +2738,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.offload_input               =*/ false,
     };
 
     return result;

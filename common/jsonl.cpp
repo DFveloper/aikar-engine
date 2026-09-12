@@ -91,6 +91,26 @@ common_chat_msg parse_chat_message(const Json & data, common_jsonl_chat_parse_mo
     // schema used by the runtime.  In particular, an assistant tool-call turn
     // is valid with no text payload: its supervised payload is `tool_calls`.
     message.content = required_string(data, "content", message.role != "assistant");
+    if (data.contains("tool_calls")) {
+        if (!data.at("tool_calls").is_array()) throw std::runtime_error("'tool_calls' must be an array");
+        for (const auto & item : data.at("tool_calls")) {
+            if (item.value("type", "") != "function" || !item.contains("function")) {
+                throw std::runtime_error("invalid tool call");
+            }
+            const auto & function = item.at("function");
+            common_chat_tool_call call;
+            call.name = required_string(function, "name", true);
+            if (!function.contains("arguments")) throw std::runtime_error("tool call is missing 'arguments'");
+            const auto & arguments = function.at("arguments");
+            call.arguments = arguments.is_string() ? arguments.template get<std::string>() : arguments.dump();
+            call.id = item.value("id", "");
+            message.tool_calls.push_back(std::move(call));
+        }
+    }
+    if (data.contains("tool_responses")) {
+        if (!data.at("tool_responses").is_array()) throw std::runtime_error("'tool_responses' must be an array");
+        message.tool_responses = common_json::parse(data.at("tool_responses").dump());
+    }
     message.reasoning_content = required_string(data, "reasoning", false);
     if (data.contains("reasoning_content")) {
         if (!message.reasoning_content.empty()) throw std::runtime_error("use only one of 'reasoning' and 'reasoning_content'");

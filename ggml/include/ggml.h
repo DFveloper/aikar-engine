@@ -432,7 +432,8 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TURBO3_0 = 43, // runtime-only TurboQuant 3-bit KV cache
         GGML_TYPE_TURBO4_0 = 44, // runtime-only TurboQuant 4-bit KV cache
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_Q8_KV   = 151, // runtime-only Q8 KV cache with 64-element blocks
+        GGML_TYPE_COUNT   = 152,
     };
 
     // precision
@@ -3097,6 +3098,7 @@ extern "C" {
         bool                     is_quantized;
         ggml_to_float_t          to_float;
         ggml_from_float_t        from_float_ref;
+        size_t                   row_meta_size;
     };
 
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);

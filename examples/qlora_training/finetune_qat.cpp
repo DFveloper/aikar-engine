@@ -490,10 +490,28 @@ struct qat_callback_context {
     int64_t ubatches_per_window;
     int64_t last_saved_step;
     int64_t last_observed_step;
+    ggml_opt_result_t result_eval;
+    int64_t validation_start;
+    int64_t validation_end;
     bool    first_save_pending;
 };
 
 static thread_local struct qat_callback_context * g_qat_callback = nullptr;
+
+static void qat_run_periodic_eval(ggml_opt_dataset_t dataset, int64_t step) {
+    auto * callback = g_qat_callback;
+    if (!callback || callback->validation_end <= callback->validation_start) return;
+    ggml_opt_result_reset(callback->result_eval);
+    llama_opt_eval_range(callback->lctx, dataset, callback->result_eval,
+        callback->validation_start, callback->validation_end, nullptr);
+    double loss = 0.0;
+    double accuracy = 0.0;
+    ggml_opt_result_loss(callback->result_eval, &loss, nullptr);
+    ggml_opt_result_accuracy(callback->result_eval, &accuracy, nullptr);
+    LOG_INF("validation: step=%ld epoch=%ld loss=%.8f acc=%.4f%%\n",
+        (long) step, (long) (callback->epoch + 1), loss, 100.0 * accuracy);
+    ggml_opt_result_reset(callback->result_eval);
+}
 
 static void qat_epoch_callback(
         bool train,
@@ -515,6 +533,9 @@ static void qat_epoch_callback(
     }
     g_qat_callback->last_observed_step = step;
     ++g_qat_callback->schedule->step;
+    if (g_qat_callback->params->eval_every > 0 && step % g_qat_callback->params->eval_every == 0) {
+        qat_run_periodic_eval(dataset, step);
+    }
     if (g_qat_callback->params->verbose_loss) {
         double loss = 0.0;
         ggml_opt_result_loss(result, &loss, nullptr);
@@ -648,6 +669,7 @@ int main(int argc, char ** argv) {
         (unsigned long long) model_info.nonquantized_bytes,
         (unsigned long long) (model_info.quantized_bytes + model_info.momentum_bytes + model_info.residual_bytes + gradient_estimate));
 
+    params.offload_input = true;
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -855,6 +877,7 @@ int main(int argc, char ** argv) {
         lctx, mtp.ctx.get(), model, &mtp, &schedule, &params, 0, 0, ubatches_per_window,
         llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx),
         llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx),
+        result_eval, idata_split, ndata,
         params.save_first_at > schedule.step
     };
     g_qat_callback = &callback_ctx;
@@ -862,6 +885,10 @@ int main(int argc, char ** argv) {
         for (int64_t epoch = 0; epoch < resume.epoch; ++epoch) {
             llama_opt_dataset_shuffle(lctx, dataset, idata_split);
         }
+    }
+    if (params.eval_initial) {
+        callback_ctx.epoch = resume.epoch;
+        qat_run_periodic_eval(dataset, llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx));
     }
     for (params.lr.epoch = (int) resume.epoch; params.lr.epoch < params.lr.epochs; ++params.lr.epoch) {
         const int64_t start = params.lr.epoch == resume.epoch ? resume.window : 0;
@@ -882,6 +909,14 @@ int main(int argc, char ** argv) {
             params.mtp_mode == "only" ? mtp.ctx.get() : lctx);
         LOG_INF("qat_epoch: epoch=%d/%d loss=%.8f uncertainty=%.8f optimizer_step=%ld\n",
             params.lr.epoch + 1, params.lr.epochs, train_loss, train_unc, (long) optimizer_step);
+        if (idata_split < ndata) {
+            double val_loss = 0.0;
+            double val_accuracy = 0.0;
+            ggml_opt_result_loss(result_eval, &val_loss, nullptr);
+            ggml_opt_result_accuracy(result_eval, &val_accuracy, nullptr);
+            LOG_INF("validation: step=%ld epoch=%d loss=%.8f acc=%.4f%%\n",
+                (long) optimizer_step, params.lr.epoch + 1, val_loss, 100.0 * val_accuracy);
+        }
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_eval);
     }

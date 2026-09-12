@@ -354,6 +354,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool offload_input;   // offload the input embedding layer when all layers are offloaded
     };
 
     struct llama_sampler_seq_config {
@@ -1735,6 +1736,10 @@ extern "C" {
         // Run the target backward/optimizer graph. Disable for MTP-only training;
         // the target forward graph still produces hidden states for the MTP model.
         bool                                 train_target;
+        // Run the MTP backward/optimizer graph. Disable for target-only training;
+        // the target forward graph still produces hidden states for the MTP model.
+        bool                                 train_mtp;
+        // When true, the MTP model is trained with a loss that encourages it to match
 
     };
 
@@ -1783,6 +1788,15 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval,
             bool                      shuffle);
+
+    // Evaluate a fixed dataset range without applying optimizer updates.
+    LLAMA_API void llama_opt_eval_range(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_start,
+            int64_t                   idata_end,
+            ggml_opt_epoch_callback   callback_eval);
 
 #ifdef __cplusplus
 }

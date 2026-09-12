@@ -82,6 +82,7 @@ struct common_chat_msg {
     std::string                               content;
     std::vector<common_chat_msg_content_part> content_parts;
     std::vector<common_chat_tool_call>        tool_calls;
+    common_json                               tool_responses;
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
@@ -91,7 +92,7 @@ struct common_chat_msg {
     std::string render_content(const std::string & delimiter = "\n\n") const;
 
     bool empty() const {
-        return content.empty() && content_parts.empty() && tool_calls.empty() && reasoning_content.empty() &&
+        return content.empty() && content_parts.empty() && tool_calls.empty() && tool_responses.empty() && reasoning_content.empty() &&
                tool_name.empty() && tool_call_id.empty();
     }
 
@@ -120,7 +121,7 @@ struct common_chat_msg {
 
     bool operator==(const common_chat_msg & other) const {
         return role == other.role && content == other.content && content_parts == other.content_parts &&
-               tool_calls == other.tool_calls && reasoning_content == other.reasoning_content &&
+               tool_calls == other.tool_calls && tool_responses == other.tool_responses && reasoning_content == other.reasoning_content &&
                tool_name == other.tool_name && tool_call_id == other.tool_call_id;
     }
 

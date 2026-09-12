@@ -546,6 +546,10 @@ task_params eval_llama_cmpl_schema(
         f->eval(ctx, data);
     }
 
+    if (params_base.cache_prompt) {
+        params.cache_prompt = true;
+    }
+
     // post-processing
     {
         // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here

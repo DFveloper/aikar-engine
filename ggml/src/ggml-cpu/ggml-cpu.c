@@ -263,6 +263,27 @@ static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
     ggml_vec_dot_turbo_f32(GGML_TYPE_TURBO4_0, n, s, vx, (const float *) vy);
 }
 
+static void ggml_vec_dot_q8_kv_q8_kv(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(n % QK8_KV == 0);
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+
+    const block_q8_kv * x = vx;
+    const block_q8_kv * y = vy;
+    float sum = 0.0f;
+    for (int ib = 0; ib < n/QK8_KV; ++ib) {
+        int32_t sumi = 0;
+        for (int i = 0; i < QK8_KV; ++i) {
+            sumi += x[ib].qs[i]*y[ib].qs[i];
+        }
+        sum += GGML_FP16_TO_FP32(x[ib].d)*GGML_FP16_TO_FP32(y[ib].d)*sumi;
+    }
+    *s = sum;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -329,6 +350,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #else
         .nrows                    = 1,
 #endif
+    },
+    [GGML_TYPE_Q8_KV] = {
+        .from_float               = quantize_row_q8_kv_ref,
+        .vec_dot                  = ggml_vec_dot_q8_kv_q8_kv,
+        .vec_dot_type             = GGML_TYPE_Q8_KV,
+        .nrows                    = 1,
     },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,

@@ -511,7 +511,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    res &= self_k_idxs->ne[0] == mctx->get_n_k_rows(params.ubatch.n_tokens);
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
@@ -534,7 +534,7 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
     bool res = true;
 
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    res &= self_k_idxs->ne[0] == mctx->get_n_k_rows(params.ubatch.n_tokens);
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
@@ -676,7 +676,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
-        res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+        res &= self_k_idxs->ne[0] == mctx->get_base()->get_n_k_rows(params.ubatch.n_tokens);
       //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
@@ -686,7 +686,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
-        res &= self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
+        res &= self_k_idxs_swa->ne[0] == mctx->get_swa()->get_n_k_rows(params.ubatch.n_tokens);
       //res &= self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
@@ -735,7 +735,7 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
 
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
-        res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+        res &= self_k_idxs->ne[0] == mctx->get_base()->get_n_k_rows(params.ubatch.n_tokens);
     }
 
     if (self_kq_mask && self_kq_mask->buffer) {
@@ -744,7 +744,7 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
-        res &= self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
+        res &= self_k_idxs_swa->ne[0] == mctx->get_swa()->get_n_k_rows(params.ubatch.n_tokens);
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {

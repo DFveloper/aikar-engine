@@ -576,13 +576,13 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     if constexpr (D == 512 &&
-            ((type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) ||
+            (((type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q8_KV) && type_K == type_V) ||
              ((type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_MXFP4) &&
               (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_MXFP4)))) {
         const ggml_tensor * K = dst->src[1];
         if (cc == GGML_CUDA_CC_VOLTA) {
             constexpr int gqa_threshold = 12288;
-            if constexpr (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
+            if constexpr ((type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q8_KV) && type_K == type_V) {
                 if (K->ne[1] >= gqa_threshold) {
                     ggml_cuda_flash_attn_ext_vec_case_volta_d512_q8<
                         D, cols_per_block, 2, type_K, type_V, use_logit_softcap>(ctx, dst);
@@ -703,6 +703,10 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 
 extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);

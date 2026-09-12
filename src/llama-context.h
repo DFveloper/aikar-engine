@@ -221,6 +221,13 @@ struct llama_context {
             ggml_opt_epoch_callback callback_eval,
             bool                    shuffle);
 
+    void opt_eval_range(
+            ggml_opt_dataset_t      dataset,
+            ggml_opt_result_t       result_eval,
+            int64_t                 idata_start,
+            int64_t                 idata_end,
+            ggml_opt_epoch_callback callback_eval);
+
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
             ggml_opt_result_t                result,

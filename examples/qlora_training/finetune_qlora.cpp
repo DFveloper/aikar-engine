@@ -63,6 +63,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <clocale>
 #include <cmath>
@@ -82,6 +83,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef GGML_USE_NVTX
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2401,6 +2406,10 @@ struct save_ctx {
     bool                 shuffle;
     bool                 verbose_loss;
     qlora_lr_schedule * schedule;
+    int32_t              eval_every;
+    ggml_opt_result_t    result_eval;
+    int64_t              validation_start;
+    int64_t              validation_end;
     bool                 loss_ema_initialized = false;
     double               loss_ema16 = 0.0;
     double               loss_ema64 = 0.0;
@@ -2413,6 +2422,26 @@ struct save_ctx {
 // TLS pointer set before each epoch so the static callback can access it.
 static thread_local save_ctx * g_save_ctx = nullptr;
 
+#ifdef GGML_USE_NVTX
+static constexpr auto nsys_profile_window = std::chrono::seconds(60);
+static std::chrono::steady_clock::time_point nsys_profile_started;
+static bool nsys_profile_range_active = false;
+#endif
+
+static void qlora_run_periodic_eval(ggml_opt_dataset_t dataset, int64_t window) {
+    if (!g_save_ctx || g_save_ctx->validation_end <= g_save_ctx->validation_start) return;
+    ggml_opt_result_reset(g_save_ctx->result_eval);
+    llama_opt_eval_range(g_save_ctx->target_ctx, dataset, g_save_ctx->result_eval,
+        g_save_ctx->validation_start, g_save_ctx->validation_end, nullptr);
+    double loss = 0.0;
+    double accuracy = 0.0;
+    ggml_opt_result_loss(g_save_ctx->result_eval, &loss, nullptr);
+    ggml_opt_result_accuracy(g_save_ctx->result_eval, &accuracy, nullptr);
+    LOG_INF("validation: step=%ld epoch=%ld loss=%.8f acc=%.4f%%\n",
+        (long) window, (long) g_save_ctx->epoch, loss, 100.0 * accuracy);
+    ggml_opt_result_reset(g_save_ctx->result_eval);
+}
+
 static void save_every_callback(
         bool               train,
         ggml_opt_context_t opt_ctx,
@@ -2422,6 +2451,14 @@ static void save_every_callback(
         int64_t            ibatch_max,
         int64_t            t_start_us) {
     ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
+
+#ifdef GGML_USE_NVTX
+    if (train && nsys_profile_range_active &&
+        std::chrono::steady_clock::now() - nsys_profile_started >= nsys_profile_window) {
+        nvtxRangePop();
+        nsys_profile_range_active = false;
+    }
+#endif
 
     // Log loss at every window boundary so we can see if/when it diverges.
     if (train && g_save_ctx) {
@@ -2459,6 +2496,9 @@ static void save_every_callback(
                         (double) g_save_ctx->schedule->current_lr);
             }
             ++g_save_ctx->schedule->step;
+            if (g_save_ctx->eval_every > 0 && window > 0 && window % g_save_ctx->eval_every == 0) {
+                qlora_run_periodic_eval(dataset, window);
+            }
         }
     }
 
@@ -3221,6 +3261,7 @@ int main(int argc, char ** argv) {
     }
 
     // --- Step 3: Load model + context (graph sized with LoRA nodes) ---
+    params.offload_input = true;
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -3472,7 +3513,8 @@ int main(int argc, char ** argv) {
         &params.mtp_lora_out, mtp.ctx ? &mtp.arch : nullptr, &params.mtp_model,
         mtp.alpha,
         params.save_every, ubatch_per_ctx, 0, 0, 0, idata_split, n_ctx,
-        params.shuffle_dataset, params.verbose_loss, &schedule
+        params.shuffle_dataset, params.verbose_loss, &schedule,
+        params.eval_every, result_eval, idata_split, ggml_opt_dataset_ndata(dataset)
     };
     g_save_ctx = &sctx;
 
@@ -3511,6 +3553,10 @@ int main(int argc, char ** argv) {
                 params.mtp_mode != "only" ? params.lora_out.c_str() : "disabled",
                 mtp.ctx ? params.mtp_lora_out.c_str() : "disabled");
     }
+    if (params.eval_initial) {
+        sctx.epoch = epoch_start + 1;
+        qlora_run_periodic_eval(dataset, schedule.step);
+    }
 
     ggml_opt_epoch_callback cb_train = save_every_callback;
 
@@ -3523,10 +3569,20 @@ int main(int argc, char ** argv) {
         sctx.loss_cumulative_count = 0;
         sctx.loss_epoch_sum = 0.0;
         sctx.loss_epoch_count = 0;
+#ifdef GGML_USE_NVTX
+        nvtxRangePushA("qlora-train");
+        nsys_profile_started = std::chrono::steady_clock::now();
+        nsys_profile_range_active = true;
+#endif
         llama_opt_epoch_range(ctx, dataset, result_train, result_eval, idata_start, idata_split,
                               cb_train,
                               ggml_opt_epoch_callback_progress_bar,
                               params.shuffle_dataset);
+#ifdef GGML_USE_NVTX
+        if (nsys_profile_range_active) {
+            nvtxRangePop();
+        }
+#endif
         fprintf(stderr, "\n");
 
         // Per-epoch loss summary

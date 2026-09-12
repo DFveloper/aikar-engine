@@ -183,6 +183,8 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--critical-max-fraction` | `1.0` | Maximum automatically selected fraction of supervised tokens per microbatch |
 | `--critical-stats-every` | `10` | Print Critical-Token SFT diagnostics every N optimizer steps |
 | `--val-split` | `0.05` | Fraction of data to hold out for validation (e.g. `0.1` = 10%); val loss logged per epoch |
+| `--eval-initial` | off | Evaluate the validation split once before training starts |
+| `--eval-every` | `0` | Evaluate the validation split every N optimizer windows (0 = epoch end only) |
 | `-epochs` / `--epochs` | `3` | Training epochs |
 | `-c` / `--ctx-size` | `512` | Training context window (tokens) |
 | `-b` / `--batch-size` | `2048` | Tokens per `llama_decode` call; set equal to `-c` |

@@ -342,6 +342,8 @@ struct common_params_speculative_draft {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    bool cache_type_k_set = false;
+    bool cache_type_v_set = false;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -492,6 +494,7 @@ struct common_params {
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
+    bool    offload_input      = false; // offload input embedding when all layers are on the GPU
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:
@@ -650,6 +653,8 @@ struct common_params {
     std::string train_file         = "";              // JSONL training dataset path
     int32_t dataset_threads        = 0;               // dataset loading workers (0 = physical CPU cores)
     int32_t save_every             = 0;     // save checkpoint every N optimizer steps (0 = disabled)
+    int32_t eval_every             = 0;     // evaluate the held-out split every N optimizer windows (0 = epoch end only)
+    bool    eval_initial           = false; // evaluate the held-out split before training starts
     int32_t save_first_at          = 0;     // save an initial checkpoint after N optimizer steps (0 = disabled)
     int32_t lora_freeze_layers     = 0;     // do not apply LoRA to the first N transformer layers
     int32_t grad_checkpoint_interval = 0;  // gradient checkpointing interval to reduce peak VRAM (0 = disabled)

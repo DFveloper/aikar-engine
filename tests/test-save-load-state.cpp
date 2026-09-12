@@ -106,16 +106,36 @@ static bool test_seq_rm_isolated(
     LOG("\n=== Test 2: sequence removal isolation ===\n");
 
     const size_t n_tokens = tokens.size() < 128 ? tokens.size() : 128;
-    for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
-        llama_batch_ptr batch(n_tokens, 0, 1);
-        for (size_t i = 0; i < n_tokens; ++i) {
-            common_batch_add(batch.get(), tokens[i], i, { seq_id }, false);
-        }
+    const size_t n_prefix = n_tokens/2;
+    llama_batch_ptr batch_prefix(n_prefix, 0, 1);
+    for (size_t i = 0; i < n_prefix; ++i) {
+        common_batch_add(batch_prefix.get(), tokens[i], i, { 0 }, false);
+    }
 
-        if (llama_decode(ctx.get(), batch.get())) {
-            LOG_ERR("%s: failed to decode prompt for sequence %d\n", __func__, seq_id);
-            return false;
-        }
+    if (llama_decode(ctx.get(), batch_prefix.get())) {
+        LOG_ERR("%s: failed to decode prefix\n", __func__);
+        return false;
+    }
+
+    llama_memory_seq_cp(llama_get_memory(ctx.get()), 0, 1, 0, n_prefix);
+
+    llama_batch_ptr batch_shared(1, 0, 2);
+    common_batch_add(batch_shared.get(), tokens[n_prefix], n_prefix, { 0, 1 }, false);
+
+    if (llama_decode(ctx.get(), batch_shared.get())) {
+        LOG_ERR("%s: failed to decode multi-sequence prefix\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr batch_suffix(2*(n_tokens - n_prefix - 1), 0, 1);
+    for (size_t i = n_prefix + 1; i < n_tokens; ++i) {
+        common_batch_add(batch_suffix.get(), tokens[i], i, { 0 }, false);
+        common_batch_add(batch_suffix.get(), tokens[(i + 1) % n_tokens], i, { 1 }, false);
+    }
+
+    if (llama_decode(ctx.get(), batch_suffix.get())) {
+        LOG_ERR("%s: failed to decode independent suffixes\n", __func__);
+        return false;
     }
 
     const auto get_seq_state = [&](llama_seq_id seq_id, std::vector<uint8_t> & state) {

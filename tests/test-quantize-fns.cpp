@@ -5,6 +5,7 @@
 
 #undef NDEBUG
 #include <assert.h>
+#include <cstring>
 #include <math.h>
 #include <stdio.h>
 #include <string>
@@ -249,6 +250,33 @@ static int test_q8_0_full_byte(bool verbose) {
     return num_failed;
 }
 
+static int test_q8_kv_row(bool verbose) {
+    constexpr int n = 256;
+
+    std::vector<float> data(n);
+    std::vector<float> out(n);
+    std::vector<uint8_t> quantized(ggml_row_size(GGML_TYPE_Q8_KV, n));
+    generate_data(0.0f, n, data.data());
+
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_Q8_KV);
+    const auto * traits_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_KV);
+    traits_cpu->from_float(data.data(), quantized.data(), n);
+    traits->to_float(quantized.data(), out.data(), n);
+
+    ggml_fp16_t scale_f16;
+    memcpy(&scale_f16, quantized.data(), sizeof(scale_f16));
+    const float scale = ggml_fp16_to_fp32(scale_f16);
+
+    const float error = array_rmse(data.data(), out.data(), n);
+    const bool failed = quantized.size() != n + (n/64)*sizeof(ggml_fp16_t) || !(scale > 0.0f) || !(error < MAX_QUANTIZATION_TOTAL_ERROR);
+    if (failed || verbose) {
+        printf(" q8_kv G64 layout and roundtrip:      %s (size=%zu scale=%f err=%f)\n",
+                RESULT_STR[failed], quantized.size(), scale, error);
+    }
+
+    return failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -270,6 +298,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_q8_0_full_byte(verbose);
+    num_failed += test_q8_kv_row(verbose);
     num_failed += test_vec_dot_q(verbose);
 
     if (num_failed || verbose) {

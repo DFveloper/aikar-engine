@@ -160,6 +160,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_n_k_rows(uint32_t n_tokens) const;
 
     bool get_has_shift() const;
 
@@ -284,6 +285,7 @@ private:
     // otherwise the value is -1
     int32_t n_embd_head_k_all = 0;
     int32_t n_embd_head_v_all = 0;
+    int32_t n_head_kv_all = 0;
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
@@ -396,6 +398,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_k_rows(uint32_t n_tokens) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include <cstdio>
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -3892,6 +3894,29 @@ void llama_context::opt_epoch_iter(
             // it must not try to build a target backward graph with no params.
             ggml_opt_alloc(opt_ctx, target_backward);
 
+            static bool training_placement_printed = false;
+            if (train && !training_placement_printed) {
+                size_t n_cpu_nodes = 0;
+                size_t n_cpu_bytes = 0;
+                std::fprintf(stderr, "qlora placement: inspecting first training graph\n");
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    ggml_tensor * node = ggml_graph_node(gf, i);
+                    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                    if (!backend || ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        continue;
+                    }
+                    ++n_cpu_nodes;
+                    n_cpu_bytes += ggml_nbytes(node);
+                    if (n_cpu_nodes <= 8) {
+                        std::fprintf(stderr, "qlora placement: CPU node %s (%s, %.2f MiB)\n",
+                                node->name, ggml_op_name(node->op), ggml_nbytes(node)/(1024.0*1024.0));
+                    }
+                }
+                std::fprintf(stderr, "qlora placement: graph splits=%d CPU nodes=%zu CPU node bytes=%.2f MiB\n",
+                        ggml_backend_sched_get_n_splits(sched.get()), n_cpu_nodes, n_cpu_bytes/(1024.0*1024.0));
+                training_placement_printed = true;
+            }
+
             const int64_t t2_inputs = ggml_time_ms();
             res->set_inputs(&ubatch);
             if (source_embd) {
@@ -4152,6 +4177,44 @@ void llama_context::opt_epoch(
             callback_eval, train, false, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
+    llama_batch_free(batch);
+}
+
+void llama_context::opt_eval_range(
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_start,
+        int64_t                   idata_end,
+        ggml_opt_epoch_callback   callback_eval) {
+    const uint32_t n_ctx = this->n_ctx();
+    const uint32_t n_batch = std::min(cparams.n_batch, n_ctx);
+    const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
+    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
+    GGML_ASSERT(idata_start >= 0 && idata_start <= idata_end && idata_end <= ndata);
+
+    const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
+    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    std::vector<llama_token> tokens(n_ctx);
+    std::vector<llama_token> labels_sparse(n_ctx);
+    std::vector<llama_opt_critical_token_metadata> critical_metadata;
+    const bool critical_enabled = opt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
+    if (critical_enabled) {
+        GGML_ASSERT(ggml_opt_dataset_aux_size(dataset) == n_ctx * sizeof(critical_metadata[0]));
+        critical_metadata.resize(n_ctx);
+    }
+
+    const int64_t t_loop_start = ggml_time_us();
+    const int64_t ndata_in_loop = (idata_end - idata_start) * ubatch_per_ctx;
+    for (int64_t idata = idata_start; idata < idata_end; ++idata) {
+        const int64_t idata_in_loop = (idata - idata_start) * ubatch_per_ctx;
+        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx * sizeof(llama_token), labels_sparse.data(), idata);
+        if (critical_enabled) {
+            ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data(), n_ctx * sizeof(critical_metadata[0]), idata);
+        }
+        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse,
+            critical_enabled ? &critical_metadata : nullptr, batch, 1.0f, callback_eval,
+            false, false, idata_in_loop, ndata_in_loop, t_loop_start);
+    }
     llama_batch_free(batch);
 }
 
@@ -5093,6 +5156,16 @@ void llama_opt_epoch_range(
         callback_train,
         callback_eval,
         shuffle);
+}
+
+void llama_opt_eval_range(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_start,
+        int64_t                   idata_end,
+        ggml_opt_epoch_callback   callback_eval) {
+    ctx->opt_eval_range(dataset, result_eval, idata_start, idata_end, callback_eval);
 }
 
 //

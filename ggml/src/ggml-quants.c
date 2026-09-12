@@ -291,6 +291,23 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
     }
 }
 
+void quantize_row_q8_kv_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK8_KV == 0);
+    block_q8_kv * y = vy;
+    for (int64_t ib = 0; ib < k/QK8_KV; ++ib) {
+        float amax = 0.0f;
+        for (int i = 0; i < QK8_KV; ++i) {
+            amax = MAX(amax, fabsf(x[ib*QK8_KV + i]));
+        }
+        const float d = amax/127.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+        y[ib].d = GGML_FP32_TO_FP16(d);
+        for (int i = 0; i < QK8_KV; ++i) {
+            y[ib].qs[i] = MIN(127, MAX(-127, (int) roundf(x[ib*QK8_KV + i]*id)));
+        }
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_RESTRICT y, int64_t k) {
     assert(QK8_1 == 32);
@@ -555,6 +572,17 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
         for (int j = 0; j < qk; ++j) {
             y[i*qk + j] = x[i].qs[j]*d;
+        }
+    }
+}
+
+void dequantize_row_q8_kv(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK8_KV == 0);
+    const block_q8_kv * x = vx;
+    for (int64_t ib = 0; ib < k/QK8_KV; ++ib) {
+        const float d = GGML_FP16_TO_FP32(x[ib].d);
+        for (int i = 0; i < QK8_KV; ++i) {
+            y[ib*QK8_KV + i] = d*x[ib].qs[i];
         }
     }
 }
@@ -2290,6 +2318,15 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, n_per_row);
     quantize_row_q8_0_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * row_size;
+}
+
+size_t quantize_q8_kv(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_KV, n_per_row);
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q8_kv_ref(src + row*n_per_row, (char *) dst + row*row_size, n_per_row);
+    }
+    return nrow*row_size;
 }
 
 size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {

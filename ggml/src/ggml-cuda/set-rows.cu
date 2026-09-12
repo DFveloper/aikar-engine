@@ -117,6 +117,58 @@ static void set_rows_cuda_turbo(
         init_fastdiv_values((uint32_t) ne12));
 }
 
+template <typename idx_t>
+static __global__ void k_set_rows_q8_kv(
+        const float * __restrict__ src,
+        const idx_t * __restrict__ rows,
+        char * __restrict__ dst,
+        int64_t ncols,
+        int64_t nrows,
+        int64_t src_row_stride,
+        int64_t dst_row_stride) {
+    const int64_t blocks_per_row = ncols/QK8_KV;
+    const int64_t row = blockIdx.x/blocks_per_row;
+    const int64_t ib = blockIdx.x%blocks_per_row;
+    if (row >= nrows) {
+        return;
+    }
+
+    const float * src_block = src + row*src_row_stride + ib*QK8_KV;
+    block_q8_kv * dst_block = (block_q8_kv *) (dst + rows[row]*dst_row_stride) + ib;
+    __shared__ float max_abs[QK8_KV];
+
+    max_abs[threadIdx.x] = fabsf(src_block[threadIdx.x]);
+    __syncthreads();
+
+    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            max_abs[threadIdx.x] = fmaxf(max_abs[threadIdx.x], max_abs[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float scale = max_abs[0]/127.0f;
+    if (threadIdx.x == 0) {
+        dst_block->d = __float2half(scale);
+    }
+    const float inv_scale = scale ? 1.0f/scale : 0.0f;
+    dst_block->qs[threadIdx.x] = (int8_t) max(-127, min(127, __float2int_rn(src_block[threadIdx.x]*inv_scale)));
+}
+
+template <typename idx_t>
+static void set_rows_cuda_q8_kv(
+        const float * src, const idx_t * rows, char * dst,
+        int64_t ncols, int64_t nrows,
+        size_t src_row_stride, size_t dst_row_stride,
+        cudaStream_t stream) {
+    GGML_ASSERT(ncols % QK8_KV == 0);
+    if (nrows == 0) {
+        return;
+    }
+    k_set_rows_q8_kv<idx_t><<<nrows*(ncols/QK8_KV), QK8_KV, 0, stream>>>(
+            src, rows, dst, ncols, nrows, src_row_stride/sizeof(float), dst_row_stride);
+}
+
 // Generic quantized set_rows kernel template
 template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
 static __global__ void k_set_rows_quant(const float * __restrict__ src0,
@@ -421,6 +473,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_Q8_KV) {
+        GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne11 == 1 && ne12 == 1 && ne13 == 1);
+        set_rows_cuda_q8_kv<idx_t>(src0_d, src1_d, (char *) dst->data,
+                ne00, ne01, nb01, nb1, stream);
     } else if (dst->type == GGML_TYPE_IQ4_NL) {
         set_rows_cuda_quant<idx_t, block_iq4_nl, QK4_NL, quantize_f32_iq4_nl_block>(
             src0_d, src1_d, (block_iq4_nl*)dst->data,

@@ -151,6 +151,46 @@ static void normalized_hadamard_ref(float * values, int n, int block) {
     }
 }
 
+static bool test_q8_kv_vs_q4_hadamard() {
+    constexpr int d = 256;
+    const ggml_type_traits * q8_traits = ggml_get_type_traits(GGML_TYPE_Q8_KV);
+    const ggml_type_traits * q4_traits = ggml_get_type_traits(GGML_TYPE_Q4_0);
+    std::vector<float> source;
+    std::vector<float> q8_all;
+    std::vector<float> q4h_all;
+
+    for (int id = 0; id < 5; ++id) {
+        std::vector<float> input = make_distribution(id);
+        std::vector<float> q4_input = input;
+        std::vector<float> q8_out(d);
+        std::vector<float> q4_out(d);
+        std::vector<uint8_t> q8_packed(ggml_row_size(GGML_TYPE_Q8_KV, d));
+        std::vector<uint8_t> q4_packed(ggml_row_size(GGML_TYPE_Q4_0, d));
+
+        normalized_hadamard_ref(q4_input.data(), d, d);
+        q8_traits->from_float_ref(input.data(), q8_packed.data(), d);
+        q8_traits->to_float(q8_packed.data(), q8_out.data(), d);
+        q4_traits->from_float_ref(q4_input.data(), q4_packed.data(), d);
+        q4_traits->to_float(q4_packed.data(), q4_out.data(), d);
+        normalized_hadamard_ref(q4_out.data(), d, d);
+
+        source.insert(source.end(), input.begin(), input.end());
+        q8_all.insert(q8_all.end(), q8_out.begin(), q8_out.end());
+        q4h_all.insert(q4h_all.end(), q4_out.begin(), q4_out.end());
+    }
+
+    const metrics q8 = measure(source, q8_all);
+    const metrics q4h = measure(source, q4h_all);
+    const double dot_ref = dot(source.data(), source.data() + d, d);
+    const double q8_dot_error = std::abs(dot(q8_all.data(), q8_all.data() + d, d) - dot_ref)/std::max(1.0, std::abs(dot_ref));
+    const double q4h_dot_error = std::abs(dot(q4h_all.data(), q4h_all.data() + d, d) - dot_ref)/std::max(1.0, std::abs(dot_ref));
+    const bool ok = q8.mse < q4h.mse && q8.cosine > q4h.cosine && q8_dot_error < q4h_dot_error;
+    std::printf("Q8_KV G64 vs Q4_0 Hadamard: mse=%g/%g cosine=%.7f/%.7f dot_rel=%g/%g bytes=%zu/%zu %s\n",
+        q8.mse, q4h.mse, q8.cosine, q4h.cosine, q8_dot_error, q4h_dot_error,
+        ggml_row_size(GGML_TYPE_Q8_KV, d), ggml_row_size(GGML_TYPE_Q4_0, d), ok ? "ok" : "FAILED");
+    return ok;
+}
+
 static bool test_normalized_hadamard_attention() {
     std::mt19937 rng(7128);
     std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -356,13 +396,13 @@ static bool test_backend_set_rows(ggml_backend_t backend, const char * label, gg
 }
 
 static bool test_backend_attention(
-        ggml_backend_t backend, const char * label, ggml_type type_k, ggml_type type_v, int d = 256, int kv = 256) {
+        ggml_backend_t backend, const char * label, ggml_type type_k, ggml_type type_v, int d = 256, int kv = 256, int nq = 1) {
     constexpr int q_heads = 16;
     constexpr int kv_heads = 2;
 
     ggml_init_params params = { 8*1024*1024, nullptr, true };
     ggml_context * ctx = ggml_init(params);
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, 1, q_heads, 1);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nq, q_heads, 1);
     ggml_tensor * k = ggml_new_tensor_4d(ctx, type_k, d, kv, kv_heads, 1);
     ggml_tensor * v = ggml_new_tensor_4d(ctx, type_v, d, kv, kv_heads, 1);
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
@@ -372,7 +412,7 @@ static bool test_backend_attention(
 
     std::mt19937 rng(12000 + 10*type_k + type_v);
     std::normal_distribution<float> normal(0.0f, 0.5f);
-    std::vector<float> q_host(d*q_heads);
+    std::vector<float> q_host(d*nq*q_heads);
     std::vector<float> k_host(d*kv*kv_heads);
     std::vector<float> v_host(d*kv*kv_heads);
     for (float & value : q_host) value = normal(rng);
@@ -380,8 +420,8 @@ static bool test_backend_attention(
     for (float & value : v_host) value = normal(rng);
 
     if (turbo_k) {
-        for (int h = 0; h < q_heads; ++h) {
-            ggml_turbo_wht_forward_f32(q_host.data() + h*d, d);
+        for (int row = 0; row < nq*q_heads; ++row) {
+            ggml_turbo_wht_forward_f32(q_host.data() + row*d, d);
         }
     }
 
@@ -400,29 +440,33 @@ static bool test_backend_attention(
         traits_v->to_float(v_packed.data() + row*row_v, v_dequant.data() + row*d, d);
     }
 
-    std::vector<float> expected(d*q_heads);
+    std::vector<float> expected(d*nq*q_heads);
     std::vector<float> scores(kv);
     for (int qh = 0; qh < q_heads; ++qh) {
         const int kvh = qh/(q_heads/kv_heads);
-        float max_score = -INFINITY;
-        for (int token = 0; token < kv; ++token) {
-            scores[token] = (float) dot(q_host.data() + qh*d, k_dequant.data() + (kvh*kv + token)*d, d)/std::sqrt((float) d);
-            max_score = std::max(max_score, scores[token]);
-        }
-        float denominator = 0.0f;
-        for (float & score : scores) {
-            score = std::exp(score - max_score);
-            denominator += score;
-        }
-        for (int token = 0; token < kv; ++token) {
-            const float weight = scores[token]/denominator;
-            const float * value = v_dequant.data() + (kvh*kv + token)*d;
-            for (int i = 0; i < d; ++i) {
-                expected[qh*d + i] += weight*value[i];
+        for (int qt = 0; qt < nq; ++qt) {
+            const int qrow = qh*nq + qt;
+            const int orow = qt*q_heads + qh;
+            float max_score = -INFINITY;
+            for (int token = 0; token < kv; ++token) {
+                scores[token] = (float) dot(q_host.data() + qrow*d, k_dequant.data() + (kvh*kv + token)*d, d)/std::sqrt((float) d);
+                max_score = std::max(max_score, scores[token]);
             }
-        }
-        if (turbo_v) {
-            ggml_turbo_wht_inverse_f32(expected.data() + qh*d, d);
+            float denominator = 0.0f;
+            for (float & score : scores) {
+                score = std::exp(score - max_score);
+                denominator += score;
+            }
+            for (int token = 0; token < kv; ++token) {
+                const float weight = scores[token]/denominator;
+                const float * value = v_dequant.data() + (kvh*kv + token)*d;
+                for (int i = 0; i < d; ++i) {
+                    expected[orow*d + i] += weight*value[i];
+                }
+            }
+            if (turbo_v) {
+                ggml_turbo_wht_inverse_f32(expected.data() + orow*d, d);
+            }
         }
     }
 
@@ -443,8 +487,8 @@ static bool test_backend_attention(
         ggml_backend_tensor_get(out, actual.data(), 0, actual.size()*sizeof(float));
         const metrics result = measure(expected, actual);
         ok = result.cosine > 0.999 && result.norm_error < 0.02 && result.max_error < 0.02;
-        std::printf("%s attention D%d/KV%d %s/%s: mse=%g max=%g cosine=%.7f %s\n",
-            label, d, kv, ggml_type_name(type_k), ggml_type_name(type_v), result.mse, result.max_error, result.cosine,
+        std::printf("%s attention D%d/KV%d/Q%d %s/%s: mse=%g max=%g cosine=%.7f %s\n",
+            label, d, kv, nq, ggml_type_name(type_k), ggml_type_name(type_v), result.mse, result.max_error, result.cosine,
             ok ? "ok" : "FAILED");
     }
 
@@ -474,6 +518,10 @@ static bool test_backend_kind(const char * prefix) {
         ok = test_backend_set_rows(backend, name, GGML_TYPE_TURBO3_0) && ok;
         ok = test_backend_set_rows(backend, name, GGML_TYPE_TURBO4_0) && ok;
         ok = test_backend_set_rows(backend, name, GGML_TYPE_MXFP4) && ok;
+        const bool supports_q8_kv = std::strcmp(prefix, "CPU") == 0 || std::strcmp(prefix, "CUDA") == 0;
+        if (supports_q8_kv) {
+            ok = test_backend_set_rows(backend, name, GGML_TYPE_Q8_KV) && ok;
+        }
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0) && ok;
@@ -489,7 +537,13 @@ static bool test_backend_kind(const char * prefix) {
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_MXFP4) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_MXFP4, GGML_TYPE_TURBO4_0) && ok;
         ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_MXFP4) && ok;
+        if (supports_q8_kv) {
+            ok = test_backend_attention(backend, name, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV, 256) && ok;
+        }
         if (std::strcmp(prefix, "CUDA") == 0) {
+            ok = test_backend_attention(backend, name, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV, 512) && ok;
+            ok = test_backend_attention(backend, name, GGML_TYPE_F16, GGML_TYPE_F16, 256, 256, 32) && ok;
+            ok = test_backend_attention(backend, name, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV, 256, 256, 32) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 512) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, 512) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 512, 16384) && ok;
@@ -517,6 +571,7 @@ int main() {
     ok = test_codec(GGML_TYPE_TURBO4_0, 0.98, 0.01) && ok;
     ok = test_codec(GGML_TYPE_MXFP4, 0.98, 0.10, false) && ok;
     ok = test_normalized_hadamard_attention() && ok;
+    ok = test_q8_kv_vs_q4_hadamard() && ok;
     ok = test_transformed_attention(GGML_TYPE_TURBO3_0) && ok;
     ok = test_transformed_attention(GGML_TYPE_TURBO4_0) && ok;
     ok = test_packed_size() && ok;

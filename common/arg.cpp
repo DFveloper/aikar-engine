@@ -306,6 +306,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F16,
     GGML_TYPE_BF16,
     GGML_TYPE_Q8_0,
+    GGML_TYPE_Q8_KV,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1,
     GGML_TYPE_IQ4_NL,
@@ -317,6 +318,9 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    if (s == "Q8_KV") {
+        return GGML_TYPE_Q8_KV;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -4243,6 +4247,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -4256,6 +4261,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -4848,6 +4854,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ? "save model checkpoint every N optimizer steps (default: 0 = only at end)"
             : "save adapter checkpoint every N dataset windows during training (default: 0 = only at end)",
         [](common_params & params, int value) { params.save_every = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--eval-every"}, "N",
+        "evaluate the validation split every N optimizer windows (default: 0 = epoch end only)",
+        [](common_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("--eval-every must be non-negative");
+            params.eval_every = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--eval-initial"},
+        "evaluate the validation split before training starts",
+        [](common_params & params) { params.eval_initial = true; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--save-first-at"}, "N",
