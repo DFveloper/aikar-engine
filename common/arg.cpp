@@ -5137,6 +5137,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.grpo_mode = true; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
+        {"--grpo-phase-offload"},
+        "alternate a full-GPU rollout runtime with host-resident GRPO training",
+        [](common_params & params) { params.grpo_phase_offload = true; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
         {"--n-gen"}, "N",
         string_format("GRPO: number of generations per prompt (default: %d)", params.grpo_n_gen),
         [](common_params & params, int value) { params.grpo_n_gen = value; }

@@ -53,6 +53,7 @@
 // Internal adapter struct — included directly to avoid the temp-GGUF roundtrip
 // for wiring trainable LoRA tensors into the compute graph.
 #include "../../src/llama-adapter.h"
+#include "../../src/llama-ext.h"
 
 #include <cerrno>
 #include <csignal>
@@ -2724,6 +2725,66 @@ static ggml_opt_dataset_t build_dataset(
 static volatile sig_atomic_t g_grpo_stop = 0;
 static void grpo_sigint_handler(int) { g_grpo_stop = 1; }
 
+static void grpo_emit_phase(const char * phase) {
+    std::string message = std::string("[QLORA:PHASE] ") + phase;
+    ipc_emit(message.c_str());
+}
+
+static bool grpo_validate_lora_maps(
+        const llama_adapter_lora & src,
+        const llama_adapter_lora & dst,
+        std::string & error) {
+    if (src.ab_map.size() != dst.ab_map.size()) {
+        error = string_format("adapter tensor map size differs: %zu != %zu", src.ab_map.size(), dst.ab_map.size());
+        return false;
+    }
+
+    for (const auto & item : src.ab_map) {
+        const auto found = dst.ab_map.find(item.first);
+        if (found == dst.ab_map.end()) {
+            error = string_format("rollout adapter is missing tensor %s", item.first.c_str());
+            return false;
+        }
+        const ggml_tensor * src_tensors[] = { item.second.a, item.second.b };
+        const ggml_tensor * dst_tensors[] = { found->second.a, found->second.b };
+        for (int i = 0; i < 2; ++i) {
+            const ggml_tensor * src_tensor = src_tensors[i];
+            const ggml_tensor * dst_tensor = dst_tensors[i];
+            if (src_tensor->type != dst_tensor->type || ggml_n_dims(src_tensor) != ggml_n_dims(dst_tensor) ||
+                ggml_nbytes(src_tensor) != ggml_nbytes(dst_tensor)) {
+                error = string_format("adapter tensor layout differs for %s.%c", item.first.c_str(), i == 0 ? 'a' : 'b');
+                return false;
+            }
+            for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                if (src_tensor->ne[dim] != dst_tensor->ne[dim]) {
+                    error = string_format("adapter tensor shape differs for %s.%c", item.first.c_str(), i == 0 ? 'a' : 'b');
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool grpo_copy_lora_maps(
+        const llama_adapter_lora & src,
+        llama_adapter_lora & dst,
+        size_t & copied_bytes,
+        std::string & error) {
+    if (!grpo_validate_lora_maps(src, dst, error)) {
+        return false;
+    }
+
+    copied_bytes = 0;
+    for (const auto & item : src.ab_map) {
+        llama_adapter_lora_weight & target = dst.ab_map.at(item.first);
+        ggml_backend_tensor_copy(item.second.a, target.a);
+        ggml_backend_tensor_copy(item.second.b, target.b);
+        copied_bytes += ggml_nbytes(item.second.a) + ggml_nbytes(item.second.b);
+    }
+    return true;
+}
+
 static int run_grpo_mode(
         common_params    & params,
         llama_model      * model,
@@ -2732,7 +2793,8 @@ static int run_grpo_mode(
         const std::string & arch,
         float               lora_alpha,
         const std::string & base_model_path,
-        const checkpoint_state * resume) {
+        const checkpoint_state * resume,
+        common_params * rollout_params = nullptr) {
 
     const int32_t n_ctx    = llama_n_ctx(ctx);
     const int32_t n_gen    = params.grpo_n_gen;
@@ -2803,7 +2865,14 @@ static int run_grpo_mode(
         /*.critical_stats_every     =*/0,
         /*.train_target             =*/true,
     };
+    if (rollout_params) {
+        llama_opt_set_weight_streaming(ctx, true);
+    }
     llama_opt_init(ctx, model, lopt_params);
+    if (rollout_params && !llama_opt_suspend(ctx)) {
+        ipc_emit("[QLORA:ERROR] failed to suspend training scheduler");
+        return 1;
+    }
 
     const llama_token bos = llama_vocab_bos(llama_model_get_vocab(model));
 
@@ -2862,15 +2931,62 @@ static int run_grpo_mode(
             }
         }
 
+        common_init_result_ptr rollout_init;
+        llama_model * generation_model = model;
+        llama_context * generation_ctx = ctx;
+        if (rollout_params) {
+            grpo_emit_phase("rollout_load");
+            const int64_t load_start = ggml_time_us();
+            for (common_adapter_lora_info & adapter : rollout_params->lora_adapters) {
+                adapter.ptr = nullptr;
+            }
+            rollout_init = common_init_from_params(*rollout_params);
+            generation_model = rollout_init->model();
+            generation_ctx = rollout_init->context();
+            llama_adapter_lora * rollout_adapter = rollout_params->lora_adapters.back().ptr;
+            llama_adapter_lora * training_adapter = params.lora_adapters.back().ptr;
+            if (!generation_model || !generation_ctx || !rollout_adapter || !training_adapter) {
+                ipc_emit("[QLORA:ERROR] failed to create rollout runtime");
+                return 1;
+            }
+
+            size_t copied_bytes = 0;
+            std::string copy_error;
+            const int64_t copy_start = ggml_time_us();
+            if (!grpo_copy_lora_maps(*training_adapter, *rollout_adapter, copied_bytes, copy_error)) {
+                std::string message = std::string("[QLORA:ERROR] ") + copy_error;
+                ipc_emit(message.c_str());
+                return 1;
+            }
+            llama_synchronize(generation_ctx);
+            LOG_INF("grpo phase: rollout_load=%.3fs lora_copy=%.3fs bytes=%zu\n",
+                    (ggml_time_us() - load_start) / 1000000.0,
+                    (ggml_time_us() - copy_start) / 1000000.0, copied_bytes);
+            grpo_emit_phase("rollout");
+        }
+
         // ── Generate N responses ──────────────────────────────────────────
         std::vector<std::string> generations(n_gen);
         for (int k = 0; k < n_gen; ++k) {
-            generations[k] = generate_response(ctx, model, prompt, max_tok, temp, rng);
+            generations[k] = generate_response(generation_ctx, generation_model, prompt, max_tok, temp, rng);
 
             char hdr[64];
             snprintf(hdr, sizeof(hdr), "[QLORA:GEN:%d/%d] ", k + 1, n_gen);
             std::string msg = std::string(hdr) + ipc_escape(generations[k]);
             ipc_emit(msg.c_str());
+        }
+
+        if (rollout_params) {
+            grpo_emit_phase("rollout_release");
+            llama_synchronize(generation_ctx);
+            rollout_init.reset();
+            generation_model = nullptr;
+            generation_ctx = nullptr;
+            grpo_emit_phase("training_resume");
+            if (!llama_opt_resume(ctx)) {
+                ipc_emit("[QLORA:ERROR] failed to resume training scheduler");
+                return 1;
+            }
         }
 
         // ── Request rewards ───────────────────────────────────────────────
@@ -2943,10 +3059,27 @@ static int run_grpo_mode(
         const int64_t idata_all = ggml_opt_dataset_ndata(step_dataset);
         ggml_opt_result_t step_result = ggml_opt_result_init();
 
+        if (rollout_params) {
+            grpo_emit_phase("training");
+        }
+        const int64_t optimizer_step_before = llama_opt_step(ctx);
+        const int64_t training_start = ggml_time_us();
         llama_opt_epoch(ctx, step_dataset, step_result, nullptr, idata_all,
                         nullptr,   // no progress bar callback — clean stdout
                         nullptr,
                         false);    // no shuffle for single-step
+        const int64_t optimizer_step_after = llama_opt_step(ctx);
+        LOG_INF("grpo phase: training=%.3fs optimizer_step=%ld->%ld\n",
+                (ggml_time_us() - training_start) / 1000000.0,
+                (long) optimizer_step_before, (long) optimizer_step_after);
+
+        if (rollout_params) {
+            grpo_emit_phase("training_suspend");
+            if (!llama_opt_suspend(ctx)) {
+                ipc_emit("[QLORA:ERROR] failed to suspend training scheduler");
+                return 1;
+            }
+        }
 
         double loss = 0.0, loss_unc = 0.0;
         ggml_opt_result_loss(step_result, &loss, &loss_unc);
@@ -2961,10 +3094,10 @@ static int run_grpo_mode(
 
         // ── Emit progress ─────────────────────────────────────────────────
         {
-            char buf[128];
+            char buf[160];
             snprintf(buf, sizeof(buf),
-                     "[QLORA:PROGRESS] step=%d/%d loss=%.4f epoch=1/1",
-                     step, n_steps, last_loss);
+                     "[QLORA:PROGRESS] step=%d/%d loss=%.4f epoch=1/1 optimizer_step=%ld",
+                     step, n_steps, last_loss, (long) optimizer_step_after);
             ipc_emit(buf);
         }
 
@@ -3172,6 +3305,10 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: --train-file is required (or use --grpo-mode for IPC training)\n", __func__);
         return 1;
     }
+    if (params.grpo_phase_offload && !params.grpo_mode) {
+        LOG_ERR("%s: --grpo-phase-offload requires --grpo-mode\n", __func__);
+        return 1;
+    }
     if (params.mtp_mode != "off" && params.grpo_mode) {
         LOG_ERR("%s: MTP training is not available with --grpo-mode\n", __func__);
         return 1;
@@ -3197,7 +3334,7 @@ int main(int argc, char ** argv) {
     }
 
     // Force settings required for training
-    params.load_mode    = LLAMA_LOAD_MODE_NONE;
+    params.load_mode    = params.grpo_phase_offload ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
     if (!params.kv_cache_training) {
         params.cache_type_k = GGML_TYPE_F32;
         params.cache_type_v = GGML_TYPE_F32;
@@ -3264,8 +3401,20 @@ int main(int argc, char ** argv) {
                 __func__, params.lora_adapters.back().path.c_str());
     }
 
+    common_params rollout_params;
+    if (params.grpo_phase_offload) {
+        rollout_params = params;
+        rollout_params.fit_params = false;
+        rollout_params.no_kv_offload = false;
+
+        params.n_gpu_layers = 0;
+        params.fit_params = false;
+        params.no_kv_offload = true;
+        params.offload_input = false;
+    }
+
     // --- Step 3: Load model + context (graph sized with LoRA nodes) ---
-    params.offload_input = true;
+    params.offload_input = !params.grpo_phase_offload;
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -3314,7 +3463,7 @@ int main(int argc, char ** argv) {
     }
 
     // Remove temp init file when we created it (resume path has no init file)
-    if (!resume_from_lora && !init_adapter_path.empty()) {
+    if (!params.grpo_phase_offload && !resume_from_lora && !init_adapter_path.empty()) {
         std::remove(expand_tilde(init_adapter_path).c_str());
     }
 
@@ -3323,7 +3472,11 @@ int main(int argc, char ** argv) {
     auto tmpls = common_chat_templates_init(model, params.chat_template);
     if (params.grpo_mode) {
         int rc = run_grpo_mode(params, model, ctx, lt, arch, lora_alpha, params.model.path,
-                               resume_requested ? &resume_state : nullptr);
+                               resume_requested ? &resume_state : nullptr,
+                               params.grpo_phase_offload ? &rollout_params : nullptr);
+        if (!resume_from_lora && !init_adapter_path.empty()) {
+            std::remove(expand_tilde(init_adapter_path).c_str());
+        }
         if (lt.buf) ggml_backend_buffer_free(lt.buf);
         if (lt.ctx) ggml_free(lt.ctx);
         llama_backend_free();

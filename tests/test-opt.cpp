@@ -895,6 +895,27 @@ static std::pair<int, int> test_backend(
     return std::make_pair(npass, ntest);
 }
 
+static bool test_scheduler_replacement(const std::vector<ggml_backend_t> & backends) {
+    ggml_backend_t backend = backends.front();
+    std::vector<ggml_backend_t> sched_backends = backends;
+    ggml_backend_sched_t backend_sched = ggml_backend_sched_new(
+        sched_backends.data(), nullptr, sched_backends.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
+    helper_ctx_data cd = helper_get_ctx_data(GGML_OPT_OPTIMIZER_TYPE_SGD, backend_sched, backend);
+    ggml_opt_set_step(cd.opt_ctx, 7);
+
+    ggml_opt_set_backend_sched(cd.opt_ctx, nullptr);
+    ggml_backend_sched_free(backend_sched);
+    ggml_backend_sched_t replacement = ggml_backend_sched_new(
+        sched_backends.data(), nullptr, sched_backends.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_opt_set_backend_sched(cd.opt_ctx, replacement);
+
+    const bool ok = ggml_opt_step(cd.opt_ctx) == 7;
+    ggml_opt_set_backend_sched(cd.opt_ctx, nullptr);
+    ggml_backend_sched_free(replacement);
+    helper_free_ctx_data(cd);
+    return ok;
+}
+
 
 int main(void) {
     ggml_log_set(nullptr, nullptr);
@@ -921,6 +942,12 @@ int main(void) {
     }
 
     size_t n_total = 0;
+    if (!backends.empty()) {
+        ++n_total;
+        if (test_scheduler_replacement(backends)) {
+            ++n_ok;
+        }
+    }
     for (enum ggml_opt_optimizer_type optim : { GGML_OPT_OPTIMIZER_TYPE_ADAMW, GGML_OPT_OPTIMIZER_TYPE_SGD }) {
         for (size_t i = 0; i < dev_count; ++i) {
             // Put the backend to be tested in front so that it's prioritized:

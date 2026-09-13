@@ -711,6 +711,7 @@ struct common_params {
 
     // grpo training
     bool    grpo_mode              = false; // enable GRPO IPC training loop
+    bool    grpo_phase_offload     = false; // alternate GPU rollout and host-resident training
     int32_t grpo_n_gen             = 8;     // generations per prompt
     int32_t grpo_n_steps           = 500;   // total GRPO optimizer steps
     float   grpo_temperature       = 0.8f;  // sampling temperature for rollouts

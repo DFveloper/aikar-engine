@@ -2609,6 +2609,20 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     delete opt_ctx;
 }
 
+void ggml_opt_set_backend_sched(ggml_opt_context_t opt_ctx, ggml_backend_sched_t backend_sched) {
+    GGML_ASSERT(opt_ctx);
+    GGML_ASSERT(!opt_ctx->eval_ready);
+
+    if (opt_ctx->backend_sched) {
+        ggml_backend_sched_synchronize(opt_ctx->backend_sched);
+        ggml_backend_sched_reset(opt_ctx->backend_sched);
+    }
+
+    opt_ctx->backend_sched        = backend_sched;
+    opt_ctx->allocated_graph      = nullptr;
+    opt_ctx->allocated_graph_copy = nullptr;
+}
+
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     if (optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);

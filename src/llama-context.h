@@ -199,6 +199,9 @@ struct llama_context {
     //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    bool opt_suspend();
+    bool opt_resume();
+    void opt_set_weight_streaming(bool enabled);
     void opt_reset(bool recreate);
     int64_t opt_qat_state_count() const;
     struct ggml_tensor * opt_qat_state_param(int64_t index) const;
@@ -258,6 +261,8 @@ struct llama_context {
             bool                             clear_memory);
 
 private:
+    bool opt_create_backend_sched();
+
     //
     // output
     //
@@ -412,6 +417,8 @@ private:
     ggml_context_ptr opt_ctx_compute_cache;
 
     size_t opt_ctx_compute_cache_size = 0;
+    size_t opt_sched_size = 0;
+    bool opt_weight_streaming = false;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

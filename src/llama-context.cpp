@@ -3593,6 +3593,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         gf_res_reserve.reset(new llm_graph_result(inflated));
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                            sched_size, cparams.pipeline_parallel, cparams.op_offload));
+        opt_sched_size = sched_size;
+        ggml_backend_sched_set_weight_streaming(sched.get(), opt_weight_streaming);
         // Suppress the next sched_reserve() call so that llama_decode() during GRPO inference
         // steps does NOT replace the training sched with a smaller inference sched.
         // opt_ctx->backend_sched stores a raw pointer to sched.get(); replacing sched while
@@ -3660,6 +3662,44 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud, lopt_params.optimizer_type, opt_ctx);
         }
     }
+}
+
+bool llama_context::opt_create_backend_sched() {
+    if (!opt_ctx || sched || opt_sched_size == 0) {
+        return false;
+    }
+
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                       opt_sched_size, cparams.pipeline_parallel, cparams.op_offload));
+    if (!sched) {
+        return false;
+    }
+    ggml_backend_sched_set_weight_streaming(sched.get(), opt_weight_streaming);
+    ggml_opt_set_backend_sched(opt_ctx, sched.get());
+    sched_need_reserve = false;
+    return true;
+}
+
+bool llama_context::opt_suspend() {
+    if (!opt_ctx || !sched) {
+        return false;
+    }
+
+    ggml_backend_sched_synchronize(sched.get());
+    ggml_opt_set_backend_sched(opt_ctx, nullptr);
+    opt_ctx_compute_cache.reset();
+    opt_ctx_compute_cache_size = 0;
+    sched.reset();
+    return true;
+}
+
+bool llama_context::opt_resume() {
+    return opt_create_backend_sched();
+}
+
+void llama_context::opt_set_weight_streaming(bool enabled) {
+    GGML_ASSERT(!opt_ctx);
+    opt_weight_streaming = enabled;
 }
 
 void llama_context::opt_reset(bool recreate) {
@@ -3919,6 +3959,13 @@ void llama_context::opt_epoch_iter(
                 }
                 std::fprintf(stderr, "qlora placement: graph splits=%d CPU nodes=%zu CPU node bytes=%.2f MiB\n",
                         ggml_backend_sched_get_n_splits(sched.get()), n_cpu_nodes, n_cpu_bytes/(1024.0*1024.0));
+                for (ggml_backend_t backend : backend_ptrs) {
+                    if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        std::fprintf(stderr, "qlora placement: %s scheduler buffer=%.2f MiB\n",
+                                ggml_backend_name(backend),
+                                ggml_backend_sched_get_buffer_size(sched.get(), backend)/(1024.0*1024.0));
+                    }
+                }
                 training_placement_printed = true;
             }
 
@@ -5080,6 +5127,19 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
 
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_init(model, lopt_params);
+}
+
+bool llama_opt_suspend(struct llama_context * ctx) {
+    return ctx && ctx->opt_suspend();
+}
+
+bool llama_opt_resume(struct llama_context * ctx) {
+    return ctx && ctx->opt_resume();
+}
+
+void llama_opt_set_weight_streaming(struct llama_context * ctx, bool enabled) {
+    GGML_ASSERT(ctx);
+    ctx->opt_set_weight_streaming(enabled);
 }
 
 void llama_opt_reset(struct llama_context * ctx, bool recreate) {
