@@ -74,6 +74,8 @@ int main(int argc, char ** argv) {
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
         /*lora_qat_type   =*/LLAMA_LORA_QAT_TYPE_NONE,
+        /*lora_qat_type_callback    =*/nullptr,
+        /*lora_qat_type_callback_ud =*/nullptr,
         /*grad_checkpoint_interval =*/params.grad_checkpoint_interval,
         /*critical_token_mode      =*/LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE,
         /*critical_token_weight    =*/1.0f,

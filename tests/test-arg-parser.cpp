@@ -5,6 +5,8 @@
 #include "speculative.h"
 
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -244,6 +246,77 @@ static void test(void) {
 
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    {
+        const std::filesystem::path recipe =
+            std::filesystem::temp_directory_path() / "llama-test-lora-qat-tensor-types.txt";
+        {
+            std::ofstream file(recipe);
+            file << "blk\\.11\\.attn_output\\.weight=Q8_0\n";
+            file << "blk\\..*\\.attn_output\\.weight=Q6_K\n";
+        }
+
+        common_params qat_params;
+        argv = {"binary_name", "-m", "model.gguf", "--tensor-type-file", recipe.string()};
+        assert(true == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QLORA));
+        assert(qat_params.lora_qat_tensor_types.size() == 2);
+
+        struct ggml_tensor tensor = {};
+        ggml_set_name(&tensor, "blk.11.attn_output.weight");
+        assert(common_lora_qat_type_for_tensor(&tensor, LLAMA_LORA_QAT_TYPE_Q4_K,
+            &qat_params.lora_qat_tensor_types) == LLAMA_LORA_QAT_TYPE_Q8_0);
+        ggml_set_name(&tensor, "blk.12.attn_output.weight");
+        assert(common_lora_qat_type_for_tensor(&tensor, LLAMA_LORA_QAT_TYPE_Q4_K,
+            &qat_params.lora_qat_tensor_types) == LLAMA_LORA_QAT_TYPE_Q6_K);
+        ggml_set_name(&tensor, "blk.12.ffn_down.weight");
+        assert(common_lora_qat_type_for_tensor(&tensor, LLAMA_LORA_QAT_TYPE_Q4_K,
+            &qat_params.lora_qat_tensor_types) == LLAMA_LORA_QAT_TYPE_Q4_K);
+
+        std::filesystem::remove(recipe);
+    }
+
+    {
+        common_params qat_params;
+        const std::filesystem::path missing =
+            std::filesystem::temp_directory_path() / "llama-test-missing-lora-qat-tensor-types.txt";
+        std::filesystem::remove(missing);
+        argv = {"binary_name", "-m", "model.gguf", "--tensor-type-file", missing.string()};
+        assert(false == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QLORA));
+    }
+
+    {
+        const std::filesystem::path recipe =
+            std::filesystem::temp_directory_path() / "llama-test-invalid-lora-qat-tensor-type.txt";
+        {
+            std::ofstream file(recipe);
+            file << "blk\\.0\\.attn_q\\.weight=Q5_0\n";
+        }
+
+        common_params qat_params;
+        argv = {"binary_name", "-m", "model.gguf", "--tensor-type-file", recipe.string()};
+        assert(false == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QLORA));
+
+        std::filesystem::remove(recipe);
+    }
+
+    {
+        const std::filesystem::path recipe =
+            std::filesystem::temp_directory_path() / "llama-test-malformed-lora-qat-tensor-type.txt";
+        {
+            std::ofstream file(recipe);
+            file << "=Q8_0\n";
+        }
+
+        common_params qat_params;
+        argv = {"binary_name", "-m", "model.gguf", "--tensor-type-file", recipe.string()};
+        assert(false == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QLORA));
+
+        std::filesystem::remove(recipe);
+    }
 
     printf("test-arg-parser: test valid usage\n\n");
 

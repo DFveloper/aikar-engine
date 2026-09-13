@@ -12,7 +12,7 @@ The local tile launcher also has a positional argument mismatch after the upstre
 
 ## Architecture
 
-The graph passes `min(hparams.n_swa, k->ne[1])` as `n_kv_max` only for sliding-window layers. The existing mask compaction kernel produces at most that many row indices per query. Full-attention layers pass zero and remain dense.
+The graph passes `min(hparams.n_swa, k->ne[2])` as `n_kv_max` only for sliding-window layers. At this point K is not yet permuted and dimension 2 is the KV token axis. The existing mask compaction kernel produces at most that many row indices per query. Full-attention layers pass zero and remain dense.
 
 CUDA selects sparse MMA before the Q8_KV vector/tile early return only when every direct-Q8 requirement is satisfied. The first supported V100 shape is:
 
@@ -24,7 +24,7 @@ CUDA selects sparse MMA before the Q8_KV vector/tile early return only when ever
 - GQA ratio 2
 - mask present, no ALiBi bias, and no logit softcap
 - positive `n_kv_max`
-- KV length at least 1024, where the direct path outperforms the existing vector kernel on V100
+- KV length at least 4096 and at least twice `n_kv_max`, so compaction removes enough rows to amortize the sparse path
 
 The MMA kernel keeps its current half-precision shared-memory layout. A Q8_KV-specific sparse loader gathers each selected `block_q8_kv` row from global memory, applies its F16 scale while converting packed int8 values to `half2`, and writes the result directly into the same swizzled shared tile consumed by the existing Volta MMA code. There is no full F16 KV staging buffer and no separate global-memory dequantization pass.
 
@@ -48,7 +48,7 @@ No user-facing flag is required. The optimization is automatic under `-fa on -ct
 
 Host-side selection prevents unsupported template combinations from launching. Device code does not assert on a zero sparse bound because a sparse kernel cannot be selected without a positive `n_kv_max`. If mask compaction sees more live rows than the bound, it stores only the first `n_kv_max` rows; the graph-provided SWA bound must therefore equal the semantic maximum number of unmasked rows.
 
-For Gemma sliding-window masks, causal masking plus the window rule produces at most `min(hparams.n_swa, k->ne[1])` live rows. Full-attention masks are excluded by the zero bound.
+For Gemma sliding-window masks, causal masking plus the window rule produces at most `min(hparams.n_swa, k->ne[2])` live rows. Full-attention masks are excluded by the zero bound.
 
 ## Files
 

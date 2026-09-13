@@ -17,6 +17,7 @@
 #include <map>
 #include <algorithm>
 #include <fstream>
+#include <regex>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -56,6 +57,16 @@ struct common_adapter_lora_info {
 
     struct llama_adapter_lora * ptr;
 };
+
+struct common_lora_qat_tensor_type {
+    std::regex pattern;
+    enum ggml_type type = GGML_TYPE_COUNT;
+};
+
+enum llama_lora_qat_type common_lora_qat_type_for_tensor(
+        const struct ggml_tensor * tensor,
+        enum llama_lora_qat_type fallback,
+        void * userdata);
 
 using llama_tokens = std::vector<llama_token>;
 
@@ -669,6 +680,8 @@ struct common_params {
     int32_t     mtp_ubatch         = 64;
     float       mtp_learning_rate  = 0.0f;
     std::string lora_qat             = "none"; // none, q3_k, q4_k, q4_0, mxfp4, q6_k, q8_0
+    std::string lora_qat_tensor_type_file = "";
+    std::vector<common_lora_qat_tensor_type> lora_qat_tensor_types;
     std::string lr_scheduler         = "constant"; // constant, cosine
     int32_t warmup_steps             = 0;   // linear learning-rate warmup in logical training steps
     int32_t lr_decay_steps           = 0;   // cosine reaches lr_min at this logical step (0 = total training steps)

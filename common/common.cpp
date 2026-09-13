@@ -72,6 +72,31 @@ common_time_meas::~common_time_meas() {
     }
 }
 
+enum llama_lora_qat_type common_lora_qat_type_for_tensor(
+        const struct ggml_tensor * tensor,
+        enum llama_lora_qat_type fallback,
+        void * userdata) {
+    if (!tensor || !userdata) {
+        return fallback;
+    }
+    const auto & tensor_types = *(const std::vector<common_lora_qat_tensor_type> *) userdata;
+    const std::string name = tensor->name;
+    for (const auto & tensor_type : tensor_types) {
+        if (std::regex_search(name, tensor_type.pattern)) {
+            switch (tensor_type.type) {
+                case GGML_TYPE_Q3_K:  return LLAMA_LORA_QAT_TYPE_Q3_K;
+                case GGML_TYPE_Q4_K:  return LLAMA_LORA_QAT_TYPE_Q4_K;
+                case GGML_TYPE_Q4_0:  return LLAMA_LORA_QAT_TYPE_Q4_0;
+                case GGML_TYPE_MXFP4: return LLAMA_LORA_QAT_TYPE_MXFP4;
+                case GGML_TYPE_Q6_K:  return LLAMA_LORA_QAT_TYPE_Q6_K;
+                case GGML_TYPE_Q8_0:  return LLAMA_LORA_QAT_TYPE_Q8_0;
+                default:              return fallback;
+            }
+        }
+    }
+    return fallback;
+}
+
 //
 // CPU utils
 //

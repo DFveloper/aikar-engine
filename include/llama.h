@@ -1689,6 +1689,11 @@ extern "C" {
         LLAMA_LORA_QAT_TYPE_Q8_0,
     };
 
+    typedef enum llama_lora_qat_type (*llama_opt_lora_qat_type_callback)(
+            const struct ggml_tensor * tensor,
+            enum llama_lora_qat_type fallback,
+            void * userdata);
+
     struct llama_opt_critical_token_metadata {
         float span_weight;
         float reward_weight;
@@ -1717,6 +1722,8 @@ extern "C" {
 
         enum ggml_opt_optimizer_type optimizer_type;
         enum llama_lora_qat_type     lora_qat_type;
+        llama_opt_lora_qat_type_callback lora_qat_type_callback;
+        void * lora_qat_type_callback_ud;
 
         // Gradient checkpointing: mark every Nth forward graph node as persistent so the
         // allocator cannot reuse its memory during backward.  Reduces peak activation VRAM

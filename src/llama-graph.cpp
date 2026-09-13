@@ -1579,8 +1579,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
         auto fake_quant = [&](ggml_tensor * tensor) {
+            const enum llama_lora_qat_type qat_type = cparams.lora_qat_type_callback
+                ? cparams.lora_qat_type_callback(w, cparams.lora_qat_type, cparams.lora_qat_type_callback_ud)
+                : cparams.lora_qat_type;
             enum ggml_type type = GGML_TYPE_COUNT;
-            switch (cparams.lora_qat_type) {
+            switch (qat_type) {
                 case LLAMA_LORA_QAT_TYPE_Q3_K: type = GGML_TYPE_Q3_K; break;
                 case LLAMA_LORA_QAT_TYPE_Q4_K: type = GGML_TYPE_Q4_K; break;
                 case LLAMA_LORA_QAT_TYPE_Q4_0: type = GGML_TYPE_Q4_0; break;
@@ -3264,7 +3267,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    const int64_t n_kv_max = is_swa ? std::min<int64_t>(hparams.n_swa, k->ne[1]) : 0;
+    const int64_t n_kv_max = is_swa ? std::min<int64_t>(hparams.n_swa, k->ne[2]) : 0;
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
 

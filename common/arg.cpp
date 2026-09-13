@@ -74,6 +74,42 @@ static std::string read_file(const std::string & fname) {
     return content;
 }
 
+static enum ggml_type lora_qat_type_from_name(const std::string & name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (lower == "q3_k")  return GGML_TYPE_Q3_K;
+    if (lower == "q4_k")  return GGML_TYPE_Q4_K;
+    if (lower == "q4_0")  return GGML_TYPE_Q4_0;
+    if (lower == "mxfp4") return GGML_TYPE_MXFP4;
+    if (lower == "q6_k")  return GGML_TYPE_Q6_K;
+    if (lower == "q8_0")  return GGML_TYPE_Q8_0;
+    return GGML_TYPE_COUNT;
+}
+
+static std::vector<common_lora_qat_tensor_type> read_lora_qat_tensor_types(const std::string & path) {
+    std::ifstream file(path);
+    if (!file) {
+        throw std::invalid_argument("failed to open tensor type file: " + path);
+    }
+
+    std::vector<common_lora_qat_tensor_type> result;
+    std::string value;
+    while (file >> value) {
+        const size_t separator = value.find('=');
+        if (separator == std::string::npos || separator == 0 || separator + 1 == value.size()) {
+            throw std::invalid_argument("invalid tensor type entry: " + value);
+        }
+        const std::string pattern = value.substr(0, separator);
+        const std::string type_name = value.substr(separator + 1);
+        const enum ggml_type type = lora_qat_type_from_name(type_name);
+        if (type == GGML_TYPE_COUNT) {
+            throw std::invalid_argument("invalid LoRA QAT tensor type: " + type_name);
+        }
+        result.push_back({ std::regex(pattern), type });
+    }
+    return result;
+}
+
 static const std::vector<common_arg> & get_common_arg_defs() {
     static const std::vector<common_arg> options = [] {
         common_params params;
@@ -4876,6 +4912,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid --lora-qat");
             }
             params.lora_qat = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"--tensor-type-file"}, "FNAME",
+        "set LoRA QAT types from whitespace-separated REGEX=TYPE entries",
+        [](common_params & params, const std::string & value) {
+            params.lora_qat_tensor_type_file = value;
+            params.lora_qat_tensor_types = read_lora_qat_tensor_types(value);
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(

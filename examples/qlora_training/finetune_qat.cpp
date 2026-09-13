@@ -809,6 +809,7 @@ int main(int argc, char ** argv) {
     struct llama_opt_params opt_params {
         0, params.mtp_mode == "only" ? lora_param_filter_none : qat_param_filter, &weight_type, qat_opt_lr_pars, &qat_lr_ctx,
         GGML_OPT_OPTIMIZER_TYPE_QLION_QAT, LLAMA_LORA_QAT_TYPE_NONE,
+        nullptr, nullptr,
         params.grad_checkpoint_interval, critical_token_mode_from_string(params.critical_token_mode),
         params.critical_token_weight, params.critical_confidence_threshold,
         critical_weight_shape_from_string(params.critical_weight_shape), params.critical_warmup_steps,
