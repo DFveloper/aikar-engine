@@ -31,6 +31,8 @@ LLAMA_API bool llama_opt_suspend(struct llama_context * ctx);
 LLAMA_API bool llama_opt_resume(struct llama_context * ctx);
 LLAMA_API void llama_opt_set_weight_streaming(
         struct llama_context * ctx, bool enabled, bool async_prefetch, size_t staging_bytes);
+LLAMA_API void llama_opt_set_segmented_training(
+        struct llama_context * ctx, bool enabled, size_t device_budget);
 
 struct quantize_state_impl;
 

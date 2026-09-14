@@ -46,7 +46,20 @@ extern "C" {
             ggml_opt_checkpoint_store_t store, const struct ggml_tensor * tensor);
     GGML_API enum ggml_status ggml_opt_checkpoint_store_restore(
             ggml_opt_checkpoint_store_t store, struct ggml_tensor * tensor);
+    GGML_API enum ggml_status ggml_opt_checkpoint_store_get(
+            ggml_opt_checkpoint_store_t store,
+            const struct ggml_tensor * tensor,
+            void * data,
+            size_t size);
     GGML_API enum ggml_status ggml_opt_segmented_forward(
+            ggml_backend_sched_t sched,
+            ggml_opt_segment_plan_t plan,
+            ggml_opt_checkpoint_store_t store);
+    GGML_API enum ggml_status ggml_opt_segmented_prepare(
+            ggml_backend_sched_t sched,
+            ggml_opt_segment_plan_t plan,
+            ggml_opt_checkpoint_store_t store);
+    GGML_API enum ggml_status ggml_opt_segmented_compute_prepared(
             ggml_backend_sched_t sched,
             ggml_opt_segment_plan_t plan,
             ggml_opt_checkpoint_store_t store);
@@ -203,6 +216,7 @@ extern "C" {
     GGML_API ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params);
     GGML_API void ggml_opt_free(ggml_opt_context_t opt_ctx);
     GGML_API void ggml_opt_set_backend_sched(ggml_opt_context_t opt_ctx, ggml_backend_sched_t backend_sched);
+    GGML_API void ggml_opt_set_segmented(ggml_opt_context_t opt_ctx, bool enabled, size_t device_budget);
 
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);

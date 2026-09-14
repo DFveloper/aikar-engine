@@ -3634,6 +3634,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     cparams.lora_qat_type_callback       = lopt_params.lora_qat_type_callback;
     cparams.lora_qat_type_callback_ud    = lopt_params.lora_qat_type_callback_ud;
     opt_ctx = ggml_opt_init(opt_params);
+    ggml_opt_set_segmented(opt_ctx, opt_segmented_training, opt_segment_device_budget);
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
@@ -3704,6 +3705,12 @@ void llama_context::opt_set_weight_streaming(bool enabled, bool async_prefetch, 
         /*.async_prefetch =*/async_prefetch,
         /*.staging_bytes  =*/staging_bytes,
     };
+}
+
+void llama_context::opt_set_segmented_training(bool enabled, size_t device_budget) {
+    GGML_ASSERT(!opt_ctx);
+    opt_segmented_training = enabled;
+    opt_segment_device_budget = device_budget;
 }
 
 void llama_context::opt_reset(bool recreate) {
@@ -5148,6 +5155,12 @@ void llama_opt_set_weight_streaming(
         struct llama_context * ctx, bool enabled, bool async_prefetch, size_t staging_bytes) {
     GGML_ASSERT(ctx);
     ctx->opt_set_weight_streaming(enabled, async_prefetch, staging_bytes);
+}
+
+void llama_opt_set_segmented_training(
+        struct llama_context * ctx, bool enabled, size_t device_budget) {
+    GGML_ASSERT(ctx);
+    ctx->opt_set_segmented_training(enabled, device_budget);
 }
 
 void llama_opt_reset(struct llama_context * ctx, bool recreate) {

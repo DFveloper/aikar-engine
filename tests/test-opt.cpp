@@ -1165,6 +1165,100 @@ static bool test_segment_plan_budget(ggml_backend_t backend, ggml_backend_t cpu_
     return ok;
 }
 
+static bool test_segmented_backward(ggml_backend_t backend, ggml_backend_t cpu_backend) {
+    ggml_backend_t selected_backends[] = { backend, cpu_backend };
+    const int n_backends = backend == cpu_backend ? 1 : 2;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(selected_backends, nullptr, n_backends, 128, false, true);
+    ggml_init_params static_params = {
+        /*.mem_size   =*/ 8*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_init_params compute_params = {
+        /*.mem_size   =*/ 128*ggml_tensor_overhead() + ggml_graph_overhead_custom(128, true),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * static_ctx = ggml_init(static_params);
+    ggml_context * compute_ctx = ggml_init(compute_params);
+    ggml_tensor * input = ggml_new_tensor_1d(static_ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * weight = ggml_new_tensor_1d(static_ctx, GGML_TYPE_F32, 4);
+    ggml_set_input(input);
+    ggml_set_param(weight);
+    ggml_tensor * product = ggml_mul(compute_ctx, input, weight);
+    ggml_tensor * hidden = ggml_sqr(compute_ctx, product);
+    ggml_tensor * loss = ggml_sum(compute_ctx, hidden);
+    ggml_set_loss(loss);
+    ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx, 128, true);
+    ggml_build_forward_expand(graph, loss);
+    ggml_build_backward_expand(compute_ctx, graph, nullptr);
+    ggml_tensor * weight_grad = ggml_graph_get_grad(graph, weight);
+    GGML_ASSERT(weight_grad);
+    ggml_set_output(weight_grad);
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors(static_ctx, backend);
+    const float input_values[] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float weight_values[] = { 0.5f, 1.0f, 1.5f, 2.0f };
+    ggml_backend_tensor_set(input, input_values, 0, sizeof(input_values));
+    ggml_backend_tensor_set(weight, weight_values, 0, sizeof(weight_values));
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+    ggml_graph_reset(graph);
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    float expected[4] = {};
+    ggml_backend_tensor_get(weight_grad, expected, 0, sizeof(expected));
+    GGML_ASSERT(ggml_backend_sched_release_allocation(sched));
+
+    ggml_opt_segment_plan_t plan = ggml_opt_segment_plan_init(graph, 2);
+    ggml_opt_checkpoint_store_t store = ggml_opt_checkpoint_store_init();
+    GGML_ASSERT(ggml_opt_segmented_prepare(sched, plan, store) == GGML_STATUS_SUCCESS);
+    ggml_graph_reset(graph);
+    const enum ggml_status status = ggml_opt_segmented_compute_prepared(sched, plan, store);
+    float actual[4] = {};
+    const enum ggml_status get_status = ggml_opt_checkpoint_store_get(
+        store, weight_grad, actual, sizeof(actual));
+    TEST_LOG("segmented backward: status=%d get=%d expected=[%.3f %.3f %.3f %.3f] actual=[%.3f %.3f %.3f %.3f]\n",
+        status, get_status, expected[0], expected[1], expected[2], expected[3], actual[0], actual[1], actual[2], actual[3]);
+    const bool ok = status == GGML_STATUS_SUCCESS && get_status == GGML_STATUS_SUCCESS &&
+        memcmp(actual, expected, sizeof(actual)) == 0;
+
+    ggml_opt_checkpoint_store_free(store);
+    ggml_opt_segment_plan_free(plan);
+    ggml_backend_sched_release_allocation(sched);
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(compute_ctx);
+    ggml_free(static_ctx);
+    return ok;
+}
+
+static bool test_segmented_optimizer(
+        enum ggml_opt_optimizer_type optimizer, ggml_backend_t backend, ggml_backend_t cpu_backend) {
+    ggml_backend_t selected_backends[] = { backend, cpu_backend };
+    const int n_backends = backend == cpu_backend ? 1 : 2;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(selected_backends, nullptr, n_backends, 256, false, true);
+    helper_ctx_data cd = helper_get_ctx_data(
+        optimizer, sched, backend, true, false, 1, 1, GGML_OPT_LOSS_TYPE_SUM);
+    ggml_opt_set_segmented(cd.opt_ctx, true, 4*1024*1024);
+    for (int idata = 0; idata < ndata; ++idata) {
+        GGML_ASSERT(ggml_opt_alloc(cd.opt_ctx, true) == GGML_STATUS_SUCCESS);
+        const float value = idata;
+        ggml_backend_tensor_set(cd.inputs, &value, 0, sizeof(value));
+        ggml_opt_eval(cd.opt_ctx, cd.result);
+    }
+    float weight = 0.0f;
+    ggml_backend_tensor_get(cd.weights, &weight, 0, sizeof(weight));
+    int64_t result_ndata = 0;
+    ggml_opt_result_ndata(cd.result, &result_ndata);
+    TEST_LOG("segmented optimizer %s on %s: weight=%.6f ndata=%ld\n",
+        ggml_opt_optimizer_name(optimizer), ggml_backend_name(backend), weight, (long) result_ndata);
+    const bool ok = almost_equal(weight, -ndata*0.5, 1e-6) && result_ndata == ndata;
+
+    ggml_opt_set_backend_sched(cd.opt_ctx, nullptr);
+    ggml_backend_sched_free(sched);
+    helper_free_ctx_data(cd);
+    return ok;
+}
+
 
 int main(void) {
     ggml_log_set(nullptr, nullptr);
@@ -1228,6 +1322,22 @@ int main(void) {
         ++n_total;
         if (test_segment_plan_budget(backends.back(), backends.back())) {
             ++n_ok;
+        }
+        for (ggml_backend_t backend : backends) {
+            TEST_LOG("running segmented backward test on %s\n", ggml_backend_name(backend));
+            ++n_total;
+            if (test_segmented_backward(backend, backends.back())) {
+                ++n_ok;
+            }
+            for (enum ggml_opt_optimizer_type optimizer : {
+                    GGML_OPT_OPTIMIZER_TYPE_ADAMW, GGML_OPT_OPTIMIZER_TYPE_SGD }) {
+                TEST_LOG("running segmented %s test on %s\n",
+                    ggml_opt_optimizer_name(optimizer), ggml_backend_name(backend));
+                ++n_total;
+                if (test_segmented_optimizer(optimizer, backend, backends.back())) {
+                    ++n_ok;
+                }
+            }
         }
     }
     for (enum ggml_opt_optimizer_type optim : { GGML_OPT_OPTIMIZER_TYPE_ADAMW, GGML_OPT_OPTIMIZER_TYPE_SGD }) {

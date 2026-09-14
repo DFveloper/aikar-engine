@@ -2807,8 +2807,8 @@ static int run_grpo_mode(
         /*.train_target             =*/true,
     };
     if (rollout_params) {
-        llama_opt_set_weight_streaming(
-            ctx, true, true, (size_t) params.layer_staging_mib * 1024 * 1024);
+        llama_opt_set_segmented_training(
+            ctx, true, (size_t) params.layer_staging_mib * 1024 * 1024);
     }
     llama_opt_init(ctx, model, lopt_params);
     if (rollout_params && !llama_opt_suspend(ctx)) {

@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
@@ -21,6 +22,7 @@
 struct ggml_opt_segment_range {
     int32_t begin;
     int32_t end;
+    std::vector<struct ggml_tensor *> nodes;
     std::vector<const struct ggml_tensor *> live_in;
     std::vector<const struct ggml_tensor *> live_out;
     std::vector<struct ggml_tensor *> leaves;
@@ -29,6 +31,7 @@ struct ggml_opt_segment_range {
 
 struct ggml_opt_segment_plan {
     std::vector<ggml_opt_segment_range> segments;
+    std::vector<struct ggml_tensor *> transient_leaves;
     size_t device_budget = 0;
     size_t measured_max = 0;
 };
@@ -41,6 +44,8 @@ struct ggml_opt_checkpoint {
 
 struct ggml_opt_checkpoint_store {
     std::unordered_map<const struct ggml_tensor *, ggml_opt_checkpoint> checkpoints;
+    std::vector<struct ggml_tensor *> pinned_tensors;
+    std::vector<ggml_backend_buffer_t> pinned_buffers;
 };
 
 static void ggml_opt_segment_add_unique(
@@ -58,6 +63,12 @@ ggml_opt_segment_plan_t ggml_opt_segment_plan_init(struct ggml_cgraph * graph, i
 
     auto * plan = new ggml_opt_segment_plan;
     std::unordered_map<const struct ggml_tensor *, int32_t> producers;
+    for (int32_t i = 0; i < graph->n_leafs; ++i) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        if (!leaf->buffer && !(leaf->flags & GGML_TENSOR_FLAG_PARAM)) {
+            plan->transient_leaves.push_back(leaf);
+        }
+    }
     std::vector<int32_t> executable;
     for (int32_t i = 0; i < graph->n_nodes; ++i) {
         if (!(graph->nodes[i]->flags & GGML_TENSOR_FLAG_PARAM)) {
@@ -71,17 +82,18 @@ ggml_opt_segment_plan_t ggml_opt_segment_plan_init(struct ggml_cgraph * graph, i
         ggml_opt_segment_range segment = {
             /*.begin =*/executable[offset],
             /*.end   =*/executable[last] + 1,
+            /*.nodes =*/{},
             /*.live_in  =*/{},
             /*.live_out =*/{},
             /*.leaves =*/{},
             /*.graph =*/{},
         };
 
-        for (int32_t i = segment.begin; i < segment.end; ++i) {
-            const struct ggml_tensor * node = graph->nodes[i];
-            if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                continue;
-            }
+        for (int32_t i = offset; i <= last; ++i) {
+            segment.nodes.push_back(graph->nodes[executable[i]]);
+        }
+
+        for (const struct ggml_tensor * node : segment.nodes) {
             for (int32_t src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
                 const struct ggml_tensor * src = node->src[src_index];
                 auto producer = producers.find(src);
@@ -108,7 +120,18 @@ ggml_opt_segment_plan_t ggml_opt_segment_plan_init(struct ggml_cgraph * graph, i
             }
         }
 
+        for (const struct ggml_tensor * node : segment.nodes) {
+            if (node->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS)) {
+                ggml_opt_segment_add_unique(segment.live_out, node);
+            }
+        }
+        for (const struct ggml_tensor * tensor : segment.live_out) {
+            const_cast<struct ggml_tensor *>(tensor)->flags |= GGML_TENSOR_FLAG_OUTPUT;
+        }
+
         segment.graph = ggml_graph_view(graph, segment.begin, segment.end);
+        segment.graph.nodes = segment.nodes.data();
+        segment.graph.n_nodes = (int32_t) segment.nodes.size();
         plan->segments.push_back(std::move(segment));
         ggml_opt_segment_range & stored = plan->segments.back();
         stored.graph.leafs = stored.leaves.data();
@@ -117,6 +140,7 @@ ggml_opt_segment_plan_t ggml_opt_segment_plan_init(struct ggml_cgraph * graph, i
     }
 
     for (ggml_opt_segment_range & segment : plan->segments) {
+        segment.graph.nodes = segment.nodes.data();
         segment.graph.leafs = segment.leaves.data();
     }
 
@@ -162,9 +186,16 @@ ggml_opt_segment_plan_t ggml_opt_segment_plan_init_budget(
     }
 
     int32_t n_executable = 0;
+    std::vector<std::array<struct ggml_tensor *, GGML_MAX_SRC>> graph_sources(graph->n_nodes);
     for (int32_t i = 0; i < graph->n_nodes; ++i) {
         n_executable += !(graph->nodes[i]->flags & GGML_TENSOR_FLAG_PARAM);
+        std::copy_n(graph->nodes[i]->src, GGML_MAX_SRC, graph_sources[i].begin());
     }
+    const auto restore_graph_sources = [&]() {
+        for (int32_t i = 0; i < graph->n_nodes; ++i) {
+            std::copy_n(graph_sources[i].begin(), GGML_MAX_SRC, graph->nodes[i]->src);
+        }
+    };
     std::vector<size_t> sizes(n_backends);
     for (int32_t max_nodes = n_executable; max_nodes >= 1; max_nodes = max_nodes == 1 ? 0 : (max_nodes + 1)/2) {
         ggml_opt_segment_plan_t plan = ggml_opt_segment_plan_init(graph, max_nodes);
@@ -172,7 +203,9 @@ ggml_opt_segment_plan_t ggml_opt_segment_plan_init_budget(
         bool measured = plan != nullptr;
         if (plan) {
             for (ggml_opt_segment_range & segment : plan->segments) {
-                if (ggml_backend_sched_measure_graph(sched, &segment.graph, sizes.data(), sizes.size()) != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_reserve_size(sched, &segment.graph, sizes.data());
+                restore_graph_sources();
+                if (!ggml_backend_sched_release_allocation(sched)) {
                     measured = false;
                     break;
                 }
@@ -241,6 +274,15 @@ ggml_opt_checkpoint_store_t ggml_opt_checkpoint_store_init(void) {
 }
 
 void ggml_opt_checkpoint_store_free(ggml_opt_checkpoint_store_t store) {
+    if (store) {
+        for (struct ggml_tensor * tensor : store->pinned_tensors) {
+            tensor->buffer = nullptr;
+            tensor->data = nullptr;
+        }
+        for (ggml_backend_buffer_t buffer : store->pinned_buffers) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
     delete store;
 }
 
@@ -276,24 +318,85 @@ enum ggml_status ggml_opt_checkpoint_store_restore(
     return GGML_STATUS_SUCCESS;
 }
 
+enum ggml_status ggml_opt_checkpoint_store_get(
+        ggml_opt_checkpoint_store_t store,
+        const struct ggml_tensor * tensor,
+        void * data,
+        size_t size) {
+    if (!store || !tensor || !data) {
+        return GGML_STATUS_FAILED;
+    }
+    auto found = store->checkpoints.find(tensor);
+    if (found == store->checkpoints.end() || found->second.data.size() != size) {
+        return GGML_STATUS_FAILED;
+    }
+    memcpy(data, found->second.data.data(), size);
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_opt_segmented_forward(
+        ggml_backend_sched_t sched,
+        ggml_opt_segment_plan_t plan,
+        ggml_opt_checkpoint_store_t store) {
+    const enum ggml_status prepare_status = ggml_opt_segmented_prepare(sched, plan, store);
+    return prepare_status == GGML_STATUS_SUCCESS
+        ? ggml_opt_segmented_compute_prepared(sched, plan, store)
+        : prepare_status;
+}
+
+enum ggml_status ggml_opt_segmented_prepare(
         ggml_backend_sched_t sched,
         ggml_opt_segment_plan_t plan,
         ggml_opt_checkpoint_store_t store) {
     if (!sched || !plan || !store || plan->segments.empty()) {
         return GGML_STATUS_FAILED;
     }
-
     if (!ggml_backend_sched_release_allocation(sched)) {
         return GGML_STATUS_ALLOC_FAILED;
     }
+    ggml_backend_buffer_type_t host_buft = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched) && !host_buft; ++i) {
+        ggml_backend_dev_t device = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+        host_buft = ggml_backend_dev_host_buffer_type(device);
+    }
+    if (!host_buft) {
+        ggml_backend_t cpu = ggml_backend_sched_get_backend(
+            sched, ggml_backend_sched_get_n_backends(sched) - 1);
+        host_buft = ggml_backend_get_default_buffer_type(cpu);
+    }
+    for (struct ggml_tensor * tensor : plan->transient_leaves) {
+        if (tensor->buffer) {
+            continue;
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(
+            host_buft, ggml_backend_buft_get_alloc_size(host_buft, tensor));
+        if (!buffer || ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer)) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        store->pinned_tensors.push_back(tensor);
+        store->pinned_buffers.push_back(buffer);
+    }
+    if (!ggml_backend_sched_alloc_graph(sched, &plan->segments.front().graph)) {
+        ggml_backend_sched_release_allocation(sched);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
 
+enum ggml_status ggml_opt_segmented_compute_prepared(
+        ggml_backend_sched_t sched,
+        ggml_opt_segment_plan_t plan,
+        ggml_opt_checkpoint_store_t store) {
+    if (!sched || !plan || !store || plan->segments.empty()) {
+        return GGML_STATUS_FAILED;
+    }
     for (size_t i = 0; i < plan->segments.size(); ++i) {
         ggml_opt_segment_range & segment = plan->segments[i];
         if (i > 0 && !ggml_backend_sched_release_allocation(sched)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
-        if (!ggml_backend_sched_alloc_graph(sched, &segment.graph)) {
+        if (i > 0 && !ggml_backend_sched_alloc_graph(sched, &segment.graph)) {
             ggml_backend_sched_release_allocation(sched);
             return GGML_STATUS_ALLOC_FAILED;
         }
@@ -351,6 +454,10 @@ struct ggml_opt_context {
     enum ggml_opt_loss_type    loss_type;
     enum ggml_opt_build_type   build_type;
     enum ggml_opt_build_type   build_type_alloc;
+    bool                       segmented = false;
+    size_t                     segment_device_budget = 0;
+    ggml_opt_segment_plan_t    segment_plan = nullptr;
+    ggml_opt_checkpoint_store_t segment_store = nullptr;
 
     struct ggml_tensor * inputs  = nullptr;
     struct ggml_tensor * outputs = nullptr;
@@ -2892,6 +2999,8 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
     }
+    ggml_opt_segment_plan_free(opt_ctx->segment_plan);
+    ggml_opt_checkpoint_store_free(opt_ctx->segment_store);
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
     for (ggml_backend_buffer_t buf : opt_ctx->bufs_momenta) {
@@ -2924,6 +3033,13 @@ void ggml_opt_set_backend_sched(ggml_opt_context_t opt_ctx, ggml_backend_sched_t
     opt_ctx->backend_sched        = backend_sched;
     opt_ctx->allocated_graph      = nullptr;
     opt_ctx->allocated_graph_copy = nullptr;
+}
+
+void ggml_opt_set_segmented(ggml_opt_context_t opt_ctx, bool enabled, size_t device_budget) {
+    GGML_ASSERT(opt_ctx);
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    opt_ctx->segmented = enabled;
+    opt_ctx->segment_device_budget = device_budget;
 }
 
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
@@ -3154,6 +3270,26 @@ enum ggml_status ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
     GGML_ASSERT(graph);
 
+    if (opt_ctx->segmented && backward) {
+        ggml_opt_segment_plan_free(opt_ctx->segment_plan);
+        ggml_opt_checkpoint_store_free(opt_ctx->segment_store);
+        opt_ctx->segment_plan = ggml_opt_segment_plan_init_budget(
+            graph, opt_ctx->backend_sched, opt_ctx->segment_device_budget);
+        opt_ctx->segment_store = ggml_opt_checkpoint_store_init();
+        if (!opt_ctx->segment_plan || ggml_opt_segmented_prepare(
+                opt_ctx->backend_sched, opt_ctx->segment_plan, opt_ctx->segment_store) != GGML_STATUS_SUCCESS) {
+            ggml_opt_segment_plan_free(opt_ctx->segment_plan);
+            ggml_opt_checkpoint_store_free(opt_ctx->segment_store);
+            opt_ctx->segment_plan = nullptr;
+            opt_ctx->segment_store = nullptr;
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        opt_ctx->allocated_graph = graph;
+        opt_ctx->allocated_graph_copy = graph;
+        opt_ctx->eval_ready = true;
+        return GGML_STATUS_SUCCESS;
+    }
+
     if (opt_ctx->allocated_graph == graph) {
         opt_ctx->eval_ready = true;
         return GGML_STATUS_SUCCESS;
@@ -3185,6 +3321,25 @@ enum ggml_status ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     opt_ctx->eval_ready = true;
     return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_opt_segment_cleanup(ggml_opt_context_t opt_ctx) {
+    if (!opt_ctx->segment_plan) {
+        return;
+    }
+    ggml_backend_sched_release_allocation(opt_ctx->backend_sched);
+    ggml_opt_segment_plan_free(opt_ctx->segment_plan);
+    ggml_opt_checkpoint_store_free(opt_ctx->segment_store);
+    opt_ctx->segment_plan = nullptr;
+    opt_ctx->segment_store = nullptr;
+}
+
+static void ggml_opt_tensor_get(
+        ggml_opt_context_t opt_ctx, const struct ggml_tensor * tensor, void * data, size_t size) {
+    if (!opt_ctx->segment_store ||
+        ggml_opt_checkpoint_store_get(opt_ctx->segment_store, tensor, data, size) != GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(tensor, data, 0, size);
+    }
 }
 
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
@@ -3250,7 +3405,15 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    const enum ggml_status compute_status = opt_ctx->segment_plan
+        ? ggml_opt_segmented_compute_prepared(opt_ctx->backend_sched, opt_ctx->segment_plan, opt_ctx->segment_store)
+        : ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    if (compute_status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("%s: optimizer graph compute failed with status %d\n", __func__, compute_status);
+        opt_ctx->eval_ready = false;
+        ggml_opt_segment_cleanup(opt_ctx);
+        return;
+    }
     if (do_optimizer_step && ggml_opt_optimizer_state_type(opt_ctx->optimizer) != GGML_TYPE_COUNT) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
         ggml_opt_step_adamw_quantized(opt_ctx, opt_pars);
@@ -3269,6 +3432,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     opt_ctx->eval_ready = false;
 
     if (!result) {
+        ggml_opt_segment_cleanup(opt_ctx);
         return;
     }
 
@@ -3285,22 +3449,21 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     result->ndata += ndata;
 
     GGML_ASSERT(ggml_is_scalar(opt_ctx->loss));
-    GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
     float loss;
-    ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
+    ggml_opt_tensor_get(opt_ctx, opt_ctx->loss, &loss, ggml_nbytes(opt_ctx->loss));
     result->loss.push_back(loss);
 
     if (opt_ctx->pred) {
         GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);
         std::vector<int32_t> pred(ndata);
-        ggml_backend_tensor_get(opt_ctx->pred, pred.data(), 0, ggml_nbytes(opt_ctx->pred));
+        ggml_opt_tensor_get(opt_ctx, opt_ctx->pred, pred.data(), ggml_nbytes(opt_ctx->pred));
         result->pred.insert(result->pred.end(), pred.begin(), pred.end());
 
         if (opt_ctx->sparse_targets && opt_ctx->sparse_weights && opt_ctx->nvalid && opt_ctx->ncorrect) {
             float nvalid_f32 = 0.0f;
             int64_t ncorrect_with_mask = 0;
-            ggml_backend_tensor_get(opt_ctx->nvalid, &nvalid_f32, 0, ggml_nbytes(opt_ctx->nvalid));
-            ggml_backend_tensor_get(opt_ctx->ncorrect, &ncorrect_with_mask, 0, ggml_nbytes(opt_ctx->ncorrect));
+            ggml_opt_tensor_get(opt_ctx, opt_ctx->nvalid, &nvalid_f32, ggml_nbytes(opt_ctx->nvalid));
+            ggml_opt_tensor_get(opt_ctx, opt_ctx->ncorrect, &ncorrect_with_mask, ggml_nbytes(opt_ctx->ncorrect));
             const int64_t nvalid_batch = std::max<int64_t>(0, std::min<int64_t>(ndata, llround(nvalid_f32)));
             const int64_t ncorrect_batch = std::max<int64_t>(0,
                     std::min<int64_t>(nvalid_batch, ncorrect_with_mask));
@@ -3308,6 +3471,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
             result->ncorrect += ncorrect_batch;
             result->nvalid_batch.push_back(nvalid_batch);
             result->ncorrect_batch.push_back(ncorrect_batch);
+            ggml_opt_segment_cleanup(opt_ctx);
             return;
         }
     }
@@ -3316,16 +3480,18 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
 
     if (!opt_ctx->ncorrect || result->ncorrect < 0) {
         result->ncorrect = -1;
+        ggml_opt_segment_cleanup(opt_ctx);
         return;
     }
 
     GGML_ASSERT(ggml_is_scalar(opt_ctx->ncorrect));
     GGML_ASSERT(opt_ctx->ncorrect->type == GGML_TYPE_I64);
     int64_t ncorrect;
-    ggml_backend_tensor_get(opt_ctx->ncorrect, &ncorrect, 0, ggml_nbytes(opt_ctx->ncorrect));
+    ggml_opt_tensor_get(opt_ctx, opt_ctx->ncorrect, &ncorrect, ggml_nbytes(opt_ctx->ncorrect));
     result->ncorrect += ncorrect;
     result->nvalid_batch.push_back(ndata);
     result->ncorrect_batch.push_back(ncorrect);
+    ggml_opt_segment_cleanup(opt_ctx);
 }
 
 // ====== High-Level Functions ======
