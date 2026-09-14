@@ -18,6 +18,309 @@
 #include <vector>
 #include <unordered_map>
 
+struct ggml_opt_segment_range {
+    int32_t begin;
+    int32_t end;
+    std::vector<const struct ggml_tensor *> live_in;
+    std::vector<const struct ggml_tensor *> live_out;
+    std::vector<struct ggml_tensor *> leaves;
+    struct ggml_cgraph graph;
+};
+
+struct ggml_opt_segment_plan {
+    std::vector<ggml_opt_segment_range> segments;
+    size_t device_budget = 0;
+    size_t measured_max = 0;
+};
+
+struct ggml_opt_checkpoint {
+    enum ggml_type type;
+    int64_t ne[GGML_MAX_DIMS];
+    std::vector<uint8_t> data;
+};
+
+struct ggml_opt_checkpoint_store {
+    std::unordered_map<const struct ggml_tensor *, ggml_opt_checkpoint> checkpoints;
+};
+
+static void ggml_opt_segment_add_unique(
+        std::vector<const struct ggml_tensor *> & tensors,
+        const struct ggml_tensor * tensor) {
+    if (std::find(tensors.begin(), tensors.end(), tensor) == tensors.end()) {
+        tensors.push_back(tensor);
+    }
+}
+
+ggml_opt_segment_plan_t ggml_opt_segment_plan_init(struct ggml_cgraph * graph, int32_t max_nodes) {
+    if (!graph || max_nodes <= 0) {
+        return nullptr;
+    }
+
+    auto * plan = new ggml_opt_segment_plan;
+    std::unordered_map<const struct ggml_tensor *, int32_t> producers;
+    std::vector<int32_t> executable;
+    for (int32_t i = 0; i < graph->n_nodes; ++i) {
+        if (!(graph->nodes[i]->flags & GGML_TENSOR_FLAG_PARAM)) {
+            producers[graph->nodes[i]] = i;
+            executable.push_back(i);
+        }
+    }
+
+    for (int32_t offset = 0; offset < (int32_t) executable.size(); offset += max_nodes) {
+        const int32_t last = std::min(offset + max_nodes, (int32_t) executable.size()) - 1;
+        ggml_opt_segment_range segment = {
+            /*.begin =*/executable[offset],
+            /*.end   =*/executable[last] + 1,
+            /*.live_in  =*/{},
+            /*.live_out =*/{},
+            /*.leaves =*/{},
+            /*.graph =*/{},
+        };
+
+        for (int32_t i = segment.begin; i < segment.end; ++i) {
+            const struct ggml_tensor * node = graph->nodes[i];
+            if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+                continue;
+            }
+            for (int32_t src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+                const struct ggml_tensor * src = node->src[src_index];
+                auto producer = producers.find(src);
+                if (src && producer != producers.end() && producer->second < segment.begin) {
+                    ggml_opt_segment_add_unique(segment.live_in, src);
+                }
+                if (src && (producer == producers.end() || producer->second < segment.begin || producer->second >= segment.end)) {
+                    if (std::find(segment.leaves.begin(), segment.leaves.end(), src) == segment.leaves.end()) {
+                        segment.leaves.push_back(const_cast<struct ggml_tensor *>(src));
+                    }
+                }
+            }
+        }
+
+        for (int32_t i = segment.end; i < graph->n_nodes; ++i) {
+            const struct ggml_tensor * node = graph->nodes[i];
+            for (int32_t src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+                const struct ggml_tensor * src = node->src[src_index];
+                auto producer = producers.find(src);
+                if (src && producer != producers.end() &&
+                    producer->second >= segment.begin && producer->second < segment.end) {
+                    ggml_opt_segment_add_unique(segment.live_out, src);
+                }
+            }
+        }
+
+        segment.graph = ggml_graph_view(graph, segment.begin, segment.end);
+        plan->segments.push_back(std::move(segment));
+        ggml_opt_segment_range & stored = plan->segments.back();
+        stored.graph.leafs = stored.leaves.data();
+        stored.graph.n_leafs = (int32_t) stored.leaves.size();
+        stored.graph.size = stored.graph.n_nodes + stored.graph.n_leafs;
+    }
+
+    for (ggml_opt_segment_range & segment : plan->segments) {
+        segment.graph.leafs = segment.leaves.data();
+    }
+
+    return plan;
+}
+
+ggml_opt_segment_plan_t ggml_opt_segment_plan_init_budget(
+        struct ggml_cgraph * graph, ggml_backend_sched_t sched, size_t device_budget) {
+    if (!graph || !sched) {
+        return nullptr;
+    }
+
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    bool has_accelerator = false;
+    if (device_budget == 0) {
+        size_t automatic_budget = SIZE_MAX;
+        for (int i = 0; i < n_backends; ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(device, &free, &total);
+            const size_t reserve = std::max<size_t>(512*1024*1024, free/10);
+            automatic_budget = std::min(automatic_budget, free > reserve ? free - reserve : free/2);
+            has_accelerator = true;
+        }
+        if (!has_accelerator) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(
+                ggml_backend_get_device(ggml_backend_sched_get_backend(sched, n_backends - 1)), &free, &total);
+            automatic_budget = free > 512*1024*1024 ? free - 512*1024*1024 : free/2;
+        }
+        device_budget = automatic_budget;
+    } else {
+        for (int i = 0; i < n_backends; ++i) {
+            has_accelerator = has_accelerator || ggml_backend_dev_type(
+                ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i))) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        }
+    }
+
+    int32_t n_executable = 0;
+    for (int32_t i = 0; i < graph->n_nodes; ++i) {
+        n_executable += !(graph->nodes[i]->flags & GGML_TENSOR_FLAG_PARAM);
+    }
+    std::vector<size_t> sizes(n_backends);
+    for (int32_t max_nodes = n_executable; max_nodes >= 1; max_nodes = max_nodes == 1 ? 0 : (max_nodes + 1)/2) {
+        ggml_opt_segment_plan_t plan = ggml_opt_segment_plan_init(graph, max_nodes);
+        size_t measured_max = 0;
+        bool measured = plan != nullptr;
+        if (plan) {
+            for (ggml_opt_segment_range & segment : plan->segments) {
+                if (ggml_backend_sched_measure_graph(sched, &segment.graph, sizes.data(), sizes.size()) != GGML_STATUS_SUCCESS) {
+                    measured = false;
+                    break;
+                }
+                for (int i = 0; i < n_backends; ++i) {
+                    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+                    const bool accelerator = ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                    if (!has_accelerator || accelerator) {
+                        measured_max = std::max(measured_max, sizes[i]);
+                    }
+                }
+            }
+        }
+        if (measured && measured_max <= device_budget) {
+            plan->device_budget = device_budget;
+            plan->measured_max = measured_max;
+            return plan;
+        }
+        ggml_opt_segment_plan_free(plan);
+    }
+    return nullptr;
+}
+
+void ggml_opt_segment_plan_free(ggml_opt_segment_plan_t plan) {
+    delete plan;
+}
+
+int32_t ggml_opt_segment_plan_count(ggml_opt_segment_plan_t plan) {
+    return plan ? (int32_t) plan->segments.size() : 0;
+}
+
+size_t ggml_opt_segment_plan_budget(ggml_opt_segment_plan_t plan) {
+    return plan ? plan->device_budget : 0;
+}
+
+size_t ggml_opt_segment_plan_measured_max(ggml_opt_segment_plan_t plan) {
+    return plan ? plan->measured_max : 0;
+}
+
+bool ggml_opt_segment_plan_is_live_in(
+        ggml_opt_segment_plan_t plan, int32_t segment, const struct ggml_tensor * tensor) {
+    if (!plan || segment < 0 || segment >= (int32_t) plan->segments.size()) {
+        return false;
+    }
+    const auto & tensors = plan->segments[segment].live_in;
+    return std::find(tensors.begin(), tensors.end(), tensor) != tensors.end();
+}
+
+bool ggml_opt_segment_plan_is_live_out(
+        ggml_opt_segment_plan_t plan, int32_t segment, const struct ggml_tensor * tensor) {
+    if (!plan || segment < 0 || segment >= (int32_t) plan->segments.size()) {
+        return false;
+    }
+    const auto & tensors = plan->segments[segment].live_out;
+    return std::find(tensors.begin(), tensors.end(), tensor) != tensors.end();
+}
+
+struct ggml_cgraph * ggml_opt_segment_plan_graph(ggml_opt_segment_plan_t plan, int32_t segment) {
+    if (!plan || segment < 0 || segment >= (int32_t) plan->segments.size()) {
+        return nullptr;
+    }
+    return &plan->segments[segment].graph;
+}
+
+ggml_opt_checkpoint_store_t ggml_opt_checkpoint_store_init(void) {
+    return new ggml_opt_checkpoint_store;
+}
+
+void ggml_opt_checkpoint_store_free(ggml_opt_checkpoint_store_t store) {
+    delete store;
+}
+
+enum ggml_status ggml_opt_checkpoint_store_save(
+        ggml_opt_checkpoint_store_t store, const struct ggml_tensor * tensor) {
+    if (!store || !tensor || !tensor->buffer || !tensor->data) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_opt_checkpoint checkpoint = {};
+    checkpoint.type = tensor->type;
+    memcpy(checkpoint.ne, tensor->ne, sizeof(checkpoint.ne));
+    checkpoint.data.resize(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, checkpoint.data.data(), 0, checkpoint.data.size());
+    store->checkpoints[tensor] = std::move(checkpoint);
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_opt_checkpoint_store_restore(
+        ggml_opt_checkpoint_store_t store, struct ggml_tensor * tensor) {
+    if (!store || !tensor || !tensor->buffer || !tensor->data) {
+        return GGML_STATUS_FAILED;
+    }
+    auto found = store->checkpoints.find(tensor);
+    if (found == store->checkpoints.end()) {
+        return GGML_STATUS_FAILED;
+    }
+    const ggml_opt_checkpoint & checkpoint = found->second;
+    if (checkpoint.type != tensor->type || checkpoint.data.size() != ggml_nbytes(tensor) ||
+        memcmp(checkpoint.ne, tensor->ne, sizeof(checkpoint.ne)) != 0) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_backend_tensor_set(tensor, checkpoint.data.data(), 0, checkpoint.data.size());
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_opt_segmented_forward(
+        ggml_backend_sched_t sched,
+        ggml_opt_segment_plan_t plan,
+        ggml_opt_checkpoint_store_t store) {
+    if (!sched || !plan || !store || plan->segments.empty()) {
+        return GGML_STATUS_FAILED;
+    }
+
+    if (!ggml_backend_sched_release_allocation(sched)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+
+    for (size_t i = 0; i < plan->segments.size(); ++i) {
+        ggml_opt_segment_range & segment = plan->segments[i];
+        if (i > 0 && !ggml_backend_sched_release_allocation(sched)) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        if (!ggml_backend_sched_alloc_graph(sched, &segment.graph)) {
+            ggml_backend_sched_release_allocation(sched);
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        for (const struct ggml_tensor * tensor : segment.live_in) {
+            const enum ggml_status status = ggml_opt_checkpoint_store_restore(
+                store, const_cast<struct ggml_tensor *>(tensor));
+            if (status != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_release_allocation(sched);
+                return status;
+            }
+        }
+        const enum ggml_status status = ggml_backend_sched_graph_compute(sched, &segment.graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_sched_release_allocation(sched);
+            return status;
+        }
+        for (const struct ggml_tensor * tensor : segment.live_out) {
+            const enum ggml_status save_status = ggml_opt_checkpoint_store_save(store, tensor);
+            if (save_status != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_release_allocation(sched);
+                return save_status;
+            }
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 struct ggml_opt_dataset {
     struct ggml_context   * ctx    = nullptr;
     ggml_backend_buffer_t   buf    = nullptr;
@@ -2805,7 +3108,7 @@ void ggml_opt_prepare_alloc(
     opt_ctx->outputs     = outputs;
 }
 
-void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+enum ggml_status ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
@@ -2853,7 +3156,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (opt_ctx->allocated_graph == graph) {
         opt_ctx->eval_ready = true;
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
     ggml_backend_sched_reset(opt_ctx->backend_sched); // clear allocation of previous graph
@@ -2872,10 +3175,16 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->allocated_graph_copy = graph;
     }
 
-    ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    if (!ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy)) {
+        opt_ctx->allocated_graph      = nullptr;
+        opt_ctx->allocated_graph_copy = nullptr;
+        opt_ctx->eval_ready           = false;
+        return GGML_STATUS_ALLOC_FAILED;
+    }
     opt_ctx->allocated_graph = graph;
 
     opt_ctx->eval_ready = true;
+    return GGML_STATUS_SUCCESS;
 }
 
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {

@@ -18,10 +18,38 @@ extern "C" {
     struct ggml_opt_dataset;
     struct ggml_opt_context;
     struct ggml_opt_result;
+    struct ggml_opt_segment_plan;
+    struct ggml_opt_checkpoint_store;
 
     typedef struct ggml_opt_dataset * ggml_opt_dataset_t;
     typedef struct ggml_opt_context * ggml_opt_context_t;
     typedef struct ggml_opt_result  * ggml_opt_result_t;
+    typedef struct ggml_opt_segment_plan * ggml_opt_segment_plan_t;
+    typedef struct ggml_opt_checkpoint_store * ggml_opt_checkpoint_store_t;
+
+    GGML_API ggml_opt_segment_plan_t ggml_opt_segment_plan_init(struct ggml_cgraph * graph, int32_t max_nodes);
+    GGML_API ggml_opt_segment_plan_t ggml_opt_segment_plan_init_budget(
+            struct ggml_cgraph * graph, ggml_backend_sched_t sched, size_t device_budget);
+    GGML_API void ggml_opt_segment_plan_free(ggml_opt_segment_plan_t plan);
+    GGML_API int32_t ggml_opt_segment_plan_count(ggml_opt_segment_plan_t plan);
+    GGML_API size_t ggml_opt_segment_plan_budget(ggml_opt_segment_plan_t plan);
+    GGML_API size_t ggml_opt_segment_plan_measured_max(ggml_opt_segment_plan_t plan);
+    GGML_API bool ggml_opt_segment_plan_is_live_in(
+            ggml_opt_segment_plan_t plan, int32_t segment, const struct ggml_tensor * tensor);
+    GGML_API bool ggml_opt_segment_plan_is_live_out(
+            ggml_opt_segment_plan_t plan, int32_t segment, const struct ggml_tensor * tensor);
+    GGML_API struct ggml_cgraph * ggml_opt_segment_plan_graph(ggml_opt_segment_plan_t plan, int32_t segment);
+
+    GGML_API ggml_opt_checkpoint_store_t ggml_opt_checkpoint_store_init(void);
+    GGML_API void ggml_opt_checkpoint_store_free(ggml_opt_checkpoint_store_t store);
+    GGML_API enum ggml_status ggml_opt_checkpoint_store_save(
+            ggml_opt_checkpoint_store_t store, const struct ggml_tensor * tensor);
+    GGML_API enum ggml_status ggml_opt_checkpoint_store_restore(
+            ggml_opt_checkpoint_store_t store, struct ggml_tensor * tensor);
+    GGML_API enum ggml_status ggml_opt_segmented_forward(
+            ggml_backend_sched_t sched,
+            ggml_opt_segment_plan_t plan,
+            ggml_opt_checkpoint_store_t store);
 
     // ====== Loss ======
 
@@ -240,7 +268,7 @@ extern "C" {
 
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
-    GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
+    GGML_API enum ggml_status ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
 
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);

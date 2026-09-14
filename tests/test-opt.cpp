@@ -296,7 +296,7 @@ static std::pair<int, int> test_grad(
 
     for (int idata = 0; idata < ndata; ++idata) {
         const float idataf = idata;
-        ggml_opt_alloc(cd.opt_ctx, /*backward =*/ true);
+        GGML_ASSERT(ggml_opt_alloc(cd.opt_ctx, /*backward =*/ true) == GGML_STATUS_SUCCESS);
         // leaked
         ggml_backend_tensor_set(cd.inputs, &idataf, 0, ggml_nbytes(cd.inputs));
         ggml_opt_eval(cd.opt_ctx, cd.result);
@@ -900,6 +900,16 @@ static bool test_scheduler_replacement(const std::vector<ggml_backend_t> & backe
     std::vector<ggml_backend_t> sched_backends = backends;
     ggml_backend_sched_t backend_sched = ggml_backend_sched_new(
         sched_backends.data(), nullptr, sched_backends.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_backend_sched_weight_streaming_params streaming_params {
+        /*.enabled        =*/true,
+        /*.async_prefetch =*/false,
+        /*.staging_bytes  =*/64*1024*1024,
+    };
+    GGML_ASSERT(ggml_backend_sched_set_weight_streaming(backend_sched, streaming_params));
+    streaming_params.async_prefetch = true;
+    GGML_ASSERT(ggml_backend_sched_set_weight_streaming(backend_sched, streaming_params));
+    streaming_params.enabled = false;
+    GGML_ASSERT(ggml_backend_sched_set_weight_streaming(backend_sched, streaming_params));
     helper_ctx_data cd = helper_get_ctx_data(GGML_OPT_OPTIMIZER_TYPE_SGD, backend_sched, backend);
     ggml_opt_set_step(cd.opt_ctx, 7);
 
@@ -913,6 +923,245 @@ static bool test_scheduler_replacement(const std::vector<ggml_backend_t> & backe
     ggml_opt_set_backend_sched(cd.opt_ctx, nullptr);
     ggml_backend_sched_free(replacement);
     helper_free_ctx_data(cd);
+    return ok;
+}
+
+static bool test_scheduler_release_allocation(const std::vector<ggml_backend_t> & backends) {
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        const_cast<ggml_backend_t *>(backends.data()), nullptr, backends.size(), 32, false, true);
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_input = ggml_init(params);
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx_input, GGML_TYPE_F32, 1024);
+    ggml_tensor * output = ggml_scale(ctx, input, 2.0f);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx_input, ggml_backend_get_default_buffer_type(backends.front()));
+    GGML_ASSERT(input_buffer);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+    GGML_ASSERT(output->buffer);
+    ggml_backend_buffer_t output_buffer = output->buffer;
+
+    GGML_ASSERT(ggml_backend_sched_release_allocation(sched));
+    const bool ok = output->buffer == nullptr && output->data == nullptr && input->buffer == input_buffer;
+
+    GGML_ASSERT(output_buffer != input_buffer);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_free(ctx_input);
+    return ok;
+}
+
+static bool test_scheduler_measure_graph(const std::vector<ggml_backend_t> & backends) {
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        const_cast<ggml_backend_t *>(backends.data()), nullptr, backends.size(), 32, false, true);
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024);
+    ggml_set_input(input);
+    ggml_tensor * output = ggml_scale(ctx, input, 2.0f);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, output);
+    std::vector<size_t> sizes(backends.size());
+
+    const enum ggml_status status = ggml_backend_sched_measure_graph(
+        sched, graph, sizes.data(), sizes.size());
+    bool any_size = false;
+    for (size_t size : sizes) {
+        any_size = any_size || size > 0;
+    }
+    const bool ok = status == GGML_STATUS_SUCCESS && any_size &&
+        input->buffer == nullptr && output->buffer == nullptr;
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    return ok;
+}
+
+static bool test_segment_plan_liveness() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+    ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+    ggml_set_input(input);
+    ggml_set_param(weight);
+    ggml_tensor * stage1 = ggml_add(ctx, input, weight);
+    ggml_tensor * stage2 = ggml_mul(ctx, stage1, stage1);
+    ggml_tensor * stage3 = ggml_add(ctx, stage2, weight);
+    ggml_tensor * stage4 = ggml_add(ctx, stage3, stage1);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, stage4);
+    ggml_opt_segment_plan_t plan = ggml_opt_segment_plan_init(graph, 1);
+
+    const int32_t count = ggml_opt_segment_plan_count(plan);
+    const bool stage1_out = ggml_opt_segment_plan_is_live_out(plan, 0, stage1);
+    const bool stage1_in = count > 0 && ggml_opt_segment_plan_is_live_in(plan, count - 1, stage1);
+    const bool weight_in = ggml_opt_segment_plan_is_live_in(plan, 0, weight);
+    const bool weight_out = ggml_opt_segment_plan_is_live_out(plan, 0, weight);
+    TEST_LOG("segment planner: nodes=%d segments=%d stage1_out=%d stage1_last_in=%d weight_in=%d weight_out=%d\n",
+            ggml_graph_n_nodes(graph), count, stage1_out, stage1_in, weight_in, weight_out);
+    const bool ok = plan && count == 4 && stage1_out && stage1_in && !weight_in && !weight_out;
+
+    ggml_opt_segment_plan_free(plan);
+    ggml_free(ctx);
+    return ok;
+}
+
+static bool test_segment_checkpoint_roundtrip(ggml_backend_t backend) {
+    ggml_backend_t backends[] = { backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 32, false, true);
+    ggml_init_params input_params = {
+        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_init_params graph_params = {
+        /*.mem_size   =*/ 16*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * input_ctx = ggml_init(input_params);
+    ggml_context * graph_ctx = ggml_init(graph_params);
+    ggml_tensor * input = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * stage1 = ggml_scale(graph_ctx, input, 2.0f);
+    ggml_tensor * output = ggml_add(graph_ctx, stage1, stage1);
+    ggml_cgraph * graph = ggml_new_graph_custom(graph_ctx, 16, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors(input_ctx, backend);
+    const float values[] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    ggml_backend_tensor_set(input, values, 0, sizeof(values));
+
+    ggml_opt_segment_plan_t plan = ggml_opt_segment_plan_init(graph, 1);
+    ggml_opt_checkpoint_store_t store = ggml_opt_checkpoint_store_init();
+    GGML_ASSERT(ggml_opt_segment_plan_count(plan) == 2);
+    ggml_cgraph * first = ggml_opt_segment_plan_graph(plan, 0);
+    ggml_cgraph * second = ggml_opt_segment_plan_graph(plan, 1);
+    TEST_LOG("checkpoint roundtrip: computing first segment\n");
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched, first) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(ggml_opt_checkpoint_store_save(store, stage1) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(ggml_backend_sched_release_allocation(sched));
+    TEST_LOG("checkpoint roundtrip: allocating second segment\n");
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, second));
+    GGML_ASSERT(ggml_opt_checkpoint_store_restore(store, stage1) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched, second) == GGML_STATUS_SUCCESS);
+    float actual[4] = {};
+    ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+    const bool ok = actual[0] == 4.0f && actual[1] == 8.0f && actual[2] == 12.0f && actual[3] == 16.0f;
+
+    ggml_opt_checkpoint_store_free(store);
+    ggml_opt_segment_plan_free(plan);
+    ggml_backend_sched_release_allocation(sched);
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(graph_ctx);
+    ggml_free(input_ctx);
+    return ok;
+}
+
+static bool test_segmented_forward(ggml_backend_t backend, ggml_backend_t cpu_backend) {
+    ggml_backend_t selected_backends[] = { backend, cpu_backend };
+    const int n_backends = backend == cpu_backend ? 1 : 2;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(selected_backends, nullptr, n_backends, 64, false, true);
+    ggml_init_params input_params = {
+        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_init_params graph_params = {
+        /*.mem_size   =*/ 32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * input_ctx = ggml_init(input_params);
+    ggml_context * graph_ctx = ggml_init(graph_params);
+    ggml_tensor * input = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * stage1 = ggml_scale(graph_ctx, input, 2.0f);
+    ggml_tensor * stage2 = ggml_sqr(graph_ctx, stage1);
+    ggml_tensor * stage3 = ggml_add(graph_ctx, stage2, stage1);
+    ggml_tensor * output = ggml_scale(graph_ctx, stage3, 0.5f);
+    ggml_cgraph * graph = ggml_new_graph_custom(graph_ctx, 32, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors(input_ctx, backend);
+    const float values[] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    ggml_backend_tensor_set(input, values, 0, sizeof(values));
+
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    float expected[4] = {};
+    ggml_backend_tensor_get(output, expected, 0, sizeof(expected));
+    GGML_ASSERT(ggml_backend_sched_release_allocation(sched));
+
+    ggml_opt_segment_plan_t plan = ggml_opt_segment_plan_init(graph, 1);
+    ggml_opt_checkpoint_store_t store = ggml_opt_checkpoint_store_init();
+    const enum ggml_status status = ggml_opt_segmented_forward(sched, plan, store);
+    float actual[4] = {};
+    if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+    }
+    const bool ok = status == GGML_STATUS_SUCCESS &&
+        memcmp(actual, expected, sizeof(actual)) == 0 &&
+        ggml_opt_segment_plan_count(plan) == 4;
+
+    ggml_opt_checkpoint_store_free(store);
+    ggml_opt_segment_plan_free(plan);
+    ggml_backend_sched_release_allocation(sched);
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(graph_ctx);
+    ggml_free(input_ctx);
+    return ok;
+}
+
+static bool test_segment_plan_budget(ggml_backend_t backend, ggml_backend_t cpu_backend) {
+    ggml_backend_t selected_backends[] = { backend, cpu_backend };
+    const int n_backends = backend == cpu_backend ? 1 : 2;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(selected_backends, nullptr, n_backends, 64, false, true);
+    ggml_init_params params = {
+        /*.mem_size   =*/ 32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256*1024);
+    ggml_set_input(input);
+    ggml_tensor * stage1 = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * stage2 = ggml_scale(ctx, stage1, 3.0f);
+    ggml_tensor * stage3 = ggml_scale(ctx, stage2, 4.0f);
+    ggml_tensor * output = ggml_scale(ctx, stage3, 5.0f);
+    stage1->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    stage2->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    stage3->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, output);
+    std::vector<size_t> full_sizes(n_backends);
+    GGML_ASSERT(ggml_backend_sched_measure_graph(sched, graph, full_sizes.data(), n_backends) == GGML_STATUS_SUCCESS);
+    size_t full_max = 0;
+    for (size_t size : full_sizes) {
+        full_max = std::max(full_max, size);
+    }
+    const size_t budget = full_max > 1 ? full_max - 1 : full_max;
+    ggml_opt_segment_plan_t plan = ggml_opt_segment_plan_init_budget(graph, sched, budget);
+    const bool ok = plan && ggml_opt_segment_plan_count(plan) > 1 &&
+        ggml_opt_segment_plan_measured_max(plan) <= ggml_opt_segment_plan_budget(plan);
+
+    ggml_opt_segment_plan_free(plan);
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
     return ok;
 }
 
@@ -942,9 +1191,42 @@ int main(void) {
     }
 
     size_t n_total = 0;
+    TEST_LOG("running segment plan test\n");
+    ++n_total;
+    if (test_segment_plan_liveness()) {
+        ++n_ok;
+    }
     if (!backends.empty()) {
+        TEST_LOG("running scheduler replacement test\n");
+        TEST_LOG("running scheduler release test\n");
         ++n_total;
         if (test_scheduler_replacement(backends)) {
+            ++n_ok;
+        }
+        TEST_LOG("running checkpoint roundtrip test\n");
+        ++n_total;
+        if (test_scheduler_release_allocation(backends)) {
+            ++n_ok;
+        }
+        TEST_LOG("running scheduler measurement test\n");
+        ++n_total;
+        if (test_scheduler_measure_graph(backends)) {
+            ++n_ok;
+        }
+        ++n_total;
+        if (test_segment_checkpoint_roundtrip(backends.back())) {
+            ++n_ok;
+        }
+        for (ggml_backend_t backend : backends) {
+            TEST_LOG("running segmented forward test on %s\n", ggml_backend_name(backend));
+            ++n_total;
+            if (test_segmented_forward(backend, backends.back())) {
+                ++n_ok;
+            }
+        }
+        TEST_LOG("running budget segment plan test\n");
+        ++n_total;
+        if (test_segment_plan_budget(backends.back(), backends.back())) {
             ++n_ok;
         }
     }
