@@ -335,13 +335,23 @@ extern "C" {
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
-    GGML_API void                 ggml_backend_sched_set_weight_streaming(ggml_backend_sched_t sched, bool enabled);
+
+    struct ggml_backend_sched_weight_streaming_params {
+        bool enabled;
+        bool async_prefetch;
+        size_t staging_bytes;
+    };
+
+    GGML_API bool                 ggml_backend_sched_set_weight_streaming(ggml_backend_sched_t sched, struct ggml_backend_sched_weight_streaming_params params);
 
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    GGML_API bool                 ggml_backend_sched_release_allocation(ggml_backend_sched_t sched);
+    GGML_API enum ggml_status     ggml_backend_sched_measure_graph(
+            ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * backend_sizes, int n_backend_sizes);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

@@ -5142,6 +5142,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.grpo_phase_offload = true; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
+        {"--layer-staging-mib"}, "N",
+        "set total double-buffered weight staging in MiB (default: 0, automatic)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("layer staging must be non-negative");
+            }
+            params.layer_staging_mib = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
         {"--n-gen"}, "N",
         string_format("GRPO: number of generations per prompt (default: %d)", params.grpo_n_gen),
         [](common_params & params, int value) { params.grpo_n_gen = value; }

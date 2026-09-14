@@ -5225,6 +5225,28 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
+static bool ggml_backend_cuda_register_host_buffer_direct(void * buffer, size_t size) {
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+static void ggml_backend_cuda_unregister_host_buffer_direct(void * buffer) {
+    cudaError_t err = cudaHostUnregister(buffer);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+}
+
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return;
@@ -6083,6 +6105,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_register_host_buffer_direct") == 0) {
+        return (void *)ggml_backend_cuda_register_host_buffer_direct;
+    }
+    if (strcmp(name, "ggml_backend_unregister_host_buffer_direct") == 0) {
+        return (void *)ggml_backend_cuda_unregister_host_buffer_direct;
     }
     if (strcmp(name, "ggml_backend_cuda_managed_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_managed_buffer_type;

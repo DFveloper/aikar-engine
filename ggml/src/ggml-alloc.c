@@ -11,7 +11,7 @@
 #include <string.h>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
-#define MAX_FREE_BLOCKS 256
+#define MAX_FREE_BLOCKS 1024
 
 //#define GGML_ALLOCATOR_DEBUG
 
@@ -579,6 +579,46 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc);
 }
 
+static bool ggml_gallocr_owns_backend_buffer(ggml_gallocr_t galloc, ggml_backend_buffer_t buffer) {
+    if (buffer == NULL) {
+        return false;
+    }
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        struct vbuffer * vbuf = galloc->buffers[i];
+        if (vbuf == NULL) {
+            continue;
+        }
+        for (int chunk = 0; chunk < GGML_VBUFFER_MAX_CHUNKS && vbuf->chunks[chunk]; ++chunk) {
+            if (vbuf->chunks[chunk] == buffer) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void ggml_gallocr_unbind_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor) {
+    if (tensor && ggml_gallocr_owns_backend_buffer(galloc, tensor->buffer)) {
+        tensor->buffer = NULL;
+        tensor->data = NULL;
+    }
+}
+
+void ggml_gallocr_unbind_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    GGML_ASSERT(galloc);
+    GGML_ASSERT(graph);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_tensor * node = graph->nodes[i];
+        ggml_gallocr_unbind_tensor(galloc, node);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_gallocr_unbind_tensor(galloc, node->src[j]);
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        ggml_gallocr_unbind_tensor(galloc, graph->leafs[i]);
+    }
+}
+
 typedef struct ggml_gallocr * ggml_gallocr_t;
 
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {
@@ -824,9 +864,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
-    size_t min_hash_size = graph->n_nodes + graph->n_leafs;
-    // add 25% margin to avoid hash collisions
-    min_hash_size += min_hash_size / 4;
+    // Graph views can contain external sources that are neither nodes nor leafs.
+    size_t min_hash_size = 2*(graph->n_nodes + graph->n_leafs);
 
     // initialize hash table
     if (galloc->hash_set.size < min_hash_size) {

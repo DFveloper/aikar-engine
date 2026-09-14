@@ -1750,83 +1750,14 @@ static ggml_opt_dataset_t build_dataset(
             (int64_t)
             val.window_offsets.size()));
 
-    // ------------------------------------------------------------
-    // 8. Window reward normalization
-    //
-    // IMPORTANT:
-    // Fit normalization using TRAIN ONLY.
-    //
-    // Do NOT independently normalize validation.
-    // Do NOT let validation statistics influence training.
-    // ------------------------------------------------------------
-
-    for (float & r : window_rewards) {
-        r = std::max(
-            -1.0f,
-            std::min(
-                1.0f,
-                r));
-    }
-
-    auto train_reward_end =
-        window_rewards.begin()
-        + idata_split_out;
-
-    const float rmin =
-        *std::min_element(
-            window_rewards.begin(),
-            train_reward_end);
-
-    const float rmax =
-        *std::max_element(
-            window_rewards.begin(),
-            train_reward_end);
-
-    const float rrange =
-        rmax - rmin;
-
-    if (rrange > 1e-6f) {
-
-        // Apply TRAIN-fitted transform to both train and val.
-        for (float & r : window_rewards) {
-
-            r =
-                (r - rmin) /
-                rrange;
-
-            // A validation reward may lie outside the
-            // training reward range.
-            r = std::max(
-                0.0f,
-                std::min(
-                    1.0f,
-                    r));
-        }
-
-        LOG_INF(
-            "%s: reward normalization fitted "
-            "on training windows: "
-            "[%.4f, %.4f] -> [0,1]\n",
-            __func__,
-            rmin,
-            rmax);
-
-    } else {
-
-        // Pure SFT / all rewards identical.
-        std::fill(
-            window_rewards.begin(),
-            window_rewards.end(),
-            1.0f);
-
-        LOG_INF(
-            "%s: training rewards are constant; "
-            "using weight 1.0\n",
-            __func__);
-    }
+    const auto train_reward_end = window_rewards.begin() + idata_split_out;
+    const float train_reward_min = *std::min_element(window_rewards.begin(), train_reward_end);
+    const float train_reward_max = *std::max_element(window_rewards.begin(), train_reward_end);
+    LOG_INF("%s: preserving training reward range [%.4f, %.4f]\n",
+            __func__, train_reward_min, train_reward_max);
 
     // ------------------------------------------------------------
-    // 9. Critical-SFT reward normalization
+    // 8. Critical-SFT reward normalization
     // ------------------------------------------------------------
 
     if (critical_enabled) {
@@ -2574,6 +2505,14 @@ static void ipc_emit(const char * msg) {
     fflush(stdout);
 }
 
+static void grpo_training_progress(
+        bool, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
+        int64_t ibatch, int64_t ibatch_max, int64_t) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "[QLORA:TRAIN_PROGRESS:%ld/%ld]", (long) ibatch, (long) ibatch_max);
+    ipc_emit(buf);
+}
+
 // Read one line from stdin, trimming the trailing newline.
 // Returns false on EOF or error.
 static bool ipc_read_line(std::string & out) {
@@ -2612,8 +2551,10 @@ static std::string generate_response(
 
     // Clear KV cache before each generation (don't carry over previous prompt state)
     llama_memory_clear(llama_get_memory(ctx), true);
-    {
-        llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+    const int32_t n_batch = llama_n_batch(ctx);
+    for (size_t offset = 0; offset < tokens.size(); offset += n_batch) {
+        const int32_t n_tokens = (int32_t) std::min<size_t>(n_batch, tokens.size() - offset);
+        llama_batch batch = llama_batch_get_one(tokens.data() + offset, n_tokens);
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("%s: llama_decode failed on prompt\n", __func__);
             return "";
@@ -2866,7 +2807,8 @@ static int run_grpo_mode(
         /*.train_target             =*/true,
     };
     if (rollout_params) {
-        llama_opt_set_weight_streaming(ctx, true);
+        llama_opt_set_segmented_training(
+            ctx, true, (size_t) params.layer_staging_mib * 1024 * 1024);
     }
     llama_opt_init(ctx, model, lopt_params);
     if (rollout_params && !llama_opt_suspend(ctx)) {
@@ -3065,7 +3007,7 @@ static int run_grpo_mode(
         const int64_t optimizer_step_before = llama_opt_step(ctx);
         const int64_t training_start = ggml_time_us();
         llama_opt_epoch(ctx, step_dataset, step_result, nullptr, idata_all,
-                        nullptr,   // no progress bar callback — clean stdout
+                        grpo_training_progress,
                         nullptr,
                         false);    // no shuffle for single-step
         const int64_t optimizer_step_after = llama_opt_step(ctx);
@@ -3307,6 +3249,10 @@ int main(int argc, char ** argv) {
     }
     if (params.grpo_phase_offload && !params.grpo_mode) {
         LOG_ERR("%s: --grpo-phase-offload requires --grpo-mode\n", __func__);
+        return 1;
+    }
+    if (params.layer_staging_mib > 0 && !params.grpo_phase_offload) {
+        LOG_ERR("%s: --layer-staging-mib requires --grpo-phase-offload\n", __func__);
         return 1;
     }
     if (params.mtp_mode != "off" && params.grpo_mode) {

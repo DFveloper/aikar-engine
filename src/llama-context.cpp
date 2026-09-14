@@ -3634,6 +3634,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     cparams.lora_qat_type_callback       = lopt_params.lora_qat_type_callback;
     cparams.lora_qat_type_callback_ud    = lopt_params.lora_qat_type_callback_ud;
     opt_ctx = ggml_opt_init(opt_params);
+    ggml_opt_set_segmented(opt_ctx, opt_segmented_training, opt_segment_device_budget);
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
@@ -3697,9 +3698,19 @@ bool llama_context::opt_resume() {
     return opt_create_backend_sched();
 }
 
-void llama_context::opt_set_weight_streaming(bool enabled) {
+void llama_context::opt_set_weight_streaming(bool enabled, bool async_prefetch, size_t staging_bytes) {
     GGML_ASSERT(!opt_ctx);
-    opt_weight_streaming = enabled;
+    opt_weight_streaming = {
+        /*.enabled        =*/enabled,
+        /*.async_prefetch =*/async_prefetch,
+        /*.staging_bytes  =*/staging_bytes,
+    };
+}
+
+void llama_context::opt_set_segmented_training(bool enabled, size_t device_budget) {
+    GGML_ASSERT(!opt_ctx);
+    opt_segmented_training = enabled;
+    opt_segment_device_budget = device_budget;
 }
 
 void llama_context::opt_reset(bool recreate) {
@@ -3937,7 +3948,10 @@ void llama_context::opt_epoch_iter(
 
             // MTP-only training still needs this forward graph for h_nextn, but
             // it must not try to build a target backward graph with no params.
-            ggml_opt_alloc(opt_ctx, target_backward);
+            if (ggml_opt_alloc(opt_ctx, target_backward) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: failed to allocate optimizer graph\n", __func__);
+                return;
+            }
 
             static bool training_placement_printed = false;
             if (train && !training_placement_printed) {
@@ -5137,9 +5151,16 @@ bool llama_opt_resume(struct llama_context * ctx) {
     return ctx && ctx->opt_resume();
 }
 
-void llama_opt_set_weight_streaming(struct llama_context * ctx, bool enabled) {
+void llama_opt_set_weight_streaming(
+        struct llama_context * ctx, bool enabled, bool async_prefetch, size_t staging_bytes) {
     GGML_ASSERT(ctx);
-    ctx->opt_set_weight_streaming(enabled);
+    ctx->opt_set_weight_streaming(enabled, async_prefetch, staging_bytes);
+}
+
+void llama_opt_set_segmented_training(
+        struct llama_context * ctx, bool enabled, size_t device_budget) {
+    GGML_ASSERT(ctx);
+    ctx->opt_set_segmented_training(enabled, device_budget);
 }
 
 void llama_opt_reset(struct llama_context * ctx, bool recreate) {
