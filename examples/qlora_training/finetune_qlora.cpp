@@ -291,11 +291,30 @@ struct qlora_lr_schedule {
 };
 
 static ggml_opt_optimizer_params qlora_opt_lr_pars(void * userdata) {
-    qlora_lr_schedule & schedule = *(qlora_lr_schedule *) userdata;
-    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
-    schedule.current_lr = schedule.get_lr();
-    result.adamw.alpha = result.sgd.alpha = schedule.current_lr;
-    result.sgd.wd = result.adamw.wd = schedule.lr->wd;
+    qlora_lr_schedule & schedule =
+        *(qlora_lr_schedule *) userdata;
+
+    ggml_opt_optimizer_params result =
+        ggml_opt_get_default_optimizer_params(nullptr);
+
+    const float lr = schedule.get_lr();
+    schedule.current_lr = lr;
+
+    // AdamW explicitly configured.
+    result.adamw.alpha = lr;
+
+    result.adamw.beta1 = 0.9f; //0.9
+    result.adamw.beta2 = 0.999f; //0.999
+    result.adamw.eps   = 1e-8f;
+
+    // IMPORTANT:
+    // For correctness/overfit testing disable weight decay.
+    // Re-enable schedule.lr->wd after the trainer is verified.
+    result.adamw.wd = 0.0f;
+
+    // Disable elementwise clipping while debugging.
+    result.adamw.gclip = 0.0f;
+
     return result;
 }
 
@@ -2418,6 +2437,8 @@ struct save_ctx {
     int64_t              loss_cumulative_count = 0;
     double               loss_epoch_sum = 0.0;
     int64_t              loss_epoch_count = 0;
+    int32_t              optimizer_bootstrap_windows_remaining = 0;
+    bool                 optimizer_bootstrap_restarted_at_epoch_end = false;
 };
 
 // TLS pointer set before each epoch so the static callback can access it.
@@ -2499,6 +2520,13 @@ static void save_every_callback(
             ++g_save_ctx->schedule->step;
             if (g_save_ctx->eval_every > 0 && window > 0 && window % g_save_ctx->eval_every == 0) {
                 qlora_run_periodic_eval(dataset, window);
+            }
+            if (g_save_ctx->optimizer_bootstrap_windows_remaining > 0 &&
+                --g_save_ctx->optimizer_bootstrap_windows_remaining == 0) {
+                g_save_ctx->optimizer_bootstrap_restarted_at_epoch_end =
+                    window == g_save_ctx->dataset_windows;
+                LOG_INF("%s: recreating optimizer after LoRA bootstrap window %ld\n", __func__, (long) window);
+                llama_opt_reset(g_save_ctx->target_ctx, true);
             }
         }
     }
@@ -3493,11 +3521,67 @@ int main(int argc, char ** argv) {
 
     const int32_t n_ctx = llama_n_ctx(ctx);
     std::vector<float> window_rewards;
-    const llama_token bos = llama_vocab_bos(llama_model_get_vocab(model));
-    const bool critical_enabled = params.critical_token_mode != "none";
-    std::vector<llama_opt_critical_token_metadata> critical_metadata;
-    auto dataset = build_dataset(samples, n_ctx, window_rewards, params.train_on_prompt, bos, critical_enabled, &critical_metadata);
-    if (!dataset) return 1;
+
+    const llama_token bos =
+        llama_vocab_bos(
+            llama_model_get_vocab(model));
+
+    const bool critical_enabled =
+        params.critical_token_mode != "none";
+
+    std::vector<llama_opt_critical_token_metadata>
+        critical_metadata;
+
+    // ------------------------------------------------------------
+    // Split RAW samples before packing.
+    // ------------------------------------------------------------
+
+    int64_t sample_split;
+
+    if (params.val_split <= 0.0f) {
+        sample_split =
+            (int64_t) samples.size();
+    } else {
+        sample_split =
+            (int64_t) std::floor(
+                (double) samples.size() *
+                (1.0 - (double) params.val_split));
+
+        sample_split =
+            std::max<int64_t>(
+                1,
+                sample_split);
+
+        // Need at least one validation sample if requested
+        // and the dataset actually permits it.
+        if (samples.size() >= 2) {
+            sample_split =
+                std::min<int64_t>(
+                    sample_split,
+                    (int64_t) samples.size() - 1);
+        }
+    }
+
+    int64_t idata_split = 0;
+
+    auto dataset = build_dataset(
+        samples,
+        n_ctx,
+        window_rewards,
+
+        sample_split,
+        idata_split,
+
+        params.train_on_prompt,
+        bos,
+        critical_enabled,
+        &critical_metadata);
+
+    if (!dataset) {
+        return 1;
+    }
+
+    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
 
     if (critical_enabled) {
         LOG_INF("critical_sft: mode=%s token_weight=%.6f confidence_threshold=%.6f weight_shape=%s warmup_steps=%d max_fraction=%.6f stats_every=%d\n",
@@ -3535,8 +3619,8 @@ int main(int argc, char ** argv) {
     };
     llama_opt_init(ctx, model, lopt_params);
 
-    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
-    const int64_t idata_split = train_split_from_val_fraction(ndata, params.val_split);
+    //const int64_t ndata = ggml_opt_dataset_ndata(dataset);
+    //const int64_t idata_split = train_split_from_val_fraction(ndata, params.val_split);
     if (idata_split <= 0) {
         LOG_ERR("%s: no training windows after val split (ndata=%ld val_split=%.3f)\n",
                 __func__, (long) ndata, (double) params.val_split);
@@ -3695,6 +3779,11 @@ int main(int argc, char ** argv) {
             params.train_on_prompt ? "prompt+response" : "response-only");
     llama_synchronize(ctx);
     const adapter_stats adapter_start = adapter_get_stats(lt);
+    const int32_t optimizer_bootstrap_windows =
+        params.lora_qat != "none" || !params.lora_qat_tensor_types.empty() ? 2 : 1;
+    sctx.optimizer_bootstrap_windows_remaining =
+        sctx.save_target && schedule.total_steps - schedule.step > optimizer_bootstrap_windows &&
+        adapter_start.b_l2 == 0.0 ? optimizer_bootstrap_windows : 0;
     LOG_INF("%s: adapter_start: total_l2=%.9f a_l2=%.9f b_l2=%.9f a_max=%.9f b_max=%.9f\n",
             __func__, adapter_start.total_l2, adapter_start.a_l2, adapter_start.b_l2,
             adapter_start.a_max_abs, adapter_start.b_max_abs);
@@ -3772,9 +3861,14 @@ int main(int argc, char ** argv) {
         if (params.optimizer_restart_every > 0 &&
             params.lr.epoch + 1 < params.lr.epochs &&
             (params.lr.epoch + 1) % params.optimizer_restart_every == 0) {
-            LOG_INF("%s: resetting optimizer state after epoch %d\n", __func__, params.lr.epoch + 1);
-            llama_opt_reset(ctx, true);
+            if (sctx.optimizer_bootstrap_restarted_at_epoch_end) {
+                LOG_INF("%s: LoRA bootstrap restart also satisfies optimizer restart after epoch %d\n", __func__, params.lr.epoch + 1);
+            } else {
+                LOG_INF("%s: resetting optimizer state after epoch %d\n", __func__, params.lr.epoch + 1);
+                llama_opt_reset(ctx, true);
+            }
         }
+        sctx.optimizer_bootstrap_restarted_at_epoch_end = false;
     }
 
     ggml_opt_result_free(result_train);

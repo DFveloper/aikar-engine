@@ -760,8 +760,8 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     ggml_opt_optimizer_params result;
 
     result.adamw.alpha = 0.001f;
-    result.adamw.beta1 = 0.9f;
-    result.adamw.beta2 = 0.999f;
+    result.adamw.beta1 = 0.9f; //0.9
+    result.adamw.beta2 = 0.999f; //0.999
     result.adamw.eps   = 1e-8f;
     result.adamw.wd    = 0.0f;
     result.adamw.gclip = 0.0f;
@@ -1784,6 +1784,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 ggml_set_name(opt_ctx->sparse_weights, "sparse_weights");
                 ggml_set_name(opt_ctx->accuracy_targets, "accuracy_targets");
                 struct ggml_tensor * loss_weights = opt_ctx->sparse_weights;
+
                 if (opt_ctx->critical_token_weighting) {
                     opt_ctx->critical_span_weights   = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
                     opt_ctx->critical_reward_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
@@ -2810,17 +2811,6 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
-
-    // For non-static graphs the compute graph is rebuilt every call, so ggml_graph_reset
-    // is not called and grad_accs may carry over values from the previous accumulation window.
-    // Explicitly zero them at the start of each gradient-accumulation cycle.
-    if (!opt_ctx->static_graphs && backward && opt_ctx->opt_i == 0) {
-        for (struct ggml_tensor * ga : opt_ctx->grad_accs) {
-            if (ga) {
-                ggml_set_zero(ga);
-            }
-        }
-    }
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
         opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
@@ -2830,6 +2820,9 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
+        if (backward && opt_ctx->opt_i == 0) {
+            ggml_graph_reset(opt_ctx->gb_grad);
+        }
     }
 
     struct ggml_cgraph * graph = nullptr;
