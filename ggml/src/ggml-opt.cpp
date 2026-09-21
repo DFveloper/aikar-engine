@@ -2820,9 +2820,6 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
-        if (backward && opt_ctx->opt_i == 0) {
-            ggml_graph_reset(opt_ctx->gb_grad);
-        }
     }
 
     struct ggml_cgraph * graph = nullptr;
@@ -2867,6 +2864,10 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     opt_ctx->allocated_graph = graph;
+
+    if (!opt_ctx->static_graphs && backward && opt_ctx->opt_i == 0) {
+        ggml_graph_reset(opt_ctx->gb_grad);
+    }
 
     opt_ctx->eval_ready = true;
 }

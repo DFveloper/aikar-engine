@@ -465,7 +465,8 @@ static std::string apply_qlora_chat_template(
         const std::vector<common_chat_msg> & messages,
         bool                                  add_generation_prompt,
         bool                                  enable_thinking,
-        int                                   preserve_thinking) {
+        int                                   preserve_thinking,
+        common_chat_continuation              continuation = COMMON_CHAT_CONTINUATION_NONE) {
 
     common_chat_templates_inputs inputs;
 
@@ -488,6 +489,9 @@ static std::string apply_qlora_chat_template(
 
     inputs.enable_thinking =
         enable_thinking;
+
+    inputs.continue_final_message =
+        continuation;
 
     if (preserve_thinking >= 0) {
         inputs.chat_template_kwargs["preserve_reasoning"] =
@@ -669,7 +673,8 @@ static bool format_supervised_chat_turn(
             full_messages,
             /*add_generation_prompt=*/false,
             enable_thinking,
-            preserve_thinking);
+            preserve_thinking,
+            COMMON_CHAT_CONTINUATION_CONTENT);
 
     // ============================================================
     // 3. Easy case: generation prompt is an exact prefix.
@@ -741,7 +746,8 @@ static bool format_supervised_chat_turn(
             marked_messages,
             /*add_generation_prompt=*/false,
             enable_thinking,
-            preserve_thinking);
+            preserve_thinking,
+            COMMON_CHAT_CONTINUATION_CONTENT);
 
     // ============================================================
     // 5. Locate semantic slots in what Jinja actually emitted.
