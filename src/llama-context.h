@@ -201,7 +201,8 @@ struct llama_context {
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
     bool opt_suspend();
     bool opt_resume();
-    void opt_set_weight_streaming(bool enabled);
+    void opt_set_weight_streaming(bool enabled, bool async_prefetch, size_t staging_bytes);
+    void opt_set_segmented_training(bool enabled, size_t device_budget);
     void opt_reset(bool recreate);
     int64_t opt_qat_state_count() const;
     struct ggml_tensor * opt_qat_state_param(int64_t index) const;
@@ -418,7 +419,9 @@ private:
 
     size_t opt_ctx_compute_cache_size = 0;
     size_t opt_sched_size = 0;
-    bool opt_weight_streaming = false;
+    struct ggml_backend_sched_weight_streaming_params opt_weight_streaming {};
+    bool   opt_segmented_training = false;
+    size_t opt_segment_device_budget = 0;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
