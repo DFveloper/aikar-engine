@@ -506,7 +506,7 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 ### Key invariants
 
 - `params.use_mmap = false` — forced; mmap'd tensors can't have data written back
-- `params.flash_attn_type = DISABLED` — no backward impl for flash attention
+- The requested `params.flash_attn_type` policy is preserved. Flash attention has a backward implementation; use `--flash-attn on` to reduce attention workspace or `--flash-attn off` when it is slower on the selected backend.
 - `params.warmup = false` — warmup runs inference with PARAM tensors → segfault
 - KV is F32 by default; `--kv-cache-training` preserves the selected server-compatible K/V quantization and Hadamard policy
 - LoRA A/B tensors are marked `PARAM` via `ggml_set_param` on the tensors loaded by `llama_adapter_lora_init`, not on the pre-init scratch tensors in `lt.buf`

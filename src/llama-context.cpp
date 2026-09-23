@@ -3539,13 +3539,6 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             n_ubatch == 0
     );
 
-    if (cparams.flash_attn) {
-        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
-        cparams.flash_attn = false;
-        sched_need_reserve = true;
-        sched_reserve();
-    }
-
     // Recreate the scheduler and gf_res_prev with a training-inflated graph size before
     // creating opt_ctx, so opt_ctx captures the new (larger) scheduler pointer.
     // The backward graph expands the forward graph with gradient nodes.
