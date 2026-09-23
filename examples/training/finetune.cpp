@@ -77,6 +77,7 @@ int main(int argc, char ** argv) {
         /*lora_qat_type_callback    =*/nullptr,
         /*lora_qat_type_callback_ud =*/nullptr,
         /*grad_checkpoint_interval =*/params.grad_checkpoint_interval,
+        /*activation_recompute     =*/params.activation_recompute,
         /*critical_token_mode      =*/LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE,
         /*critical_token_weight    =*/1.0f,
         /*critical_confidence_threshold =*/0.25f,

@@ -7,6 +7,87 @@
 #include <cstring>
 #include <vector>
 
+static constexpr size_t Q4_0_OUT_PROD_WORKSPACE_MAX = 64ull*1024*1024;
+
+static __global__ void out_prod_q4_0_dequant_tile(
+        const char * src, half * dst, int64_t ne0, int64_t row_begin, int64_t n_rows, size_t nb1) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne0*n_rows) {
+        return;
+    }
+
+    const int64_t col = i % ne0;
+    const int64_t row = i / ne0;
+    const block_q4_0 * block = (const block_q4_0 *) (src + (row_begin + row)*nb1) + col/QK4_0;
+    const int q = col % QK4_0;
+    const uint8_t packed = block->qs[q % (QK4_0/2)];
+    const int value = ((q < QK4_0/2 ? packed : packed >> 4) & 0x0f) - 8;
+    dst[i] = __float2half(__half2float(block->d)*value);
+}
+
+static __global__ void out_prod_f32_to_f16_tile(
+        const char * src, half * dst, int64_t ne0, int64_t row_begin, int64_t n_rows, size_t nb0, size_t nb1) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne0*n_rows) {
+        return;
+    }
+
+    const int64_t col = i % ne0;
+    const int64_t row = i / ne0;
+    dst[i] = __float2half(*(const float *) (src + col*nb0 + (row_begin + row)*nb1));
+}
+
+static void ggml_cuda_out_prod_q4_0_tiled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const size_t elements_per_row = ne00 + ne10;
+    const int64_t rows_per_tile = std::max<int64_t>(1, std::min<int64_t>(ne01,
+        Q4_0_OUT_PROD_WORKSPACE_MAX/(sizeof(half)*elements_per_row)));
+    const size_t workspace_elements = rows_per_tile*elements_per_row;
+    ggml_cuda_pool_alloc<half> workspace(ctx.pool(), workspace_elements);
+    half * src0_f16 = workspace.ptr;
+    half * src1_f16 = workspace.ptr + rows_per_tile*ne00;
+
+    cudaStream_t stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    const int64_t dps2 = ne2/ne02;
+    const int64_t dps3 = ne3/ne03;
+    const int threads = 256;
+    const float alpha = 1.0f;
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            const char * src0_batch = (const char *) src0->data + (i2/dps2)*nb02 + (i3/dps3)*nb03;
+            const char * src1_batch = (const char *) src1->data + i2*nb12 + i3*nb13;
+            float * dst_batch = (float *) ((char *) dst->data + i2*nb2 + i3*nb3);
+
+            for (int64_t row_begin = 0; row_begin < ne01; row_begin += rows_per_tile) {
+                const int64_t n_rows = std::min<int64_t>(rows_per_tile, ne01 - row_begin);
+                const int64_t n0 = ne00*n_rows;
+                const int64_t n1 = ne10*n_rows;
+                out_prod_q4_0_dequant_tile<<<(n0 + threads - 1)/threads, threads, 0, stream>>>(
+                    src0_batch, src0_f16, ne00, row_begin, n_rows, nb01);
+                out_prod_f32_to_f16_tile<<<(n1 + threads - 1)/threads, threads, 0, stream>>>(
+                    src1_batch, src1_f16, ne10, row_begin, n_rows, nb10, nb11);
+                CUDA_CHECK(cudaGetLastError());
+
+                const float tile_beta = row_begin == 0 ? beta : 1.0f;
+                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    ne00, ne10, n_rows,
+                    &alpha, src0_f16, CUDA_R_16F, ne00,
+                            src1_f16, CUDA_R_16F, ne10,
+                    &tile_beta, dst_batch, CUDA_R_32F, ne0,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+        }
+    }
+}
+
 static __global__ void k_compute_out_prod_ptrs(
         const float * src0_d, const float * src1_d, float * dst_d,
         const float ** ptrs_a, const float ** ptrs_b, float ** ptrs_c,
@@ -51,6 +132,11 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst, floa
 
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
+
+    if (src0->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_out_prod_q4_0_tiled(ctx, dst, beta);
+        return;
+    }
 
     // If src0 is quantized, dequantize to a temp F32 buffer on GPU
     ggml_cuda_pool_alloc<float> src0_f32_alloc;

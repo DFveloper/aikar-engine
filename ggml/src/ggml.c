@@ -3375,7 +3375,7 @@ bool ggml_prec_set_src(
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
-                if (idx != 1) {
+                if (idx > 1) {
                     return false;
                 }
 

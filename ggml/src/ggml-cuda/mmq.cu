@@ -263,13 +263,7 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
-#ifdef GGML_CUDA_FORCE_CUBLAS
-    return false;
-#endif // GGML_CUDA_FORCE_CUBLAS
-
-    bool mmq_supported;
-
+static bool ggml_cuda_mmq_type_supported(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -296,24 +290,41 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-            mmq_supported = true;
-            break;
+            return true;
         default:
-            mmq_supported = false;
-            break;
+            return false;
     }
+}
 
-    if (!mmq_supported) {
+static bool ggml_cuda_mmq_has_shared_memory() {
+    const int    id    = ggml_cuda_get_device();
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    return smpbo >= 48 * 1024;
+}
+
+bool ggml_cuda_can_use_mmq(enum ggml_type type, int cc) {
+#ifdef GGML_CUDA_FORCE_CUBLAS
+    return false;
+#endif // GGML_CUDA_FORCE_CUBLAS
+
+    if (!ggml_cuda_mmq_type_supported(type) || !ggml_cuda_mmq_has_shared_memory()) {
         return false;
     }
 
-    // MMQ tiles require at least 48 KiB per-block shared memory; fall back to BLAS otherwise.
-    {
-        const int    id    = ggml_cuda_get_device();
-        const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-        if (smpbo < 48 * 1024) {
-            return false;
-        }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && !turing_mma_available(cc)) {
+        return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A;
+    }
+
+    return true;
+}
+
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+#ifdef GGML_CUDA_FORCE_CUBLAS
+    return false;
+#endif // GGML_CUDA_FORCE_CUBLAS
+
+    if (!ggml_cuda_mmq_type_supported(type) || !ggml_cuda_mmq_has_shared_memory()) {
+        return false;
     }
 
     if (turing_mma_available(cc)) {

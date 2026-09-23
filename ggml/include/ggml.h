@@ -677,6 +677,8 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_RECOMPUTE = 32, // ...is the output of an activation recompute region
+        GGML_TENSOR_FLAG_RECOMPUTE_INPUT = 64, // ...is the input to an activation recompute region
     };
 
     enum ggml_tri_type {
@@ -1469,13 +1471,14 @@ extern "C" {
     //  - GGML_PREC_Q8   - not allowed
     //  - GGML_PREC_Q4   - not allowed
     //
-    // return false on faliure
+    // return false on failure
     GGML_API bool ggml_prec_set_acc(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
     // [TAG_GGML_PREC]
     // set the smallest rank that the implementation can use to internally convert the src[idx] data to
+    // for MUL_MAT and MUL_MAT_ID, src[0] is the stored matrix and src[1] is the runtime activation
     // ranks in decreasing order:
     //  - GGML_PREC_F32  - GGML_TYPE_F32
     //  - GGML_PREC_BF16 - GGML_TYPE_BF16
@@ -1490,7 +1493,7 @@ extern "C" {
     //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
     //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
     //
-    // return false on faliure
+    // return false on failure
     GGML_API bool ggml_prec_set_src(
             struct ggml_tensor * a,
             enum ggml_prec       prec,

@@ -2485,7 +2485,7 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, bool training) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2512,7 +2512,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), training);
 
     res->reset();
 
@@ -2540,7 +2540,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                  bool   training) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2556,6 +2557,8 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.sparse_loss =*/ sparse_loss.active,
+        /*.training    =*/ training,
+        /*.activation_recompute =*/ opt_params.activation_recompute,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3560,7 +3563,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                 gf_res_prev.reset(new llm_graph_result(tmp_cap));
                 gf_res_reserve.reset(new llm_graph_result(tmp_cap));
                 // split_only=true: only splits the graph, doesn't reallocate compute buffers
-                auto * gf_train = graph_reserve(n_ubatch, 1, n_ubatch, mctx_tmp.get(), /*split_only=*/true);
+                auto * gf_train = graph_reserve(n_ubatch, 1, n_ubatch, mctx_tmp.get(), /*split_only=*/true, /*sizes=*/nullptr, /*training=*/true);
                 if (gf_train) {
                     train_fwd_nodes = (uint32_t)ggml_graph_n_nodes(gf_train);
                     LLAMA_LOG_INFO("%s: measured training graph nodes = %u (n_ubatch=%u)\n",
@@ -3603,6 +3606,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars_ud           = lopt_params.get_opt_pars_ud;
     opt_params.optimizer                 = lopt_params.optimizer_type;
     opt_params.grad_checkpoint_interval  = lopt_params.grad_checkpoint_interval;
+    opt_params.activation_recompute      = lopt_params.activation_recompute || lopt_params.grad_checkpoint_interval > 0;
     opt_params.critical_token_weighting  = lopt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
     opt_params.critical_confidence_weighting = lopt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_CONFIDENCE ||
                                                lopt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_HYBRID;
@@ -3772,10 +3776,10 @@ void llama_context::opt_epoch_iter(
             batch.pos     [pos_batch]    = position_offset + pos_ctx + pos_batch;
             batch.n_seq_id[pos_batch]    = 1;
             batch.seq_id  [pos_batch][0] = 0;
-            batch.logits  [pos_batch]    = true;
+            batch.logits  [pos_batch]    = labels_sparse[pos_ctx + pos_batch] >= 0;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, false)) {
             LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
             return;
         }
@@ -3786,7 +3790,7 @@ void llama_context::opt_epoch_iter(
 
         embd_seq.clear();
 
-        uint32_t n_outputs_all = n_tokens_all;
+        uint32_t n_outputs_all = std::max<uint32_t>(1, balloc->get_n_outputs());
 
         auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
@@ -3805,7 +3809,20 @@ void llama_context::opt_epoch_iter(
         do {
             const auto & ubatch = mctx->get_ubatch();
 
-            n_outputs = ubatch.n_tokens;
+            std::vector<uint32_t> supervised_rows;
+            supervised_rows.reserve(ubatch.n_tokens);
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.output[i]) {
+                    supervised_rows.push_back(i);
+                }
+            }
+            const bool zero_label_sentinel = supervised_rows.empty();
+            if (zero_label_sentinel) {
+                const uint32_t sentinel_row = ubatch.n_tokens - 1;
+                ubatch.output[sentinel_row] = 1;
+                supervised_rows.push_back(sentinel_row);
+            }
+            n_outputs = supervised_rows.size();
 
             if (!mctx->apply()) {
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
@@ -3815,7 +3832,7 @@ void llama_context::opt_epoch_iter(
             auto * res = gf_res_prev.get();
 
             const int64_t t0_build = ggml_time_ms();
-            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), train);
 
             res->reset();
 
@@ -3890,13 +3907,7 @@ void llama_context::opt_epoch_iter(
             const int64_t t1_alloc = ggml_time_ms();
 
             if (confidence_weighting) {
-                int32_t n_active_ubatch = 0;
-
-                // Count only tokens that actually belong to this ubatch.
-                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                    n_active_ubatch +=
-                        labels_sparse[pos_ctx + pos_batch + i] >= 0;
-                }
+                const int32_t n_active_ubatch = zero_label_sentinel ? 0 : (int32_t) supervised_rows.size();
 
                 int32_t max_tokens = -1;
 
@@ -3931,6 +3942,9 @@ void llama_context::opt_epoch_iter(
             // MTP-only training still needs this forward graph for h_nextn, but
             // it must not try to build a target backward graph with no params.
             ggml_opt_alloc(opt_ctx, target_backward);
+            if (target_backward && opt_params.activation_recompute && ggml_opt_recompute_regions(opt_ctx) == 0) {
+                throw std::runtime_error("activation recompute is not supported by this training graph");
+            }
 
             static bool training_placement_printed = false;
             if (train && !training_placement_printed) {
@@ -3952,6 +3966,10 @@ void llama_context::opt_epoch_iter(
                 }
                 std::fprintf(stderr, "qlora placement: graph splits=%d CPU nodes=%zu CPU node bytes=%.2f MiB\n",
                         ggml_backend_sched_get_n_splits(sched.get()), n_cpu_nodes, n_cpu_bytes/(1024.0*1024.0));
+                if (opt_params.activation_recompute) {
+                    std::fprintf(stderr, "qlora placement: activation recompute regions=%d replay nodes=%d\n",
+                            ggml_opt_recompute_regions(opt_ctx), ggml_opt_recompute_nodes(opt_ctx));
+                }
                 for (ggml_backend_t backend : backend_ptrs) {
                     if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                         std::fprintf(stderr, "qlora placement: %s scheduler buffer=%.2f MiB\n",
@@ -3992,7 +4010,7 @@ void llama_context::opt_epoch_iter(
                 struct ggml_tensor * accuracy_targets = ggml_opt_accuracy_targets(opt_ctx);
                 GGML_ASSERT(labels || (sparse_targets && sparse_weights));
                 if (labels) {
-                    GGML_ASSERT(labels->ne[1] == n_ubatch);
+                    GGML_ASSERT(labels->ne[1] == n_outputs);
                     ggml_set_zero(labels);
                 }
                 struct ggml_tensor * span_weights = critical_metadata ? ggml_opt_critical_span_weights(opt_ctx) : nullptr;
@@ -4000,7 +4018,7 @@ void llama_context::opt_epoch_iter(
                 struct ggml_tensor * warmup_scale_tensor = critical_metadata ? ggml_opt_critical_warmup_scale(opt_ctx) : nullptr;
                 if (critical_metadata) {
                     GGML_ASSERT(span_weights && reward_weights && warmup_scale_tensor);
-                    GGML_ASSERT(span_weights->ne[0] == n_ubatch && reward_weights->ne[0] == n_ubatch);
+                    GGML_ASSERT(span_weights->ne[0] == n_outputs && reward_weights->ne[0] == n_outputs);
                     std::fill(span_weights_host.begin(), span_weights_host.end(), 0.0f);
                     std::fill(reward_weights_host.begin(), reward_weights_host.end(), 0.0f);
                 }
@@ -4009,30 +4027,31 @@ void llama_context::opt_epoch_iter(
                     std::fill(accuracy_targets_host.begin(), accuracy_targets_host.end(), -1);
                     std::fill(sparse_weights_host.begin(), sparse_weights_host.end(), 0.0f);
                 }
-                for (uint32_t pos_ubatch = 0; pos_ubatch < ubatch.n_tokens; ++pos_ubatch) {
+                for (uint32_t output_row = 0; output_row < supervised_rows.size(); ++output_row) {
+                    const uint32_t pos_ubatch = supervised_rows[output_row];
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                     // -1 sentinel means "masked position" (prompt token, BOS separator, etc).
                     // Leave the dense label row or sparse weight at zero.
                     if (labels_sparse[ilabel] < 0) continue;
                     GGML_ASSERT(labels_sparse[ilabel] < res->get_logits()->ne[0]);
-                    const float active_label_scale = critical_metadata ? 1.0f : label_scale;
+                    const float active_label_scale = critical_metadata ? 1.0f : label_scale*n_outputs/ubatch.n_tokens;
                     if (labels) {
-                        ggml_backend_tensor_set(labels, &active_label_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                        ggml_backend_tensor_set(labels, &active_label_scale, (output_row*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                     } else {
-                        sparse_targets_host[pos_ubatch] = labels_sparse[ilabel];
-                        accuracy_targets_host[pos_ubatch] = labels_sparse[ilabel];
-                        sparse_weights_host[pos_ubatch] = active_label_scale;
+                        sparse_targets_host[output_row] = labels_sparse[ilabel];
+                        accuracy_targets_host[output_row] = labels_sparse[ilabel];
+                        sparse_weights_host[output_row] = active_label_scale;
                     }
                     if (critical_metadata) {
-                        span_weights_host[pos_ubatch] = (*critical_metadata)[ilabel].span_weight;
-                        reward_weights_host[pos_ubatch] = train ? (*critical_metadata)[ilabel].reward_weight : 1.0f;
+                        span_weights_host[output_row] = (*critical_metadata)[ilabel].span_weight;
+                        reward_weights_host[output_row] = train ? (*critical_metadata)[ilabel].reward_weight : 1.0f;
                     }
                 }
                 if (sparse_targets) {
-                    ggml_backend_tensor_set(sparse_targets, sparse_targets_host.data(), 0, n_ubatch*sizeof(int32_t));
+                    ggml_backend_tensor_set(sparse_targets, sparse_targets_host.data(), 0, n_outputs*sizeof(int32_t));
                     GGML_ASSERT(accuracy_targets);
-                    ggml_backend_tensor_set(accuracy_targets, accuracy_targets_host.data(), 0, n_ubatch*sizeof(int32_t));
-                    ggml_backend_tensor_set(sparse_weights, sparse_weights_host.data(), 0, n_ubatch*sizeof(float));
+                    ggml_backend_tensor_set(accuracy_targets, accuracy_targets_host.data(), 0, n_outputs*sizeof(int32_t));
+                    ggml_backend_tensor_set(sparse_weights, sparse_weights_host.data(), 0, n_outputs*sizeof(float));
                 }
                 if (critical_metadata) {
                     float warmup_scale = 1.0f;
@@ -4040,8 +4059,8 @@ void llama_context::opt_epoch_iter(
                         GGML_ASSERT(opt_params.critical_step);
                         warmup_scale = std::min(1.0f, (float) *opt_params.critical_step / opt_params.critical_warmup_steps);
                     }
-                    ggml_backend_tensor_set(span_weights, span_weights_host.data(), 0, n_ubatch*sizeof(float));
-                    ggml_backend_tensor_set(reward_weights, reward_weights_host.data(), 0, n_ubatch*sizeof(float));
+                    ggml_backend_tensor_set(span_weights, span_weights_host.data(), 0, n_outputs*sizeof(float));
+                    ggml_backend_tensor_set(reward_weights, reward_weights_host.data(), 0, n_outputs*sizeof(float));
                     ggml_backend_tensor_set(warmup_scale_tensor, &warmup_scale, 0, sizeof(float));
                     stats_warmup_scale = warmup_scale;
                 }
@@ -4071,8 +4090,8 @@ void llama_context::opt_epoch_iter(
             }
 
             if (critical_stats_due) {
-                ggml_backend_tensor_get(ggml_opt_critical_selected(opt_ctx), stats_selected.data(), 0, n_ubatch*sizeof(float));
-                ggml_backend_tensor_get(ggml_opt_critical_effective_weights(opt_ctx), stats_effective.data(), 0, n_ubatch*sizeof(float));
+                ggml_backend_tensor_get(ggml_opt_critical_selected(opt_ctx), stats_selected.data(), 0, n_outputs*sizeof(float));
+                ggml_backend_tensor_get(ggml_opt_critical_effective_weights(opt_ctx), stats_effective.data(), 0, n_outputs*sizeof(float));
                 float unweighted_loss = 0.0f;
                 float weighted_loss = 0.0f;
                 ggml_backend_tensor_get(ggml_opt_critical_unweighted_loss(opt_ctx), &unweighted_loss, 0, sizeof(float));
@@ -4080,18 +4099,18 @@ void llama_context::opt_epoch_iter(
                 stats_unweighted_loss += unweighted_loss;
                 stats_weighted_loss += weighted_loss;
                 bool has_active = false;
-                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                    const uint32_t ilabel = pos_ctx + pos_batch + i;
+                for (uint32_t output_row = 0; output_row < supervised_rows.size(); ++output_row) {
+                    const uint32_t ilabel = pos_ctx + pos_batch + supervised_rows[output_row];
                     if (labels_sparse[ilabel] < 0) continue;
                     has_active = true;
                     const bool is_explicit = (*critical_metadata)[ilabel].span_weight > 1.0f;
-                    const bool is_confidence = stats_selected[i] > 0.5f;
+                    const bool is_confidence = stats_selected[output_row] > 0.5f;
                     ++stats_active;
                     stats_explicit += is_explicit;
                     stats_confidence += is_confidence;
                     stats_critical += is_explicit || is_confidence;
-                    stats_weight_sum += stats_effective[i];
-                    stats_weight_max = std::max(stats_weight_max, stats_effective[i]);
+                    stats_weight_sum += stats_effective[output_row];
+                    stats_weight_max = std::max(stats_weight_max, stats_effective[output_row]);
                 }
                 stats_loss_units += has_active;
             }

@@ -821,6 +821,8 @@ struct llm_graph_params {
     uint32_t n_outputs;
 
     bool sparse_loss;
+    bool training;
+    bool activation_recompute;
 
     llm_graph_cb cb;
 
@@ -894,6 +896,8 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            training == other.training &&
+            activation_recompute == other.activation_recompute &&
             sparse_loss == other.sparse_loss &&
             cvec  == other.cvec  &&
             loras == other.loras &&
@@ -1038,6 +1042,8 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const bool training;
+    const bool activation_recompute;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

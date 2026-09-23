@@ -4896,8 +4896,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"--grad-checkpoint"}, "N",
-        "gradient checkpointing interval to reduce peak activation VRAM (0 = disabled, default: 0)",
-        [](common_params & params, int value) { params.grad_checkpoint_interval = value; }
+        "deprecated alias for --activation-recompute on when N is greater than zero",
+        [](common_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("--grad-checkpoint must be non-negative");
+            params.grad_checkpoint_interval = value;
+            params.activation_recompute = value > 0;
+            LOG_WRN("--grad-checkpoint is deprecated; use --activation-recompute on|off\n");
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--activation-recompute"}, "on|off",
+        "recompute supported activation regions during backward to reduce VRAM (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "on") {
+                params.activation_recompute = true;
+            } else if (value == "off") {
+                params.activation_recompute = false;
+            } else {
+                throw std::invalid_argument("invalid --activation-recompute: expected on or off");
+            }
+        }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--kv-cache-training"},

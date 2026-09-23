@@ -668,7 +668,8 @@ struct common_params {
     bool    eval_initial           = false; // evaluate the held-out split before training starts
     int32_t save_first_at          = 0;     // save an initial checkpoint after N optimizer steps (0 = disabled)
     int32_t lora_freeze_layers     = 0;     // do not apply LoRA to the first N transformer layers
-    int32_t grad_checkpoint_interval = 0;  // gradient checkpointing interval to reduce peak VRAM (0 = disabled)
+    int32_t grad_checkpoint_interval = 0;  // deprecated compatibility option
+    bool    activation_recompute   = false; // recompute supported activation regions during backward
     int32_t optimizer_restart_every = 0;   // reset optimizer state every N epochs (0 = disabled)
     std::string mtp_mode           = "off"; // off, joint, only
     std::string mtp_model          = "";

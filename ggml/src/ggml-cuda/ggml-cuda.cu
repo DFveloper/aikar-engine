@@ -1922,6 +1922,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    const enum ggml_prec src0_prec = (enum ggml_prec) ggml_get_op_params_i32(dst, 2);
+    if (src0_prec == GGML_PREC_Q4 && src0->type == GGML_TYPE_Q4_0 && ggml_cuda_can_use_mmq(src0->type, cc)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)

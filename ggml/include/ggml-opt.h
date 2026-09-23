@@ -147,12 +147,9 @@ extern "C" {
         ggml_opt_get_optimizer_params get_opt_pars;    // callback for calculating optimizer parameters
         void *                        get_opt_pars_ud; // userdata for calculating optimizer parameters
 
-        // Gradient checkpointing: keep the output of every Nth forward node alive through
-        // the backward pass so the allocator cannot reuse its memory for other tensors.
-        // This trades compute for VRAM — intermediate activations between checkpoints are
-        // freed and recomputed during the backward pass by the existing graph structure.
-        // Set to 0 (default) to disable.  A value of ~32–64 cuts activation VRAM by ~50%.
+        // Deprecated compatibility field. Values above zero enable activation recomputation.
         int32_t grad_checkpoint_interval;
+        bool activation_recompute;
 
         bool    critical_token_weighting;
         bool    critical_confidence_weighting;
@@ -180,6 +177,8 @@ extern "C" {
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
 
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
+    GGML_API int32_t ggml_opt_recompute_regions(ggml_opt_context_t opt_ctx);
+    GGML_API int32_t ggml_opt_recompute_nodes(ggml_opt_context_t opt_ctx);
 
     // get underlying tensors that store data
     // if not using static graphs these pointers become invalid with the next call to ggml_opt_alloc

@@ -64,7 +64,8 @@ static helper_ctx_data helper_get_ctx_data(
         const bool              optimizer_defaults = true,
         int64_t                 nbatch_logical     = 1,
         int64_t                 nbatch_physical    = 1,
-        enum ggml_opt_loss_type loss_type          = GGML_OPT_LOSS_TYPE_SUM) {
+        enum ggml_opt_loss_type loss_type          = GGML_OPT_LOSS_TYPE_SUM,
+        bool                    activation_recompute = false) {
     std::vector<ggml_opt_dataset_t> datasets(ndata);
     for (int64_t ndata_shard = 1; ndata_shard <= ndata; ++ndata_shard) {
         ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
@@ -145,6 +146,7 @@ static helper_ctx_data helper_get_ctx_data(
     opt_params.outputs     = outputs;
     opt_params.opt_period  = opt_period;
     opt_params.optimizer   = optim;
+    opt_params.activation_recompute = activation_recompute;
     if (!optimizer_defaults) {
         opt_params.get_opt_pars = helper_get_test_opt_pars;
     }
@@ -169,6 +171,253 @@ static void helper_free_ctx_data(struct helper_ctx_data ctx_data) {
         ggml_opt_dataset_free(dataset);
     }
     ggml_opt_dataset_free(ctx_data.dataset_unsupervised);
+}
+
+static void print_ok(const char * func, bool subtest_ok, int & npass, int & ntest, const char * args);
+
+struct recompute_test_ctx {
+    ggml_backend_sched_t sched;
+    ggml_context * ctx_static;
+    ggml_context * ctx_compute;
+    ggml_opt_context_t opt_ctx;
+    ggml_opt_result_t result;
+    ggml_tensor * inputs;
+    ggml_tensor * weights_up;
+    ggml_tensor * weights_down;
+    ggml_tensor * outputs;
+    ggml_backend_buffer_t buf;
+};
+
+static recompute_test_ctx make_recompute_test_ctx(
+        const std::vector<ggml_backend_t> & backends, ggml_backend_t backend, bool activation_recompute) {
+    constexpr int64_t n_embd = 64;
+    constexpr int64_t n_ff = 256;
+    constexpr int64_t n_tokens = 128;
+
+    std::vector<ggml_backend_t> sched_backends = backends;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+            sched_backends.data(), nullptr, sched_backends.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
+
+    ggml_init_params static_params = {
+        /*.mem_size   =*/ 8*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_static = ggml_init(static_params);
+
+    ggml_init_params compute_params = {
+        /*.mem_size   =*/ GGML_DEFAULT_GRAPH_SIZE*ggml_tensor_overhead() + 3*ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+
+    ggml_tensor * inputs = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * weights_up = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, n_embd, n_ff);
+    ggml_tensor * weights_down = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, n_ff, n_embd);
+    ggml_set_param(weights_up);
+    ggml_set_param(weights_down);
+
+    ggml_tensor * outputs = inputs;
+    for (int i = 0; i < 4; ++i) {
+        ggml_tensor * checkpoint = ggml_scale(ctx_compute, outputs, 1.0f);
+        checkpoint->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+        ggml_tensor * hidden = ggml_mul_mat(ctx_compute, weights_up, checkpoint);
+        hidden = ggml_gelu(ctx_compute, hidden);
+        outputs = ggml_mul_mat(ctx_compute, weights_down, hidden);
+        outputs->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    std::vector<float> input_data(ggml_nelements(inputs));
+    std::vector<float> weight_data(ggml_nelements(weights_up));
+    for (size_t i = 0; i < input_data.size(); ++i) {
+        input_data[i] = 0.01f*(float) ((int) (i % 17) - 8);
+    }
+    for (size_t i = 0; i < weight_data.size(); ++i) {
+        weight_data[i] = 0.001f*(float) ((int) (i % 13) - 6);
+    }
+    ggml_backend_tensor_set(inputs, input_data.data(), 0, input_data.size()*sizeof(float));
+    ggml_backend_tensor_set(weights_up, weight_data.data(), 0, weight_data.size()*sizeof(float));
+    ggml_backend_tensor_set(weights_down, weight_data.data(), 0, weight_data.size()*sizeof(float));
+
+    ggml_opt_params opt_params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    opt_params.ctx_compute = ctx_compute;
+    opt_params.inputs = inputs;
+    opt_params.outputs = outputs;
+    opt_params.opt_period = 2;
+    opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    opt_params.get_opt_pars = helper_get_test_opt_pars;
+    opt_params.activation_recompute = activation_recompute;
+
+    return {
+        sched,
+        ctx_static,
+        ctx_compute,
+        ggml_opt_init(opt_params),
+        ggml_opt_result_init(),
+        inputs,
+        weights_up,
+        weights_down,
+        outputs,
+        buf,
+    };
+}
+
+static void free_recompute_test_ctx(recompute_test_ctx & ctx) {
+    ggml_opt_result_free(ctx.result);
+    ggml_opt_free(ctx.opt_ctx);
+    ggml_backend_buffer_free(ctx.buf);
+    ggml_free(ctx.ctx_static);
+    ggml_free(ctx.ctx_compute);
+    ggml_backend_sched_free(ctx.sched);
+}
+
+struct recompute_eval_data {
+    ggml_tensor * output;
+    int replay_executions = 0;
+    std::vector<float> output_data;
+};
+
+static bool count_recompute_eval(ggml_tensor * tensor, bool ask, void * user_data) {
+    recompute_eval_data * data = (recompute_eval_data *) user_data;
+    const bool is_recompute = strncmp(tensor->name, "recompute_", 10) == 0;
+    const bool is_output = tensor == data->output;
+    if (!ask) {
+        if (is_recompute) {
+            ++data->replay_executions;
+        }
+        if (is_output) {
+            ggml_backend_tensor_get(tensor, data->output_data.data(), 0, data->output_data.size()*sizeof(float));
+        }
+    }
+    return is_recompute || is_output;
+}
+
+static std::pair<int, int> test_activation_recompute_replays_mlp(
+        const std::vector<ggml_backend_t> & backends, ggml_backend_t backend, bool check_buffer_size) {
+    int ntest = 0;
+    int npass = 0;
+
+    recompute_test_ctx off = make_recompute_test_ctx(backends, backend, false);
+    recompute_test_ctx on = make_recompute_test_ctx(backends, backend, true);
+
+    ggml_opt_alloc(off.opt_ctx, true);
+    const size_t off_buffer_size = ggml_backend_sched_get_buffer_size(off.sched, backend);
+    recompute_eval_data eval_off = { off.outputs, 0, std::vector<float>(ggml_nelements(off.outputs)) };
+    ggml_backend_sched_set_eval_callback(off.sched, count_recompute_eval, &eval_off);
+    ggml_opt_eval(off.opt_ctx, off.result);
+    recompute_eval_data eval_on = { on.outputs, 0, std::vector<float>(ggml_nelements(on.outputs)) };
+    ggml_backend_sched_set_eval_callback(on.sched, count_recompute_eval, &eval_on);
+    ggml_opt_alloc(on.opt_ctx, true);
+    const size_t on_buffer_size = ggml_backend_sched_get_buffer_size(on.sched, backend);
+    ggml_opt_eval(on.opt_ctx, on.result);
+
+    print_ok(__func__, ggml_opt_recompute_regions(on.opt_ctx) == 4, npass, ntest,
+             "subtest=replay_region");
+    print_ok(__func__, ggml_opt_recompute_nodes(on.opt_ctx) >= 12, npass, ntest,
+             "subtest=replay_internal_nodes");
+    print_ok(__func__, eval_on.replay_executions > 0, npass, ntest,
+             "subtest=replay_execution");
+    if (check_buffer_size) {
+        print_ok(__func__, on_buffer_size < off_buffer_size, npass, ntest,
+                 "subtest=allocator_buffer_reduction");
+    }
+
+    double loss_off = 0.0;
+    double loss_on = 0.0;
+    ggml_opt_result_loss(off.result, &loss_off, nullptr);
+    ggml_opt_result_loss(on.result, &loss_on, nullptr);
+    print_ok(__func__, almost_equal(loss_off, loss_on, 1e-5), npass, ntest,
+             "subtest=loss");
+
+    bool outputs_equal = true;
+    for (size_t i = 0; i < eval_off.output_data.size(); ++i) {
+        outputs_equal = outputs_equal && almost_equal(eval_off.output_data[i], eval_on.output_data[i], 1e-5);
+    }
+    print_ok(__func__, outputs_equal, npass, ntest, "subtest=forward_output");
+
+    ggml_tensor * params_off[] = { off.weights_up, off.weights_down };
+    ggml_tensor * params_on[] = { on.weights_up, on.weights_down };
+    bool gradients_equal = true;
+    for (size_t ip = 0; ip < 2; ++ip) {
+        std::vector<float> grad_off(ggml_nelements(params_off[ip]));
+        std::vector<float> grad_on(ggml_nelements(params_on[ip]));
+        ggml_backend_tensor_get(ggml_opt_grad_acc(off.opt_ctx, params_off[ip]), grad_off.data(), 0, grad_off.size()*sizeof(float));
+        ggml_backend_tensor_get(ggml_opt_grad_acc(on.opt_ctx, params_on[ip]), grad_on.data(), 0, grad_on.size()*sizeof(float));
+        for (size_t i = 0; i < grad_off.size(); ++i) {
+            gradients_equal = gradients_equal && almost_equal(grad_off[i], grad_on[i], 1e-5);
+        }
+    }
+    print_ok(__func__, gradients_equal, npass, ntest, "subtest=gradient");
+
+    ggml_opt_alloc(off.opt_ctx, true);
+    ggml_opt_eval(off.opt_ctx, nullptr);
+    ggml_opt_alloc(on.opt_ctx, true);
+    ggml_opt_eval(on.opt_ctx, nullptr);
+    bool updates_equal = true;
+    for (size_t ip = 0; ip < 2; ++ip) {
+        std::vector<float> weights_off(ggml_nelements(params_off[ip]));
+        std::vector<float> weights_on(ggml_nelements(params_on[ip]));
+        ggml_backend_tensor_get(params_off[ip], weights_off.data(), 0, weights_off.size()*sizeof(float));
+        ggml_backend_tensor_get(params_on[ip], weights_on.data(), 0, weights_on.size()*sizeof(float));
+        for (size_t i = 0; i < weights_off.size(); ++i) {
+            updates_equal = updates_equal && almost_equal(weights_off[i], weights_on[i], 1e-5);
+        }
+    }
+    print_ok(__func__, updates_equal, npass, ntest, "subtest=optimizer_update");
+
+    free_recompute_test_ctx(off);
+    free_recompute_test_ctx(on);
+    return std::make_pair(npass, ntest);
+}
+
+static std::pair<int, int> test_activation_recompute_equivalence(
+        enum ggml_opt_optimizer_type optim,
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    helper_ctx_data off = helper_get_ctx_data(optim, backend_sched, backend,
+            true, false, 2, 1, GGML_OPT_LOSS_TYPE_SUM, false);
+    helper_ctx_data on = helper_get_ctx_data(optim, backend_sched, backend,
+            true, false, 2, 1, GGML_OPT_LOSS_TYPE_SUM, true);
+
+    const float input = 2.0f;
+    ggml_backend_tensor_set(off.inputs, &input, 0, sizeof(input));
+    ggml_opt_alloc(off.opt_ctx, true);
+    ggml_opt_eval(off.opt_ctx, off.result);
+
+    float weight_off = 0.0f;
+    float weight_on  = 0.0f;
+    float grad_off = 0.0f;
+    float grad_on  = 0.0f;
+    ggml_backend_tensor_get(ggml_opt_grad_acc(off.opt_ctx, off.weights), &grad_off, 0, sizeof(grad_off));
+    double loss_off = 0.0;
+    double loss_on = 0.0;
+    ggml_opt_result_loss(off.result, &loss_off, nullptr);
+    ggml_opt_alloc(off.opt_ctx, true);
+    ggml_opt_eval(off.opt_ctx, nullptr);
+    ggml_backend_tensor_get(off.weights, &weight_off, 0, sizeof(weight_off));
+
+    ggml_backend_tensor_set(on.inputs, &input, 0, sizeof(input));
+    ggml_opt_alloc(on.opt_ctx, true);
+    ggml_opt_eval(on.opt_ctx, on.result);
+    ggml_backend_tensor_get(ggml_opt_grad_acc(on.opt_ctx, on.weights), &grad_on, 0, sizeof(grad_on));
+    ggml_opt_result_loss(on.result, &loss_on, nullptr);
+    ggml_opt_alloc(on.opt_ctx, true);
+    ggml_opt_eval(on.opt_ctx, nullptr);
+    ggml_backend_tensor_get(on.weights, &weight_on, 0, sizeof(weight_on));
+    print_ok(__func__, almost_equal(loss_off, loss_on, 1e-6), npass, ntest,
+             "subtest=forward_loss");
+    print_ok(__func__, almost_equal(grad_off, grad_on, 1e-6), npass, ntest,
+             "subtest=parameter_gradient");
+    print_ok(__func__, almost_equal(weight_off, weight_on, 1e-6), npass, ntest,
+             "subtest=optimizer_update");
+
+    helper_free_ctx_data(off);
+    helper_free_ctx_data(on);
+    return std::make_pair(npass, ntest);
 }
 
 static void print_ok(bool subtest_ok) {
@@ -840,9 +1089,24 @@ static std::pair<int, int> test_regression(
 }
 
 static std::pair<int, int> test_backend(
-    ggml_backend_sched_t backend_sched, ggml_backend_t backend, enum ggml_opt_optimizer_type optim) {
+        const std::vector<ggml_backend_t> & backends,
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend, enum ggml_opt_optimizer_type optim) {
     int npass = 0;
     int ntest = 0;
+
+    if (optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW) {
+        const char * backend_name = ggml_backend_name(backend);
+        std::pair<int, int> partial = test_activation_recompute_replays_mlp(
+                backends, backend, strcmp(backend_name, "CPU") == 0);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+
+    {
+        std::pair<int, int> partial = test_activation_recompute_equivalence(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
 
     for (bool shuffle : {false, true}) {
         std::pair<int, int> partial = test_dataset(optim, backend_sched, backend, shuffle);
@@ -1006,7 +1270,7 @@ int main(void) {
 
             std::pair<int, int> result;
             if (!skip) {
-                result = test_backend(backend_sched, backends[i], optim);
+                result = test_backend(backends_modded, backend_sched, backends[i], optim);
                 printf("  %d/%d tests passed\n", result.first, result.second);
             }
 

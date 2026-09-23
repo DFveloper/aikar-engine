@@ -343,6 +343,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cur = ggml_add(ctx0, cur_mlp, cur_moe);
             cb(cur, "ffn_moe_combined", il);
         } else {
+            if (training && activation_recompute) {
+                attn_out->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+            }
             cur = build_norm(attn_out,
                     model.layers[il].ffn_norm, nullptr,
                     LLM_NORM_RMS, il);
@@ -360,6 +363,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 model.layers[il].ffn_post_norm, nullptr,
                 LLM_NORM_RMS, -1);
         cb(cur, "ffn_post_norm", il);
+        if (!is_moe_layer && training && activation_recompute) {
+            cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+        }
 
         // residual connection
         cur = ggml_add(ctx0, cur, attn_out);

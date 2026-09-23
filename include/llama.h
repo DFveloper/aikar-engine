@@ -1725,11 +1725,9 @@ extern "C" {
         llama_opt_lora_qat_type_callback lora_qat_type_callback;
         void * lora_qat_type_callback_ud;
 
-        // Gradient checkpointing: mark every Nth forward graph node as persistent so the
-        // allocator cannot reuse its memory during backward.  Reduces peak activation VRAM
-        // at the cost of ~0 extra compute (activations are kept, not recomputed).
-        // Set to 0 (default) to disable.  Good values: 32–64 nodes ≈ every 1–2 transformer layers.
+        // Deprecated compatibility field. Values above zero enable activation recomputation.
         int32_t grad_checkpoint_interval;
+        bool activation_recompute;
 
         enum llama_opt_critical_token_mode   critical_token_mode;
         float                                critical_token_weight;

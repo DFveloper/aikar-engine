@@ -1528,6 +1528,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
+    training         (params.training),
+    activation_recompute(params.activation_recompute),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -1564,6 +1566,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
+        GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1630,6 +1635,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
+        GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];

@@ -320,6 +320,25 @@ static void test(void) {
 
     printf("test-arg-parser: test valid usage\n\n");
 
+    {
+        common_params train_params;
+        assert(!train_params.activation_recompute);
+
+        argv = {"binary_name", "-m", "model.gguf", "--activation-recompute", "on"};
+        assert(true == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), train_params, LLAMA_EXAMPLE_FINETUNE_QLORA));
+        assert(train_params.activation_recompute);
+
+        argv = {"binary_name", "-m", "model.gguf", "--activation-recompute", "off"};
+        assert(true == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), train_params, LLAMA_EXAMPLE_FINETUNE_QAT));
+        assert(!train_params.activation_recompute);
+
+        argv = {"binary_name", "-m", "model.gguf", "--activation-recompute", "invalid"};
+        assert(false == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), train_params, LLAMA_EXAMPLE_FINETUNE_QLORA));
+    }
+
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");

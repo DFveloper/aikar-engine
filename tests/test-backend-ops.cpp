@@ -415,7 +415,15 @@ static std::string var_to_str(ggml_type type) {
 }
 
 static std::string var_to_str(ggml_prec prec) {
-    return prec == GGML_PREC_F32 ? "f32" : "def";
+    switch (prec) {
+        case GGML_PREC_DEFAULT: return "def";
+        case GGML_PREC_F32:     return "f32";
+        case GGML_PREC_BF16:    return "bf16";
+        case GGML_PREC_F16:     return "f16";
+        case GGML_PREC_Q8:      return "q8";
+        case GGML_PREC_Q4:      return "q4";
+    }
+    return std::to_string(prec);
 }
 
 static std::string var_to_str(ggml_op_pool pool) {
@@ -4978,9 +4986,10 @@ struct test_mul_mat : public test_case {
     const int64_t k_v; // size of k in memory, resulting in a non-contiguous view for k_v > k, no view for k_v == 0
     const uint32_t o; // number of outputs
     const bool src_overlap; // a and b are overlapping views of the same tensor
+    const ggml_prec src0_prec;
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap);
+        return VARS_TO_STR12(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, src0_prec);
     }
 
     double max_nmse_err() override {
@@ -5009,8 +5018,9 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap) {}
+            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false,
+            ggml_prec src0_prec = GGML_PREC_DEFAULT)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), src0_prec(src0_prec) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -5078,9 +5088,15 @@ struct test_mul_mat : public test_case {
 
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
         ggml_set_name(out, "out");
+        if (src0_prec != GGML_PREC_DEFAULT) {
+            GGML_ASSERT(ggml_prec_set_src(out, src0_prec, 0));
+        }
         for (uint32_t i = 1; i < o; ++i) {
             ggml_tensor * out2 = ggml_mul_mat(ctx, a, b);
             ggml_set_name(out2, "out2");
+            if (src0_prec != GGML_PREC_DEFAULT) {
+                GGML_ASSERT(ggml_prec_set_src(out2, src0_prec, 0));
+            }
             out = ggml_add(ctx, out, out2);
         }
 
@@ -10490,6 +10506,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, 128, 256, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, 128, 256, {1,1}, {1,1}, {0,1,2,3}, 0, 1, false, GGML_PREC_Q4));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 64, 128, 256, {1,1}, {1,1}, {0,1,2,3}, 0, 1, false, GGML_PREC_Q4));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));
@@ -10702,6 +10721,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_out_prod_id(16, 12, 4, 2, 5));
     test_cases.emplace_back(new test_out_prod_accumulate());
     test_cases.emplace_back(new test_out_prod_accumulate(GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 33, 257));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 96, 17, 129));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1536, 8, 4096));
     test_cases.emplace_back(new test_out_prod_id(32, 24, 8, 4, 10));
     test_cases.emplace_back(new test_out_prod_id(64, 32, 16, 4, 16));
 

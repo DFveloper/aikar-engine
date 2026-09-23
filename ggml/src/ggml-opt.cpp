@@ -117,6 +117,10 @@ struct ggml_opt_context {
     int32_t opt_period         = 1;
     int32_t opt_i              = 0;
     int32_t grad_checkpoint_interval = 0;
+    bool    activation_recompute = false;
+    int32_t recompute_regions = 0;
+    int32_t recompute_nodes = 0;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> recompute_replacements;
     bool    loss_per_datapoint = false;
     bool    critical_token_weighting = false;
     bool    critical_confidence_weighting = false;
@@ -797,6 +801,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars              =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud          =*/ nullptr,
         /*grad_checkpoint_interval =*/ 0,
+        /*activation_recompute     =*/ false,
         /*critical_token_weighting =*/ false,
         /*critical_confidence_weighting =*/ false,
         /*critical_token_weight    =*/ 1.0f,
@@ -866,6 +871,143 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     }
 
     return dst;
+}
+
+static bool ggml_opt_tensor_depends_on(
+        ggml_tensor * tensor, ggml_tensor * input, std::map<ggml_tensor *, bool> & memo) {
+    if (!tensor) {
+        return false;
+    }
+    const auto found = memo.find(tensor);
+    if (found != memo.end()) {
+        return found->second;
+    }
+    if (tensor == input) {
+        memo[tensor] = true;
+        return true;
+    }
+    memo[tensor] = false;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_opt_tensor_depends_on(tensor->src[i], input, memo)) {
+            memo[tensor] = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static ggml_tensor * ggml_opt_clone_recompute_tensor(
+        ggml_context * ctx,
+        ggml_tensor * tensor,
+        ggml_tensor * input,
+        std::map<ggml_tensor *, bool> & dependency_memo,
+        std::map<ggml_tensor *, ggml_tensor *> & clones) {
+    if (!tensor || tensor == input || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
+        return tensor;
+    }
+    const auto found = clones.find(tensor);
+    if (found != clones.end()) {
+        return found->second;
+    }
+
+    ggml_tensor * clone = ggml_dup_tensor(ctx, tensor);
+    clones[tensor] = clone;
+    clone->op = tensor->op;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        clone->nb[i] = tensor->nb[i];
+    }
+    clone->flags = tensor->flags & ~(GGML_TENSOR_FLAG_RECOMPUTE | GGML_TENSOR_FLAG_RECOMPUTE_INPUT);
+    memcpy(clone->op_params, tensor->op_params, sizeof(tensor->op_params));
+    ggml_format_name(clone, "recompute_%s", tensor->name);
+    clone->view_offs = tensor->view_offs;
+    clone->view_src = ggml_opt_clone_recompute_tensor(
+            ctx, tensor->view_src, input, dependency_memo, clones);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        clone->src[i] = ggml_opt_clone_recompute_tensor(
+                ctx, tensor->src[i], input, dependency_memo, clones);
+    }
+    return clone;
+}
+
+static void ggml_opt_prepare_recompute(ggml_opt_context_t opt_ctx, int n_nodes_f) {
+    if (!opt_ctx->activation_recompute) {
+        return;
+    }
+
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> regions;
+    ggml_tensor * input = nullptr;
+    for (int i = 0; i < n_nodes_f; ++i) {
+        ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
+        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE_INPUT) {
+            GGML_ASSERT(input == nullptr && "nested activation recompute regions are not supported");
+            input = node;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE) {
+            GGML_ASSERT(input && "activation recompute output has no input boundary");
+            regions.emplace_back(input, node);
+            input = nullptr;
+        }
+    }
+    GGML_ASSERT(input == nullptr && "activation recompute input has no output boundary");
+
+    for (const auto & region : regions) {
+        std::map<ggml_tensor *, bool> dependency_memo;
+        std::map<ggml_tensor *, ggml_tensor *> clones;
+        ggml_tensor * replay = ggml_opt_clone_recompute_tensor(
+                opt_ctx->ctx_compute, region.second, region.first, dependency_memo, clones);
+        GGML_ASSERT(replay != region.second && "activation recompute output does not depend on its input");
+        for (const auto & entry : clones) {
+            opt_ctx->recompute_replacements.emplace_back(entry.first, entry.second);
+        }
+        opt_ctx->recompute_regions++;
+        opt_ctx->recompute_nodes += (int32_t) clones.size();
+    }
+    GGML_LOG_INFO("%s: activation recompute: %d regions, %d replay nodes\n",
+            __func__, opt_ctx->recompute_regions, opt_ctx->recompute_nodes);
+}
+
+static ggml_cgraph * ggml_opt_apply_recompute(ggml_opt_context_t opt_ctx, int n_nodes_f) {
+    if (opt_ctx->recompute_replacements.empty()) {
+        return opt_ctx->gb_grad;
+    }
+
+    ggml_cgraph * graph = opt_ctx->gb_grad;
+    for (int i = n_nodes_f; i < opt_ctx->gb_grad->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        for (const auto & entry : opt_ctx->recompute_replacements) {
+            if (node->view_src == entry.first) {
+                node->view_src = entry.second;
+                break;
+            }
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            for (const auto & entry : opt_ctx->recompute_replacements) {
+                if (node->src[j] == entry.first) {
+                    node->src[j] = entry.second;
+                    break;
+                }
+            }
+        }
+    }
+
+    ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, /*grads =*/ true);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_build_forward_expand(reordered, graph->nodes[i]);
+    }
+    for (size_t i = 0; i < graph->visited_hash_set.size; ++i) {
+        if (!ggml_bitset_get(graph->visited_hash_set.used, i)) {
+            continue;
+        }
+        ggml_tensor * tensor = graph->visited_hash_set.keys[i];
+        const size_t reordered_pos = ggml_hash_find(&reordered->visited_hash_set, tensor);
+        if (reordered_pos == GGML_HASHSET_FULL ||
+            !ggml_bitset_get(reordered->visited_hash_set.used, reordered_pos)) {
+            continue;
+        }
+        reordered->grads[reordered_pos] = graph->grads[i];
+        reordered->grad_accs[reordered_pos] = graph->grad_accs[i];
+    }
+    return reordered;
 }
 
 static bool ggml_opt_depends_on_qat_alias(
@@ -1685,6 +1827,10 @@ if (!dumped_qat_placement &&
     return result;
 }
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
+    opt_ctx->recompute_regions = 0;
+    opt_ctx->recompute_nodes = 0;
+    opt_ctx->recompute_replacements.clear();
+
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
 
@@ -2333,31 +2479,6 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_format_name(opt_ctx->opt_step_params, "%s_params", ggml_opt_optimizer_name(optimizer));
     }
 
-    // Gradient checkpointing: mark every Nth forward node as OUTPUT so the allocator
-    // keeps its memory alive through the backward pass.  The backward graph already
-    // contains the forward ops (gb_grad is a superset of gf), so the checkpointed
-    // activations are naturally available for backward matmuls without recomputation.
-    // This prevents the allocator from aliasing those buffers to later ops, cutting
-    // peak activation VRAM at the cost of slightly larger static allocation.
-    if (opt_ctx->grad_checkpoint_interval > 0) {
-        const int interval = opt_ctx->grad_checkpoint_interval;
-        const int n_fwd    = opt_ctx->gf->n_nodes;
-        int ckpt_count = 0;
-        for (int i = interval - 1; i < n_fwd; i += interval) {
-            struct ggml_tensor * node = opt_ctx->gf->nodes[i];
-            // Only checkpoint F32 compute nodes — skip I32 index tensors and already-output nodes.
-            if (node->type != GGML_TYPE_F32) continue;
-            if (node->flags & GGML_TENSOR_FLAG_OUTPUT)  continue;
-            if (node->flags & GGML_TENSOR_FLAG_INPUT)   continue;
-            node->flags |= GGML_TENSOR_FLAG_OUTPUT;
-            ckpt_count++;
-        }
-        if (ckpt_count > 0) {
-            GGML_LOG_DEBUG("%s: gradient checkpointing: marked %d/%d nodes as persistent (interval=%d)\n",
-                __func__, ckpt_count, n_fwd, interval);
-        }
-    }
-
     if (qlion_qat) {
         const uint64_t signature = ggml_opt_qat_graph_signature(opt_ctx);
         const bool changed = signature != opt_ctx->qat_dependency_signature ||
@@ -2378,6 +2499,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
+    const int recompute_forward_nodes = opt_ctx->gf->n_nodes;
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
     if (qlion_qat) {
         opt_ctx->qat_forward_nodes.clear();
@@ -2432,6 +2554,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     } else {
         ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
     }
+    ggml_opt_prepare_recompute(opt_ctx, recompute_forward_nodes);
+    opt_ctx->gb_grad = ggml_opt_apply_recompute(opt_ctx, recompute_forward_nodes);
 
     if (need_quantized_momenta) {
         const enum ggml_type state_type = ggml_opt_optimizer_state_type(opt_ctx->optimizer);
@@ -2553,6 +2677,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->outputs          = params.outputs;
     result->opt_period                = params.opt_period;
     result->grad_checkpoint_interval  = params.grad_checkpoint_interval;
+    result->activation_recompute      = params.activation_recompute || params.grad_checkpoint_interval > 0;
     result->get_opt_pars              = params.get_opt_pars;
     result->get_opt_pars_ud           = params.get_opt_pars_ud;
     result->optimizer                 = params.optimizer;
@@ -2645,6 +2770,14 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
 
 bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx) {
     return opt_ctx->static_graphs;
+}
+
+int32_t ggml_opt_recompute_regions(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->recompute_regions;
+}
+
+int32_t ggml_opt_recompute_nodes(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->recompute_nodes;
 }
 
 struct ggml_tensor * ggml_opt_inputs(ggml_opt_context_t opt_ctx) {
@@ -2966,7 +3099,6 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     const int64_t ndata = opt_ctx->outputs->ne[1];
-    GGML_ASSERT(result->ndata == ndata*int64_t(result->loss.size()) && "varying batch size not supported");
     result->ndata += ndata;
 
     GGML_ASSERT(ggml_is_scalar(opt_ctx->loss));
