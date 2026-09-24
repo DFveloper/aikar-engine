@@ -1126,16 +1126,18 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
     "ACC_QLION_QAT",
+    "ACC_QLION_QAT_ROWS",
     "OPT_STEP_QLION_QAT",
     "OPT_STEP_QLION_QAT_ID",
     "OPT_STEP_QLION_QAT_ROWS",
+    "OPT_STEP_QLION_QAT_SPARSE_ROWS",
     "OPT_STEP_QLION_QAT_TIED",
 
     "GLU",
     "GLU_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1250,16 +1252,18 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "adamw(x)",
     "sgd(x)",
     "acc_qlion_qat(x)",
+    "acc_qlion_qat_rows(x)",
     "qlion_qat(x)",
     "qlion_qat_id(x)",
     "qlion_qat_rows(x)",
+    "qlion_qat_sparse_rows(x)",
     "qlion_qat_tied(x)",
 
     "glu(x)",
     "glu_back(dy,x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6717,6 +6721,50 @@ struct ggml_tensor * ggml_acc_qlion_qat_tied(
     return result;
 }
 
+struct ggml_tensor * ggml_acc_qlion_qat_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * accumulator,
+        struct ggml_tensor  * state_ids,
+        struct ggml_tensor  * state_hash,
+        struct ggml_tensor  * state_count,
+        struct ggml_tensor  * micro_slots,
+        struct ggml_tensor  * micro_next,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        bool                  reset,
+        bool                  rehash) {
+    GGML_ASSERT(accumulator->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(state_ids->type == GGML_TYPE_I32 && state_hash->type == GGML_TYPE_I32);
+    GGML_ASSERT(state_count->type == GGML_TYPE_I32 && ggml_nelements(state_count) == 1);
+    GGML_ASSERT(micro_slots->type == GGML_TYPE_I32 && micro_next->type == GGML_TYPE_I32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(accumulator->ne[0] == grad->ne[0]);
+    GGML_ASSERT(ggml_nrows(grad) == ggml_nelements(ids));
+    GGML_ASSERT(ggml_nelements(state_ids) == ggml_nrows(accumulator));
+    GGML_ASSERT(ggml_nelements(state_hash) >= 2 * ggml_nelements(state_ids));
+    GGML_ASSERT((ggml_nelements(state_hash) & (ggml_nelements(state_hash) - 1)) == 0);
+    GGML_ASSERT(ggml_nelements(micro_slots) >= ggml_nelements(state_ids) + ggml_nelements(ids));
+    GGML_ASSERT(ggml_nelements(micro_next) >= ggml_nelements(ids));
+    GGML_ASSERT(ggml_is_contiguous(accumulator) && ggml_is_contiguous(state_ids));
+    GGML_ASSERT(ggml_is_contiguous(state_hash) && ggml_is_contiguous(state_count));
+    GGML_ASSERT(ggml_is_contiguous(micro_slots) && ggml_is_contiguous(micro_next));
+    GGML_ASSERT(ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, accumulator);
+    result->op = GGML_OP_ACC_QLION_QAT_ROWS;
+    result->src[0] = accumulator;
+    result->src[1] = state_ids;
+    result->src[2] = state_hash;
+    result->src[3] = state_count;
+    result->src[4] = micro_slots;
+    result->src[5] = micro_next;
+    result->src[6] = grad;
+    result->src[7] = ids;
+    ggml_set_op_params_i32(result, 0, reset ? 1 : 0);
+    ggml_set_op_params_i32(result, 1, rehash ? 1 : 0);
+    return result;
+}
+
 struct ggml_tensor * ggml_opt_step_qlion_qat(
         struct ggml_context * ctx,
         struct ggml_tensor  * weight,
@@ -6818,6 +6866,40 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_rows(
     result->src[3] = momentum;
     result->src[4] = residual;
     result->src[5] = params;
+    return result;
+}
+
+struct ggml_tensor * ggml_opt_step_qlion_qat_sparse_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * count,
+        struct ggml_tensor  * momentum,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * params) {
+    GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(grad->type == GGML_TYPE_Q8_0 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(count->type == GGML_TYPE_I32 && ggml_nelements(count) == 1);
+    GGML_ASSERT(weight->ne[0] == grad->ne[0]);
+    GGML_ASSERT(ggml_nelements(ids) == ggml_nrows(grad));
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 5);
+    GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(count) && ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
+    result->op = GGML_OP_OPT_STEP_QLION_QAT_SPARSE_ROWS;
+    result->src[0] = weight;
+    result->src[1] = grad;
+    result->src[2] = ids;
+    result->src[3] = count;
+    result->src[4] = momentum;
+    result->src[5] = residual;
+    result->src[6] = params;
     return result;
 }
 

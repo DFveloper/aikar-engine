@@ -12704,6 +12704,112 @@ void ggml_compute_forward_acc_qlion_qat(const ggml_compute_params * params, ggml
     }
 }
 
+static uint32_t ggml_qlion_qat_row_hash(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value;
+}
+
+void ggml_compute_forward_acc_qlion_qat_rows(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * accumulator = dst->src[0];
+    ggml_tensor * state_ids = dst->src[1];
+    ggml_tensor * state_hash = dst->src[2];
+    ggml_tensor * state_count = dst->src[3];
+    ggml_tensor * micro_slots = dst->src[4];
+    ggml_tensor * micro_next = dst->src[5];
+    const ggml_tensor * grad = dst->src[6];
+    const ggml_tensor * ids = dst->src[7];
+    const bool reset = ggml_get_op_params_i32(dst, 0) != 0;
+    const bool rehash = ggml_get_op_params_i32(dst, 1) != 0;
+    const int64_t capacity = ggml_nrows(accumulator);
+    const int64_t hash_capacity = ggml_nelements(state_hash);
+    const int64_t n_indices = ggml_nelements(ids);
+    const int64_t n_blocks_row = accumulator->ne[0] / 32;
+    int32_t * state_id_data = (int32_t *) state_ids->data;
+    int32_t * hash_data = (int32_t *) state_hash->data;
+    int32_t * count_data = (int32_t *) state_count->data;
+    int32_t * slot_data = (int32_t *) micro_slots->data;
+    int32_t * next_data = (int32_t *) micro_next->data;
+
+    if (params->ith == 0) {
+        if (reset) {
+            memset(accumulator->data, 0, ggml_nbytes(accumulator));
+            std::fill(state_id_data, state_id_data + capacity, -1);
+            std::fill(hash_data, hash_data + hash_capacity, -1);
+            *count_data = 0;
+        } else if (rehash) {
+            std::fill(hash_data, hash_data + hash_capacity, -1);
+            GGML_ASSERT(*count_data >= 0 && *count_data <= capacity);
+            for (int32_t slot = 0; slot < *count_data; ++slot) {
+                const int32_t row = state_id_data[slot];
+                GGML_ASSERT(row >= 0);
+                uint32_t bucket = ggml_qlion_qat_row_hash((uint32_t) row) & (hash_capacity - 1);
+                while (hash_data[bucket] >= 0) {
+                    bucket = (bucket + 1) & (hash_capacity - 1);
+                }
+                hash_data[bucket] = slot;
+            }
+        }
+        std::fill(slot_data, slot_data + capacity, -1);
+        std::fill(next_data, next_data + n_indices, -1);
+        const int32_t * row_data = (const int32_t *) ids->data;
+        for (int32_t index = 0; index < n_indices; ++index) {
+            const int32_t row = row_data[index];
+            GGML_ASSERT(row >= 0);
+            uint32_t bucket = ggml_qlion_qat_row_hash((uint32_t) row) & (hash_capacity - 1);
+            while (hash_data[bucket] >= 0 && state_id_data[hash_data[bucket]] != row) {
+                bucket = (bucket + 1) & (hash_capacity - 1);
+            }
+            int32_t slot = hash_data[bucket];
+            if (slot < 0) {
+                slot = (*count_data)++;
+                GGML_ASSERT(slot < capacity);
+                state_id_data[slot] = row;
+                hash_data[bucket] = slot;
+            }
+            const int32_t previous = slot_data[slot];
+            slot_data[capacity + index] = previous < 0 ? -slot - 1 : slot;
+            if (previous >= 0) {
+                next_data[previous] = index;
+            }
+            slot_data[slot] = index;
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    const ggml_type_traits * traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    const int64_t n_work = n_indices * n_blocks_row;
+    const int64_t work_begin = n_work * params->ith / params->nth;
+    const int64_t work_end = n_work * (params->ith + 1) / params->nth;
+    const float * grad_data = (const float *) grad->data;
+    for (int64_t work = work_begin; work < work_end; ++work) {
+        const int64_t index = work / n_blocks_row;
+        const int64_t block = work % n_blocks_row;
+        const int32_t encoded = slot_data[capacity + index];
+        if (encoded >= 0) {
+            continue;
+        }
+        const int32_t slot = -encoded - 1;
+        uint8_t * accumulator_block = (uint8_t *) accumulator->data +
+            (slot * n_blocks_row + block) * traits->type_size;
+        float values[32];
+        traits->to_float(accumulator_block, values, 32);
+        for (int32_t occurrence = index; occurrence >= 0; occurrence = next_data[occurrence]) {
+            const float * grad_block = grad_data + occurrence * accumulator->ne[0] + block * 32;
+            for (int lane = 0; lane < 32; ++lane) {
+                const float gradient = std::isfinite(grad_block[lane]) ? grad_block[lane] : 0.0f;
+                const float value = values[lane] + gradient;
+                values[lane] = std::max(-128.0f * 65504.0f, std::min(128.0f * 65504.0f,
+                    std::isfinite(value) ? value : 0.0f));
+            }
+        }
+        traits->from_float_ref(values, accumulator_block, 32);
+    }
+}
+
 void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params, ggml_tensor * dst) {
     ggml_tensor * weight = dst->src[0];
     const ggml_tensor * grad = dst->src[1];
@@ -12925,6 +13031,44 @@ void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * pa
             (uint8_t *) weight->data + ib * weight_traits->type_size,
             (uint8_t *) momentum->data + ib * momentum_traits->type_size,
             (uint8_t *) residual->data + ib * residual_traits->type_size,
+            grad_block, p);
+    }
+}
+
+void ggml_compute_forward_opt_step_qlion_qat_sparse_rows(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    const ggml_tensor * count = dst->src[3];
+    ggml_tensor * momentum = dst->src[4];
+    ggml_tensor * residual = dst->src[5];
+    const ggml_tensor * opt_params = dst->src[6];
+    const ggml_type_traits * weight_traits = ggml_get_type_traits(weight->type);
+    const ggml_type_traits * grad_traits = ggml_get_type_traits(grad->type);
+    const ggml_type_traits * momentum_traits = ggml_get_type_traits(momentum->type);
+    const ggml_type_traits * residual_traits = ggml_get_type_traits(residual->type);
+    const float * p = ggml_get_data_f32(opt_params);
+    const int32_t * row_data = (const int32_t *) ids->data;
+    const int32_t n_rows = *(const int32_t *) count->data;
+    const int64_t capacity = ggml_nrows(grad);
+    const int64_t n_blocks_row = weight->ne[0] / 32;
+    GGML_ASSERT(n_rows >= 0 && n_rows <= capacity && n_rows <= weight->ne[1]);
+    const int64_t n_work = n_rows * n_blocks_row;
+    const int64_t work_begin = n_work * params->ith / params->nth;
+    const int64_t work_end = n_work * (params->ith + 1) / params->nth;
+    for (int64_t work = work_begin; work < work_end; ++work) {
+        const int64_t slot = work / n_blocks_row;
+        const int64_t block = work % n_blocks_row;
+        const int32_t row = row_data[slot];
+        GGML_ASSERT(row >= 0 && row < weight->ne[1]);
+        const int64_t weight_block_index = row * n_blocks_row + block;
+        const int64_t grad_block_index = slot * n_blocks_row + block;
+        float grad_block[32];
+        grad_traits->to_float((const uint8_t *) grad->data + grad_block_index * grad_traits->type_size, grad_block, 32);
+        ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
+            (uint8_t *) weight->data + weight_block_index * weight_traits->type_size,
+            (uint8_t *) momentum->data + weight_block_index * momentum_traits->type_size,
+            (uint8_t *) residual->data + weight_block_index * residual_traits->type_size,
             grad_block, p);
     }
 }

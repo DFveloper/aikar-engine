@@ -3770,6 +3770,9 @@ void llama_context::opt_epoch_iter(
     }
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
+        if (train && opt_params.optimizer_type == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+            ggml_opt_set_current_period(opt_ctx, n_batch / n_ubatch);
+        }
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
             batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];

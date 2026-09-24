@@ -91,6 +91,23 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> qat_momentum;
     std::vector<struct ggml_tensor *> qat_residual;
     std::vector<struct ggml_tensor *> qat_grad_accumulator;
+    enum class qat_grad_state_kind { unclassified, dense, sparse_rows };
+    struct qat_grad_state {
+        qat_grad_state_kind kind = qat_grad_state_kind::unclassified;
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_tensor * accumulator = nullptr;
+        ggml_tensor * row_ids = nullptr;
+        ggml_tensor * row_hash = nullptr;
+        ggml_tensor * row_count = nullptr;
+        ggml_tensor * micro_slots = nullptr;
+        ggml_tensor * micro_next = nullptr;
+        int64_t capacity = 0;
+        int64_t hash_capacity = 0;
+        int64_t input_capacity = 0;
+        bool rehash = false;
+    };
+    std::vector<qat_grad_state> qat_grad_states;
     std::vector<std::vector<struct ggml_tensor *>> qat_aliases;
     std::vector<std::vector<struct ggml_tensor *>> qat_pending_grads;
     std::vector<size_t> qat_expected_grads;
@@ -115,6 +132,7 @@ struct ggml_opt_context {
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
+    int32_t configured_opt_period = 1;
     int32_t opt_i              = 0;
     int32_t grad_checkpoint_interval = 0;
     bool    activation_recompute = false;
@@ -225,6 +243,166 @@ static int ggml_opt_qat_backend_priority(
     }
 }
 
+static bool ggml_opt_qat_supports_sparse_rows(const ggml_tensor * param) {
+    const ggml_backend_buffer_type_t buft = param->buffer
+        ? ggml_backend_buffer_get_type(param->buffer)
+        : ggml_backend_cpu_buffer_type();
+    if (buft == ggml_backend_cpu_buffer_type()) {
+        return true;
+    }
+    const ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev) {
+        return false;
+    }
+    const ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    return name && strcmp(name, "CUDA") == 0;
+}
+
+static ggml_opt_context::qat_grad_state ggml_opt_qat_make_grad_state(
+        ggml_tensor * param,
+        ggml_opt_context::qat_grad_state_kind kind,
+        int64_t capacity,
+        int64_t input_capacity) {
+    ggml_opt_context::qat_grad_state state;
+    state.kind = kind;
+    state.capacity = capacity;
+    state.input_capacity = input_capacity;
+    if (kind == ggml_opt_context::qat_grad_state_kind::sparse_rows) {
+        GGML_ASSERT(capacity > 0 && capacity <= INT32_MAX / 4);
+        GGML_ASSERT(input_capacity >= 0 && input_capacity <= INT32_MAX - capacity);
+        state.hash_capacity = 1;
+        while (state.hash_capacity <= 2 * capacity) {
+            state.hash_capacity *= 2;
+        }
+    }
+    const size_t n_tensors = kind == ggml_opt_context::qat_grad_state_kind::sparse_rows ? 6 : 1;
+    ggml_init_params init_params = { n_tensors * ggml_tensor_overhead(), nullptr, true };
+    state.ctx = ggml_init(init_params);
+    GGML_ASSERT(state.ctx);
+    if (kind == ggml_opt_context::qat_grad_state_kind::sparse_rows) {
+        state.accumulator = ggml_new_tensor_2d(state.ctx, GGML_TYPE_Q8_0, param->ne[0], capacity);
+        state.row_ids = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, capacity);
+        state.row_hash = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, state.hash_capacity);
+        state.row_count = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, 1);
+        state.micro_slots = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, capacity + input_capacity);
+        state.micro_next = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, input_capacity);
+        ggml_format_name(state.accumulator, "QLion sparse Q8_0 gradient accumulator for %s", param->name);
+    } else {
+        state.accumulator = ggml_new_tensor(state.ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne);
+        ggml_format_name(state.accumulator, "QLion Q8_0 gradient accumulator for %s", param->name);
+    }
+    const ggml_backend_buffer_type_t buft = param->buffer
+        ? ggml_backend_buffer_get_type(param->buffer)
+        : ggml_backend_cpu_buffer_type();
+    state.buffer = ggml_backend_alloc_ctx_tensors_from_buft(state.ctx, buft);
+    GGML_ASSERT(state.buffer);
+    ggml_backend_buffer_clear(state.buffer, 0);
+    return state;
+}
+
+static void ggml_opt_qat_free_grad_state(ggml_opt_context::qat_grad_state & state) {
+    ggml_backend_buffer_free(state.buffer);
+    ggml_free(state.ctx);
+    state = {};
+}
+
+static void ggml_opt_qat_copy_grad_state(
+        const ggml_opt_context::qat_grad_state & src,
+        ggml_opt_context::qat_grad_state & dst) {
+    if (src.kind == ggml_opt_context::qat_grad_state_kind::dense) {
+        ggml_backend_tensor_copy(src.accumulator, dst.accumulator);
+        return;
+    }
+    ggml_tensor dst_accumulator = *dst.accumulator;
+    dst_accumulator.ne[1] = src.capacity;
+    memcpy(dst_accumulator.nb, src.accumulator->nb, sizeof(dst_accumulator.nb));
+    ggml_backend_tensor_copy(src.accumulator, &dst_accumulator);
+    ggml_tensor dst_ids = *dst.row_ids;
+    dst_ids.ne[0] = src.capacity;
+    memcpy(dst_ids.nb, src.row_ids->nb, sizeof(dst_ids.nb));
+    ggml_backend_tensor_copy(src.row_ids, &dst_ids);
+    ggml_backend_tensor_copy(src.row_count, dst.row_count);
+    dst.rehash = true;
+}
+
+static void ggml_opt_qat_copy_sparse_to_dense(
+        const ggml_opt_context::qat_grad_state & src,
+        ggml_opt_context::qat_grad_state & dst,
+        const ggml_tensor * param) {
+    GGML_ASSERT(src.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows);
+    GGML_ASSERT(dst.kind == ggml_opt_context::qat_grad_state_kind::dense);
+
+    const int32_t row_count = [&]() {
+        int32_t value = 0;
+        ggml_backend_tensor_get(src.row_count, &value, 0, sizeof(value));
+        return value;
+    }();
+    if (row_count <= 0) {
+        return;
+    }
+
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, param->ne[0]);
+    std::vector<int32_t> row_ids((size_t) row_count);
+    std::vector<uint8_t> rows((size_t) row_count * row_bytes);
+    ggml_backend_tensor_get(src.row_ids, row_ids.data(), 0, row_ids.size() * sizeof(int32_t));
+
+    ggml_tensor src_rows = *src.accumulator;
+    src_rows.ne[1] = row_count;
+    memcpy(src_rows.nb, src.accumulator->nb, sizeof(src_rows.nb));
+    ggml_backend_tensor_get(&src_rows, rows.data(), 0, rows.size());
+
+    for (int32_t i = 0; i < row_count; ++i) {
+        GGML_ASSERT(row_ids[(size_t) i] >= 0 && row_ids[(size_t) i] < param->ne[1]);
+        ggml_backend_tensor_set(dst.accumulator,
+            rows.data() + (size_t) i * row_bytes,
+            (size_t) row_ids[(size_t) i] * row_bytes,
+            row_bytes);
+    }
+}
+
+static ggml_opt_context::qat_grad_state & ggml_opt_qat_select_grad_state(
+        ggml_opt_context_t opt_ctx,
+        size_t index,
+        ggml_opt_context::qat_grad_state_kind kind,
+        int64_t required_capacity,
+        int64_t input_capacity) {
+    auto & state = opt_ctx->qat_grad_states[index];
+    if (state.kind == kind && state.capacity >= required_capacity && state.input_capacity >= input_capacity) {
+        return state;
+    }
+    GGML_ASSERT(state.kind == ggml_opt_context::qat_grad_state_kind::unclassified ||
+        state.kind == kind ||
+        (state.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows &&
+         kind == ggml_opt_context::qat_grad_state_kind::dense));
+    GGML_ASSERT(required_capacity > 0);
+    const int64_t capacity = state.buffer
+        ? std::min<int64_t>(opt_ctx->qat_params[index]->ne[1], std::max(required_capacity, 2 * state.capacity))
+        : required_capacity;
+    const int64_t input = state.buffer ? std::max(input_capacity, 2 * state.input_capacity) : input_capacity;
+    if (state.buffer) {
+        ggml_backend_sched_synchronize(opt_ctx->backend_sched);
+    }
+    auto replacement = ggml_opt_qat_make_grad_state(opt_ctx->qat_params[index], kind, capacity, input);
+    if (state.buffer) {
+        if (state.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows &&
+            kind == ggml_opt_context::qat_grad_state_kind::dense) {
+            ggml_opt_qat_copy_sparse_to_dense(state, replacement, opt_ctx->qat_params[index]);
+        } else {
+            ggml_opt_qat_copy_grad_state(state, replacement);
+        }
+        ggml_opt_qat_free_grad_state(state);
+    }
+    state = replacement;
+    opt_ctx->qat_grad_accumulator[index] = state.accumulator;
+    GGML_LOG_INFO("QLion QAT: gradient state %s %s capacity=%" PRId64 " input=%" PRId64 " bytes=%zu\n",
+        opt_ctx->qat_params[index]->name,
+        kind == ggml_opt_context::qat_grad_state_kind::sparse_rows ? "sparse_rows" : "dense",
+        state.capacity, state.input_capacity,
+        ggml_backend_buffer_get_size(state.buffer));
+    return state;
+}
+
 void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor * param) {
     GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT);
     GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q4_0));
@@ -291,7 +469,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                 //
                 // Create replacement state metadata.
                 //
-                const size_t n_state_tensors = opt_ctx->opt_period > 1 ? 3 : 2;
+                const size_t n_state_tensors = 2;
                 struct ggml_init_params state_params = {
                     /* .mem_size   = */
                         n_state_tensors * ggml_tensor_overhead(),
@@ -326,10 +504,6 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                         param->ne
                     );
 
-                struct ggml_tensor * new_grad_accumulator = opt_ctx->opt_period > 1
-                    ? ggml_new_tensor(new_state_ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne)
-                    : nullptr;
-
                 ggml_format_name(
                     new_momentum,
                     "QLion Q8_0 momentum for %s",
@@ -341,10 +515,6 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                     "QLion Q4_0 residual for %s",
                     param->name
                 );
-
-                if (new_grad_accumulator) {
-                    ggml_format_name(new_grad_accumulator, "QLion Q8_0 gradient accumulator for %s", param->name);
-                }
 
                 ggml_backend_buffer_t new_state_buffer =
                     ggml_backend_alloc_ctx_tensors_from_buft(
@@ -373,8 +543,14 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                     new_residual
                 );
 
-                if (new_grad_accumulator) {
-                    ggml_backend_tensor_copy(opt_ctx->qat_grad_accumulator[i], new_grad_accumulator);
+                if (opt_ctx->qat_grad_states[i].buffer) {
+                    ggml_backend_sched_synchronize(opt_ctx->backend_sched);
+                    const auto & old_state = opt_ctx->qat_grad_states[i];
+                    auto new_state = ggml_opt_qat_make_grad_state(param, old_state.kind, old_state.capacity, old_state.input_capacity);
+                    ggml_opt_qat_copy_grad_state(old_state, new_state);
+                    ggml_opt_qat_free_grad_state(opt_ctx->qat_grad_states[i]);
+                    opt_ctx->qat_grad_states[i] = new_state;
+                    opt_ctx->qat_grad_accumulator[i] = new_state.accumulator;
                 }
 
                 GGML_LOG_INFO(
@@ -416,9 +592,6 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
 
                 opt_ctx->qat_residual[i] =
                     new_residual;
-
-                opt_ctx->qat_grad_accumulator[i] =
-                    new_grad_accumulator;
 
                 opt_ctx->qat_buffers[i] =
                     new_state_buffer;
@@ -467,7 +640,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
     ggml_backend_buffer_type_t param_buft = param->buffer
         ? ggml_backend_buffer_get_type(param->buffer)
         : ggml_backend_cpu_buffer_type();
-    const size_t n_state_tensors = opt_ctx->opt_period > 1 ? 3 : 2;
+    const size_t n_state_tensors = 2;
     struct ggml_init_params state_params = {
         /*.mem_size   =*/ n_state_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -476,21 +649,16 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
     struct ggml_context * state_ctx = ggml_init(state_params);
     struct ggml_tensor * momentum = ggml_new_tensor(state_ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne);
     struct ggml_tensor * residual = ggml_new_tensor(state_ctx, GGML_TYPE_Q4_0, GGML_MAX_DIMS, param->ne);
-    struct ggml_tensor * grad_accumulator = opt_ctx->opt_period > 1
-        ? ggml_new_tensor(state_ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne)
-        : nullptr;
     ggml_format_name(momentum, "QLion Q8_0 momentum for %s", param->name);
     ggml_format_name(residual, "QLion Q4_0 residual for %s", param->name);
-    if (grad_accumulator) {
-        ggml_format_name(grad_accumulator, "QLion Q8_0 gradient accumulator for %s", param->name);
-    }
     ggml_backend_buffer_t state_buffer = ggml_backend_alloc_ctx_tensors_from_buft(state_ctx, param_buft);
     GGML_ASSERT(state_buffer);
     ggml_backend_buffer_clear(state_buffer, 0);
     opt_ctx->qat_params.push_back(param);
     opt_ctx->qat_momentum.push_back(momentum);
     opt_ctx->qat_residual.push_back(residual);
-    opt_ctx->qat_grad_accumulator.push_back(grad_accumulator);
+    opt_ctx->qat_grad_accumulator.push_back(nullptr);
+    opt_ctx->qat_grad_states.emplace_back();
     opt_ctx->qat_aliases.push_back({ param });
     opt_ctx->qat_buffers.push_back(state_buffer);
     opt_ctx->qat_contexts.push_back(state_ctx);
@@ -1573,9 +1741,11 @@ if (!dumped_qat_placement &&
             )) {
 
             if (opt_ctx->opt_period > 1) {
+                auto & state = ggml_opt_qat_select_grad_state(opt_ctx, i,
+                    ggml_opt_context::qat_grad_state_kind::dense, ggml_nrows(canonical_param), 0);
                 ggml_tensor * accumulated = ggml_acc_qlion_qat_tied(
                     ctx,
-                    opt_ctx->qat_grad_accumulator[i],
+                    state.accumulator,
                     out_prod->src[0],
                     out_prod->src[1],
                     rows_back->src[0],
@@ -1616,6 +1786,39 @@ if (!dumped_qat_placement &&
 
     if (!step) {
 
+        ggml_tensor * rows_back = pending.size() == 1 && pending[0]->op == GGML_OP_GET_ROWS_BACK
+            ? pending[0] : nullptr;
+        const bool pure_rows = rows_back && rows_back->src[0] && rows_back->src[1] &&
+            rows_back->src[0]->type == GGML_TYPE_F32 && rows_back->src[1]->type == GGML_TYPE_I32 &&
+            rows_back->src[0]->ne[0] == canonical_param->ne[0] &&
+            ggml_nrows(rows_back->src[0]) == ggml_nelements(rows_back->src[1]) &&
+            canonical_param->ne[2] == 1 && canonical_param->ne[3] == 1 &&
+            ggml_is_contiguous(rows_back->src[0]) && ggml_is_contiguous(rows_back->src[1]) &&
+            ggml_opt_qat_supports_sparse_rows(canonical_param);
+
+        if (opt_ctx->opt_period > 1 && pure_rows) {
+            const int64_t n_input = ggml_nelements(rows_back->src[1]);
+            const int64_t capacity = std::max<int64_t>(1, std::min<int64_t>(canonical_param->ne[1],
+                (int64_t) opt_ctx->opt_period * n_input));
+            auto & state = ggml_opt_qat_select_grad_state(opt_ctx, i,
+                ggml_opt_context::qat_grad_state_kind::sparse_rows, capacity, n_input);
+            ggml_tensor * accumulated = ggml_acc_qlion_qat_rows(ctx,
+                state.accumulator, state.row_ids, state.row_hash, state.row_count,
+                state.micro_slots, state.micro_next, rows_back->src[0], rows_back->src[1],
+                opt_ctx->opt_i == 0, state.rehash);
+            ggml_format_name(accumulated, "QLion sparse Q8_0 gradient accumulation for %s", canonical_param->name);
+            if (opt_ctx->build_type != GGML_OPT_BUILD_TYPE_OPT) {
+                return accumulated;
+            }
+            step = ggml_opt_step_qlion_qat_sparse_rows(ctx, canonical_param, accumulated,
+                state.row_ids, state.row_count, opt_ctx->qat_momentum[i],
+                opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
+        }
+
+    }
+
+    if (!step) {
+
         ggml_tensor * combined =
             pending[0];
 
@@ -1633,9 +1836,11 @@ if (!dumped_qat_placement &&
         }
 
         if (opt_ctx->opt_period > 1) {
+            auto & state = ggml_opt_qat_select_grad_state(opt_ctx, i,
+                ggml_opt_context::qat_grad_state_kind::dense, ggml_nrows(canonical_param), 0);
             ggml_tensor * accumulated = ggml_acc_qlion_qat(
                 ctx,
-                opt_ctx->qat_grad_accumulator[i],
+                state.accumulator,
                 combined,
                 opt_ctx->opt_i == 0);
 
@@ -2676,6 +2881,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->inputs           = params.inputs;
     result->outputs          = params.outputs;
     result->opt_period                = params.opt_period;
+    result->configured_opt_period     = params.opt_period;
     result->grad_checkpoint_interval  = params.grad_checkpoint_interval;
     result->activation_recompute      = params.activation_recompute || params.grad_checkpoint_interval > 0;
     result->get_opt_pars              = params.get_opt_pars;
@@ -2729,6 +2935,9 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     for (struct ggml_context * ctx : opt_ctx->qat_contexts) {
         ggml_free(ctx);
     }
+    for (auto & state : opt_ctx->qat_grad_states) {
+        ggml_opt_qat_free_grad_state(state);
+    }
     ggml_free(opt_ctx->ctx_static);
     ggml_free(opt_ctx->ctx_cpu);
     ggml_free(opt_ctx->ctx_copy);
@@ -2762,7 +2971,15 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
         for (ggml_backend_buffer_t buf : opt_ctx->qat_buffers) {
             ggml_backend_buffer_clear(buf, 0);
         }
+        for (auto & state : opt_ctx->qat_grad_states) {
+            if (state.buffer) {
+                ggml_backend_buffer_clear(state.buffer, 0);
+                state.rehash = false;
+            }
+        }
         opt_ctx->iter = 1;
+        opt_ctx->opt_i = 0;
+        opt_ctx->opt_period = opt_ctx->configured_opt_period;
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
@@ -3008,6 +3225,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
     const bool do_optimizer_step = opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT;
+    const int32_t effective_period = opt_ctx->opt_period;
     if (do_optimizer_step) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
 
@@ -3069,12 +3287,18 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    for (auto & state : opt_ctx->qat_grad_states) {
+        state.rehash = false;
+    }
     if (do_optimizer_step && ggml_opt_optimizer_state_type(opt_ctx->optimizer) != GGML_TYPE_COUNT) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
         ggml_opt_step_adamw_quantized(opt_ctx, opt_pars);
     }
     opt_ctx->iter += do_optimizer_step;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+    if (do_optimizer_step) {
+        opt_ctx->opt_period = opt_ctx->configured_opt_period;
+    }
 
     if (!opt_ctx->static_graphs) {
         opt_ctx->gf                   = nullptr;
@@ -3092,10 +3316,10 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
 
     if (result->ndata == 0) {
         result->loss_per_datapoint = opt_ctx->loss_per_datapoint;
-        result->opt_period         = opt_ctx->opt_period;
+        result->opt_period         = opt_ctx->configured_opt_period;
     } else {
         GGML_ASSERT(result->loss_per_datapoint == opt_ctx->loss_per_datapoint);
-        GGML_ASSERT(result->opt_period         == opt_ctx->opt_period);
+        GGML_ASSERT(result->opt_period         == opt_ctx->configured_opt_period);
     }
 
     const int64_t ndata = opt_ctx->outputs->ne[1];
@@ -3105,6 +3329,9 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
     float loss;
     ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
+    if (opt_ctx->loss_per_datapoint) {
+        loss *= (float) effective_period / opt_ctx->configured_opt_period;
+    }
     result->loss.push_back(loss);
 
     if (opt_ctx->pred) {
@@ -3449,6 +3676,13 @@ struct ggml_tensor * ggml_opt_qat_state_residual(ggml_opt_context_t opt_ctx, int
 struct ggml_tensor * ggml_opt_qat_state_gradient_accumulator(ggml_opt_context_t opt_ctx, int64_t index) {
     GGML_ASSERT(index >= 0 && index < (int64_t) opt_ctx->qat_grad_accumulator.size());
     return opt_ctx->qat_grad_accumulator[index];
+}
+
+void ggml_opt_set_current_period(ggml_opt_context_t opt_ctx, int32_t period) {
+    GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT);
+    GGML_ASSERT(!opt_ctx->static_graphs && !opt_ctx->eval_ready && opt_ctx->opt_i == 0);
+    GGML_ASSERT(period >= 1 && period <= opt_ctx->configured_opt_period);
+    opt_ctx->opt_period = period;
 }
 
 int64_t ggml_opt_step(ggml_opt_context_t opt_ctx) {

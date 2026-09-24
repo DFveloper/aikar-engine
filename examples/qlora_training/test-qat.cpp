@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-opt.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -512,6 +513,296 @@ static std::vector<uint8_t> quantize_rows(enum ggml_type type, const std::vector
     return result;
 }
 
+static void sparse_reference_accumulate(
+        std::vector<uint8_t> & accumulator,
+        std::vector<int32_t> & active_ids,
+        const std::vector<float> & grad,
+        const std::vector<int32_t> & ids,
+        int64_t cols,
+        int64_t capacity,
+        bool reset) {
+    const ggml_type_traits * traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, cols);
+    if (reset) {
+        std::fill(accumulator.begin(), accumulator.end(), 0);
+        active_ids.clear();
+    }
+    for (size_t index = 0; index < ids.size(); ++index) {
+        if (std::find(active_ids.begin(), active_ids.end(), ids[index]) != active_ids.end()) {
+            continue;
+        }
+        check(active_ids.size() < (size_t) capacity, "sparse reference capacity exhausted");
+        active_ids.push_back(ids[index]);
+    }
+    for (size_t slot = 0; slot < active_ids.size(); ++slot) {
+        std::vector<float> values(cols, 0.0f);
+        if (!reset || slot < active_ids.size()) {
+            traits->to_float(accumulator.data() + slot * row_bytes, values.data(), cols);
+        }
+        bool touched = false;
+        for (size_t index = 0; index < ids.size(); ++index) {
+            if (ids[index] != active_ids[slot]) {
+                continue;
+            }
+            touched = true;
+            for (int64_t col = 0; col < cols; ++col) {
+                values[col] += grad[col + cols * index];
+            }
+        }
+        if (touched) {
+            traits->from_float_ref(values.data(), accumulator.data() + slot * row_bytes, cols);
+        }
+    }
+}
+
+static void test_native_sparse_rows_accumulation(
+        enum qat_weight_format format,
+        ggml_backend_dev_t device,
+        bool required) {
+    constexpr int64_t cols = 64;
+    constexpr int64_t rows = 7;
+    constexpr int64_t capacity = 8;
+    constexpr int64_t hash_capacity = 16;
+    const enum ggml_type weight_type = qat_weight_ggml_type(format);
+    const std::vector<int32_t> ids_a = { 1, 3, 1 };
+    const std::vector<int32_t> ids_b = { 3, 4 };
+    const std::vector<int32_t> ids_c = { 1, 5 };
+    const std::vector<int32_t> ids_d = { 2 };
+    const std::vector<int32_t> ids_e = { 0, 1, 0 };
+    auto make_grad = [cols](size_t count, float phase) {
+        std::vector<float> result(cols * count);
+        for (size_t i = 0; i < result.size(); ++i) {
+            result[i] = 0.04f * std::sin(0.07f * (float) i + phase);
+        }
+        return result;
+    };
+    const std::vector<float> grad_a = make_grad(ids_a.size(), 0.1f);
+    const std::vector<float> grad_b = make_grad(ids_b.size(), 0.4f);
+    const std::vector<float> grad_c = make_grad(ids_c.size(), 0.7f);
+    const std::vector<float> grad_d = make_grad(ids_d.size(), 1.0f);
+    const std::vector<float> grad_e = make_grad(ids_e.size(), 1.3f);
+    std::vector<float> initial_values(cols * rows);
+    for (size_t i = 0; i < initial_values.size(); ++i) {
+        initial_values[i] = 0.25f + 0.06f * std::cos(0.05f * (float) i);
+    }
+    const std::vector<uint8_t> initial_weight = quantize_rows(weight_type, initial_values, cols);
+    const size_t weight_row_bytes = ggml_row_size(weight_type, cols);
+    const size_t momentum_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, cols);
+    const size_t residual_row_bytes = ggml_row_size(GGML_TYPE_Q4_0, cols);
+    std::vector<uint8_t> expected_accumulator(capacity * momentum_row_bytes, 0);
+    std::vector<int32_t> expected_ids;
+    sparse_reference_accumulate(expected_accumulator, expected_ids, grad_a, ids_a, cols, capacity, true);
+    sparse_reference_accumulate(expected_accumulator, expected_ids, grad_b, ids_b, cols, capacity, false);
+    sparse_reference_accumulate(expected_accumulator, expected_ids, grad_c, ids_c, cols, capacity, false);
+    check(expected_ids == std::vector<int32_t>({ 1, 3, 4, 5 }), "sparse reference row order changed");
+
+    std::vector<float> full_gradient(cols * rows, 0.0f);
+    const ggml_type_traits * q8_traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    for (size_t slot = 0; slot < expected_ids.size(); ++slot) {
+        q8_traits->to_float(expected_accumulator.data() + slot * momentum_row_bytes,
+            full_gradient.data() + expected_ids[slot] * cols, cols);
+    }
+    qat_tensor_state reference;
+    std::string error;
+    check(qat_tensor_state_init_quantized(reference, format, initial_weight.data(), initial_weight.size(), initial_values.size(), error), error.c_str());
+    qat_qlion_params params;
+    params.learning_rate = 0.006f;
+    params.beta = 0.75f;
+    params.weight_decay = 0.0f;
+    params.gradient_clip = 0.04f;
+    qat_step_stats stats;
+    check(qat_tensor_state_step(reference, full_gradient.data(), params, stats, error), error.c_str());
+    std::vector<float> unquantized_gradient(cols * rows, 0.0f);
+    auto add_microbatch = [&](const std::vector<float> & grad, const std::vector<int32_t> & ids) {
+        for (size_t index = 0; index < ids.size(); ++index) {
+            for (int64_t col = 0; col < cols; ++col) {
+                unquantized_gradient[ids[index] * cols + col] += grad[index * cols + col];
+            }
+        }
+    };
+    add_microbatch(grad_a, ids_a);
+    add_microbatch(grad_b, ids_b);
+    add_microbatch(grad_c, ids_c);
+    qat_tensor_state nonaccumulated;
+    check(qat_tensor_state_init_quantized(nonaccumulated, format, initial_weight.data(), initial_weight.size(), initial_values.size(), error), error.c_str());
+    check(qat_tensor_state_step(nonaccumulated, unquantized_gradient.data(), params, stats, error), error.c_str());
+    auto max_logical_difference = [&](ggml_type type, const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+        const ggml_type_traits * traits = ggml_get_type_traits(type);
+        const size_t row_bytes = ggml_row_size(type, cols);
+        std::vector<float> row_a(cols);
+        std::vector<float> row_b(cols);
+        float maximum = 0.0f;
+        for (int64_t row = 0; row < rows; ++row) {
+            traits->to_float(a.data() + row * row_bytes, row_a.data(), cols);
+            traits->to_float(b.data() + row * row_bytes, row_b.data(), cols);
+            for (int64_t col = 0; col < cols; ++col) {
+                maximum = std::max(maximum, std::abs(row_a[col] - row_b[col]));
+            }
+        }
+        return maximum;
+    };
+    const float weight_difference = max_logical_difference(weight_type, reference.weight, nonaccumulated.weight);
+    const float momentum_difference = max_logical_difference(GGML_TYPE_Q8_0, reference.momentum, nonaccumulated.momentum);
+    const float residual_difference = max_logical_difference(GGML_TYPE_Q4_0, reference.residual, nonaccumulated.residual);
+    printf("QLion sparse effective-batch comparison %s: weight=%g momentum=%g residual=%g\n",
+        format == QAT_WEIGHT_MXFP4 ? "mxfp4" : "q4_0", weight_difference, momentum_difference, residual_difference);
+    check(weight_difference == 0.0f && momentum_difference < 1.0e-4f && residual_difference < 6.5e-3f,
+        "sparse accumulation differs excessively from the non-accumulated effective batch");
+    std::vector<uint8_t> expected_momentum(reference.momentum.size(), 0);
+    std::vector<uint8_t> expected_residual(reference.residual.size(), 0);
+    for (int32_t row : expected_ids) {
+        memcpy(expected_momentum.data() + row * momentum_row_bytes,
+            reference.momentum.data() + row * momentum_row_bytes, momentum_row_bytes);
+        memcpy(expected_residual.data() + row * residual_row_bytes,
+            reference.residual.data() + row * residual_row_bytes, residual_row_bytes);
+    }
+
+    ggml_backend_t backend = device ? ggml_backend_dev_init(device, nullptr) : nullptr;
+    if (!backend && !required) {
+        return;
+    }
+    check(backend != nullptr, "failed to create sparse accumulation backend");
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ 48 * ggml_tensor_overhead() + 3 * ggml_graph_overhead_custom(24, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, cols, rows);
+    ggml_set_param(weight);
+    ggml_tensor * accumulator = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, cols, capacity);
+    ggml_tensor * state_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, capacity);
+    ggml_tensor * state_hash = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, hash_capacity);
+    ggml_tensor * state_count = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * micro_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, capacity + 3);
+    ggml_tensor * micro_next = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+    ggml_tensor * tensor_grad_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, ids_a.size());
+    ggml_tensor * tensor_ids_a = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ids_a.size());
+    ggml_tensor * tensor_grad_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, ids_b.size());
+    ggml_tensor * tensor_ids_b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ids_b.size());
+    ggml_tensor * tensor_grad_c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, ids_c.size());
+    ggml_tensor * tensor_ids_c = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ids_c.size());
+    ggml_tensor * tensor_grad_d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, ids_d.size());
+    ggml_tensor * tensor_ids_d = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ids_d.size());
+    ggml_tensor * tensor_grad_e = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, ids_e.size());
+    ggml_tensor * tensor_ids_e = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ids_e.size());
+    ggml_tensor * tensor_grad_empty = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, 0);
+    ggml_tensor * tensor_ids_empty = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 0);
+    ggml_tensor * momentum = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, cols, rows);
+    ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, cols, rows);
+    ggml_tensor * opt_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
+    ggml_tensor * acc_a = ggml_acc_qlion_qat_rows(ctx, accumulator, state_ids, state_hash, state_count,
+        micro_slots, micro_next, tensor_grad_a, tensor_ids_a, true, false);
+    ggml_tensor * acc_b = ggml_acc_qlion_qat_rows(ctx, acc_a, state_ids, state_hash, state_count,
+        micro_slots, micro_next, tensor_grad_b, tensor_ids_b, false, false);
+    ggml_tensor * acc_c = ggml_acc_qlion_qat_rows(ctx, acc_b, state_ids, state_hash, state_count,
+        micro_slots, micro_next, tensor_grad_c, tensor_ids_c, false, false);
+    ggml_tensor * result = ggml_opt_step_qlion_qat_sparse_rows(ctx, weight, acc_c, state_ids, state_count,
+        momentum, residual, opt_params);
+    ggml_tensor * acc_d = ggml_acc_qlion_qat_rows(ctx, accumulator, state_ids, state_hash, state_count,
+        micro_slots, micro_next, tensor_grad_d, tensor_ids_d, true, false);
+    ggml_tensor * result_d = ggml_opt_step_qlion_qat_sparse_rows(ctx, weight, acc_d, state_ids, state_count,
+        momentum, residual, opt_params);
+    ggml_tensor * acc_e = ggml_acc_qlion_qat_rows(ctx, accumulator, state_ids, state_hash, state_count,
+        micro_slots, micro_next, tensor_grad_e, tensor_ids_e, true, false);
+    ggml_tensor * acc_empty = ggml_acc_qlion_qat_rows(ctx, accumulator, state_ids, state_hash, state_count,
+        micro_slots, micro_next, tensor_grad_empty, tensor_ids_empty, true, false);
+    ggml_tensor * result_empty = ggml_opt_step_qlion_qat_sparse_rows(ctx, weight, acc_empty, state_ids, state_count,
+        momentum, residual, opt_params);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 24, false);
+    ggml_build_forward_expand(graph, result);
+    ggml_cgraph * graph_d = ggml_new_graph_custom(ctx, 24, false);
+    ggml_build_forward_expand(graph_d, result_d);
+    ggml_cgraph * graph_e = ggml_new_graph_custom(ctx, 24, false);
+    ggml_build_forward_expand(graph_e, acc_e);
+    ggml_cgraph * graph_empty = ggml_new_graph_custom(ctx, 24, false);
+    ggml_build_forward_expand(graph_empty, result_empty);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "failed to allocate sparse accumulation tensors");
+
+    const float native_params[] = { params.learning_rate, params.beta, params.weight_decay, params.gradient_clip, 0.0f };
+    std::vector<uint8_t> accumulator_zero(ggml_nbytes(accumulator), 0);
+    std::vector<int32_t> ids_empty(capacity, -1);
+    std::vector<int32_t> hash_empty(hash_capacity, -1);
+    std::vector<uint8_t> momentum_zero(ggml_nbytes(momentum), 0);
+    std::vector<uint8_t> residual_zero(ggml_nbytes(residual), 0);
+    ggml_backend_tensor_set(weight, initial_weight.data(), 0, initial_weight.size());
+    ggml_backend_tensor_set(accumulator, accumulator_zero.data(), 0, accumulator_zero.size());
+    ggml_backend_tensor_set(state_ids, ids_empty.data(), 0, ids_empty.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(state_hash, hash_empty.data(), 0, hash_empty.size() * sizeof(int32_t));
+    const int32_t count_zero = 0;
+    ggml_backend_tensor_set(state_count, &count_zero, 0, sizeof(count_zero));
+    ggml_backend_tensor_set(tensor_grad_a, grad_a.data(), 0, grad_a.size() * sizeof(float));
+    ggml_backend_tensor_set(tensor_ids_a, ids_a.data(), 0, ids_a.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(tensor_grad_b, grad_b.data(), 0, grad_b.size() * sizeof(float));
+    ggml_backend_tensor_set(tensor_ids_b, ids_b.data(), 0, ids_b.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(tensor_grad_c, grad_c.data(), 0, grad_c.size() * sizeof(float));
+    ggml_backend_tensor_set(tensor_ids_c, ids_c.data(), 0, ids_c.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(tensor_grad_d, grad_d.data(), 0, grad_d.size() * sizeof(float));
+    ggml_backend_tensor_set(tensor_ids_d, ids_d.data(), 0, ids_d.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(tensor_grad_e, grad_e.data(), 0, grad_e.size() * sizeof(float));
+    ggml_backend_tensor_set(tensor_ids_e, ids_e.data(), 0, ids_e.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(momentum, momentum_zero.data(), 0, momentum_zero.size());
+    ggml_backend_tensor_set(residual, residual_zero.data(), 0, residual_zero.size());
+    ggml_backend_tensor_set(opt_params, native_params, 0, sizeof(native_params));
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "sparse accumulation step failed");
+
+    std::vector<uint8_t> accumulator_after(expected_accumulator.size());
+    std::vector<int32_t> ids_after(capacity);
+    int32_t count_after = 0;
+    std::vector<uint8_t> weight_after(initial_weight.size());
+    std::vector<uint8_t> momentum_after(ggml_nbytes(momentum));
+    std::vector<uint8_t> residual_after(ggml_nbytes(residual));
+    ggml_backend_tensor_get(accumulator, accumulator_after.data(), 0, accumulator_after.size());
+    ggml_backend_tensor_get(state_ids, ids_after.data(), 0, ids_after.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(state_count, &count_after, 0, sizeof(count_after));
+    ggml_backend_tensor_get(weight, weight_after.data(), 0, weight_after.size());
+    ggml_backend_tensor_get(momentum, momentum_after.data(), 0, momentum_after.size());
+    ggml_backend_tensor_get(residual, residual_after.data(), 0, residual_after.size());
+    check(accumulator_after == expected_accumulator, "sparse Q8 accumulator differs from reference");
+    check(count_after == 4, "sparse accumulator active row count is incorrect");
+    check(std::equal(expected_ids.begin(), expected_ids.end(), ids_after.begin()), "sparse accumulator row order changed");
+    check(weight_after == reference.weight, "sparse accumulated weight differs from dense Q8 reference");
+    check(momentum_after == expected_momentum, "sparse accumulated momentum differs from dense Q8 reference");
+    check(residual_after == expected_residual, "sparse accumulated residual differs from dense Q8 reference");
+
+    const std::vector<uint8_t> weight_before_d = weight_after;
+    const std::vector<uint8_t> momentum_before_d = momentum_after;
+    const std::vector<uint8_t> residual_before_d = residual_after;
+    check(ggml_backend_graph_compute(backend, graph_d) == GGML_STATUS_SUCCESS, "sparse accumulator reset step failed");
+    ggml_backend_tensor_get(state_count, &count_after, 0, sizeof(count_after));
+    ggml_backend_tensor_get(state_ids, ids_after.data(), 0, ids_after.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(weight, weight_after.data(), 0, weight_after.size());
+    ggml_backend_tensor_get(momentum, momentum_after.data(), 0, momentum_after.size());
+    ggml_backend_tensor_get(residual, residual_after.data(), 0, residual_after.size());
+    check(count_after == 1 && ids_after[0] == 2, "sparse accumulator reset kept stale rows");
+    for (int64_t row = 0; row < rows; ++row) {
+        if (row == 2) {
+            continue;
+        }
+        check(memcmp(weight_after.data() + row * weight_row_bytes,
+            weight_before_d.data() + row * weight_row_bytes, weight_row_bytes) == 0, "reset period changed an untouched weight row");
+        check(memcmp(momentum_after.data() + row * momentum_row_bytes,
+            momentum_before_d.data() + row * momentum_row_bytes, momentum_row_bytes) == 0, "reset period changed an untouched momentum row");
+        check(memcmp(residual_after.data() + row * residual_row_bytes,
+            residual_before_d.data() + row * residual_row_bytes, residual_row_bytes) == 0, "reset period changed an untouched residual row");
+    }
+
+    check(ggml_backend_graph_compute(backend, graph_e) == GGML_STATUS_SUCCESS, "sparse row-zero accumulation failed");
+    ggml_backend_tensor_get(state_count, &count_after, 0, sizeof(count_after));
+    ggml_backend_tensor_get(state_ids, ids_after.data(), 0, ids_after.size() * sizeof(int32_t));
+    check(count_after == 2, "duplicate sparse row created multiple slots");
+    check(ids_after[0] == 0 && ids_after[1] == 1, "row zero or collision changed deterministic row order");
+
+    check(ggml_backend_graph_compute(backend, graph_empty) == GGML_STATUS_SUCCESS, "empty sparse period failed");
+    ggml_backend_tensor_get(state_count, &count_after, 0, sizeof(count_after));
+    check(count_after == 0, "empty sparse period retained stale rows");
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t device, bool required) {
     constexpr int64_t cols = 32;
     constexpr int64_t rows = 7;
@@ -948,6 +1239,192 @@ static void test_embedding_sparse_qat(enum qat_weight_format format) {
     ggml_backend_free(backend);
 }
 
+struct qlion_accumulation_trace {
+    bool sparse = false;
+    bool dense = false;
+    bool full_f32 = false;
+};
+
+static bool trace_qlion_accumulation(ggml_tensor * tensor, bool ask, void * userdata) {
+    GGML_UNUSED(ask);
+    qlion_accumulation_trace & trace = *(qlion_accumulation_trace *) userdata;
+    trace.sparse = trace.sparse || tensor->op == GGML_OP_ACC_QLION_QAT_ROWS;
+    trace.dense = trace.dense || tensor->op == GGML_OP_ACC_QLION_QAT;
+    trace.full_f32 = trace.full_f32 ||
+        (tensor->type == GGML_TYPE_F32 && tensor->ne[0] == 64 && tensor->ne[1] == 64);
+    return false;
+}
+
+static void test_qlion_lazy_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device) {
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    check(backend != nullptr, "failed to create lazy-state backend");
+    ggml_backend_t cpu_backend = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr :
+        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backends[] = { backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, cpu_backend ? 2 : 1,
+        GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_init_params static_params = { 4 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx_static, qat_weight_ggml_type(format), 64, 64);
+    ggml_set_name(weight, "rows.weight");
+    ggml_set_param(weight);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, 3);
+    ggml_tensor * ids_large = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, 5);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    std::vector<float> values(64 * 64, 0.25f);
+    const std::vector<uint8_t> initial = quantize_rows(qat_weight_ggml_type(format), values, 64);
+    const int32_t row_ids[] = { 1, 3, 1 };
+    const int32_t large_row_ids[] = { 1, 5, 6, 2, 1 };
+    ggml_backend_tensor_set(weight, initial.data(), 0, initial.size());
+    ggml_backend_tensor_set(ids, row_ids, 0, sizeof(row_ids));
+    ggml_backend_tensor_set(ids_large, large_row_ids, 0, sizeof(large_row_ids));
+
+    ggml_opt_params opt_params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
+    opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    opt_params.opt_period = 4;
+    opt_params.get_opt_pars = test_qlion_optimizer_params;
+    ggml_opt_context_t opt = ggml_opt_init(opt_params);
+    ggml_opt_qat_register_param(opt, weight);
+    ggml_opt_set_current_period(opt, 2);
+    ggml_opt_result_t opt_result = ggml_opt_result_init();
+    check(ggml_opt_qat_state_gradient_accumulator(opt, 0) == nullptr,
+        "QLion allocated gradient state before graph classification");
+
+    ggml_init_params compute_params = {
+        GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 3 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+        nullptr,
+        true,
+    };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+    ggml_tensor * output = ggml_get_rows(ctx_compute, weight, ids);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(graph, output);
+    ggml_opt_prepare_alloc(opt, ctx_compute, graph, ids, output);
+    ggml_opt_alloc(opt, true);
+    ggml_tensor * gradient_state = ggml_opt_qat_state_gradient_accumulator(opt, 0);
+    check(gradient_state != nullptr, "QLion did not select gradient state from the graph");
+    check(gradient_state->type == GGML_TYPE_Q8_0 && gradient_state->ne[1] == 6,
+        "pure GET_ROWS_BACK gradient did not select compact Q8 row state");
+    std::vector<float> labels_zero(ggml_nelements(ggml_opt_labels(opt)), 0.0f);
+    ggml_backend_tensor_set(ggml_opt_labels(opt), labels_zero.data(), 0, labels_zero.size() * sizeof(float));
+    qlion_accumulation_trace trace;
+    ggml_backend_sched_set_eval_callback(sched, trace_qlion_accumulation, &trace);
+    ggml_opt_eval(opt, opt_result);
+    check(trace.sparse && !trace.dense && !trace.full_f32,
+        "pure GET_ROWS_BACK created a full F32 gradient or selected dense Q8 accumulation");
+
+    ggml_context * ctx_compute_large = ggml_init(compute_params);
+    ggml_tensor * output_large = ggml_get_rows(ctx_compute_large, weight, ids_large);
+    ggml_cgraph * graph_large = ggml_new_graph_custom(ctx_compute_large, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(graph_large, output_large);
+    ggml_opt_prepare_alloc(opt, ctx_compute_large, graph_large, ids_large, output_large);
+    ggml_opt_alloc(opt, true);
+    gradient_state = ggml_opt_qat_state_gradient_accumulator(opt, 0);
+    check(gradient_state->type == GGML_TYPE_Q8_0 && gradient_state->ne[1] >= 10 && gradient_state->ne[1] < weight->ne[1],
+        "sparse gradient state failed to grow with larger microbatch");
+    labels_zero.assign(ggml_nelements(ggml_opt_labels(opt)), 0.0f);
+    ggml_backend_tensor_set(ggml_opt_labels(opt), labels_zero.data(), 0, labels_zero.size() * sizeof(float));
+    ggml_opt_eval(opt, opt_result);
+    check(ggml_opt_step(opt) == 1, "short QLion accumulation period did not produce one optimizer step");
+    double loss = 0.0;
+    ggml_opt_result_loss(opt_result, &loss, nullptr);
+    check(std::abs(loss - 0.0625) < 1.0e-5, "short QLion accumulation period changed reported loss scaling");
+
+    std::vector<uint8_t> weight_after(initial.size());
+    ggml_backend_tensor_get(weight, weight_after.data(), 0, weight_after.size());
+    check(weight_after != initial, "sparse gradient growth lost the optimizer update");
+    ggml_tensor * momentum_state = ggml_opt_qat_state_momentum(opt, 0);
+    const size_t momentum_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, 64);
+    std::vector<uint8_t> first_row_momentum(momentum_row_bytes);
+    ggml_backend_tensor_get(momentum_state, first_row_momentum.data(), 3 * momentum_row_bytes, momentum_row_bytes);
+    check(std::any_of(first_row_momentum.begin(), first_row_momentum.end(), [](uint8_t byte) { return byte != 0; }),
+        "sparse gradient growth lost a row from the first microbatch");
+
+    ggml_opt_free(opt);
+    ggml_opt_result_free(opt_result);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx_static);
+    ggml_free(ctx_compute);
+    ggml_free(ctx_compute_large);
+    ggml_backend_sched_free(sched);
+    if (cpu_backend) {
+        ggml_backend_free(cpu_backend);
+    }
+    ggml_backend_free(backend);
+}
+
+static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device) {
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr :
+        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backends[] = { backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, cpu_backend ? 2 : 1,
+        GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_init_params static_params = { 3 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx_static, qat_weight_ggml_type(format), 64, 64);
+    ggml_set_name(weight, "mixed.weight");
+    ggml_set_param(weight);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, 3);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 64, 3);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    const std::vector<float> weight_values(64 * 64, 0.25f);
+    const std::vector<uint8_t> weight_data = quantize_rows(qat_weight_ggml_type(format), weight_values, 64);
+    const int32_t row_ids[] = { 1, 3, 1 };
+    const std::vector<float> x_values(64 * 3, 0.1f);
+    ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size());
+    ggml_backend_tensor_set(ids, row_ids, 0, sizeof(row_ids));
+    ggml_backend_tensor_set(x, x_values.data(), 0, x_values.size() * sizeof(float));
+
+    ggml_opt_params opt_params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
+    opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    opt_params.opt_period = 2;
+    opt_params.get_opt_pars = test_qlion_optimizer_params;
+    ggml_opt_context_t opt = ggml_opt_init(opt_params);
+    ggml_opt_qat_register_param(opt, weight);
+    qlion_accumulation_trace trace;
+    ggml_backend_sched_set_eval_callback(sched, trace_qlion_accumulation, &trace);
+    std::vector<ggml_context *> compute_contexts;
+    for (int micro = 0; micro < 2; ++micro) {
+        ggml_init_params compute_params = {
+            GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 3 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+            nullptr,
+            true,
+        };
+        ggml_context * ctx_compute = ggml_init(compute_params);
+        compute_contexts.push_back(ctx_compute);
+        ggml_tensor * output = ggml_add(ctx_compute, ggml_get_rows(ctx_compute, weight, ids), ggml_mul_mat(ctx_compute, weight, x));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, output);
+        ggml_opt_prepare_alloc(opt, ctx_compute, graph, ids, output);
+        ggml_opt_alloc(opt, true);
+        ggml_tensor * gradient_state = ggml_opt_qat_state_gradient_accumulator(opt, 0);
+        check(gradient_state && gradient_state->type == GGML_TYPE_Q8_0 && ggml_are_same_shape(weight, gradient_state),
+            "mixed OUT_PROD and GET_ROWS_BACK did not select the full dense Q8 accumulator");
+        std::vector<float> labels_zero(ggml_nelements(ggml_opt_labels(opt)), 0.0f);
+        ggml_backend_tensor_set(ggml_opt_labels(opt), labels_zero.data(), 0, labels_zero.size() * sizeof(float));
+        ggml_opt_eval(opt, nullptr);
+    }
+    ggml_tensor * momentum = ggml_opt_qat_state_momentum(opt, 0);
+    std::vector<uint8_t> row_zero(ggml_row_size(GGML_TYPE_Q8_0, 64));
+    ggml_backend_tensor_get(momentum, row_zero.data(), 0, row_zero.size());
+    check(trace.dense && !trace.sparse, "mixed gradient did not use the dense Q8 accumulation operation");
+    check(std::any_of(row_zero.begin(), row_zero.end(), [](uint8_t byte) { return byte != 0; }),
+        "mixed gradient lost the dense OUT_PROD contribution to an untouched row");
+
+    ggml_opt_free(opt);
+    ggml_backend_buffer_free(buffer);
+    for (ggml_context * ctx_compute : compute_contexts) {
+        ggml_free(ctx_compute);
+    }
+    ggml_free(ctx_static);
+    ggml_backend_sched_free(sched);
+    if (cpu_backend) {
+        ggml_backend_free(cpu_backend);
+    }
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
     test_zero_gradient(QAT_WEIGHT_MXFP4);
@@ -974,6 +1451,8 @@ int main() {
     test_native_routed_update(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_rows_update(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_rows_update(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_sparse_rows_accumulation(QAT_WEIGHT_MXFP4, cpu_device, true);
+    test_native_sparse_rows_accumulation(QAT_WEIGHT_Q4_0, cpu_device, true);
     const char * backend_filter = getenv("QAT_TEST_BACKEND");
     for (size_t i = 0; backend_filter && i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t device = ggml_backend_dev_get(i);
@@ -994,6 +1473,12 @@ int main() {
         test_native_routed_update(QAT_WEIGHT_Q4_0, device, false);
         test_native_rows_update(QAT_WEIGHT_MXFP4, device, false);
         test_native_rows_update(QAT_WEIGHT_Q4_0, device, false);
+        test_native_sparse_rows_accumulation(QAT_WEIGHT_MXFP4, device, false);
+        test_native_sparse_rows_accumulation(QAT_WEIGHT_Q4_0, device, false);
+        test_qlion_lazy_gradient_state(QAT_WEIGHT_MXFP4, device);
+        test_qlion_lazy_gradient_state(QAT_WEIGHT_Q4_0, device);
+        test_qlion_mixed_gradient_state(QAT_WEIGHT_MXFP4, device);
+        test_qlion_mixed_gradient_state(QAT_WEIGHT_Q4_0, device);
     }
     test_native_optimizer_graph(QAT_WEIGHT_MXFP4);
     test_native_optimizer_graph(QAT_WEIGHT_Q4_0);
@@ -1001,6 +1486,10 @@ int main() {
     test_moe_sparse_qat(QAT_WEIGHT_Q4_0);
     test_embedding_sparse_qat(QAT_WEIGHT_MXFP4);
     test_embedding_sparse_qat(QAT_WEIGHT_Q4_0);
+    test_qlion_lazy_gradient_state(QAT_WEIGHT_MXFP4, cpu_device);
+    test_qlion_lazy_gradient_state(QAT_WEIGHT_Q4_0, cpu_device);
+    test_qlion_mixed_gradient_state(QAT_WEIGHT_MXFP4, cpu_device);
+    test_qlion_mixed_gradient_state(QAT_WEIGHT_Q4_0, cpu_device);
     printf("QAT reference tests passed\n");
     return 0;
 }

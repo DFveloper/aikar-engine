@@ -590,12 +590,20 @@ static void qat_epoch_callback(
 static void qat_print_memory(struct llama_context * lctx, const struct qat_model_info & model_info) {
     uint64_t momentum_bytes = 0;
     uint64_t residual_bytes = 0;
-    uint64_t gradient_bytes = 0;
+    uint64_t dense_gradient_bytes = 0;
+    uint64_t sparse_gradient_bytes = 0;
     for (int64_t i = 0; i < llama_opt_qat_state_count(lctx); ++i) {
         momentum_bytes += ggml_nbytes(llama_opt_qat_state_momentum(lctx, i));
         residual_bytes += ggml_nbytes(llama_opt_qat_state_residual(lctx, i));
         struct ggml_tensor * gradient = llama_opt_qat_state_gradient_accumulator(lctx, i);
-        gradient_bytes += gradient ? ggml_nbytes(gradient) : 0;
+        if (gradient) {
+            const struct ggml_tensor * param = llama_opt_qat_state_param(lctx, i);
+            if (ggml_are_same_shape(param, gradient)) {
+                dense_gradient_bytes += ggml_nbytes(gradient);
+            } else {
+                sparse_gradient_bytes += ggml_nbytes(gradient);
+            }
+        }
     }
     uint64_t context_bytes = 0;
     uint64_t compute_bytes = 0;
@@ -603,12 +611,26 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
         context_bytes += item.second.context;
         compute_bytes += item.second.compute;
     }
-    LOG_INF("qat_memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu gradient_q8_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu\n",
+    size_t device_used_bytes = 0;
+    if (llama_opt_qat_state_count(lctx) > 0) {
+        const struct ggml_tensor * param = llama_opt_qat_state_param(lctx, 0);
+        const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(param->buffer);
+        const ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+        if (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+            device_used_bytes = total_bytes - free_bytes;
+        }
+    }
+    LOG_INF("qat_memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu dense_gradient_q8_0=%llu sparse_gradient_q8_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu device_used=%zu\n",
         (unsigned long long) model_info.quantized_bytes, (unsigned long long) momentum_bytes,
-        (unsigned long long) residual_bytes, (unsigned long long) gradient_bytes,
+        (unsigned long long) residual_bytes, (unsigned long long) dense_gradient_bytes,
+        (unsigned long long) sparse_gradient_bytes,
         (unsigned long long) model_info.nonquantized_bytes,
         (unsigned long long) context_bytes, (unsigned long long) compute_bytes,
-        (unsigned long long) (model_info.quantized_bytes + momentum_bytes + residual_bytes + gradient_bytes));
+        (unsigned long long) (model_info.quantized_bytes + momentum_bytes + residual_bytes + dense_gradient_bytes + sparse_gradient_bytes),
+        device_used_bytes);
 }
 
 int main(int argc, char ** argv) {
@@ -911,6 +933,9 @@ int main(int argc, char ** argv) {
             params.mtp_mode == "only" ? mtp.ctx.get() : lctx);
         LOG_INF("qat_epoch: epoch=%d/%d loss=%.8f uncertainty=%.8f optimizer_step=%ld\n",
             params.lr.epoch + 1, params.lr.epochs, train_loss, train_unc, (long) optimizer_step);
+        if ((int64_t) params.lr.epoch == resume.epoch) {
+            qat_print_memory(lctx, model_info);
+        }
         if (idata_split < ndata) {
             double val_loss = 0.0;
             double val_accuracy = 0.0;

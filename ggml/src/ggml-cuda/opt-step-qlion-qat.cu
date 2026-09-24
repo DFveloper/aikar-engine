@@ -3,6 +3,7 @@
 #include "moe-route.cuh"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 
 static constexpr int QLION_QAT_ID_GEMM_CAP   = 256;
@@ -942,6 +943,115 @@ static __global__ void acc_qlion_qat(
     }
 }
 
+static __device__ uint32_t qlion_qat_row_hash(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value;
+}
+
+static __global__ void acc_qlion_qat_rows_index(
+        int32_t * __restrict__ state_ids,
+        int32_t * __restrict__ state_hash,
+        int32_t * __restrict__ state_count,
+        int32_t * __restrict__ micro_slots,
+        int32_t * __restrict__ micro_next,
+        const int32_t * __restrict__ ids,
+        int32_t capacity,
+        int32_t hash_capacity,
+        int32_t n_indices,
+        bool rehash) {
+    if (rehash) {
+        assert(*state_count >= 0 && *state_count <= capacity);
+        for (int32_t slot = 0; slot < *state_count; ++slot) {
+            const int32_t row = state_ids[slot];
+            assert(row >= 0);
+            uint32_t bucket = qlion_qat_row_hash((uint32_t) row) & (hash_capacity - 1);
+            while (state_hash[bucket] >= 0) {
+                bucket = (bucket + 1) & (hash_capacity - 1);
+            }
+            state_hash[bucket] = slot;
+        }
+    }
+    for (int32_t slot = 0; slot < capacity; ++slot) {
+        micro_slots[slot] = -1;
+    }
+    for (int32_t index = 0; index < n_indices; ++index) {
+        micro_next[index] = -1;
+        const int32_t row = ids[index];
+        assert(row >= 0);
+        uint32_t bucket = qlion_qat_row_hash((uint32_t) row) & (hash_capacity - 1);
+        while (state_hash[bucket] >= 0 && state_ids[state_hash[bucket]] != row) {
+            bucket = (bucket + 1) & (hash_capacity - 1);
+        }
+        int32_t slot = state_hash[bucket];
+        if (slot < 0) {
+            slot = (*state_count)++;
+            assert(slot < capacity);
+            state_ids[slot] = row;
+            state_hash[bucket] = slot;
+        }
+        const int32_t previous = micro_slots[slot];
+        micro_slots[capacity + index] = previous < 0 ? -slot - 1 : slot;
+        if (previous >= 0) {
+            micro_next[previous] = index;
+        }
+        micro_slots[slot] = index;
+    }
+}
+
+static __global__ void acc_qlion_qat_rows(
+        block_q8_0 * __restrict__ accumulator,
+        const int32_t * __restrict__ micro_slots,
+        const int32_t * __restrict__ micro_next,
+        const float * __restrict__ grad,
+        int64_t capacity,
+        int64_t n_indices,
+        int64_t n_blocks_row) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int64_t task = (int64_t) blockIdx.x * QLION_QAT_WARPS_PER_BLOCK + warp;
+    if (task >= n_indices * n_blocks_row) {
+        return;
+    }
+    const int64_t index = task / n_blocks_row;
+    const int64_t block = task % n_blocks_row;
+    const int32_t encoded = micro_slots[capacity + index];
+    if (encoded >= 0) {
+        return;
+    }
+    const int32_t slot = -encoded - 1;
+    const int64_t ib = slot * n_blocks_row + block;
+    float value = __half2float(accumulator[ib].d) * (float) accumulator[ib].qs[lane];
+    for (int32_t occurrence = index; occurrence >= 0; occurrence = micro_next[occurrence]) {
+        const float grad_value = grad[(int64_t) occurrence * n_blocks_row * 32 + block * 32 + lane];
+        const float g = isfinite(grad_value) ? grad_value : 0.0f;
+        const float sum = value + g;
+        value = isfinite(sum) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, sum)) : 0.0f;
+    }
+    __shared__ float values[QLION_QAT_WARPS_PER_BLOCK][32];
+    values[warp][lane] = value;
+    __syncwarp();
+    if (lane == 0) {
+        float amax = 0.0f;
+        float signed_max = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            if (amax < fabsf(values[warp][i])) {
+                amax = fabsf(values[warp][i]);
+                signed_max = values[warp][i];
+            }
+        }
+        const float scale = signed_max / -128.0f;
+        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+        accumulator[ib].d = __float2half(scale);
+        for (int i = 0; i < 32; ++i) {
+            accumulator[ib].qs[i] = (int8_t) max(-128, min(127, (int) roundf(values[warp][i] * inverse)));
+        }
+    }
+}
+
 static __global__ void acc_qlion_qat_tied(
         block_q8_0 * __restrict__ accumulator,
         const float * __restrict__ dense_a,
@@ -1375,6 +1485,35 @@ static __global__ void opt_step_qlion_qat_rows(
     opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, g);
 }
 
+template<bool mxfp4>
+static __global__ void opt_step_qlion_qat_sparse_rows(
+        void * __restrict__ weight_data,
+        const block_q8_0 * __restrict__ grad,
+        const int32_t * __restrict__ ids,
+        const int32_t * __restrict__ count,
+        block_q8_0 * __restrict__ momentum,
+        block_q4_0 * __restrict__ residual,
+        const float * __restrict__ pars,
+        int64_t n_blocks_row,
+        int64_t n_rows,
+        int64_t capacity) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int64_t task = (int64_t) blockIdx.x * QLION_QAT_WARPS_PER_BLOCK + warp;
+    if (task >= (int64_t) *count * n_blocks_row) {
+        return;
+    }
+    const int64_t slot = task / n_blocks_row;
+    const int64_t block = task % n_blocks_row;
+    assert(*count <= capacity);
+    const int32_t row = ids[slot];
+    assert(row >= 0 && row < n_rows);
+    const int64_t ib = (int64_t) row * n_blocks_row + block;
+    const block_q8_0 q = grad[task];
+    const float g = __half2float(q.d) * (float) q.qs[lane];
+    opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, g);
+}
+
 void ggml_cuda_opt_step_qlion_qat_tied(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst) {
@@ -1765,6 +1904,45 @@ void ggml_cuda_acc_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         GGML_ASSERT(grad->type == GGML_TYPE_F32);
         acc_qlion_qat<<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             (block_q8_0 *) accumulator->data, (const float *) grad->data, n_blocks, reset);
+    }
+}
+
+void ggml_cuda_acc_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * accumulator = dst->src[0];
+    ggml_tensor * state_ids = dst->src[1];
+    ggml_tensor * state_hash = dst->src[2];
+    ggml_tensor * state_count = dst->src[3];
+    ggml_tensor * micro_slots = dst->src[4];
+    ggml_tensor * micro_next = dst->src[5];
+    const ggml_tensor * grad = dst->src[6];
+    const ggml_tensor * ids = dst->src[7];
+    const int64_t capacity = ggml_nrows(accumulator);
+    const int64_t n_indices = ggml_nelements(ids);
+    const int64_t n_blocks_row = accumulator->ne[0] / 32;
+    const bool reset = ggml_get_op_params_i32(dst, 0) != 0;
+    const bool rehash = ggml_get_op_params_i32(dst, 1) != 0;
+    GGML_ASSERT(capacity <= INT32_MAX && ggml_nelements(state_hash) <= INT32_MAX && n_indices <= INT32_MAX);
+    if (reset) {
+        CUDA_CHECK(cudaMemsetAsync(accumulator->data, 0, ggml_nbytes(accumulator), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(state_ids->data, 0xff, ggml_nbytes(state_ids), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(state_hash->data, 0xff, ggml_nbytes(state_hash), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(state_count->data, 0, ggml_nbytes(state_count), ctx.stream()));
+    } else if (rehash) {
+        CUDA_CHECK(cudaMemsetAsync(state_hash->data, 0xff, ggml_nbytes(state_hash), ctx.stream()));
+    }
+    acc_qlion_qat_rows_index<<<1, 1, 0, ctx.stream()>>>(
+        (int32_t *) state_ids->data, (int32_t *) state_hash->data, (int32_t *) state_count->data,
+        (int32_t *) micro_slots->data, (int32_t *) micro_next->data, (const int32_t *) ids->data,
+        (int32_t) capacity, (int32_t) ggml_nelements(state_hash), (int32_t) n_indices, rehash && !reset);
+    CUDA_CHECK(cudaGetLastError());
+    const int64_t n_tasks = n_indices * n_blocks_row;
+    if (n_tasks > 0) {
+        const int64_t grid_blocks = (n_tasks + QLION_QAT_WARPS_PER_BLOCK - 1) / QLION_QAT_WARPS_PER_BLOCK;
+        acc_qlion_qat_rows<<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            (block_q8_0 *) accumulator->data, (const int32_t *) micro_slots->data,
+            (const int32_t *) micro_next->data, (const float *) grad->data,
+            capacity, n_indices, n_blocks_row);
+        CUDA_CHECK(cudaGetLastError());
     }
 }
 
@@ -2313,4 +2491,33 @@ void ggml_cuda_opt_step_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_ten
             (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
             n_blocks_row, weight->ne[1], n_indices);
     }
+}
+
+void ggml_cuda_opt_step_qlion_qat_sparse_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    const ggml_tensor * count = dst->src[3];
+    ggml_tensor * momentum = dst->src[4];
+    ggml_tensor * residual = dst->src[5];
+    const ggml_tensor * pars = dst->src[6];
+    const int64_t capacity = ggml_nrows(grad);
+    const int64_t n_blocks_row = weight->ne[0] / 32;
+    const int64_t n_tasks = capacity * n_blocks_row;
+    if (n_tasks == 0) {
+        return;
+    }
+    const int64_t grid_blocks = (n_tasks + QLION_QAT_WARPS_PER_BLOCK - 1) / QLION_QAT_WARPS_PER_BLOCK;
+    if (weight->type == GGML_TYPE_MXFP4) {
+        opt_step_qlion_qat_sparse_rows<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, (const block_q8_0 *) grad->data, (const int32_t *) ids->data,
+            (const int32_t *) count->data, (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
+            (const float *) pars->data, n_blocks_row, weight->ne[1], capacity);
+    } else {
+        opt_step_qlion_qat_sparse_rows<false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, (const block_q8_0 *) grad->data, (const int32_t *) ids->data,
+            (const int32_t *) count->data, (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
+            (const float *) pars->data, n_blocks_row, weight->ne[1], capacity);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }

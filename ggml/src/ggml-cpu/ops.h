@@ -133,9 +133,11 @@ void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, str
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_acc_qlion_qat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_acc_qlion_qat_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_qlion_qat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_qlion_qat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_qlion_qat_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_opt_step_qlion_qat_sparse_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_qlion_qat_tied(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus
 }
