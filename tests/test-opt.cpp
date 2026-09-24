@@ -224,8 +224,8 @@ static recompute_test_ctx make_recompute_test_ctx(
         checkpoint->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
         ggml_tensor * hidden = ggml_mul_mat(ctx_compute, weights_up, checkpoint);
         hidden = ggml_gelu(ctx_compute, hidden);
+        hidden->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
         outputs = ggml_mul_mat(ctx_compute, weights_down, hidden);
-        outputs->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
@@ -315,7 +315,7 @@ static std::pair<int, int> test_activation_recompute_replays_mlp(
 
     print_ok(__func__, ggml_opt_recompute_regions(on.opt_ctx) == 4, npass, ntest,
              "subtest=replay_region");
-    print_ok(__func__, ggml_opt_recompute_nodes(on.opt_ctx) >= 12, npass, ntest,
+    print_ok(__func__, ggml_opt_recompute_nodes(on.opt_ctx) == 8, npass, ntest,
              "subtest=replay_internal_nodes");
     print_ok(__func__, eval_on.replay_executions > 0, npass, ntest,
              "subtest=replay_execution");

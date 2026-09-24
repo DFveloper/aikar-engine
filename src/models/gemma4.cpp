@@ -351,22 +351,23 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
+            ggml_tensor * ffn_down_input = nullptr;
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
                     model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
                     nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    LLM_FFN_GELU, LLM_FFN_PAR, il, &ffn_down_input);
+            GGML_ASSERT(ffn_down_input);
+            if (training && activation_recompute) {
+                ffn_down_input->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+            }
             cb(cur, "ffn_out", il);
         }
         cur = build_norm(cur,
                 model.layers[il].ffn_post_norm, nullptr,
                 LLM_NORM_RMS, -1);
         cb(cur, "ffn_post_norm", il);
-        if (!is_moe_layer && training && activation_recompute) {
-            cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
-        }
-
         // residual connection
         cur = ggml_add(ctx0, cur, attn_out);
 
