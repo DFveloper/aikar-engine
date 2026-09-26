@@ -23,7 +23,6 @@ One update decodes a 32-value block from each state, applies the QLion update, r
   --qat-momentum q8_0 \
   --qat-residual q4_0 \
   --qat-update-granularity tensor \
-  --qat-max-sample-tokens 64 \
   --qat-out trained-mxfp4.gguf \
   -c 512 -b 512 -ub 64 \
   -lr 1e-6 -lr-min 1e-7 --lr-scheduler cosine --epochs 1

@@ -5125,16 +5125,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
-        {"--qat-max-sample-tokens"}, "N",
-        "truncate each tokenized QLion sample to at most N tokens (0 = context length)",
-        [](common_params & params, int value) {
-            if (value < 0 || value == 1) {
-                throw std::invalid_argument("--qat-max-sample-tokens must be 0 or at least 2");
-            }
-            params.qat_max_sample_tokens = value;
-        }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
-    add_opt(common_arg(
         {"--preserve-thinking"},
         {"--no-preserve-thinking"},
         "preserve assistant reasoning in chat history when the template supports it (default: enabled)",

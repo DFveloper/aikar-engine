@@ -9,14 +9,23 @@ extern "C" {
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <set>
 #include <stdexcept>
+#include <sys/stat.h>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 using json = nlohmann::ordered_json;
 
@@ -67,7 +76,13 @@ int32_t metadata_i32(const gguf_context * ctx, const std::string & key) {
 }
 
 void write_json_atomic(const json & value, const std::string & path) {
-    const std::string tmp = path + ".tmp";
+    static std::atomic<uint64_t> next_tmp_id { 0 };
+#if defined(_WIN32)
+    const int pid = _getpid();
+#else
+    const int pid = getpid();
+#endif
+    const std::string tmp = path + "." + std::to_string(pid) + "." + std::to_string(next_tmp_id++) + ".tmp";
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -82,6 +97,33 @@ void write_json_atomic(const json & value, const std::string & path) {
         std::remove(tmp.c_str());
         throw std::runtime_error("failed to replace output: " + path);
     }
+}
+
+json model_file_identity(const std::string & path) {
+    const std::filesystem::path canonical = std::filesystem::canonical(path);
+    json identity = {
+        { "path", canonical.string() },
+        { "size", std::filesystem::file_size(canonical) },
+        { "mtime", std::filesystem::last_write_time(canonical).time_since_epoch().count() },
+    };
+#if defined(__linux__)
+    struct stat st;
+    if (stat(canonical.c_str(), &st) != 0) {
+        throw std::runtime_error("failed to stat GGUF model: " + path);
+    }
+    identity["device"] = st.st_dev;
+    identity["inode"] = st.st_ino;
+    identity["ctime_sec"] = st.st_ctim.tv_sec;
+    identity["ctime_nsec"] = st.st_ctim.tv_nsec;
+#endif
+    return identity;
+}
+
+json model_info_json(const common_moe_prune_model_info & model) {
+    return { { "architecture", model.architecture }, { "model_hash", model.model_hash },
+             { "expert_tensor_hash", model.expert_tensor_hash }, { "layer_count", model.layer_count },
+             { "expert_count", model.expert_count }, { "experts_used", model.experts_used },
+             { "moe_layers", model.moe_layers }, { "expert_bytes", model.expert_bytes } };
 }
 
 }
@@ -226,6 +268,48 @@ common_moe_prune_model_info common_moe_prune_inspect_model(const std::string & p
     result.expert_tensor_hash = digest_hex(digest);
     sha256_final(&model_hash, digest);
     result.model_hash = digest_hex(digest);
+    return result;
+}
+
+common_moe_prune_model_info common_moe_prune_inspect_model_cached(
+        const std::string & path, const std::string & cache_path, bool * cache_hit) {
+    if (cache_hit) *cache_hit = false;
+    const json identity = model_file_identity(path);
+    {
+        std::ifstream in(cache_path);
+        if (in) {
+            try {
+                json cache;
+                in >> cache;
+                if (cache.at("format") == "aikar-moe-prune-model-cache" && cache.at("version") == 1 &&
+                    cache.at("source") == identity) {
+                    const json & saved = cache.at("model");
+                    common_moe_prune_model_info result;
+                    result.architecture = saved.at("architecture").get<std::string>();
+                    result.model_hash = saved.at("model_hash").get<std::string>();
+                    result.expert_tensor_hash = saved.at("expert_tensor_hash").get<std::string>();
+                    result.layer_count = saved.at("layer_count").get<int32_t>();
+                    result.expert_count = saved.at("expert_count").get<int32_t>();
+                    result.experts_used = saved.at("experts_used").get<int32_t>();
+                    result.moe_layers = saved.at("moe_layers").get<std::vector<int32_t>>();
+                    result.expert_bytes = saved.at("expert_bytes").get<uint64_t>();
+                    if (result.architecture == "gemma4" && result.layer_count == 30 &&
+                        result.model_hash.rfind("sha256:", 0) == 0 &&
+                        result.expert_tensor_hash.rfind("sha256:", 0) == 0) {
+                        if (cache_hit) *cache_hit = true;
+                        return result;
+                    }
+                }
+            } catch (const json::exception &) {
+            }
+        }
+    }
+    const common_moe_prune_model_info result = common_moe_prune_inspect_model(path);
+    if (model_file_identity(path) != identity) {
+        throw std::runtime_error("GGUF model changed while hashing: " + path);
+    }
+    write_json_atomic({ { "format", "aikar-moe-prune-model-cache" }, { "version", 1 },
+                        { "source", identity }, { "model", model_info_json(result) } }, cache_path);
     return result;
 }
 

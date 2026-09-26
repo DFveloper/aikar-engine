@@ -54,6 +54,7 @@ using common_moe_prune_stats = std::map<int32_t, std::vector<common_moe_prune_ex
 
 std::string common_moe_prune_sha256_file(const std::string & path);
 common_moe_prune_model_info common_moe_prune_inspect_model(const std::string & path);
+common_moe_prune_model_info common_moe_prune_inspect_model_cached(const std::string & path, const std::string & cache_path, bool * cache_hit = nullptr);
 common_moe_prune_profile common_moe_prune_profile_load(const std::string & path);
 void common_moe_prune_profile_write(const common_moe_prune_profile & profile, const std::string & path);
 void common_moe_prune_profile_validate(const common_moe_prune_profile & profile, const common_moe_prune_model_info & model);

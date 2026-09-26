@@ -656,8 +656,10 @@ void run_profiles(const options & opts) {
 
 void run_analyze(const options & opts) {
     std::filesystem::create_directories(opts.output_dir);
-    std::cerr << "aikar-prune: inspecting model and hashing GGUF\n";
-    const common_moe_prune_model_info model_info = common_moe_prune_inspect_model(opts.model);
+    bool model_cache_hit = false;
+    const common_moe_prune_model_info model_info = common_moe_prune_inspect_model_cached(
+        opts.model, opts.output_dir + "/model-info-cache.json", &model_cache_hit);
+    std::cerr << "aikar-prune: " << (model_cache_hit ? "reused model hash cache" : "hashed GGUF and saved model cache") << '\n';
     aikar_dataset dataset;
     const std::string dataset_hash = common_moe_prune_sha256_file(opts.dataset);
     const std::string cache_path = importance_cache_path(opts);

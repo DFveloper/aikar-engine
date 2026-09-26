@@ -174,9 +174,27 @@ int main() {
 
     const std::string source_path = "/tmp/aikar-moe-prune-test-source.gguf";
     const std::string output_path = "/tmp/aikar-moe-prune-test-output.gguf";
+    const std::string cache_path = "/tmp/aikar-moe-prune-test-model-cache.json";
+    std::remove(cache_path.c_str());
     make_fixture(source_path);
     const common_moe_prune_model_info fixture_info = common_moe_prune_inspect_model(source_path);
     require(fixture_info.model_hash == common_moe_prune_sha256_file(source_path));
+    bool cache_hit = true;
+    const common_moe_prune_model_info first = common_moe_prune_inspect_model_cached(source_path, cache_path, &cache_hit);
+    require(!cache_hit && first.model_hash == fixture_info.model_hash);
+    const common_moe_prune_model_info second = common_moe_prune_inspect_model_cached(source_path, cache_path, &cache_hit);
+    require(cache_hit && second.model_hash == first.model_hash);
+    {
+        FILE * file = fopen(source_path.c_str(), "ab");
+        require(file != nullptr);
+        require(fputc(0, file) != EOF);
+        fclose(file);
+    }
+    const common_moe_prune_model_info changed = common_moe_prune_inspect_model_cached(source_path, cache_path, &cache_hit);
+    require(!cache_hit && changed.model_hash != first.model_hash);
+    std::remove(cache_path.c_str());
+    make_fixture(source_path);
+    require(common_moe_prune_inspect_model(source_path).model_hash == fixture_info.model_hash);
     common_moe_prune_profile fixture_profile;
     fixture_profile.architecture = fixture_info.architecture;
     fixture_profile.model_hash = fixture_info.model_hash;
@@ -210,5 +228,6 @@ int main() {
     std::remove(source_path.c_str());
     std::remove(output_path.c_str());
     std::remove((output_path + ".report.json").c_str());
+    std::remove(cache_path.c_str());
     return 0;
 }

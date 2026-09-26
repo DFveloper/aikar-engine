@@ -5,39 +5,6 @@
 #include "llama-impl.h"
 #include "llama-model-saver.h"
 
-static void truncate_samples_to_context(
-        std::vector<training_sample> & samples,
-        int32_t n_ctx,
-        int32_t requested_max_tokens) {
-    const size_t max_tokens = requested_max_tokens > 0
-        ? std::min((size_t) requested_max_tokens, (size_t) n_ctx + 1)
-        : (size_t) n_ctx + 1;
-    size_t truncated_samples = 0;
-    size_t removed_tokens = 0;
-
-    for (training_sample & sample : samples) {
-        if (sample.tokens.size() <= max_tokens) {
-            continue;
-        }
-        const size_t end = sample.tokens.size();
-        const size_t begin = end - max_tokens;
-        const size_t remove = sample.tokens.size() - (end - begin);
-        sample.tokens.erase(sample.tokens.begin() + end, sample.tokens.end());
-        sample.tokens.erase(sample.tokens.begin(), sample.tokens.begin() + begin);
-        sample.is_label.erase(sample.is_label.begin() + end, sample.is_label.end());
-        sample.is_label.erase(sample.is_label.begin(), sample.is_label.begin() + begin);
-        if (!sample.critical_weights.empty()) {
-            sample.critical_weights.erase(sample.critical_weights.begin() + end, sample.critical_weights.end());
-            sample.critical_weights.erase(sample.critical_weights.begin(), sample.critical_weights.begin() + begin);
-        }
-        ++truncated_samples;
-        removed_tokens += remove;
-    }
-
-    LOG_INF("%s: truncated_samples=%zu removed_tokens=%zu max_sample_tokens=%zu\n",
-        __func__, truncated_samples, removed_tokens, max_tokens);
-}
-
 static int64_t train_sample_split_by_conversation(
         const std::vector<training_sample> & samples,
         float                                val_split,
@@ -710,9 +677,7 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: dataset chat template=%s\n", __func__, params.chat_template.empty() ? "model metadata" : "command-line override");
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_ctx = llama_n_ctx(lctx);
-    const size_t render_max_tokens = params.qat_max_sample_tokens > 0
-        ? std::min((size_t) params.qat_max_sample_tokens, (size_t) n_ctx + 1)
-        : (size_t) n_ctx + 1;
+    const size_t render_max_tokens = 0;
     std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
         params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
         params.preserve_thinking ? 1 : 0, render_max_tokens);
@@ -720,7 +685,6 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;
     }
-    truncate_samples_to_context(samples, n_ctx, params.qat_max_sample_tokens);
     int64_t train_conversations = 0;
     int64_t val_conversations = 0;
 
