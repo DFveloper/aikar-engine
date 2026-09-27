@@ -142,7 +142,7 @@ static __device__ __forceinline__ int mxfp4_best_index(
         : mag;
 }
 
-template<bool mxfp4>
+template<ggml_type weight_type>
 static __device__ void opt_step_qlion_qat_apply(
         void * __restrict__ weight_data,
         block_q8_0 * __restrict__ momentum,
@@ -193,18 +193,15 @@ static __device__ void opt_step_qlion_qat_apply(
             8
         );
 
-    const float weight_old =
-        mxfp4
-            ? mxfp4_value(
-                ((const block_mxfp4 *)
-                    weight_data)[ib],
-                lane
-            )
-            : q4_0_value(
-                ((const block_q4_0 *)
-                    weight_data)[ib],
-                lane
-            );
+    float weight_old;
+    if constexpr (weight_type == GGML_TYPE_MXFP4) {
+        weight_old = mxfp4_value(((const block_mxfp4 *) weight_data)[ib], lane);
+    } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
+        const block_q8_0 & block = ((const block_q8_0 *) weight_data)[ib];
+        weight_old = __half2float(block.d) * block.qs[lane];
+    } else {
+        weight_old = q4_0_value(((const block_q4_0 *) weight_data)[ib], lane);
+    }
     g = isfinite(g) ? g : 0.0f;
     if (gclip > 0.0f) {
         g = fmaxf(-gclip, fminf(gclip, g));
@@ -215,12 +212,13 @@ static __device__ void opt_step_qlion_qat_apply(
     const float direction = momentum_new > 0.0f ? 1.0f : (momentum_new < 0.0f ? -1.0f : 0.0f);
     float target = weight_old + residual_value - alpha * (direction + wd * weight_old);
     target = isfinite(target) ? target : weight_old;
-    if (!mxfp4) {
-        target = fmaxf(-8.0f * 65504.0f, fminf(8.0f * 65504.0f, target));
+    if constexpr (weight_type != GGML_TYPE_MXFP4) {
+        const float limit = weight_type == GGML_TYPE_Q8_0 ? 128.0f * 65504.0f : 8.0f * 65504.0f;
+        target = fmaxf(-limit, fminf(limit, target));
     }
 
     float weight_new;
-    if constexpr (mxfp4) {
+    if constexpr (weight_type == GGML_TYPE_MXFP4) {
         const float amax =
             warp_reduce_max(fabsf(target));
 
@@ -303,6 +301,15 @@ static __device__ void opt_step_qlion_qat_apply(
             ((block_mxfp4 *) weight_data)[ib].qs[lane] = q | (q_hi << 4);
         }
         weight_new = scale * kvalues_mxfp4[q];
+    } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
+        const float scale = warp_signed_absmax(target) / -128.0f;
+        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+        const int q = max(-128, min(127, (int) roundf(target * inverse)));
+        if (lane == 0) {
+            ((block_q8_0 *) weight_data)[ib].d = __float2half(scale);
+        }
+        ((block_q8_0 *) weight_data)[ib].qs[lane] = (int8_t) q;
+        weight_new = __half2float(__float2half(scale)) * q;
     } else {
         const float signed_max = warp_signed_absmax(target);
         const float scale = signed_max / -8.0f;
@@ -752,7 +759,7 @@ static __device__ void opt_step_qlion_qat_apply(
 }
 
 
-template<bool mxfp4>
+template<ggml_type weight_type>
 static __global__ void
 opt_step_qlion_qat_tied_apply(
         void * __restrict__
@@ -825,7 +832,7 @@ opt_step_qlion_qat_tied_apply(
                 local_row
         ];
 
-    opt_step_qlion_qat_apply<mxfp4>(
+    opt_step_qlion_qat_apply<weight_type>(
         weight_data,
         momentum,
         residual,
@@ -906,9 +913,10 @@ qlion_qat_tied_add_sparse(
     }
 }
 
+template<bool grad_q8>
 static __global__ void acc_qlion_qat(
         block_q8_0 * __restrict__ accumulator,
-        const float * __restrict__ grad,
+        const void * __restrict__ grad,
         int64_t n_blocks,
         bool reset) {
     const int warp = threadIdx.x >> 5;
@@ -920,8 +928,11 @@ static __global__ void acc_qlion_qat(
 
     __shared__ float values[QLION_QAT_WARPS_PER_BLOCK][32];
     const float old = reset ? 0.0f : __half2float(accumulator[ib].d) * (float) accumulator[ib].qs[lane];
-    const float g = isfinite(grad[ib * 32 + lane]) ? grad[ib * 32 + lane] : 0.0f;
-    const float value = old + g;
+    const float g = grad_q8
+        ? __half2float(((const block_q8_0 *) grad)[ib].d) * ((const block_q8_0 *) grad)[ib].qs[lane]
+        : ((const float *) grad)[ib * 32 + lane];
+    const float safe_g = isfinite(g) ? g : 0.0f;
+    const float value = old + safe_g;
     values[warp][lane] = isfinite(value) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, value)) : 0.0f;
     __syncwarp();
 
@@ -1108,7 +1119,7 @@ static __global__ void acc_qlion_qat_tied(
     }
 }
 
-template<bool mxfp4, bool grad_q8>
+template<ggml_type weight_type, bool grad_q8>
 static __global__ void opt_step_qlion_qat(
         void * __restrict__ weight_data,
         const void * __restrict__ grad,
@@ -1136,7 +1147,7 @@ static __global__ void opt_step_qlion_qat(
         ? __half2float(((const block_q8_0 *) grad)[ib].d) * (float) ((const block_q8_0 *) grad)[ib].qs[lane]
         : ((const float *) grad)[ib * 32 + lane];
 
-    opt_step_qlion_qat_apply<mxfp4>(
+    opt_step_qlion_qat_apply<weight_type>(
         weight_data,
         momentum,
         residual,
@@ -1265,7 +1276,7 @@ static __global__ void qlion_qat_id_gather_expert_batch_padded(
     }
 }
 
-template<bool mxfp4>
+template<ggml_type weight_type>
 static __global__ void opt_step_qlion_qat_id_apply_gemm(
         void * __restrict__ weight_data,
         const float * __restrict__ expert_grad,
@@ -1415,7 +1426,7 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
         expert * n_blocks_expert +
         local_ib;
 
-    opt_step_qlion_qat_apply<mxfp4>(
+    opt_step_qlion_qat_apply<weight_type>(
         weight_data,
         momentum,
         residual,
@@ -1426,7 +1437,7 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     );
 }
 
-template<bool mxfp4>
+template<ggml_type weight_type>
 static __global__ void opt_step_qlion_qat_rows(
         void * __restrict__ weight_data,
         const float * __restrict__ grad,
@@ -1482,10 +1493,10 @@ static __global__ void opt_step_qlion_qat_rows(
         }
     }
     const int64_t ib = row * n_blocks_row + block;
-    opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, g);
+    opt_step_qlion_qat_apply<weight_type>(weight_data, momentum, residual, pars, ib, lane, g);
 }
 
-template<bool mxfp4>
+template<ggml_type weight_type>
 static __global__ void opt_step_qlion_qat_sparse_rows(
         void * __restrict__ weight_data,
         const block_q8_0 * __restrict__ grad,
@@ -1511,7 +1522,7 @@ static __global__ void opt_step_qlion_qat_sparse_rows(
     const int64_t ib = (int64_t) row * n_blocks_row + block;
     const block_q8_0 q = grad[task];
     const float g = __half2float(q.d) * (float) q.qs[lane];
-    opt_step_qlion_qat_apply<mxfp4>(weight_data, momentum, residual, pars, ib, lane, g);
+    opt_step_qlion_qat_apply<weight_type>(weight_data, momentum, residual, pars, ib, lane, g);
 }
 
 void ggml_cuda_opt_step_qlion_qat_tied(
@@ -1547,7 +1558,8 @@ void ggml_cuda_opt_step_qlion_qat_tied(
         weight->type ==
             GGML_TYPE_MXFP4 ||
         weight->type ==
-            GGML_TYPE_Q4_0
+            GGML_TYPE_Q4_0 ||
+        weight->type == GGML_TYPE_Q8_0
     );
 
     GGML_ASSERT(
@@ -1824,7 +1836,7 @@ void ggml_cuda_opt_step_qlion_qat_tied(
         if (weight->type ==
             GGML_TYPE_MXFP4) {
 
-            opt_step_qlion_qat_tied_apply<true>
+            opt_step_qlion_qat_tied_apply<GGML_TYPE_MXFP4>
                 <<<apply_blocks,
                    QLION_QAT_THREADS,
                    0,
@@ -1848,9 +1860,15 @@ void ggml_cuda_opt_step_qlion_qat_tied(
                     tile_rows
                 );
 
+        } else if (weight->type == GGML_TYPE_Q8_0) {
+            opt_step_qlion_qat_tied_apply<GGML_TYPE_Q8_0>
+                <<<apply_blocks, QLION_QAT_THREADS, 0, stream>>>(
+                    weight->data, tile_grad.ptr, (block_q8_0 *) momentum->data,
+                    (block_q4_0 *) residual->data, (const float *) pars->data,
+                    n_blocks_row, row_base, tile_rows);
         } else {
 
-            opt_step_qlion_qat_tied_apply<false>
+            opt_step_qlion_qat_tied_apply<GGML_TYPE_Q4_0>
                 <<<apply_blocks,
                    QLION_QAT_THREADS,
                    0,
@@ -1901,9 +1919,14 @@ void ggml_cuda_acc_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             n_blocks, accumulator->ne[0] / 32, accumulator->ne[1], dense_a->ne[1],
             ggml_nelements(sparse_ids), reset);
     } else {
-        GGML_ASSERT(grad->type == GGML_TYPE_F32);
-        acc_qlion_qat<<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
-            (block_q8_0 *) accumulator->data, (const float *) grad->data, n_blocks, reset);
+        GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
+        if (grad->type == GGML_TYPE_Q8_0) {
+            acc_qlion_qat<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+                (block_q8_0 *) accumulator->data, grad->data, n_blocks, reset);
+        } else {
+            acc_qlion_qat<false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+                (block_q8_0 *) accumulator->data, grad->data, n_blocks, reset);
+        }
     }
 }
 
@@ -1952,7 +1975,7 @@ void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_tensor * momentum = dst->src[2];
     ggml_tensor * residual = dst->src[3];
     const ggml_tensor * pars = dst->src[4];
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT((grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0) &&
         momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(pars->type == GGML_TYPE_F32 && ggml_nelements(pars) == 5);
@@ -1967,19 +1990,27 @@ void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor *
         ) /
     QLION_QAT_WARPS_PER_BLOCK;
     if (weight->type == GGML_TYPE_MXFP4 && grad->type == GGML_TYPE_Q8_0) {
-        opt_step_qlion_qat<true, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat<GGML_TYPE_MXFP4, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     } else if (weight->type == GGML_TYPE_MXFP4) {
-        opt_step_qlion_qat<true, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat<GGML_TYPE_MXFP4, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, grad->data, (block_q8_0 *) momentum->data,
+            (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
+    } else if (weight->type == GGML_TYPE_Q8_0 && grad->type == GGML_TYPE_Q8_0) {
+        opt_step_qlion_qat<GGML_TYPE_Q8_0, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, grad->data, (block_q8_0 *) momentum->data,
+            (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
+    } else if (weight->type == GGML_TYPE_Q8_0) {
+        opt_step_qlion_qat<GGML_TYPE_Q8_0, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     } else if (grad->type == GGML_TYPE_Q8_0) {
-        opt_step_qlion_qat<false, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat<GGML_TYPE_Q4_0, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     } else {
-        opt_step_qlion_qat<false, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat<GGML_TYPE_Q4_0, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
             (block_q4_0 *) residual->data, (const float *) pars->data, n_blocks);
     }
@@ -2012,7 +2043,8 @@ void ggml_cuda_opt_step_qlion_qat_id(
 
     GGML_ASSERT(
         weight->type == GGML_TYPE_MXFP4 ||
-        weight->type == GGML_TYPE_Q4_0
+        weight->type == GGML_TYPE_Q4_0 ||
+        weight->type == GGML_TYPE_Q8_0
     );
 
     GGML_ASSERT(
@@ -2402,7 +2434,7 @@ const int64_t gather_blocks =
             weight->type ==
             GGML_TYPE_MXFP4
         ) {
-            opt_step_qlion_qat_id_apply_gemm<true>
+            opt_step_qlion_qat_id_apply_gemm<GGML_TYPE_MXFP4>
                 <<<apply_blocks, QLION_QAT_THREADS, 0, stream>>>(
                     weight->data,
                     expert_grad.ptr,
@@ -2426,8 +2458,18 @@ const int64_t gather_blocks =
                     batch_count,
                     cap
                 );
+        } else if (weight->type == GGML_TYPE_Q8_0) {
+            opt_step_qlion_qat_id_apply_gemm<GGML_TYPE_Q8_0>
+                <<<apply_blocks, QLION_QAT_THREADS, 0, stream>>>(
+                    weight->data, expert_grad.ptr,
+                    (const float *) activations->data, (const float *) grad->data,
+                    expert_offsets.ptr, routes.ptr,
+                    (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
+                    (const float *) pars->data,
+                    n_blocks_row, rows, n_act_used, n_used,
+                    expert_base, batch_count, cap);
         } else {
-            opt_step_qlion_qat_id_apply_gemm<false>
+            opt_step_qlion_qat_id_apply_gemm<GGML_TYPE_Q4_0>
                 <<<apply_blocks, QLION_QAT_THREADS, 0, stream>>>(
                     weight->data,
                     expert_grad.ptr,
@@ -2465,7 +2507,7 @@ void ggml_cuda_opt_step_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_ten
     ggml_tensor * momentum = dst->src[3];
     ggml_tensor * residual = dst->src[4];
     const ggml_tensor * pars = dst->src[5];
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0 && pars->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
@@ -2481,12 +2523,17 @@ void ggml_cuda_opt_step_qlion_qat_rows(ggml_backend_cuda_context & ctx, ggml_ten
         ) /
         QLION_QAT_WARPS_PER_BLOCK;
     if (weight->type == GGML_TYPE_MXFP4) {
-        opt_step_qlion_qat_rows<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat_rows<GGML_TYPE_MXFP4><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, (const float *) grad->data, (const int32_t *) ids->data,
+            (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
+            n_blocks_row, weight->ne[1], n_indices);
+    } else if (weight->type == GGML_TYPE_Q8_0) {
+        opt_step_qlion_qat_rows<GGML_TYPE_Q8_0><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const float *) grad->data, (const int32_t *) ids->data,
             (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
             n_blocks_row, weight->ne[1], n_indices);
     } else {
-        opt_step_qlion_qat_rows<false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat_rows<GGML_TYPE_Q4_0><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const float *) grad->data, (const int32_t *) ids->data,
             (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data, (const float *) pars->data,
             n_blocks_row, weight->ne[1], n_indices);
@@ -2509,12 +2556,17 @@ void ggml_cuda_opt_step_qlion_qat_sparse_rows(ggml_backend_cuda_context & ctx, g
     }
     const int64_t grid_blocks = (n_tasks + QLION_QAT_WARPS_PER_BLOCK - 1) / QLION_QAT_WARPS_PER_BLOCK;
     if (weight->type == GGML_TYPE_MXFP4) {
-        opt_step_qlion_qat_sparse_rows<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat_sparse_rows<GGML_TYPE_MXFP4><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+            weight->data, (const block_q8_0 *) grad->data, (const int32_t *) ids->data,
+            (const int32_t *) count->data, (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
+            (const float *) pars->data, n_blocks_row, weight->ne[1], capacity);
+    } else if (weight->type == GGML_TYPE_Q8_0) {
+        opt_step_qlion_qat_sparse_rows<GGML_TYPE_Q8_0><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const block_q8_0 *) grad->data, (const int32_t *) ids->data,
             (const int32_t *) count->data, (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
             (const float *) pars->data, n_blocks_row, weight->ne[1], capacity);
     } else {
-        opt_step_qlion_qat_sparse_rows<false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+        opt_step_qlion_qat_sparse_rows<GGML_TYPE_Q4_0><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, (const block_q8_0 *) grad->data, (const int32_t *) ids->data,
             (const int32_t *) count->data, (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
             (const float *) pars->data, n_blocks_row, weight->ne[1], capacity);

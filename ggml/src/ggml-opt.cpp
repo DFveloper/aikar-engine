@@ -91,6 +91,7 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> qat_momentum;
     std::vector<struct ggml_tensor *> qat_residual;
     std::vector<struct ggml_tensor *> qat_grad_accumulator;
+    bool qat_grad_accumulator_cpu = false;
     enum class qat_grad_state_kind { unclassified, dense, sparse_rows };
     struct qat_grad_state {
         qat_grad_state_kind kind = qat_grad_state_kind::unclassified;
@@ -263,7 +264,8 @@ static ggml_opt_context::qat_grad_state ggml_opt_qat_make_grad_state(
         ggml_tensor * param,
         ggml_opt_context::qat_grad_state_kind kind,
         int64_t capacity,
-        int64_t input_capacity) {
+        int64_t input_capacity,
+        bool use_cpu) {
     ggml_opt_context::qat_grad_state state;
     state.kind = kind;
     state.capacity = capacity;
@@ -292,7 +294,7 @@ static ggml_opt_context::qat_grad_state ggml_opt_qat_make_grad_state(
         state.accumulator = ggml_new_tensor(state.ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne);
         ggml_format_name(state.accumulator, "QLion Q8_0 gradient accumulator for %s", param->name);
     }
-    const ggml_backend_buffer_type_t buft = param->buffer
+    const ggml_backend_buffer_type_t buft = use_cpu ? ggml_backend_cpu_buffer_type() : param->buffer
         ? ggml_backend_buffer_get_type(param->buffer)
         : ggml_backend_cpu_buffer_type();
     state.buffer = ggml_backend_alloc_ctx_tensors_from_buft(state.ctx, buft);
@@ -383,7 +385,7 @@ static ggml_opt_context::qat_grad_state & ggml_opt_qat_select_grad_state(
     if (state.buffer) {
         ggml_backend_sched_synchronize(opt_ctx->backend_sched);
     }
-    auto replacement = ggml_opt_qat_make_grad_state(opt_ctx->qat_params[index], kind, capacity, input);
+    auto replacement = ggml_opt_qat_make_grad_state(opt_ctx->qat_params[index], kind, capacity, input, opt_ctx->qat_grad_accumulator_cpu);
     if (state.buffer) {
         if (state.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows &&
             kind == ggml_opt_context::qat_grad_state_kind::dense) {
@@ -405,7 +407,7 @@ static ggml_opt_context::qat_grad_state & ggml_opt_qat_select_grad_state(
 
 void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor * param) {
     GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT);
-    GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q4_0));
+    GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q4_0 || param->type == GGML_TYPE_Q8_0));
     GGML_ASSERT(ggml_is_contiguous(param));
     for (size_t i = 0; i < opt_ctx->qat_params.size(); ++i) {
         struct ggml_tensor * canonical = opt_ctx->qat_params[i];
@@ -546,7 +548,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                 if (opt_ctx->qat_grad_states[i].buffer) {
                     ggml_backend_sched_synchronize(opt_ctx->backend_sched);
                     const auto & old_state = opt_ctx->qat_grad_states[i];
-                    auto new_state = ggml_opt_qat_make_grad_state(param, old_state.kind, old_state.capacity, old_state.input_capacity);
+                    auto new_state = ggml_opt_qat_make_grad_state(param, old_state.kind, old_state.capacity, old_state.input_capacity, opt_ctx->qat_grad_accumulator_cpu);
                     ggml_opt_qat_copy_grad_state(old_state, new_state);
                     ggml_opt_qat_free_grad_state(opt_ctx->qat_grad_states[i]);
                     opt_ctx->qat_grad_states[i] = new_state;
@@ -977,6 +979,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*critical_weight_linear   =*/ false,
         /*sparse_labels            =*/ false,
         /*fused_backward           =*/ false,
+        /*qat_grad_accumulator_cpu =*/ false,
         /*optimizer                =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
     };
 }
@@ -1838,6 +1841,10 @@ if (!dumped_qat_placement &&
         if (opt_ctx->opt_period > 1) {
             auto & state = ggml_opt_qat_select_grad_state(opt_ctx, i,
                 ggml_opt_context::qat_grad_state_kind::dense, ggml_nrows(canonical_param), 0);
+            if (combined->type == GGML_TYPE_F32) {
+                combined = ggml_cast(ctx, combined, GGML_TYPE_Q8_0);
+                ggml_format_name(combined, "QLion Q8_0 microgradient for %s", canonical_param->name);
+            }
             ggml_tensor * accumulated = ggml_acc_qlion_qat(
                 ctx,
                 state.accumulator,
@@ -2468,7 +2475,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             }
 
             if (node->type != GGML_TYPE_MXFP4 &&
-                node->type != GGML_TYPE_Q4_0) {
+                node->type != GGML_TYPE_Q4_0 &&
+                node->type != GGML_TYPE_Q8_0) {
                 continue;
             }
 
@@ -2894,6 +2902,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->critical_weight_linear    = params.critical_weight_linear;
     result->sparse_labels             = params.sparse_labels;
     result->fused_backward            = params.fused_backward;
+    result->qat_grad_accumulator_cpu   = params.qat_grad_accumulator_cpu;
 
     GGML_ASSERT(result->opt_period >= 1);
     result->static_graphs = result->ctx_compute;
@@ -3212,6 +3221,33 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->allocated_graph_copy = graph;
     }
 
+    if (opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+        ggml_backend_t gpu_backend = nullptr;
+        ggml_backend_t cpu_backend = nullptr;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
+            const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+            if (device_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                gpu_backend = backend;
+            } else if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                cpu_backend = backend;
+            }
+        }
+        if (gpu_backend || cpu_backend) {
+            for (int i = 0; i < ggml_graph_n_nodes(opt_ctx->allocated_graph_copy); ++i) {
+                ggml_tensor * node = ggml_graph_node(opt_ctx->allocated_graph_copy, i);
+                const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
+                    node->src[0] && node->src[0]->type == GGML_TYPE_F32;
+                if ((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) &&
+                    !node->buffer && gpu_backend && ggml_backend_supports_op(gpu_backend, node)) {
+                    ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, gpu_backend);
+                } else if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && !node->buffer && cpu_backend &&
+                    ggml_backend_supports_op(cpu_backend, node)) {
+                    ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, cpu_backend);
+                }
+            }
+        }
+    }
     ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     opt_ctx->allocated_graph = graph;
 

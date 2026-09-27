@@ -15,6 +15,7 @@ enum ggml_type qat_weight_ggml_type(enum qat_weight_format format) {
     switch (format) {
         case QAT_WEIGHT_MXFP4: return GGML_TYPE_MXFP4;
         case QAT_WEIGHT_Q4_0:  return GGML_TYPE_Q4_0;
+        case QAT_WEIGHT_Q8_0:  return GGML_TYPE_Q8_0;
     }
     return GGML_TYPE_COUNT;
 }
@@ -350,11 +351,12 @@ bool qat_tensor_state_step(
         update[i] = -params.learning_rate * (direction + params.weight_decay * weight[i]);
         target_no_feedback[i] = weight[i] + update[i];
         target[i] = target_no_feedback[i] + (params.enable_residual ? residual[i] : 0.0f);
-        if (state.format == QAT_WEIGHT_Q4_0) {
-            const float clipped = std::max(-QAT_Q4_0_MAX_ABS, std::min(QAT_Q4_0_MAX_ABS, target[i]));
+        if (state.format == QAT_WEIGHT_Q4_0 || state.format == QAT_WEIGHT_Q8_0) {
+            const float limit = state.format == QAT_WEIGHT_Q4_0 ? QAT_Q4_0_MAX_ABS : QAT_Q8_0_MAX_ABS;
+            const float clipped = std::max(-limit, std::min(limit, target[i]));
             stats.clipped_targets += clipped != target[i];
             target[i] = clipped;
-            target_no_feedback[i] = std::max(-QAT_Q4_0_MAX_ABS, std::min(QAT_Q4_0_MAX_ABS, target_no_feedback[i]));
+            target_no_feedback[i] = std::max(-limit, std::min(limit, target_no_feedback[i]));
         } else if (!std::isfinite(target[i])) {
             target[i] = weight[i];
             stats.clipped_targets++;
@@ -426,4 +428,3 @@ bool qat_tensor_state_step(
     state.residual = std::move(residual_new);
     return qat_tensor_state_validate(state, error);
 }
-

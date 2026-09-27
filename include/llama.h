@@ -1744,6 +1744,7 @@ extern "C" {
         // Run the MTP backward/optimizer graph. Disable for target-only training;
         // the target forward graph still produces hidden states for the MTP model.
         bool                                 train_mtp;
+        bool                                 qat_grad_accumulator_cpu = false;
         // When true, the MTP model is trained with a loss that encourages it to match
 
     };

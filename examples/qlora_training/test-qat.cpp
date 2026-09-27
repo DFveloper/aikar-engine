@@ -644,9 +644,11 @@ static void test_native_sparse_rows_accumulation(
     const float weight_difference = max_logical_difference(weight_type, reference.weight, nonaccumulated.weight);
     const float momentum_difference = max_logical_difference(GGML_TYPE_Q8_0, reference.momentum, nonaccumulated.momentum);
     const float residual_difference = max_logical_difference(GGML_TYPE_Q4_0, reference.residual, nonaccumulated.residual);
+    const char * format_name = format == QAT_WEIGHT_MXFP4 ? "mxfp4" : format == QAT_WEIGHT_Q4_0 ? "q4_0" : "q8_0";
     printf("QLion sparse effective-batch comparison %s: weight=%g momentum=%g residual=%g\n",
-        format == QAT_WEIGHT_MXFP4 ? "mxfp4" : "q4_0", weight_difference, momentum_difference, residual_difference);
-    check(weight_difference == 0.0f && momentum_difference < 1.0e-4f && residual_difference < 6.5e-3f,
+        format_name, weight_difference, momentum_difference, residual_difference);
+    check(weight_difference <= (format == QAT_WEIGHT_Q8_0 ? 6.0e-3f : 0.0f) &&
+        momentum_difference < 1.0e-4f && residual_difference < 6.5e-3f,
         "sparse accumulation differs excessively from the non-accumulated effective batch");
     std::vector<uint8_t> expected_momentum(reference.momentum.size(), 0);
     std::vector<uint8_t> expected_residual(reference.residual.size(), 0);
@@ -1243,6 +1245,7 @@ struct qlion_accumulation_trace {
     bool sparse = false;
     bool dense = false;
     bool full_f32 = false;
+    bool q8_microgradient_host = false;
 };
 
 static bool trace_qlion_accumulation(ggml_tensor * tensor, bool ask, void * userdata) {
@@ -1252,10 +1255,13 @@ static bool trace_qlion_accumulation(ggml_tensor * tensor, bool ask, void * user
     trace.dense = trace.dense || tensor->op == GGML_OP_ACC_QLION_QAT;
     trace.full_f32 = trace.full_f32 ||
         (tensor->type == GGML_TYPE_F32 && tensor->ne[0] == 64 && tensor->ne[1] == 64);
+    trace.q8_microgradient_host = trace.q8_microgradient_host ||
+        (tensor->op == GGML_OP_CPY && tensor->type == GGML_TYPE_Q8_0 && tensor->src[0] &&
+         tensor->src[0]->type == GGML_TYPE_F32 && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer));
     return false;
 }
 
-static void test_qlion_lazy_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device) {
+static void test_qlion_lazy_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device, bool grad_cpu = false) {
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
     check(backend != nullptr, "failed to create lazy-state backend");
     ggml_backend_t cpu_backend = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr :
@@ -1283,6 +1289,7 @@ static void test_qlion_lazy_gradient_state(enum qat_weight_format format, ggml_b
     opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
     opt_params.opt_period = 4;
     opt_params.get_opt_pars = test_qlion_optimizer_params;
+    opt_params.qat_grad_accumulator_cpu = grad_cpu;
     ggml_opt_context_t opt = ggml_opt_init(opt_params);
     ggml_opt_qat_register_param(opt, weight);
     ggml_opt_set_current_period(opt, 2);
@@ -1303,6 +1310,10 @@ static void test_qlion_lazy_gradient_state(enum qat_weight_format format, ggml_b
     ggml_opt_alloc(opt, true);
     ggml_tensor * gradient_state = ggml_opt_qat_state_gradient_accumulator(opt, 0);
     check(gradient_state != nullptr, "QLion did not select gradient state from the graph");
+    if (grad_cpu) {
+        check(ggml_backend_buffer_is_host(gradient_state->buffer), "QLion gradient state was not allocated in host RAM");
+        check(!ggml_backend_buffer_is_host(ggml_opt_qat_state_momentum(opt, 0)->buffer), "QLion momentum left the GPU");
+    }
     check(gradient_state->type == GGML_TYPE_Q8_0 && gradient_state->ne[1] == 6,
         "pure GET_ROWS_BACK gradient did not select compact Q8 row state");
     std::vector<float> labels_zero(ggml_nelements(ggml_opt_labels(opt)), 0.0f);
@@ -1353,7 +1364,7 @@ static void test_qlion_lazy_gradient_state(enum qat_weight_format format, ggml_b
     ggml_backend_free(backend);
 }
 
-static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device) {
+static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device, bool grad_cpu = false) {
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
     ggml_backend_t cpu_backend = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr :
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -1380,6 +1391,7 @@ static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_
     opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
     opt_params.opt_period = 2;
     opt_params.get_opt_pars = test_qlion_optimizer_params;
+    opt_params.qat_grad_accumulator_cpu = grad_cpu;
     ggml_opt_context_t opt = ggml_opt_init(opt_params);
     ggml_opt_qat_register_param(opt, weight);
     qlion_accumulation_trace trace;
@@ -1401,9 +1413,17 @@ static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_
         ggml_tensor * gradient_state = ggml_opt_qat_state_gradient_accumulator(opt, 0);
         check(gradient_state && gradient_state->type == GGML_TYPE_Q8_0 && ggml_are_same_shape(weight, gradient_state),
             "mixed OUT_PROD and GET_ROWS_BACK did not select the full dense Q8 accumulator");
+        if (grad_cpu) {
+            check(ggml_backend_buffer_is_host(gradient_state->buffer), "dense Q8 accumulator was not allocated in host RAM");
+            check(!ggml_backend_buffer_is_host(ggml_opt_qat_state_momentum(opt, 0)->buffer), "QLion momentum left the GPU");
+        }
         std::vector<float> labels_zero(ggml_nelements(ggml_opt_labels(opt)), 0.0f);
         ggml_backend_tensor_set(ggml_opt_labels(opt), labels_zero.data(), 0, labels_zero.size() * sizeof(float));
         ggml_opt_eval(opt, nullptr);
+    }
+    if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        check(trace.q8_microgradient_host == grad_cpu,
+            "Q8_0 microgradient placement did not follow --qat-grad-accumulator");
     }
     ggml_tensor * momentum = ggml_opt_qat_state_momentum(opt, 0);
     std::vector<uint8_t> row_zero(ggml_row_size(GGML_TYPE_Q8_0, 64));
@@ -1429,6 +1449,7 @@ int main() {
     ggml_backend_load_all();
     test_zero_gradient(QAT_WEIGHT_MXFP4);
     test_zero_gradient(QAT_WEIGHT_Q4_0);
+    test_zero_gradient(QAT_WEIGHT_Q8_0);
     test_q4_0_residual_round_trip();
     test_error_feedback(QAT_WEIGHT_MXFP4);
     test_error_feedback(QAT_WEIGHT_Q4_0);
@@ -1438,21 +1459,29 @@ int main() {
     test_nonfinite_gradient_guard();
     test_reference_trajectory(QAT_WEIGHT_MXFP4);
     test_reference_trajectory(QAT_WEIGHT_Q4_0);
+    test_reference_trajectory(QAT_WEIGHT_Q8_0);
     test_state_resume_trajectory(QAT_WEIGHT_MXFP4);
     test_state_resume_trajectory(QAT_WEIGHT_Q4_0);
+    test_state_resume_trajectory(QAT_WEIGHT_Q8_0);
     ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     test_native_backend_step(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_backend_step(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_backend_step(QAT_WEIGHT_Q8_0, cpu_device, true);
     test_native_microbatch_step(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_microbatch_step(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_microbatch_step(QAT_WEIGHT_Q8_0, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_moe_dx(QAT_WEIGHT_Q8_0, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_routed_update(QAT_WEIGHT_Q8_0, cpu_device, true);
     test_native_rows_update(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_rows_update(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_rows_update(QAT_WEIGHT_Q8_0, cpu_device, true);
     test_native_sparse_rows_accumulation(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_sparse_rows_accumulation(QAT_WEIGHT_Q4_0, cpu_device, true);
+    test_native_sparse_rows_accumulation(QAT_WEIGHT_Q8_0, cpu_device, true);
     const char * backend_filter = getenv("QAT_TEST_BACKEND");
     for (size_t i = 0; backend_filter && i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t device = ggml_backend_dev_get(i);
@@ -1465,31 +1494,48 @@ int main() {
         printf("Testing QAT backend: %s\n", ggml_backend_dev_name(device));
         test_native_backend_step(QAT_WEIGHT_MXFP4, device, false);
         test_native_backend_step(QAT_WEIGHT_Q4_0, device, false);
+        test_native_backend_step(QAT_WEIGHT_Q8_0, device, false);
         test_native_microbatch_step(QAT_WEIGHT_MXFP4, device, false);
         test_native_microbatch_step(QAT_WEIGHT_Q4_0, device, false);
+        test_native_microbatch_step(QAT_WEIGHT_Q8_0, device, false);
         test_native_moe_dx(QAT_WEIGHT_MXFP4, device, false);
         test_native_moe_dx(QAT_WEIGHT_Q4_0, device, false);
+        test_native_moe_dx(QAT_WEIGHT_Q8_0, device, false);
         test_native_routed_update(QAT_WEIGHT_MXFP4, device, false);
         test_native_routed_update(QAT_WEIGHT_Q4_0, device, false);
+        test_native_routed_update(QAT_WEIGHT_Q8_0, device, false);
         test_native_rows_update(QAT_WEIGHT_MXFP4, device, false);
         test_native_rows_update(QAT_WEIGHT_Q4_0, device, false);
+        test_native_rows_update(QAT_WEIGHT_Q8_0, device, false);
         test_native_sparse_rows_accumulation(QAT_WEIGHT_MXFP4, device, false);
         test_native_sparse_rows_accumulation(QAT_WEIGHT_Q4_0, device, false);
+        test_native_sparse_rows_accumulation(QAT_WEIGHT_Q8_0, device, false);
         test_qlion_lazy_gradient_state(QAT_WEIGHT_MXFP4, device);
         test_qlion_lazy_gradient_state(QAT_WEIGHT_Q4_0, device);
+        if (strstr(ggml_backend_dev_name(device), "CUDA")) {
+            test_qlion_lazy_gradient_state(QAT_WEIGHT_Q8_0, device, true);
+        }
         test_qlion_mixed_gradient_state(QAT_WEIGHT_MXFP4, device);
         test_qlion_mixed_gradient_state(QAT_WEIGHT_Q4_0, device);
+        if (strstr(ggml_backend_dev_name(device), "CUDA")) {
+            test_qlion_mixed_gradient_state(QAT_WEIGHT_Q8_0, device, true);
+        }
     }
     test_native_optimizer_graph(QAT_WEIGHT_MXFP4);
     test_native_optimizer_graph(QAT_WEIGHT_Q4_0);
+    test_native_optimizer_graph(QAT_WEIGHT_Q8_0);
     test_moe_sparse_qat(QAT_WEIGHT_MXFP4);
     test_moe_sparse_qat(QAT_WEIGHT_Q4_0);
+    test_moe_sparse_qat(QAT_WEIGHT_Q8_0);
     test_embedding_sparse_qat(QAT_WEIGHT_MXFP4);
     test_embedding_sparse_qat(QAT_WEIGHT_Q4_0);
+    test_embedding_sparse_qat(QAT_WEIGHT_Q8_0);
     test_qlion_lazy_gradient_state(QAT_WEIGHT_MXFP4, cpu_device);
     test_qlion_lazy_gradient_state(QAT_WEIGHT_Q4_0, cpu_device);
+    test_qlion_lazy_gradient_state(QAT_WEIGHT_Q8_0, cpu_device);
     test_qlion_mixed_gradient_state(QAT_WEIGHT_MXFP4, cpu_device);
     test_qlion_mixed_gradient_state(QAT_WEIGHT_Q4_0, cpu_device);
+    test_qlion_mixed_gradient_state(QAT_WEIGHT_Q8_0, cpu_device);
     printf("QAT reference tests passed\n");
     return 0;
 }

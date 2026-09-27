@@ -5085,13 +5085,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.qat_resume = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
-        {"--quant-type"}, "mxfp4|q4_0",
-        "required native model-weight format",
+        {"--quant-type"}, "mxfp4|q4_0|q8_0|q4_0,q8_0|mxfp4,q8_0",
+        "required native model-weight formats",
         [](common_params & params, const std::string & value) {
-            if (value != "mxfp4" && value != "q4_0") {
-                throw std::invalid_argument("--quant-type must be mxfp4 or q4_0");
+            if (value != "mxfp4" && value != "q4_0" && value != "q8_0" &&
+                value != "q4_0,q8_0" && value != "mxfp4,q8_0") {
+                throw std::invalid_argument("unsupported --quant-type");
             }
             params.qat_quant_type = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-grad-accumulator"}, "device|cpu",
+        "native QAT gradient accumulator location",
+        [](common_params & params, const std::string & value) {
+            if (value != "device" && value != "cpu") {
+                throw std::invalid_argument("unsupported --qat-grad-accumulator");
+            }
+            params.qat_grad_accumulator_cpu = value == "cpu";
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(

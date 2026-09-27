@@ -63,7 +63,6 @@ static int64_t train_sample_split_by_conversation(
 }
 
 struct qat_model_info {
-    enum ggml_type weight_type = GGML_TYPE_COUNT;
     uint64_t quantized_bytes = 0;
     uint64_t nonquantized_bytes = 0;
     uint64_t momentum_bytes = 0;
@@ -71,7 +70,23 @@ struct qat_model_info {
     int64_t quantized_tensors = 0;
 };
 
-static bool qat_inspect_model(const std::string & path, enum ggml_type expected, struct qat_model_info & info) {
+static std::vector<enum ggml_type> qat_weight_types(const std::string & selected) {
+    if (selected == "q8_0") {
+        return { GGML_TYPE_Q8_0 };
+    }
+    if (selected == "q4_0") {
+        return { GGML_TYPE_Q4_0 };
+    }
+    if (selected == "q4_0,q8_0") {
+        return { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 };
+    }
+    if (selected == "mxfp4,q8_0") {
+        return { GGML_TYPE_MXFP4, GGML_TYPE_Q8_0 };
+    }
+    return { GGML_TYPE_MXFP4 };
+}
+
+static bool qat_inspect_model(const std::string & path, const std::vector<enum ggml_type> & expected, struct qat_model_info & info) {
     struct ggml_context * ctx_meta = nullptr;
     struct gguf_init_params params = { true, &ctx_meta };
     struct gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
@@ -80,19 +95,21 @@ static bool qat_inspect_model(const std::string & path, enum ggml_type expected,
         return false;
     }
     info = {};
-    info.weight_type = expected;
+    std::vector<int64_t> counts(expected.size(), 0);
     for (int64_t i = 0; i < gguf_get_n_tensors(gctx); ++i) {
         const char * name = gguf_get_tensor_name(gctx, i);
         struct ggml_tensor * tensor = ggml_get_tensor(ctx_meta, name);
         GGML_ASSERT(tensor);
         if (ggml_is_quantized(tensor->type)) {
-            if (tensor->type != expected) {
-                LOG_ERR("%s: tensor %s has %s, expected an unmixed %s model\n",
-                    __func__, name, ggml_type_name(tensor->type), ggml_type_name(expected));
+            const auto found = std::find(expected.begin(), expected.end(), tensor->type);
+            if (found == expected.end()) {
+                LOG_ERR("%s: tensor %s has unsupported type %s\n",
+                    __func__, name, ggml_type_name(tensor->type));
                 gguf_free(gctx);
                 ggml_free(ctx_meta);
                 return false;
             }
+            counts[found - expected.begin()]++;
             info.quantized_bytes += ggml_nbytes(tensor);
             info.momentum_bytes += ggml_row_size(GGML_TYPE_Q8_0, tensor->ne[0]) * ggml_nrows(tensor);
             info.residual_bytes += ggml_row_size(GGML_TYPE_Q4_0, tensor->ne[0]) * ggml_nrows(tensor);
@@ -103,16 +120,19 @@ static bool qat_inspect_model(const std::string & path, enum ggml_type expected,
     }
     gguf_free(gctx);
     ggml_free(ctx_meta);
-    if (info.quantized_tensors == 0) {
-        LOG_ERR("%s: model contains no %s tensors\n", __func__, ggml_type_name(expected));
-        return false;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (counts[i] == 0) {
+            LOG_ERR("%s: model contains no %s tensors\n", __func__, ggml_type_name(expected[i]));
+            return false;
+        }
     }
     return true;
 }
 
 static bool qat_param_filter(const struct ggml_tensor * tensor, void * userdata) {
-    const enum ggml_type expected = *(const enum ggml_type *) userdata;
-    return tensor && tensor->type == expected && strcmp(tensor->name, "rope_freqs.weight") != 0;
+    const auto & expected = *(const std::vector<enum ggml_type> *) userdata;
+    return tensor && std::find(expected.begin(), expected.end(), tensor->type) != expected.end() &&
+        strcmp(tensor->name, "rope_freqs.weight") != 0;
 }
 
 struct qat_opt_lr_context {
@@ -646,9 +666,9 @@ int main(int argc, char ** argv) {
     if (!params.qat_resume.empty()) {
         params.model.path = params.qat_resume;
     }
-    enum ggml_type weight_type = params.qat_quant_type == "mxfp4" ? GGML_TYPE_MXFP4 : GGML_TYPE_Q4_0;
+    std::vector<enum ggml_type> weight_types = qat_weight_types(params.qat_quant_type);
     struct qat_model_info model_info;
-    if (!qat_inspect_model(params.model.path, weight_type, model_info)) {
+    if (!qat_inspect_model(params.model.path, weight_types, model_info)) {
         return 1;
     }
     const uint64_t gradient_estimate = params.n_ubatch < params.n_batch ? model_info.momentum_bytes : 0;
@@ -793,7 +813,7 @@ int main(int argc, char ** argv) {
         params.qat_fast_state_scale
     };
     struct llama_opt_params opt_params {
-        0, params.mtp_mode == "only" ? lora_param_filter_none : qat_param_filter, &weight_type, qat_opt_lr_pars, &qat_lr_ctx,
+        0, params.mtp_mode == "only" ? lora_param_filter_none : qat_param_filter, &weight_types, qat_opt_lr_pars, &qat_lr_ctx,
         GGML_OPT_OPTIMIZER_TYPE_QLION_QAT, LLAMA_LORA_QAT_TYPE_NONE,
         nullptr, nullptr,
         params.grad_checkpoint_interval, params.activation_recompute,
@@ -802,10 +822,12 @@ int main(int argc, char ** argv) {
         critical_weight_shape_from_string(params.critical_weight_shape), params.critical_warmup_steps,
         params.critical_max_fraction, &schedule.step, params.critical_stats_every,
         params.mtp_mode != "only",
+        false,
+        params.qat_grad_accumulator_cpu,
     };
     llama_opt_init(lctx, model, opt_params);
     if (params.mtp_mode != "only" && llama_opt_qat_state_count(lctx) == 0) {
-        LOG_ERR("%s: the training graph contains no trainable %s tensors\n", __func__, ggml_type_name(weight_type));
+        LOG_ERR("%s: the training graph contains no trainable %s tensors\n", __func__, params.qat_quant_type.c_str());
         return 1;
     }
     qat_print_memory(lctx, model_info);

@@ -373,7 +373,7 @@ static constexpr int MUL_MAT_ID_BACK_WARPS =
 // Each warp handles one quant block = 32 columns.
 // ============================================================
 
-template<bool mxfp4>
+template<ggml_type weight_type>
 static __global__ void mul_mat_id_back_dequant_batch(
         const void * __restrict__ weight_data,
         float * __restrict__ weight_f32,
@@ -431,18 +431,15 @@ static __global__ void mul_mat_id_back_dequant_batch(
                 rows * expert
             );
 
-    const float value =
-        mxfp4
-            ? mxfp4_get(
-                ((const block_mxfp4 *)
-                    weight_data)[global_ib],
-                lane
-            )
-            : q4_0_get(
-                ((const block_q4_0 *)
-                    weight_data)[global_ib],
-                lane
-            );
+    float value;
+    if constexpr (weight_type == GGML_TYPE_MXFP4) {
+        value = mxfp4_get(((const block_mxfp4 *) weight_data)[global_ib], lane);
+    } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
+        const block_q8_0 & block = ((const block_q8_0 *) weight_data)[global_ib];
+        value = __half2float(block.d) * block.qs[lane];
+    } else {
+        value = q4_0_get(((const block_q4_0 *) weight_data)[global_ib], lane);
+    }
 
     const int64_t col =
         block * 32 +
@@ -666,7 +663,7 @@ static __global__ void mul_mat_id_back_scatter(
 // All normal routes return immediately.
 // ============================================================
 
-template<bool mxfp4>
+template<ggml_type weight_type>
 static __global__ void mul_mat_id_back_overflow(
         const void * __restrict__ weight_data,
         const float * __restrict__ grad,
@@ -753,18 +750,15 @@ static __global__ void mul_mat_id_back_overflow(
                         expert
                 );
 
-        const float value =
-            mxfp4
-                ? mxfp4_get(
-                    ((const block_mxfp4 *)
-                        weight_data)[ib],
-                    lane
-                )
-                : q4_0_get(
-                    ((const block_q4_0 *)
-                        weight_data)[ib],
-                    lane
-                );
+        float value;
+        if constexpr (weight_type == GGML_TYPE_MXFP4) {
+            value = mxfp4_get(((const block_mxfp4 *) weight_data)[ib], lane);
+        } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
+            const block_q8_0 & block = ((const block_q8_0 *) weight_data)[ib];
+            value = __half2float(block.d) * block.qs[lane];
+        } else {
+            value = q4_0_get(((const block_q4_0 *) weight_data)[ib], lane);
+        }
 
         sum =
             fmaf(
@@ -864,7 +858,8 @@ void ggml_cuda_mul_mat_id_back(
         weight->type ==
             GGML_TYPE_MXFP4 ||
         weight->type ==
-            GGML_TYPE_Q4_0
+            GGML_TYPE_Q4_0 ||
+        weight->type == GGML_TYPE_Q8_0
     );
 
     GGML_ASSERT(
@@ -1094,7 +1089,7 @@ void ggml_cuda_mul_mat_id_back(
         if (weight->type ==
             GGML_TYPE_MXFP4) {
 
-            mul_mat_id_back_dequant_batch<true>
+            mul_mat_id_back_dequant_batch<GGML_TYPE_MXFP4>
                 <<<dequant_blocks,
                    dequant_threads,
                    0,
@@ -1108,9 +1103,13 @@ void ggml_cuda_mul_mat_id_back(
                     batch_count
                 );
 
+        } else if (weight->type == GGML_TYPE_Q8_0) {
+            mul_mat_id_back_dequant_batch<GGML_TYPE_Q8_0>
+                <<<dequant_blocks, dequant_threads, 0, stream>>>(
+                    weight->data, weight_f32.ptr, cols, rows, n_blocks_row, expert_base, batch_count);
         } else {
 
-            mul_mat_id_back_dequant_batch<false>
+            mul_mat_id_back_dequant_batch<GGML_TYPE_Q4_0>
                 <<<dequant_blocks,
                    dequant_threads,
                    0,
@@ -1224,7 +1223,7 @@ void ggml_cuda_mul_mat_id_back(
     if (weight->type ==
         GGML_TYPE_MXFP4) {
 
-        mul_mat_id_back_overflow<true>
+        mul_mat_id_back_overflow<GGML_TYPE_MXFP4>
             <<<overflow_blocks,
                MUL_MAT_ID_BACK_WARPS * 32,
                0,
@@ -1258,9 +1257,16 @@ void ggml_cuda_mul_mat_id_back(
                 cap
             );
 
+    } else if (weight->type == GGML_TYPE_Q8_0) {
+        mul_mat_id_back_overflow<GGML_TYPE_Q8_0>
+            <<<overflow_blocks, MUL_MAT_ID_BACK_WARPS * 32, 0, stream>>>(
+                weight->data, (const float *) grad->data, (const int32_t *) ids->data,
+                route_rank.ptr, (float *) dst->data,
+                n_blocks_row, rows, n_expert, n_used, n_tokens,
+                grad_s0, grad_s1, grad_s2, ids_s0, ids_s1, cap);
     } else {
 
-        mul_mat_id_back_overflow<false>
+        mul_mat_id_back_overflow<GGML_TYPE_Q4_0>
             <<<overflow_blocks,
                MUL_MAT_ID_BACK_WARPS * 32,
                0,

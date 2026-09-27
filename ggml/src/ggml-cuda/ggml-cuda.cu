@@ -5666,7 +5666,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT_ID_BACK:
             return op->type == GGML_TYPE_F32
-                && (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0)
+                && (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0)
                 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
         case GGML_OP_OUT_PROD_ID:
             return op->src[0] != nullptr && op->src[1] != nullptr && op->src[2] != nullptr

@@ -3470,7 +3470,7 @@ static void llama_set_param(
     if (!tensor) {
         return;
     }
-    const bool qat_type = tensor->type == GGML_TYPE_MXFP4 || tensor->type == GGML_TYPE_Q4_0;
+    const bool qat_type = tensor->type == GGML_TYPE_MXFP4 || tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q8_0;
     if ((optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && !qat_type) ||
         (optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && tensor->type != GGML_TYPE_F32)) {
         return;
@@ -3607,6 +3607,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.optimizer                 = lopt_params.optimizer_type;
     opt_params.grad_checkpoint_interval  = lopt_params.grad_checkpoint_interval;
     opt_params.activation_recompute      = lopt_params.activation_recompute || lopt_params.grad_checkpoint_interval > 0;
+    opt_params.qat_grad_accumulator_cpu   = lopt_params.qat_grad_accumulator_cpu;
     opt_params.critical_token_weighting  = lopt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
     opt_params.critical_confidence_weighting = lopt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_CONFIDENCE ||
                                                lopt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_HYBRID;
@@ -3631,6 +3632,16 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     cparams.lora_qat_type_callback       = lopt_params.lora_qat_type_callback;
     cparams.lora_qat_type_callback_ud    = lopt_params.lora_qat_type_callback_ud;
     opt_ctx = ggml_opt_init(opt_params);
+    if (lopt_params.qat_grad_accumulator_cpu && backend_cpu) {
+        for (const auto & set_n_threads_fn : set_n_threads_fns) {
+            set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads_batch);
+        }
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (set_threadpool_fn && threadpool_batch) {
+            set_threadpool_fn(backend_cpu, threadpool_batch);
+        }
+    }
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;

@@ -158,6 +158,7 @@ extern "C" {
         bool    critical_weight_linear;
         bool    sparse_labels;
         bool    fused_backward;
+        bool    qat_grad_accumulator_cpu;
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;

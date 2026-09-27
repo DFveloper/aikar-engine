@@ -702,6 +702,7 @@ struct common_params {
     std::string qat_out = "qat-model.gguf";
     std::string qat_resume = "";
     std::string qat_quant_type = "mxfp4";
+    bool qat_grad_accumulator_cpu = false;
     std::string qat_momentum = "q8_0";
     std::string qat_residual = "q4_0";
     std::string qat_update_granularity = "tensor";

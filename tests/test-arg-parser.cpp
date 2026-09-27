@@ -320,6 +320,18 @@ static void test(void) {
 
     printf("test-arg-parser: test valid usage\n\n");
 
+    for (const char * type : { "mxfp4", "q4_0", "q8_0", "q4_0,q8_0", "mxfp4,q8_0" }) {
+        common_params qat_params;
+        argv = { "binary_name", "-m", "model.gguf", "--quant-type", type };
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));
+        assert(qat_params.qat_quant_type == type);
+    }
+    for (const char * type : { "q4_k", "q8_0,q4_0", "q4_0,mxfp4", "q4_0,q8_0,q8_0" }) {
+        common_params qat_params;
+        argv = { "binary_name", "-m", "model.gguf", "--quant-type", type };
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));
+    }
+
     {
         common_params train_params;
         assert(!train_params.activation_recompute);

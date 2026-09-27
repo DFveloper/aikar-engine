@@ -6677,7 +6677,7 @@ struct ggml_tensor * ggml_acc_qlion_qat(
         struct ggml_tensor  * grad,
         bool                  reset) {
     GGML_ASSERT(accumulator->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(ggml_are_same_shape(accumulator, grad));
     GGML_ASSERT(ggml_is_contiguous(accumulator));
     GGML_ASSERT(ggml_is_contiguous(grad));
@@ -6773,7 +6773,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * params) {
     GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(ggml_are_same_shape(weight, grad));
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
@@ -6807,7 +6807,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_id(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * params) {
     GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(activations->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(weight->ne[0] == activations->ne[0] && weight->ne[1] == grad->ne[0]);
     const int64_t n_exp_used = grad->ne[1];
@@ -6847,7 +6847,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_rows(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * params) {
     GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(weight->ne[0] == grad->ne[0]);
     GGML_ASSERT(ggml_nelements(ids) == ggml_nrows(grad));
@@ -6879,7 +6879,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_sparse_rows(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * params) {
     GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_Q8_0 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(count->type == GGML_TYPE_I32 && ggml_nelements(count) == 1);
     GGML_ASSERT(weight->ne[0] == grad->ne[0]);
@@ -6916,7 +6916,8 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_tied(
 
     GGML_ASSERT(
         weight->type == GGML_TYPE_MXFP4 ||
-        weight->type == GGML_TYPE_Q4_0
+        weight->type == GGML_TYPE_Q4_0 ||
+        weight->type == GGML_TYPE_Q8_0
     );
 
     GGML_ASSERT(dense_a->type == GGML_TYPE_F32);

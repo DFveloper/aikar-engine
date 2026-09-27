@@ -10,6 +10,7 @@
 enum qat_weight_format {
     QAT_WEIGHT_MXFP4,
     QAT_WEIGHT_Q4_0,
+    QAT_WEIGHT_Q8_0,
 };
 
 struct qat_tensor_state {
@@ -86,4 +87,3 @@ bool qat_tensor_state_step(
         const struct qat_qlion_params & params,
         struct qat_step_stats & stats,
         std::string & error);
-
