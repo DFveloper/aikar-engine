@@ -1267,6 +1267,7 @@ struct ggml_cuda_graph {
     struct mmvq_activation_cache_entry {
         void * data = nullptr;
         size_t size = 0;
+        bool quantized = false;
     };
 
     ~ggml_cuda_graph() {

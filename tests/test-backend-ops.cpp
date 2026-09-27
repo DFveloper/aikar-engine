@@ -1162,6 +1162,8 @@ static void print_test_result_locked(printer * output_printer, const test_result
 struct test_case {
     virtual ~test_case() {}
 
+    virtual int graph_warmup_runs() const { return 0; }
+
     virtual std::string op_desc(ggml_tensor * t) {
         return ggml_op_desc(t);
     }
@@ -1453,6 +1455,12 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+
+        for (int i = 0; i < graph_warmup_runs(); ++i) {
+            if (ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
+                return test_status_t::FAIL;
+            }
         }
 
         // compare
@@ -5095,6 +5103,8 @@ struct test_mul_mat : public test_case {
     double max_nmse_err() override {
         return 5e-4;
     }
+
+    int graph_warmup_runs() const override { return o > 1 ? 3 : 0; }
 
     double max_nmse_err(ggml_backend_t backend) override {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
@@ -10707,6 +10717,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, 1, 256, {1,1}, {1,1}, {0,1,2,3}, 0, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, 128, 256, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, 128, 256, {1,1}, {1,1}, {0,1,2,3}, 0, 1, false, GGML_PREC_Q4));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 64, 128, 256, {1,1}, {1,1}, {0,1,2,3}, 0, 1, false, GGML_PREC_Q4));

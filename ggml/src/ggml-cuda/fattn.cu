@@ -132,7 +132,10 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_should_use_sparse(const int device,
          (Q->ne[0] == 576 && V->ne[0] == 512 && gqa_ratio % 16 == 0));
     const bool mma_sparse_available = q8_kv ? cc == GGML_CUDA_CC_VOLTA && volta_q8_sparse_shape :
         Q->ne[0] != 256 && (turing_mma_available(cc) || (volta_mma_available(cc) && volta_f16_sparse_shape));
-    const bool sparse_kv_length = K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
+    const bool volta_q8_single_token = q8_kv && cc == GGML_CUDA_CC_VOLTA &&
+        volta_q8_sparse_shape && Q->ne[1] == 1;
+    const int64_t sparse_min_kv = volta_q8_single_token ? 16384 : 4096;
+    const bool sparse_kv_length = K->ne[1] >= std::max<int64_t>(sparse_min_kv, 2LL*n_kv_max);
     return GGML_CUDA_CC_IS_NVIDIA(cc) && mma_sparse_available &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&

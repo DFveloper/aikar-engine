@@ -1601,17 +1601,22 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t q8_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     char * src1_q8_1_data = nullptr;
+    bool quantize_src1 = true;
 #ifdef USE_CUDA_GRAPH
     if (ctx.active_graph_capture && ctx.active_graph != nullptr) {
         auto it = ctx.active_graph->mmvq_activation_cache.find(src1);
         if (it != ctx.active_graph->mmvq_activation_cache.end() && it->second.size == q8_size) {
             src1_q8_1_data = (char *) it->second.data;
+            quantize_src1 = !it->second.quantized;
+            it->second.quantized = true;
         }
     }
 #endif
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     if (src1_q8_1_data == nullptr) {
         src1_q8_1_data = src1_q8_1.alloc(q8_size);
+    }
+    if (quantize_src1) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
