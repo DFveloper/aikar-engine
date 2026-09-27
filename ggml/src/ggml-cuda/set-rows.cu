@@ -169,6 +169,129 @@ static void set_rows_cuda_q8_kv(
             src, rows, dst, ncols, nrows, src_row_stride/sizeof(float), dst_row_stride);
 }
 
+template <int d_head, bool q8_kv>
+static __global__ void k_rms_norm_set_rows(
+        const float * __restrict__ src,
+        const int64_t * __restrict__ rows,
+        char * __restrict__ dst,
+        int64_t n_head,
+        int64_t src_head_stride,
+        int64_t src_token_stride,
+        int64_t dst_row_stride,
+        float eps) {
+    constexpr int block_size = 256;
+
+    const int64_t row   = blockIdx.x;
+    const int64_t head  = row % n_head;
+    const int64_t token = row / n_head;
+    const int tid = threadIdx.x;
+
+    const float * src_row = src + token*src_token_stride + head*src_head_stride;
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < d_head; col += block_size) {
+        const float value = src_row[col];
+        tmp += value*value;
+    }
+
+    extern __shared__ float scratch[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, scratch);
+    const float norm_scale = rsqrtf(tmp/d_head + eps);
+
+    ggml_cuda_pdl_lc();
+    if constexpr (q8_kv) {
+        block_q8_kv * dst_row = (block_q8_kv *) (dst + rows[row]*dst_row_stride);
+
+        for (int col_base = 0; col_base < d_head; col_base += block_size) {
+            const int col = col_base + tid;
+            const float value = src_row[col]*norm_scale;
+            scratch[tid] = fabsf(value);
+            __syncthreads();
+
+            const int lane = tid % QK8_KV;
+            for (int stride = QK8_KV/2; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+                }
+                __syncthreads();
+            }
+
+            block_q8_kv * dst_block = dst_row + col/QK8_KV;
+            const float scale = scratch[tid - lane]/127.0f;
+            if (lane == 0) {
+                dst_block->d = __float2half(scale);
+            }
+            const float inv_scale = scale ? 1.0f/scale : 0.0f;
+            dst_block->qs[lane] = (int8_t) max(-127, min(127, __float2int_rn(value*inv_scale)));
+            __syncthreads();
+        }
+    } else {
+        half * dst_row = (half *) (dst + rows[token]*dst_row_stride) + head*d_head;
+        for (int col = tid; col < d_head; col += block_size) {
+            dst_row[col] = __float2half(src_row[col]*norm_scale);
+        }
+    }
+}
+
+template <int d_head, bool q8_kv>
+static void rms_norm_set_rows_cuda(
+        const float * src,
+        const int64_t * rows,
+        char * dst,
+        int64_t n_head,
+        int64_t n_tokens,
+        size_t src_head_stride,
+        size_t src_token_stride,
+        size_t dst_row_stride,
+        float eps,
+        cudaStream_t stream) {
+    constexpr int block_size = 256;
+    const ggml_cuda_kernel_launch_params launch_params = {
+        (unsigned int) (n_head*n_tokens), block_size, block_size*sizeof(float), stream
+    };
+    ggml_cuda_kernel_launch(k_rms_norm_set_rows<d_head, q8_kv>, launch_params,
+        src, rows, dst, n_head, src_head_stride/sizeof(float), src_token_stride/sizeof(float), dst_row_stride, eps);
+}
+
+void ggml_cuda_op_rms_norm_set_rows(ggml_backend_cuda_context & ctx,
+                                    ggml_tensor *               rms_norm,
+                                    ggml_tensor *               set_rows) {
+    const ggml_tensor * src = rms_norm->src[0];
+    const ggml_tensor * rows = set_rows->src[1];
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(rows->type == GGML_TYPE_I64);
+    GGML_ASSERT(src->ne[0] == 256 || src->ne[0] == 512);
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const bool q8_kv = set_rows->type == GGML_TYPE_Q8_KV;
+    const int64_t d_head = src->ne[0];
+    const int64_t n_head = src->ne[1];
+    const int64_t n_tokens = src->ne[2];
+    cudaStream_t stream = ctx.stream();
+
+    if (d_head == 256) {
+        if (q8_kv) {
+            rms_norm_set_rows_cuda<256, true>((const float *) src->data, (const int64_t *) rows->data,
+                (char *) set_rows->data, n_head, n_tokens, src->nb[1], src->nb[2], set_rows->nb[1], eps, stream);
+        } else {
+            rms_norm_set_rows_cuda<256, false>((const float *) src->data, (const int64_t *) rows->data,
+                (char *) set_rows->data, n_head, n_tokens, src->nb[1], src->nb[2], set_rows->nb[1], eps, stream);
+        }
+    } else {
+        if (q8_kv) {
+            rms_norm_set_rows_cuda<512, true>((const float *) src->data, (const int64_t *) rows->data,
+                (char *) set_rows->data, n_head, n_tokens, src->nb[1], src->nb[2], set_rows->nb[1], eps, stream);
+        } else {
+            rms_norm_set_rows_cuda<512, false>((const float *) src->data, (const int64_t *) rows->data,
+                (char *) set_rows->data, n_head, n_tokens, src->nb[1], src->nb[2], set_rows->nb[1], eps, stream);
+        }
+    }
+}
+
 // Generic quantized set_rows kernel template
 template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
 static __global__ void k_set_rows_quant(const float * __restrict__ src0,

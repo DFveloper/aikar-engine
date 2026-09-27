@@ -529,6 +529,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "q8_0") {
         return GGML_TYPE_Q8_0;
     }
+    if (s == "q8_kv") {
+        return GGML_TYPE_Q8_KV;
+    }
     if (s == "q4_0") {
         return GGML_TYPE_Q4_0;
     }

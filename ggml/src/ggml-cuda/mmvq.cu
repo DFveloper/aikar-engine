@@ -321,6 +321,39 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+#ifdef USE_CUDA_GRAPH
+void ggml_cuda_prepare_mmvq_activation_cache(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, ggml_cuda_graph & graph) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (!src0 || !src1 || !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 ||
+                node->type != GGML_TYPE_F32 || src1->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+                !ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
+            continue;
+        }
+
+        const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+        const size_t size = src1->ne[3] * src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1;
+        auto & entry = graph.mmvq_activation_cache[src1];
+        if (entry.data != nullptr && entry.size == size) {
+            continue;
+        }
+        if (entry.data != nullptr) {
+            CUDA_CHECK(cudaFree(entry.data));
+        }
+        CUDA_CHECK(cudaMalloc(&entry.data, size));
+        entry.size = size;
+    }
+}
+#endif
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -999,7 +1032,8 @@ static __global__ void mul_mat_vec_q4_0_moe_reduce(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
         const float * expert_scale_ptr, const float * expert_weights_ptr, float * dst_ptr,
         const uint32_t ncols_x, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y) {
+        const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t ids_stride) {
     constexpr int n_expert_used = 8;
     constexpr int qk            = ggml_cuda_type_traits<GGML_TYPE_Q4_0>::qk;
     constexpr int qi            = ggml_cuda_type_traits<GGML_TYPE_Q4_0>::qi;
@@ -1008,11 +1042,12 @@ static __global__ void mul_mat_vec_q4_0_moe_reduce(
     constexpr int blocks_per_iter = vdr*warp_size/qi;
 
     const int expert_slot = threadIdx.y;
+    const int token       = blockIdx.y;
     const int row0        = c_rows_per_block*blockIdx.x;
-    const int expert_id   = ids_ptr[expert_slot];
+    const int expert_id   = ids_ptr[token*ids_stride + expert_slot];
     const int blocks_per_row_x = ncols_x/qk;
 
-    const block_q8_1 * y = (const block_q8_1 *) vy_ptr + expert_slot*stride_channel_y;
+    const block_q8_1 * y = (const block_q8_1 *) vy_ptr + (token*n_expert_used + expert_slot)*stride_channel_y;
     const int kbx_offset = expert_id*stride_channel_x + row0*stride_row_x;
 
     float tmp[c_rows_per_block] = { 0.0f };
@@ -1038,7 +1073,7 @@ static __global__ void mul_mat_vec_q4_0_moe_reduce(
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int row = 0; row < c_rows_per_block; ++row) {
-            expert_sum[row][expert_slot] = tmp[row]*expert_scale_ptr[expert_id]*expert_weights_ptr[expert_slot];
+            expert_sum[row][expert_slot] = tmp[row]*expert_scale_ptr[expert_id]*expert_weights_ptr[token*n_expert_used + expert_slot];
         }
     }
     __syncthreads();
@@ -1049,7 +1084,7 @@ static __global__ void mul_mat_vec_q4_0_moe_reduce(
         for (int expert = 1; expert < n_expert_used; ++expert) {
             sum += expert_sum[threadIdx.x][expert];
         }
-        dst_ptr[row0 + threadIdx.x] = sum;
+        dst_ptr[token*nrows_x + row0 + threadIdx.x] = sum;
     }
 }
 
@@ -1564,12 +1599,23 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t q8_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    char * src1_q8_1_data = nullptr;
+#ifdef USE_CUDA_GRAPH
+    if (ctx.active_graph_capture && ctx.active_graph != nullptr) {
+        auto it = ctx.active_graph->mmvq_activation_cache.find(src1);
+        if (it != ctx.active_graph->mmvq_activation_cache.end() && it->second.size == q8_size) {
+            src1_q8_1_data = (char *) it->second.data;
+        }
+    }
+#endif
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (src1_q8_1_data == nullptr) {
+        src1_q8_1_data = src1_q8_1.alloc(q8_size);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_data, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1595,7 +1641,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_data, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
@@ -1619,9 +1665,11 @@ void ggml_cuda_mul_mat_vec_q4_0_moe_reduce(
     GGML_ASSERT(src1->ne[1] == n_expert_used);
     GGML_ASSERT(ids->ne[0] == n_expert_used);
     GGML_ASSERT(ggml_nelements(expert_scale) == src0->ne[2]);
-    GGML_ASSERT(ggml_nelements(expert_weights) == n_expert_used);
-    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
-    GGML_ASSERT(dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(src1->ne[2] >= 1 && src1->ne[2] <= 4 && src1->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == src1->ne[2] && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(ggml_nelements(expert_weights) == n_expert_used*src1->ne[2]);
+    GGML_ASSERT(dst->ne[1] == src1->ne[2] && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(src1));
     GGML_ASSERT(ggml_is_contiguous(expert_scale));
     GGML_ASSERT(ggml_is_contiguous(expert_weights));
     GGML_ASSERT(ggml_is_contiguous(dst));
@@ -1646,7 +1694,7 @@ void ggml_cuda_mul_mat_vec_q4_0_moe_reduce(
     const uint32_t stride_channel_y = ne10_padded/QK8_1;
 
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-    const dim3 block_nums((src0->ne[1] + rows_per_block - 1)/rows_per_block, 1, 1);
+    const dim3 block_nums((src0->ne[1] + rows_per_block - 1)/rows_per_block, src1->ne[2], 1);
     const dim3 block_dims(warp_size, n_expert_used, 1);
     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
 
@@ -1656,7 +1704,8 @@ void ggml_cuda_mul_mat_vec_q4_0_moe_reduce(
     ggml_cuda_kernel_launch(mul_mat_vec_q4_0_moe_reduce<rows_per_block>, launch_params,
         src0->data, src1_q8_1.get(), (const int32_t *) ids->data,
         (const float *) expert_scale->data, (const float *) expert_weights->data, dst_d,
-        (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], stride_row_x, stride_channel_x, stride_channel_y);
+        (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], stride_row_x, stride_channel_x, stride_channel_y,
+        (uint32_t) (ids->nb[1]/sizeof(int32_t)));
 
     if (use_dst_tmp) {
         CUDA_CHECK(cudaMemcpyAsync(dst->data, dst_d, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));

@@ -1264,7 +1264,17 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
+    struct mmvq_activation_cache_entry {
+        void * data = nullptr;
+        size_t size = 0;
+    };
+
     ~ggml_cuda_graph() {
+        for (auto & entry : mmvq_activation_cache) {
+            if (entry.second.data != nullptr) {
+                CUDA_CHECK(cudaFree(entry.second.data));
+            }
+        }
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
@@ -1283,6 +1293,16 @@ struct ggml_cuda_graph {
     int volta_q8_fwht_n_nodes = -1;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> volta_q8_fwht_set_rows;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> volta_q8_set_rows_fwht;
+    std::unordered_map<const ggml_tensor *, mmvq_activation_cache_entry> mmvq_activation_cache;
+
+    void clear_mmvq_activation_cache() {
+        for (auto & entry : mmvq_activation_cache) {
+            if (entry.second.data != nullptr) {
+                CUDA_CHECK(cudaFree(entry.second.data));
+            }
+        }
+        mmvq_activation_cache.clear();
+    }
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1460,6 +1480,11 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_graph * active_graph = nullptr;
+    bool active_graph_capture = false;
+#endif
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
