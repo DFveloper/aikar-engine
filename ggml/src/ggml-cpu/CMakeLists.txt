@@ -31,8 +31,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.cpp
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
-        ggml-cpu/iqp.cpp
-        ggml-cpu/iqp.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
         ggml-cpu/quants.c
@@ -43,6 +41,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/amx/amx.h
         ggml-cpu/amx/mmq.cpp
         ggml-cpu/amx/mmq.h
+        ggml-cpu/tiled/tiled.cpp
+        ggml-cpu/tiled/tiled.h
+        ggml-cpu/tiled/tiled-kernel.cpp
+        ggml-cpu/tiled/tiled-kernel.h
         ggml-cpu/ggml-cpu-impl.h
         ggml-cpu/common.h
         ggml-cpu/binary-ops.h
@@ -674,12 +676,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
-
-    if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND NOT GGML_SYSTEM_ARCH STREQUAL "x86")
-        message(STATUS "Skipping PCH for ${GGML_CPU_NAME}: GCC PCH is only enabled for x86 (arch: ${GGML_SYSTEM_ARCH})")
-    else()
-        target_precompile_headers(${GGML_CPU_NAME} PRIVATE ggml-impl.h)
-    endif()
 
     if (EMSCRIPTEN)
         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")

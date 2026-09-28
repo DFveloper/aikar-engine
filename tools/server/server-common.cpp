@@ -15,6 +15,8 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <chrono>
+#include <thread>
 
 #ifdef _WIN32
 // windows.h defines min and max as macros, which breaks std::min and std::max
@@ -1196,6 +1198,11 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // an absent or empty schema means any object
+    if (json_schema.is_object() && json_schema.empty()) {
+        json_schema["type"] = "object";
+    }
+
     // get input files
     if (!body.contains("messages")) {
         throw std::invalid_argument("'messages' is required");
@@ -1256,12 +1263,13 @@ json oaicompat_chat_params_parse(
                 p["text"] = get_media_marker();
                 p.erase("input_audio");
 
-            } else if (type == "input_video") {
+            } else if (type == "input_video" || type == "video_url") {
                 if (!opt.allow_video) {
                     throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
 
-                json input_video = json_value(p, "input_video", json::object());
+                // accept the OpenAI-style "video_url" key as an alias of "input_video"
+                json input_video = json_value(p, type, json::object());
                 std::string url  = json_value(input_video, "data",
                                         json_value(input_video, "url", std::string()));
                 handle_media(out_files, url, opt.media_path);
@@ -1269,6 +1277,7 @@ json oaicompat_chat_params_parse(
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
                 p.erase("input_video");
+                p.erase("video_url");
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");
