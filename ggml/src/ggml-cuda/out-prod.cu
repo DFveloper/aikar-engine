@@ -9,38 +9,40 @@
 
 static constexpr size_t Q4_0_OUT_PROD_WORKSPACE_MAX = 64ull*1024*1024;
 
-static __global__ void out_prod_q4_0_dequant_tile(
-        const char * src, half * dst, int64_t ne0, int64_t row_begin, int64_t n_rows, size_t nb1) {
-    const int64_t blocks_per_row = ne0/QK4_0;
+static __global__ void out_prod_q4_0_prepare_tile(
+        const char * src0, half * dst0, int64_t ne00,
+        const char * src1, half * dst1, int64_t ne10,
+        int64_t row_begin, int64_t n_rows, size_t nb01, size_t nb10, size_t nb11) {
     const int64_t block_index = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (block_index >= blocks_per_row*n_rows) {
-        return;
-    }
+    const int64_t blocks = (ne00/QK4_0)*n_rows;
+    const int64_t elements = ne10*n_rows;
+    const int64_t work = block_index;
 
-    const int64_t row = block_index/blocks_per_row;
-    const int64_t block_col = block_index%blocks_per_row;
-    const block_q4_0 * block = (const block_q4_0 *) (src + (row_begin + row)*nb1) + block_col;
-    const float scale = __half2float(block->d);
-    half * row_dst = dst + row*ne0 + block_col*QK4_0;
+    if (work < blocks) {
+        const int64_t row = work/(ne00/QK4_0);
+        const int64_t block_col = work%(ne00/QK4_0);
+        const block_q4_0 * block = (const block_q4_0 *) (src0 + (row_begin + row)*nb01) + block_col;
+        const float scale = __half2float(block->d);
+        half2 * row_dst = reinterpret_cast<half2 *>(dst0 + row*ne00 + block_col*QK4_0);
 
 #pragma unroll
-    for (int q = 0; q < QK4_0/2; ++q) {
-        const uint8_t packed = block->qs[q];
-        row_dst[q] = __float2half(scale*((packed & 0x0f) - 8));
-        row_dst[q + QK4_0/2] = __float2half(scale*((packed >> 4) - 8));
-    }
-}
-
-static __global__ void out_prod_f32_to_f16_tile(
-        const char * src, half * dst, int64_t ne0, int64_t row_begin, int64_t n_rows, size_t nb0, size_t nb1) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= ne0*n_rows) {
-        return;
+        for (int q = 0; q < QK4_0/4; ++q) {
+            const uint8_t packed0 = block->qs[2*q];
+            const uint8_t packed1 = block->qs[2*q + 1];
+            row_dst[q] = __halves2half2(
+                __float2half(scale*((packed0 & 0x0f) - 8)),
+                __float2half(scale*((packed1 & 0x0f) - 8)));
+            row_dst[QK4_0/4 + q] = __halves2half2(
+                __float2half(scale*((packed0 >> 4) - 8)),
+                __float2half(scale*((packed1 >> 4) - 8)));
+        }
     }
 
-    const int64_t col = i % ne0;
-    const int64_t row = i / ne0;
-    dst[i] = __float2half(*(const float *) (src + col*nb0 + (row_begin + row)*nb1));
+    if (work < elements) {
+        const int64_t row = work/ne10;
+        const int64_t col = work%ne10;
+        *(dst1 + row*ne10 + col) = __float2half(*(const float *) (src1 + col*nb10 + (row_begin + row)*nb11));
+    }
 }
 
 static void ggml_cuda_out_prod_q4_0_tiled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta) {
@@ -76,10 +78,10 @@ static void ggml_cuda_out_prod_q4_0_tiled(ggml_backend_cuda_context & ctx, ggml_
                 const int64_t n_rows = std::min<int64_t>(rows_per_tile, ne01 - row_begin);
                 const int64_t n0 = (ne00/QK4_0)*n_rows;
                 const int64_t n1 = ne10*n_rows;
-                out_prod_q4_0_dequant_tile<<<(n0 + threads - 1)/threads, threads, 0, stream>>>(
-                    src0_batch, src0_f16, ne00, row_begin, n_rows, nb01);
-                out_prod_f32_to_f16_tile<<<(n1 + threads - 1)/threads, threads, 0, stream>>>(
-                    src1_batch, src1_f16, ne10, row_begin, n_rows, nb10, nb11);
+                const int64_t n = std::max(n0, n1);
+                out_prod_q4_0_prepare_tile<<<(n + threads - 1)/threads, threads, 0, stream>>>(
+                    src0_batch, src0_f16, ne00, src1_batch, src1_f16, ne10,
+                    row_begin, n_rows, nb01, nb10, nb11);
                 CUDA_CHECK(cudaGetLastError());
 
                 const float tile_beta = row_begin == 0 ? beta : 1.0f;
