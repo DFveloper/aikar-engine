@@ -56,6 +56,7 @@ static __device__ __forceinline__ float fattn_back_reduce_max(float value, float
 
 static __global__ void flash_attn_back_softmax_f16(
         const float * scores, half * probabilities, const half * mask,
+        const float * sinks, float * sink_probabilities, int64_t sink_index,
         int64_t M, int64_t N, uint64_t m_nb1, int causal, float scale) {
     const int64_t iq = blockIdx.x;
     const int64_t key_end = causal ? min(M, M - N + iq + 1) : M;
@@ -69,8 +70,14 @@ static __global__ void flash_attn_back_softmax_f16(
             local_max = fmaxf(local_max, scores[ik + M*iq]*scale + mv);
         }
     }
+    if (threadIdx.x == 0 && sinks) {
+        local_max = fmaxf(local_max, sinks[sink_index]);
+    }
     const float max_score = fattn_back_reduce_max(local_max, shared);
     if (max_score == -INFINITY) {
+        if (threadIdx.x == 0 && sink_probabilities) {
+            sink_probabilities[iq] = 0.0f;
+        }
         for (int64_t ik = threadIdx.x; ik < M; ik += blockDim.x) {
             probabilities[ik + M*iq] = __float2half(0.0f);
         }
@@ -84,7 +91,13 @@ static __global__ void flash_attn_back_softmax_f16(
             local_sum += expf(scores[ik + M*iq]*scale + mv - max_score);
         }
     }
+    if (threadIdx.x == 0 && sinks) {
+        local_sum += expf(sinks[sink_index] - max_score);
+    }
     const float inv_sum = 1.0f/fattn_back_reduce_sum(local_sum, shared);
+    if (threadIdx.x == 0 && sink_probabilities) {
+        sink_probabilities[iq] = sinks ? expf(sinks[sink_index] - max_score)*inv_sum : 0.0f;
+    }
 
     for (int64_t ik = threadIdx.x; ik < M; ik += blockDim.x) {
         float probability = 0.0f;
@@ -99,7 +112,8 @@ static __global__ void flash_attn_back_softmax_f16(
 }
 
 static __global__ void flash_attn_back_softmax_grad_f16(
-        const float * dp, half * probabilities_ds, int64_t M, int64_t N, float scale) {
+        const float * dp, half * probabilities_ds, const float * sink_probabilities,
+        float * grad_s, int64_t sink_index, int64_t M, int64_t N, float scale) {
     const int64_t iq = blockIdx.x;
     extern __shared__ float shared[];
 
@@ -109,6 +123,9 @@ static __global__ void flash_attn_back_softmax_grad_f16(
         local_mean += __half2float(probabilities_ds[index])*dp[index];
     }
     const float mean = fattn_back_reduce_sum(local_mean, shared);
+    if (threadIdx.x == 0 && sink_probabilities && grad_s) {
+        atomicAdd(grad_s + sink_index, -sink_probabilities[iq]*mean);
+    }
 
     for (int64_t ik = threadIdx.x; ik < M; ik += blockDim.x) {
         const int64_t index = ik + M*iq;
@@ -129,14 +146,19 @@ static bool use_volta_f16_fattn_back(const ggml_backend_cuda_context & ctx, cons
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     return ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA &&
-        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && !dst->src[5] &&
+        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
         max_bias == 0.0f && logit_softcap == 0.0f && q->ne[2] % k->ne[2] == 0 &&
         q->ne[0] % 8 == 0 && v->ne[0] % 8 == 0 && q->ne[1] > 0 && k->ne[1] > 0 &&
         k->ne[0] == q->ne[0] && v->ne[1] == k->ne[1] && v->ne[2] == k->ne[2] &&
         k->ne[3] == q->ne[3] && v->ne[3] == q->ne[3] &&
         d->ne[0] == v->ne[0] && d->ne[1] == q->ne[2] && d->ne[2] == q->ne[1] && d->ne[3] == q->ne[3] &&
+        (!dst->src[5] || (dst->src[5]->type == GGML_TYPE_F32 && ggml_is_contiguous(dst->src[5]) &&
+            dst->src[5]->ne[0] == q->ne[2])) &&
         q->nb[0] == sizeof(float) && d->nb[0] == sizeof(float) &&
-        ggml_is_contiguous(k) && ggml_is_contiguous(v);
+        k->nb[0] == sizeof(half) && v->nb[0] == sizeof(half) &&
+        k->nb[1] >= q->ne[0]*sizeof(half) && v->nb[1] >= v->ne[0]*sizeof(half) &&
+        k->nb[1] % (8*sizeof(half)) == 0 && v->nb[1] % (8*sizeof(half)) == 0 &&
+        k->nb[1]/sizeof(half) <= INT_MAX && v->nb[1]/sizeof(half) <= INT_MAX;
 }
 
 static void launch_volta_f16_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -145,6 +167,7 @@ static void launch_volta_f16_fattn_back(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * d = dst->src[3];
     const ggml_tensor * mask = dst->src[4];
+    const ggml_tensor * sinks = dst->src[5];
 
     float scale;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -164,11 +187,14 @@ static void launch_volta_f16_fattn_back(ggml_backend_cuda_context & ctx, ggml_te
     const int HK = k->ne[2];
     const int B  = q->ne[3];
     const int q_per_kv = HQ/HK;
+    const int ldk = k->nb[1]/sizeof(half);
+    const int ldv = v->nb[1]/sizeof(half);
 
     ggml_cuda_pool_alloc<half> q_f16(ctx.pool(), ggml_nelements(q));
     ggml_cuda_pool_alloc<half> d_f16(ctx.pool(), ggml_nelements(d));
     ggml_cuda_pool_alloc<float> matrix_f32(ctx.pool(), (size_t) M*N);
     ggml_cuda_pool_alloc<half> matrix_f16(ctx.pool(), (size_t) M*N);
+    ggml_cuda_pool_alloc<float> sink_probabilities(ctx.pool(), sinks ? N : 0);
 
     cudaStream_t stream = ctx.stream();
     to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
@@ -198,14 +224,16 @@ static void launch_volta_f16_fattn_back(ggml_backend_cuda_context & ctx, ggml_te
     const int threads = 256;
     const size_t offs_k = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN);
     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+    const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
     float * grad_q = (float *) dst->data;
     float * grad_k = (float *) ((char *) dst->data + offs_k);
     float * grad_v = (float *) ((char *) dst->data + offs_v);
+    float * grad_s = (float *) ((char *) dst->data + offs_s);
 
     for (int ib = 0; ib < B; ++ib) {
         for (int ikh = 0; ikh < HK; ++ikh) {
-            const half * pk = (const half *) k->data + (size_t) DK*M*(ikh + HK*ib);
-            const half * pv = (const half *) v->data + (size_t) DV*M*(ikh + HK*ib);
+            const half * pk = (const half *) ((const char *) k->data + ikh*k->nb[2] + ib*k->nb[3]);
+            const half * pv = (const half *) ((const char *) v->data + ikh*v->nb[2] + ib*v->nb[3]);
             float * pgk = grad_k + (size_t) DK*M*(ikh + HK*ib);
             float * pgv = grad_v + (size_t) DV*M*(ikh + HK*ib);
 
@@ -219,12 +247,15 @@ static void launch_volta_f16_fattn_back(ggml_backend_cuda_context & ctx, ggml_te
 
                 CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                     M, N, DK, &alpha,
-                    pk, CUDA_R_16F, DK, pq, CUDA_R_16F, DK,
+                    pk, CUDA_R_16F, ldk, pq, CUDA_R_16F, DK,
                     &beta_zero, matrix_f32.ptr, CUDA_R_32F, M,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
                 flash_attn_back_softmax_f16<<<N, threads, threads*sizeof(float), stream>>>(
-                    matrix_f32.ptr, matrix_f16.ptr, pm, M, N, mask ? mask->nb[1] : 0,
+                    matrix_f32.ptr, matrix_f16.ptr, pm,
+                    sinks ? (const float *) sinks->data : nullptr,
+                    sinks ? sink_probabilities.ptr : nullptr, iqh,
+                    M, N, mask ? mask->nb[1] : 0,
                     ggml_flash_attn_ext_get_causal(dst) ? 1 : 0, scale);
                 CUDA_CHECK(cudaGetLastError());
 
@@ -237,22 +268,27 @@ static void launch_volta_f16_fattn_back(ggml_backend_cuda_context & ctx, ggml_te
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                 }
 
-                if (need_q || need_k) {
+                const bool need_sinks = !(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) ||
+                    (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS);
+                if (need_q || need_k || need_sinks) {
                     CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                         M, N, DV, &alpha,
-                        pv, CUDA_R_16F, DV, pd, CUDA_R_16F, DV*HQ,
+                        pv, CUDA_R_16F, ldv, pd, CUDA_R_16F, DV*HQ,
                         &beta_zero, matrix_f32.ptr, CUDA_R_32F, M,
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
                     flash_attn_back_softmax_grad_f16<<<N, threads, threads*sizeof(float), stream>>>(
-                        matrix_f32.ptr, matrix_f16.ptr, M, N, scale);
+                        matrix_f32.ptr, matrix_f16.ptr,
+                        sinks ? sink_probabilities.ptr : nullptr,
+                        sinks && need_sinks ? grad_s : nullptr,
+                        iqh, M, N, scale);
                     CUDA_CHECK(cudaGetLastError());
                 }
 
                 if (need_q) {
                     CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                         DK, N, M, &alpha,
-                        pk, CUDA_R_16F, DK, matrix_f16.ptr, CUDA_R_16F, M,
+                        pk, CUDA_R_16F, ldk, matrix_f16.ptr, CUDA_R_16F, M,
                         &beta_zero, pgq, CUDA_R_32F, DK,
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                 }

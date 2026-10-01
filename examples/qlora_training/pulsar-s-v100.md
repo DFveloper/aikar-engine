@@ -38,3 +38,23 @@ The old training process was stopped. Validation runs finished; a new full curri
 - Full CTest has two remaining failures: `test-chat` throws while parsing tool responses, and `test-generate-models` segfaults. Five dependent recurrent/save-load tests consequently do not run. `test-state-restore-fragmented` passed when rerun with GPU access. The full suite is not green.
 
 Raw validation logs and benchmark JSON files are in `/tmp/pulsar-recompute/`; `all48-64-real-final.log` contains the exact benchmark command. Existing user changes were retained; no commit or submission was made.
+
+## Strided KV attention backward
+
+Gemma4 exposes its F16 KV cache as interleaved head/token views. The V100 backward fast path now reads each head at its original byte offset and passes the token stride as the cuBLAS leading dimension. This avoids the scalar fallback without copying the KV cache. Sink normalization and gradients are supported by the same fast path when a model supplies sinks; Pulsar S does not supply them.
+
+The following measurements use the first six rows of the real Stage1 dataset, context/batch 8192, F16 KV, all layers and experts on CUDA, activation recompute, seed 3407, and 18 CPU threads. Each run completes the first 8192-token optimizer window and is then terminated. Window time includes graph setup and the optimizer update, but excludes model loading. Throughput counts all 8192 input tokens, including masked or padded tokens.
+
+| Configuration | First window | Tokens/s | Peak GPU memory |
+| --- | --- | --- | --- |
+| Rank 16, attention O, microbatch 256, before stride support | 213 s | 38.5 | 15,351 MiB |
+| Rank 16, attention O, microbatch 256, with stride support | 70 s | 117.0 | 15,351 MiB |
+| Rank 48, attention Q/O and dense FFN gate/up/down, microbatch 128, with stride support | 104 s | 78.8 | 15,833 MiB |
+
+The rank 16 comparison uses alpha 8 and learning rate 8e-6. Its logged window loss is 2.268973 in both runs, with a 3.04x speedup. The rank 48 run uses alpha 24 and learning rate 6e-6; it is a larger-adapter capacity measurement on the same Stage1 samples, not a full Stage3 curriculum run. Neither result establishes sustained epoch throughput or validation/checkpoint memory capacity. Adapter tensor identity after the update was not compared.
+
+CUDA backend comparisons cover interleaved Q/K/V and upstream gradients, two batches, GQA, 256/512 head dimensions, and sink gradients with the fast path eligible. All eight `FLASH_ATTN_BACK` cases pass the existing CPU-reference tolerance of 2e-5 NMSE.
+
+Exact commands, memory samples, and logs are under `/tmp/pulsar-recompute/`: `sink-real8192-ub256` is the baseline, `gemma4-stride-real8192-ub256` is the rank 16 result, and `gemma4-stride-real8192-r48-ub128` is the rank 48 result. Nsight report import failed with a "Wrong event order" error; no profiler-derived kernel timing is reported.
+
+The full CTest rerun finishes in 46 seconds with 63/70 tests passing. The previously recorded `test-chat` abort and `test-generate-models` segfault remain. Their fixture failure prevents `test-recurrent-state-rollback`, `test-recurrent-state-rollback-nemotron-h`, `test-recurrent-state-rollback-dsv4`, `test-recurrent-state-rollback-kimi-k3`, and `test-save-load-state` from running. `test-opt` and `test-qat` pass in CTest, and a separate `QAT_TEST_BACKEND=CUDA0` run passes. The suite is not fully green; the log is `/tmp/pulsar-recompute/gemma4-ctest.log`.

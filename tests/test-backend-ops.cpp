@@ -8548,12 +8548,16 @@ struct test_flash_attn_back : public test_case {
     const ggml_type type_kv;
     const bool sinks;
     const bool causal;
+    const bool interleaved;
+    const int64_t head_dim;
+    const bool bias;
 
-    test_flash_attn_back(ggml_type type_kv = GGML_TYPE_F16, bool sinks = false, bool causal = true)
-        : type_kv(type_kv), sinks(sinks), causal(causal) {}
+    test_flash_attn_back(ggml_type type_kv = GGML_TYPE_F16, bool sinks = false, bool causal = true,
+            bool interleaved = false, int64_t head_dim = 64, bool bias = true)
+        : type_kv(type_kv), sinks(sinks), causal(causal), interleaved(interleaved), head_dim(head_dim), bias(bias) {}
 
     std::string vars() override {
-        return VARS_TO_STR3(type_kv, sinks, causal);
+        return VARS_TO_STR6(type_kv, sinks, causal, interleaved, head_dim, bias);
     }
 
     double max_nmse_err() override {
@@ -8561,17 +8565,24 @@ struct test_flash_attn_back : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t DK = 64;
-        const int64_t DV = 64;
+        const int64_t DK = head_dim;
+        const int64_t DV = head_dim;
         const int64_t N  = 4;
-        const int64_t M  = 8;
+        const int64_t M  = head_dim == 512 ? 256 : 8;
         const int64_t HQ = 4;
         const int64_t HK = 2;
 
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, N, HQ, 1);
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_kv, DK, M, HK, 1);
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_kv, DV, M, HK, 1);
-        ggml_tensor * d = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DV, HQ, N, 1);
+        const int64_t B = interleaved ? 2 : 1;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, interleaved ? HQ : N, interleaved ? N : HQ, B);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_kv, DK, interleaved ? HK : M, interleaved ? M : HK, B);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_kv, DV, interleaved ? HK : M, interleaved ? M : HK, B);
+        ggml_tensor * d = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DV, interleaved ? N : HQ, interleaved ? HQ : N, B);
+        if (interleaved) {
+            q = ggml_permute(ctx, q, 0, 2, 1, 3);
+            k = ggml_permute(ctx, k, 0, 2, 1, 3);
+            v = ggml_permute(ctx, v, 0, 2, 1, 3);
+            d = ggml_permute(ctx, d, 0, 2, 1, 3);
+        }
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, M, N, 1, 1);
         ggml_set_name(q, "q");
         ggml_set_name(k, "k");
@@ -8585,7 +8596,7 @@ struct test_flash_attn_back : public test_case {
             ggml_set_name(s, "s");
         }
 
-        ggml_tensor * forward = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) DK), sinks ? 2.0f : 0.0f, sinks ? 1.5f : 0.0f);
+        ggml_tensor * forward = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) DK), sinks && bias ? 2.0f : 0.0f, sinks && bias ? 1.5f : 0.0f);
         ggml_flash_attn_ext_add_sinks(forward, s);
         ggml_flash_attn_ext_set_causal(forward, causal);
         ggml_tensor * out = ggml_flash_attn_ext_back(ctx, forward, d);
@@ -11730,6 +11741,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, false, true));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_Q4_0, false, true));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, false, true, true, 256, false));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true, true, 512, false));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true, true, 256, false));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, false, false, 64, false));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
