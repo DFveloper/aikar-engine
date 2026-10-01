@@ -11,18 +11,24 @@ static constexpr size_t Q4_0_OUT_PROD_WORKSPACE_MAX = 64ull*1024*1024;
 
 static __global__ void out_prod_q4_0_dequant_tile(
         const char * src, half * dst, int64_t ne0, int64_t row_begin, int64_t n_rows, size_t nb1) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= ne0*n_rows) {
+    const int64_t blocks_per_row = ne0/QK4_0;
+    const int64_t block_index = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (block_index >= blocks_per_row*n_rows) {
         return;
     }
 
-    const int64_t col = i % ne0;
-    const int64_t row = i / ne0;
-    const block_q4_0 * block = (const block_q4_0 *) (src + (row_begin + row)*nb1) + col/QK4_0;
-    const int q = col % QK4_0;
-    const uint8_t packed = block->qs[q % (QK4_0/2)];
-    const int value = ((q < QK4_0/2 ? packed : packed >> 4) & 0x0f) - 8;
-    dst[i] = __float2half(__half2float(block->d)*value);
+    const int64_t row = block_index/blocks_per_row;
+    const int64_t block_col = block_index%blocks_per_row;
+    const block_q4_0 * block = (const block_q4_0 *) (src + (row_begin + row)*nb1) + block_col;
+    const float scale = __half2float(block->d);
+    half * row_dst = dst + row*ne0 + block_col*QK4_0;
+
+#pragma unroll
+    for (int q = 0; q < QK4_0/2; ++q) {
+        const uint8_t packed = block->qs[q];
+        row_dst[q] = __float2half(scale*((packed & 0x0f) - 8));
+        row_dst[q + QK4_0/2] = __float2half(scale*((packed >> 4) - 8));
+    }
 }
 
 static __global__ void out_prod_f32_to_f16_tile(
@@ -68,7 +74,7 @@ static void ggml_cuda_out_prod_q4_0_tiled(ggml_backend_cuda_context & ctx, ggml_
 
             for (int64_t row_begin = 0; row_begin < ne01; row_begin += rows_per_tile) {
                 const int64_t n_rows = std::min<int64_t>(rows_per_tile, ne01 - row_begin);
-                const int64_t n0 = ne00*n_rows;
+                const int64_t n0 = (ne00/QK4_0)*n_rows;
                 const int64_t n1 = ne10*n_rows;
                 out_prod_q4_0_dequant_tile<<<(n0 + threads - 1)/threads, threads, 0, stream>>>(
                     src0_batch, src0_f16, ne00, row_begin, n_rows, nb01);
