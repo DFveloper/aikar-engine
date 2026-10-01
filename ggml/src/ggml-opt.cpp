@@ -1073,7 +1073,8 @@ static ggml_tensor * ggml_opt_clone_recompute_tensor(
         ggml_tensor * input,
         std::map<ggml_tensor *, bool> & dependency_memo,
         std::map<ggml_tensor *, ggml_tensor *> & clones) {
-    if (!tensor || tensor == input || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
+    // Keep the expert selection from the original forward pass.
+    if (!tensor || tensor == input || tensor->type == GGML_TYPE_I32 || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
         return tensor;
     }
     const auto found = clones.find(tensor);

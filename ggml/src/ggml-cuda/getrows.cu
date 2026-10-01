@@ -132,7 +132,10 @@ static __global__ void k_get_rows_float_vec(
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
-        const int64_t ncols, const int64_t nrows_grad, const int64_t nrows_dst) {
+        const int64_t ncols, const int64_t nrows_grad, const int64_t nrows_dst,
+        const int64_t ne2, const int64_t ne3,
+        const size_t gs1, const size_t gs2, const size_t gs3,
+        const size_t rs0, const size_t rs1, const size_t rs2) {
     const int col = blockIdx.x*blockDim.x + threadIdx.x;
 
     if (col >= ncols) {
@@ -142,14 +145,17 @@ static __global__ void k_get_rows_back_float(
     ggml_cuda_pdl_sync();
 
     // grid.y is clamped to the CUDA grid limit, so stride over the destination rows
-    for (int64_t dst_row = blockIdx.y; dst_row < nrows_dst; dst_row += gridDim.y) {
+    for (int64_t dst_row = blockIdx.y; dst_row < nrows_dst*ne2*ne3; dst_row += gridDim.y) {
+        const int64_t row = dst_row % nrows_dst;
+        const int64_t i2 = (dst_row / nrows_dst) % ne2;
+        const int64_t i3 = dst_row / (nrows_dst*ne2);
         float sum = 0.0f;
 
         for (int64_t i = 0; i < nrows_grad; ++i) {
-            if (rows[i] != dst_row) {
+            if (rows[i*rs0 + i2*rs1 + i3*rs2] != row) {
                 continue;
             }
-            sum += grad[i*ncols + col];
+            sum += grad[i*gs1 + i2*gs2 + i3*gs3 + col];
         }
 
         dst[dst_row*ncols + col] = sum;
@@ -474,17 +480,18 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
-    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(nb00 == sizeof(float));
+    GGML_ASSERT(nb10 == sizeof(int32_t));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
-    GGML_ASSERT(ne02*ne03 == 1);
-    GGML_ASSERT(ne12*ne13 == 1);
-    GGML_ASSERT(ne2*ne3 == 1);
+    GGML_ASSERT(ne01 == ne10 && ne02 == ne11 && ne03 == ne12);
+    GGML_ASSERT(ne2 == ne11 && ne3 == ne12 && ne13 == 1);
 
     const dim3 block_dims(CUDA_GET_ROWS_BACK_BLOCK_SIZE, 1, 1);
     const int block_num_x = (ne00 + CUDA_GET_ROWS_BACK_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BACK_BLOCK_SIZE;
-    const dim3 block_nums(block_num_x, MIN(ne1, (int64_t)UINT16_MAX), 1);
+    const dim3 block_nums(block_num_x, MIN(ne1*ne2*ne3, (int64_t)UINT16_MAX), 1);
 
-    k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne1);
+    k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne1,
+            ne2, ne3, nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
+            nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t));
 }

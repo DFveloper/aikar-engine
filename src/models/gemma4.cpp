@@ -288,6 +288,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         cb(attn_out, "attn_out", il);
 
         // feed-forward network
+        if (training && activation_recompute) {
+            attn_out->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+        }
         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
         if (is_moe_layer) {
             // MLP (shared exp)
@@ -341,11 +344,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur_moe, "ffn_moe", il);
 
             cur = ggml_add(ctx0, cur_mlp, cur_moe);
+            if (training && activation_recompute) {
+                cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+            }
             cb(cur, "ffn_moe_combined", il);
         } else {
-            if (training && activation_recompute) {
-                attn_out->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
-            }
             cur = build_norm(attn_out,
                     model.layers[il].ffn_norm, nullptr,
                     LLM_NORM_RMS, il);
@@ -455,11 +458,6 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
         res->t_inp_tokens = inp->tokens;
 
         inp_per_layer = ggml_get_rows  (ctx0, model.per_layer_tok_embd, inp->tokens);
-        inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);
-        inp_per_layer = ggml_scale     (ctx0, inp_per_layer, tok_embd_scale);
-        cb(inp_per_layer, "inp_per_layer_selected", -1);
-
-        res->add_input(std::move(inp));
     } else {
         // Multimodal embedding path: use padding token (ID=0) embedding
         // TODO: verify if this is the correct behavior in transformers implementation
@@ -468,11 +466,27 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
         // Extract and dequantize padding token embedding (row 0)
         ggml_tensor * padding = ggml_view_1d(ctx0, model.per_layer_tok_embd, embd_size, 0);
         inp_per_layer = ggml_cast (ctx0, padding, GGML_TYPE_F32);
-        inp_per_layer = ggml_scale(ctx0, inp_per_layer, tok_embd_scale);
+    }
 
-        // Reshape to [n_embd_per_layer, n_layer, 1]
-        inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, 1);
-        cb(inp_per_layer, "inp_per_layer_multimodal", -1);
+    for (const auto & lora : *loras) {
+        llama_adapter_lora_weight * lw = lora.first->get_weight(model.per_layer_tok_embd);
+        if (!lw) {
+            continue;
+        }
+
+        ggml_tensor * a = inp->tokens
+            ? ggml_get_rows(ctx0, lw->a, inp->tokens)
+            : ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, lw->a, lw->a->ne[0], 0), lw->a->ne[0], 1);
+        const float scale = lw->get_scale(lora.first->alpha, lora.second);
+        inp_per_layer = ggml_add(ctx0, inp_per_layer, ggml_scale(ctx0, ggml_mul_mat(ctx0, lw->b, a), scale));
+    }
+
+    inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, ubatch.token ? n_tokens : 1);
+    inp_per_layer = ggml_scale(ctx0, inp_per_layer, tok_embd_scale);
+    cb(inp_per_layer, ubatch.token ? "inp_per_layer_selected" : "inp_per_layer_multimodal", -1);
+
+    if (ubatch.token) {
+        res->add_input(std::move(inp));
     }
     return inp_per_layer;
 }
@@ -486,9 +500,8 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * 
     const float per_layer_projection_scale = 1.0f / sqrtf((float) n_embd);
     const float per_layer_input_scale      = 1.0f / sqrtf(2.0f);
 
-    // note: this matrix multiplication will be performed in the input layer (i.e. on the CPU)
     ggml_tensor * per_layer_proj;
-    per_layer_proj = ggml_mul_mat   (ctx0, model.per_layer_model_proj, inp_batch);
+    per_layer_proj = build_lora_mm (model.per_layer_model_proj, inp_batch);
     per_layer_proj = ggml_scale     (ctx0, per_layer_proj, per_layer_projection_scale);
     per_layer_proj = ggml_reshape_3d(ctx0, per_layer_proj, n_embd_per_layer, n_layer, n_tokens);
 

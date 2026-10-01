@@ -5544,18 +5544,21 @@ static void ggml_compute_forward_get_rows_back_f32_f16(
 
     memset(dst->data, 0, ggml_nbytes(dst));
 
-    const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
-
-    GGML_ASSERT( dst->ne[0] == nc);
+    const int64_t nc = src0->ne[0];
+    GGML_ASSERT(dst->ne[0] == nc);
     GGML_ASSERT(src0->nb[0] == sizeof(ggml_fp16_t));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
-
-        for (int j = 0; j < nc; ++j) {
-            ggml_fp16_t v = ((ggml_fp16_t *) ((char *) src0->data + i*src0->nb[1]))[j];
-            ((float *) ((char *) dst->data + r*dst->nb[1]))[j] += GGML_CPU_FP16_TO_FP32(v);
+    for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+        for (int64_t i1 = 0; i1 < src1->ne[1]; ++i1) {
+            for (int64_t i0 = 0; i0 < src1->ne[0]; ++i0) {
+                const int32_t r = *(const int32_t *) ((const char *) src1->data + i0*src1->nb[0] + i1*src1->nb[1] + i2*src1->nb[2]);
+                GGML_ASSERT(r >= 0 && r < dst->ne[1]);
+                const ggml_fp16_t * row = (const ggml_fp16_t *) ((const char *) src0->data + i0*src0->nb[1] + i1*src0->nb[2] + i2*src0->nb[3]);
+                float * out = (float *) ((char *) dst->data + r*dst->nb[1] + i1*dst->nb[2] + i2*dst->nb[3]);
+                for (int64_t j = 0; j < nc; ++j) {
+                    out[j] += GGML_CPU_FP16_TO_FP32(row[j]);
+                }
+            }
         }
     }
 }
@@ -5577,19 +5580,20 @@ static void ggml_compute_forward_get_rows_back_f32(
 
     memset(dst->data, 0, ggml_nbytes(dst));
 
-    const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
-
-    GGML_ASSERT( dst->ne[0] == nc);
+    const int64_t nc = src0->ne[0];
+    GGML_ASSERT(dst->ne[0] == nc);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
-
-        ggml_vec_add_f32(nc,
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *) src0->data + i*src0->nb[1]));
+    for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+        for (int64_t i1 = 0; i1 < src1->ne[1]; ++i1) {
+            for (int64_t i0 = 0; i0 < src1->ne[0]; ++i0) {
+                const int32_t r = *(const int32_t *) ((const char *) src1->data + i0*src1->nb[0] + i1*src1->nb[1] + i2*src1->nb[2]);
+                GGML_ASSERT(r >= 0 && r < dst->ne[1]);
+                const float * row = (const float *) ((const char *) src0->data + i0*src0->nb[1] + i1*src0->nb[2] + i2*src0->nb[3]);
+                float * out = (float *) ((char *) dst->data + r*dst->nb[1] + i1*dst->nb[2] + i2*dst->nb[3]);
+                ggml_vec_add_f32(nc, out, out, row);
+            }
+        }
     }
 }
 

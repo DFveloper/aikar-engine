@@ -32,7 +32,7 @@ Use `--quant-type q4_0` for an unmixed Q4_0 input model. With a cosine schedule,
 
 Both trainers enable `--preserve-thinking` by default. For chat templates that support preserved reasoning, prior assistant reasoning remains in the training context for every model architecture. Use `--no-preserve-thinking` to disable it.
 
-When `GGML_OPT_EMA_N` is enabled, displayed accuracy is computed as EMA(correct supervised tokens) divided by EMA(supervised tokens). Each step is therefore weighted by its supervised-token count instead of every packed window contributing equally.
+Both trainers show loss and accuracy as EMA 100 in the progress bar by default. Set `GGML_OPT_EMA_N` to override the window length. Displayed accuracy is computed as EMA(correct supervised tokens) divided by EMA(supervised tokens), so each step is weighted by its supervised-token count.
 
 Both trainers accept `--chat-template-file template.jinja`. The file overrides the template used by every dataset worker. QLion keeps the input GGUF metadata and original chat template when it saves checkpoints and the final model.
 
@@ -462,7 +462,11 @@ Python                         C++ (llama-finetune-qlora --grpo-mode)
 Every backward step dequantizes all frozen Q4_K_M weight tensors to compute activation gradients (needed to propagate loss from the output back to each LoRA layer). For a 28-layer 1.7B model at `-ub 512`, this is ~280 dequantizing matmuls per step → step time is 3–5× slower than inference.
 
 **2. Activation VRAM**
-Activation recomputation is exposed as a training policy. The current graph retains the existing forward/backward lifetime behavior; use `--activation-recompute off` (the default) until rematerialization support is enabled for the target architecture.
+`--activation-recompute on` supports Gemma4 dense FFNs and MoE FFNs. MoE recomputation covers the shared and routed FFN branches and reuses the original expert selection. Attention, KV writes, residual connections, and per-layer embedding branches stay outside the replay region. Unsupported training graphs reject this option. CUDA supports batched router `GET_ROWS_BACK` without a CPU fallback, including strided top-k indices.
+
+For Gemma4 MoE on a V100 16GB, start with `--device CUDA0 --split-mode none -ngl all -ncmoe 0 --activation-recompute on -fa on -c 8192 -b 8192 -ub 64`. Keeping experts on CUDA avoids copying frozen expert weights on every backward microbatch. Use `--kv-cache-training -ctk f16 -ctv f16` for additional VRAM headroom; this explicitly selects F16 training KV instead of the default F32. Check peak memory for the selected rank and LoRA targets before increasing the microbatch.
+
+For deterministic on/off comparisons, set `GGML_CUDA_DISABLE_FUSION=1` for both runs and keep the microbatch, KV types, seed, and targets identical. Recomputed activation lifetimes can change CUDA fusion choices and floating-point rounding when fusion is enabled.
 
 **3. Full backprop through all layers** *(partially addressed by `--freeze-layers`)*
 Gradients propagate through all layers that have LoRA adapters. Use `--freeze-layers N` to skip LoRA allocation for blk.0..N-1 — those layers receive no gradient (the `grads_needed` pruner already skips their backward ops automatically). Only the top (total_layers - N) layers are trained.
@@ -472,7 +476,7 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 | Priority | Optimization | Expected gain | Status |
 |---|---|---|---|
 | ✅ Done | **`--freeze-layers N`** — no LoRA on first N layers; backward auto-pruned | Proportional to N/total | Implemented |
-| In progress | **`--activation-recompute on|off`** — select activation recomputation policy for training | Training graph policy | CLI/API wired; graph rematerialization pending |
+| Done | **`--activation-recompute on|off`** - rematerialize Gemma4 dense and MoE FFNs | Lower activation memory | Implemented; original expert selection retained |
 | ✅ Done | **`--grad-checkpoint N`** — deprecated compatibility alias; values above zero enable activation recomputation | Backward-compatible CLI | Deprecated |
 | ✅ Done | **`--train-on-prompt`** — compute loss on prompt tokens too | Configurable loss target | Implemented |
 | ✅ Done | **`--shuffle-dataset`** — shuffle windows each epoch | Better convergence | Implemented |

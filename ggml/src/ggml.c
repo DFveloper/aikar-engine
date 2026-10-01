@@ -4176,14 +4176,7 @@ struct ggml_tensor * ggml_get_rows_back(
     GGML_ASSERT(b->type == GGML_TYPE_I32);
     GGML_ASSERT(a->ne[0] == c->ne[0]);
 
-    // Support both 2D and 3D: result shape matches c (the source tensor shape)
-    // TODO: implement non F32 return
-    struct ggml_tensor * result;
-    if (c->ne[2] > 1) {
-        result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1], c->ne[2]);
-    } else {
-        result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1]);
-    }
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, c->ne);
 
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;

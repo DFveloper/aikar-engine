@@ -622,6 +622,7 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+    set_default_progress_ema();
     common_params params;
     params.escape = false;
     params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;

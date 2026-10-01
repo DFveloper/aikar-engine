@@ -2067,14 +2067,11 @@ static lora_tensors alloc_lora_tensors(
     for (const auto & ti : matched) {
         const int64_t in_dim  = ti.ne0; // columns (input features)
         const int64_t out_dim = ti.ne1; // rows    (output features)
+        const bool is_token_embd = ti.name == "token_embd.weight" || ti.name == "per_layer_token_embd.weight";
 
-        // lora_a: [in_dim, rank]   applied first: a @ x
-        // lora_b: [rank,   out_dim] applied second: b @ (a @ x)
-        // Convention matches llama-adapter.cpp:48-60:
-        //   a->ne[0] == in_dim,  a->ne[1] == rank
-        //   b->ne[0] == rank,    b->ne[1] == out_dim
-        ggml_tensor * la = ggml_new_tensor_2d(lt.ctx, GGML_TYPE_F32, in_dim, rank);
-        ggml_tensor * lb = ggml_new_tensor_2d(lt.ctx, GGML_TYPE_F32, rank,   out_dim);
+        // Embeddings gather rows from A, then multiply by B. Other matrices multiply by A, then B.
+        ggml_tensor * la = ggml_new_tensor_2d(lt.ctx, GGML_TYPE_F32, is_token_embd ? rank : in_dim, is_token_embd ? out_dim : rank);
+        ggml_tensor * lb = ggml_new_tensor_2d(lt.ctx, GGML_TYPE_F32, rank, is_token_embd ? in_dim : out_dim);
 
         ggml_set_name(la, (ti.name + ".lora_a").c_str());
         ggml_set_name(lb, (ti.name + ".lora_b").c_str());
@@ -2449,6 +2446,12 @@ struct save_ctx {
 
 // TLS pointer set before each epoch so the static callback can access it.
 static thread_local save_ctx * g_save_ctx = nullptr;
+
+static void set_default_progress_ema() {
+    if (!std::getenv("GGML_OPT_EMA_N")) {
+        common_set_env("GGML_OPT_EMA_N", "100");
+    }
+}
 
 #ifdef GGML_USE_NVTX
 static constexpr auto nsys_profile_window = std::chrono::seconds(60);
@@ -3325,6 +3328,7 @@ static bool mtp_init_training(
 #ifndef LLAMA_FINETUNE_QLORA_SHARED_ONLY
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+    set_default_progress_ema();
 
     common_params params;
     params.escape = false;

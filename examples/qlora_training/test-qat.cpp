@@ -805,12 +805,11 @@ static void test_native_sparse_rows_accumulation(
     ggml_backend_free(backend);
 }
 
-static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t device, bool required) {
+static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t device, bool required, int64_t tokens = 3) {
     constexpr int64_t cols = 32;
     constexpr int64_t rows = 7;
     constexpr int64_t experts = 4;
     constexpr int64_t used = 2;
-    constexpr int64_t tokens = 3;
     const enum ggml_type weight_type = qat_weight_ggml_type(format);
     const ggml_type_traits * traits = ggml_get_type_traits(weight_type);
     std::vector<float> weight_values(cols * rows * experts);
@@ -827,7 +826,10 @@ static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t
     for (size_t i = 0; i < grad.size(); ++i) {
         grad[i] = 0.1f * std::cos(0.11f * (float) i);
     }
-    const int32_t route_ids[used * tokens] = { 0, 2, 3, 2, 1, 3 };
+    std::vector<int32_t> route_ids(used * tokens, 0);
+    if (tokens == 3) {
+        route_ids = { 0, 2, 3, 2, 1, 3 };
+    }
     std::vector<float> expected(cols * used * tokens, 0.0f);
     for (int64_t token = 0; token < tokens; ++token) {
         for (int64_t route = 0; route < used; ++route) {
@@ -862,11 +864,53 @@ static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t
     check(buffer != nullptr, "failed to allocate MoE dX tensors");
     ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size());
     ggml_backend_tensor_set(grad_tensor, grad.data(), 0, grad.size() * sizeof(float));
-    ggml_backend_tensor_set(ids, route_ids, 0, sizeof(route_ids));
+    ggml_backend_tensor_set(ids, route_ids.data(), 0, route_ids.size() * sizeof(int32_t));
     check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "native quantized MoE dX failed");
     std::vector<float> actual(expected.size());
     ggml_backend_tensor_get(dx, actual.data(), 0, actual.size() * sizeof(float));
     check(rmse(actual, expected) < 1.0e-6, "native quantized MoE dX differs from reference");
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+static void test_batched_router_backward(ggml_backend_dev_t device, bool required, bool fourth_dim = false, ggml_type type = GGML_TYPE_F32) {
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    check(backend != nullptr, "failed to create router test backend");
+    ggml_init_params params = { 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    const int64_t ne2 = fourth_dim ? 1 : 2;
+    const int64_t ne3 = fourth_dim ? 2 : 1;
+    ggml_tensor * shape = ggml_new_tensor_4d(ctx, type, 2, 3, ne2, ne3);
+    ggml_tensor * grad = ggml_new_tensor_4d(ctx, type, 2, 2, ne2, ne3);
+    ggml_tensor * indices = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, ne2, ne3);
+    ggml_tensor * selected = ggml_view_3d(ctx, indices, 2, ne2, ne3, indices->nb[1], indices->nb[2], 0);
+    ggml_tensor * result = ggml_get_rows_back(ctx, grad, selected, shape);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, result);
+    if (!ggml_backend_supports_op(backend, result) && !required) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "failed to allocate router test tensors");
+    const float upstream[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    const int32_t ids[] = { 1, 1, 99, 99, 0, 2, 99, 99 };
+    const std::vector<float> expected = { 0, 0, 4, 6, 0, 0, 5, 6, 0, 0, 7, 8 };
+    if (type == GGML_TYPE_F16) {
+        ggml_fp16_t upstream_f16[8];
+        ggml_fp32_to_fp16_row(upstream, upstream_f16, 8);
+        ggml_backend_tensor_set(grad, upstream_f16, 0, sizeof(upstream_f16));
+    } else {
+        ggml_backend_tensor_set(grad, upstream, 0, sizeof(upstream));
+    }
+    ggml_backend_tensor_set(indices, ids, 0, sizeof(ids));
+    check(ggml_backend_supports_op(backend, result), "batched router backward is not supported");
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "batched router backward failed");
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(result, actual.data(), 0, actual.size() * sizeof(float));
+    check(rmse(actual, expected) < 1.0e-6, "batched router backward differs from reference");
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);
@@ -1464,6 +1508,8 @@ int main() {
     test_state_resume_trajectory(QAT_WEIGHT_Q4_0);
     test_state_resume_trajectory(QAT_WEIGHT_Q8_0);
     ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    test_batched_router_backward(cpu_device, true);
+    test_batched_router_backward(cpu_device, true, true, GGML_TYPE_F16);
     test_native_backend_step(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_backend_step(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_backend_step(QAT_WEIGHT_Q8_0, cpu_device, true);
@@ -1473,6 +1519,8 @@ int main() {
     test_native_moe_dx(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_Q8_0, cpu_device, true);
+    test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true, 33);
+    test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true, 129);
     test_native_routed_update(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_Q8_0, cpu_device, true);
@@ -1492,6 +1540,8 @@ int main() {
             continue;
         }
         printf("Testing QAT backend: %s\n", ggml_backend_dev_name(device));
+        test_batched_router_backward(device, false);
+        test_batched_router_backward(device, false, true);
         test_native_backend_step(QAT_WEIGHT_MXFP4, device, false);
         test_native_backend_step(QAT_WEIGHT_Q4_0, device, false);
         test_native_backend_step(QAT_WEIGHT_Q8_0, device, false);
@@ -1501,6 +1551,8 @@ int main() {
         test_native_moe_dx(QAT_WEIGHT_MXFP4, device, false);
         test_native_moe_dx(QAT_WEIGHT_Q4_0, device, false);
         test_native_moe_dx(QAT_WEIGHT_Q8_0, device, false);
+        test_native_moe_dx(QAT_WEIGHT_Q4_0, device, false, 33);
+        test_native_moe_dx(QAT_WEIGHT_Q4_0, device, false, 129);
         test_native_routed_update(QAT_WEIGHT_MXFP4, device, false);
         test_native_routed_update(QAT_WEIGHT_Q4_0, device, false);
         test_native_routed_update(QAT_WEIGHT_Q8_0, device, false);

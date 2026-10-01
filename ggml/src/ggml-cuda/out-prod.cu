@@ -1021,8 +1021,8 @@ void ggml_cuda_mul_mat_id_back(
         ids_s1
     );
 
-    constexpr int64_t cap =
-        MUL_MAT_ID_BACK_CAP;
+    // An expert has at most one route per token. Duplicate routes use the overflow path.
+    const int64_t cap = std::min<int64_t>(MUL_MAT_ID_BACK_CAP, std::max<int64_t>(32, n_tokens));
 
     constexpr int64_t expert_batch =
         MUL_MAT_ID_BACK_BATCH;
