@@ -1,0 +1,114 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#ifdef WRITE
+layout(local_size_x = 64) in;
+#else
+layout(local_size_x = 128) in;
+#endif
+layout(push_constant) uniform parameter {
+    uint D, NH, HK, NS, NP, BS, window, n_kv, non_causal;
+    uint token_stride, head_stride, page_stride;
+    float scale;
+} p;
+layout(binding = 0) readonly buffer Q { float q[]; };
+layout(binding = 1) readonly buffer K { float k[]; };
+layout(binding = 2) readonly buffer V { float v[]; };
+layout(binding = 3) buffer Cache { uint16_t cache[]; };
+layout(binding = 4) readonly buffer Table { int table[]; };
+layout(binding = 5) readonly buffer Slots { int slots[]; };
+layout(binding = 6) readonly buffer Queries { int queries[]; };
+layout(binding = 7) writeonly buffer Out { float out_data[]; };
+shared float scratch[128];
+
+float load_value(uint row, uint i) {
+#ifdef Q8_KV
+    uint block = row + (i/64)*33;
+    float d = unpackHalf2x16(uint(cache[block])).x;
+    uint packed = uint(cache[block + 1 + (i%64)/2]);
+    int value = int((packed >> (8*(i%2))) & 255);
+    return d*float(value >= 128 ? value - 256 : value);
+#else
+    return unpackHalf2x16(uint(cache[row + i])).x;
+#endif
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+#ifdef WRITE
+    uint h = gl_WorkGroupID.x%p.HK;
+    uint seq = (gl_WorkGroupID.x/p.HK)%p.NS;
+    uint t = gl_WorkGroupID.x/(p.HK*p.NS);
+    int slot = slots[t*p.NS + seq];
+    if (slot < 0) { return; }
+    for (uint kv = 0; kv < 2; ++kv) {
+        uint row = (uint(slot)/p.BS)*p.page_stride + (h + kv*p.HK)*p.head_stride + (uint(slot)%p.BS)*p.token_stride;
+        for (uint base = 0; base < p.D; base += 64) {
+            uint index = (t*p.HK + h)*p.D + base + lane;
+            float value = kv == 0 ? k[index] : v[index];
+#ifdef Q8_KV
+            scratch[lane] = abs(value);
+            barrier();
+            for (uint delta = 32; delta > 0; delta >>= 1) {
+                if (lane < delta) { scratch[lane] = max(scratch[lane], scratch[lane + delta]); }
+                barrier();
+            }
+            // Correct approximate division before rounding packed values.
+            precise float maximum = scratch[0];
+            precise float d = maximum/127.0;
+            d = fma(fma(-d, 127.0, maximum), 1.0/127.0, d);
+            precise float inv = d == 0.0 ? 0.0 : 1.0/d;
+            inv = fma(inv, fma(-inv, d, 1.0), inv);
+            barrier();
+            precise float scaled = abs(value*inv);
+            float integer = floor(scaled);
+            int quant = int(sign(value)*(integer + float(scaled - integer >= 0.5)));
+            scratch[lane] = float(clamp(quant, -127, 127));
+            barrier();
+            uint block = row + (base/64)*33;
+            if (lane == 0) { cache[block] = uint16_t(packHalf2x16(vec2(d, 0.0)) & 65535); }
+            if (lane < 32) {
+                uint lo = uint(int(scratch[2*lane])) & 255;
+                uint hi = uint(int(scratch[2*lane + 1])) & 255;
+                cache[block + 1 + lane] = uint16_t(lo | (hi << 8));
+            }
+            barrier();
+#else
+            cache[row + base + lane] = uint16_t(packHalf2x16(vec2(value, 0.0)) & 65535);
+#endif
+        }
+    }
+#else
+    uint h = gl_WorkGroupID.x%p.NH, t = gl_WorkGroupID.x/p.NH;
+    uint hk = h/(p.NH/p.HK);
+    int pos = queries[2*t], seq = queries[2*t + 1];
+    float acc[8];
+    for (uint j = 0; j < 8; ++j) { acc[j] = 0.0; }
+    float m = -uintBitsToFloat(0x7f800000), sum = 0.0;
+    int begin = p.window == 0 ? 0 : max(0, pos - int(p.window) + 1);
+    int end = p.non_causal == 0 ? pos : int(p.n_kv) - 1;
+    for (int token = begin; token <= end; ++token) {
+        uint ix = 2*(uint(seq)*p.NP + uint(token)/p.BS);
+        int physical = table[ix];
+        if (physical < 0 || (uint(table[ix + 1]) & (1u << (uint(token)%p.BS))) == 0) { continue; }
+        uint kr = uint(physical)*p.page_stride + hk*p.head_stride + (uint(token)%p.BS)*p.token_stride;
+        float dot = 0.0;
+        for (uint i = lane; i < p.D; i += 128) { dot += q[(t*p.NH + h)*p.D + i]*load_value(kr, i); }
+        scratch[lane] = dot;
+        barrier();
+        for (uint delta = 64; delta > 0; delta >>= 1) {
+            if (lane < delta) { scratch[lane] += scratch[lane + delta]; }
+            barrier();
+        }
+        dot = scratch[0]*p.scale;
+        barrier();
+        float next = max(m, dot), old = exp(m - next), weight = exp(dot - next);
+        for (uint i = lane; i < p.D; i += 128) {
+            acc[i/128] = acc[i/128]*old + weight*load_value(kr + p.HK*p.head_stride, i);
+        }
+        sum = sum*old + weight; m = next;
+    }
+    for (uint i = lane; i < p.D; i += 128) { out_data[(t*p.NH + h)*p.D + i] = acc[i/128]/sum; }
+#endif
+}

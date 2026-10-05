@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0e12" />
+    <title>Lumen 학습 현황</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Lumen QLoRA / QLion QAT</p>
+          <h1>학습 현황</h1>
+        </div>
+        <div class="status-wrap">
+          <span id="source" class="source">데이터 대기 중</span>
+          <span id="status" class="status idle"><i></i>대기</span>
+        </div>
+      </header>
+
+      <section class="progress-panel" aria-labelledby="progress-title">
+        <div class="progress-copy">
+          <p id="progress-title" class="label">전체 진행률</p>
+          <div class="progress-value"><span id="percent">0.00</span><small>%</small></div>
+          <p id="steps" class="muted">0 / 0 스텝</p>
+        </div>
+        <div class="progress-track" aria-hidden="true"><span id="progress-bar"></span></div>
+        <div class="time-grid">
+          <div><span>경과 시간</span><strong id="elapsed">--:--:--</strong></div>
+          <div><span id="eta-label">예상 남은 시간 · EMA100</span><strong id="eta">--:--:--</strong></div>
+          <div><span id="rate-label">처리 속도 · EMA100</span><strong id="rate">--</strong></div>
+        </div>
+      </section>
+
+      <section id="train-charts" class="metric-grid" aria-label="훈련 지표">
+        <article class="metric-card accent-cyan">
+          <div class="metric-heading"><span id="loss-label">가중 Loss · EMA100</span><em>낮을수록 좋음</em></div>
+          <strong><span id="loss">--</span><small id="loss-trend" class="trend neutral">--</small></strong>
+          <svg id="loss-chart" class="chart" viewBox="0 0 600 150" role="img" aria-label="Loss 추세"></svg>
+          <div id="loss-range" class="range"></div>
+        </article>
+        <article class="metric-card accent-amber">
+          <div class="metric-heading"><span id="accuracy-label">정확도 (ACC) · EMA100</span><em id="accuracy-scope">Supervised token top-1</em></div>
+          <strong><span id="accuracy">--</span><small>%</small><small id="accuracy-trend" class="trend neutral">--</small></strong>
+          <svg id="accuracy-chart" class="chart" viewBox="0 0 600 150" role="img" aria-label="정확도 추세"></svg>
+          <div id="accuracy-range" class="range"></div>
+        </article>
+        <article class="metric-card accent-green">
+          <div class="metric-heading"><span id="unweighted-nll-label">비가중 NLL · Optimizer step EMA100</span><em>낮을수록 좋음</em></div>
+          <strong><span id="unweighted-nll">--</span><small id="unweighted-nll-trend" class="trend neutral">--</small></strong>
+          <svg id="unweighted-nll-chart" class="chart" viewBox="0 0 600 150" role="img" aria-label="Unweighted NLL 추세"></svg>
+          <div id="unweighted-nll-range" class="range"></div>
+        </article>
+      </section>
+
+      <section id="validation-charts" class="metric-grid validation-grid" aria-label="검증 지표">
+        <article class="metric-card accent-violet">
+          <div class="metric-heading"><span>검증 Loss</span><em>낮을수록 좋음</em></div>
+          <strong id="validation-loss">--</strong>
+          <svg id="validation-loss-chart" class="chart" viewBox="0 0 600 150" role="img" aria-label="검증 Loss 추세"></svg>
+          <div id="validation-loss-range" class="range"></div>
+        </article>
+        <article class="metric-card accent-violet">
+          <div class="metric-heading"><span>검증 정확도 (ACC)</span><em>높을수록 좋음</em></div>
+          <strong><span id="validation-accuracy">--</span><small>%</small></strong>
+          <svg id="validation-accuracy-chart" class="chart" viewBox="0 0 600 150" role="img" aria-label="검증 정확도 추세"></svg>
+          <div id="validation-accuracy-range" class="range"></div>
+        </article>
+      </section>
+
+      <section id="combined-charts" class="metric-grid combined-grid" aria-label="훈련과 검증 비교">
+        <article class="metric-card accent-cyan">
+          <div class="metric-heading"><span>가중 Loss · Train</span><em>낮을수록 좋음</em></div>
+          <svg id="combined-weighted-loss-chart" class="chart" viewBox="0 0 600 150" role="img" aria-label="훈련 가중 Loss 추세"></svg>
+          <div id="combined-weighted-loss-range" class="range"></div>
+        </article>
+        <article class="metric-card accent-green">
+          <div class="metric-heading"><span>비가중 NLL · Train / Val</span><em>낮을수록 좋음</em></div>
+          <svg id="combined-nll-chart" class="chart comparison-chart" viewBox="0 0 600 150" role="img" aria-label="훈련 비가중 NLL 및 검증 Loss 비교"></svg>
+          <div id="combined-nll-range" class="range"></div>
+        </article>
+        <article class="metric-card accent-amber">
+          <div class="metric-heading"><span>ACC · Train / Val</span><em>높을수록 좋음</em></div>
+          <svg id="combined-accuracy-chart" class="chart comparison-chart" viewBox="0 0 600 150" role="img" aria-label="훈련 및 검증 정확도 비교"></svg>
+          <div id="combined-accuracy-range" class="range"></div>
+        </article>
+      </section>
+
+      <section class="smoothing-control" aria-label="추세 평활화 설정">
+        <label for="ema-window">Acc · Loss · Unweighted NLL 추세 창</label>
+        <select id="ema-window" name="ema-window">
+          <option value="25">EMA 25 windows</option>
+          <option value="50">EMA 50 windows</option>
+          <option value="100" selected>EMA 100 windows</option>
+          <option value="250">EMA 250 windows</option>
+          <option value="500">EMA 500 windows</option>
+          <option value="1000">EMA 1000 windows</option>
+        </select>
+        <span>세 그래프와 현재값에 동일 적용</span>
+        <label class="combine-toggle"><input id="combine-charts" type="checkbox" /> Train / Val 그래프 합치기</label>
+      </section>
+
+      <section class="detail-grid">
+        <article class="panel critical-panel">
+          <div class="panel-title">
+            <div><p id="critical-label" class="label">토큰 가중치 진단 · EMA100</p><h2>Critical-token 통계</h2></div>
+            <span id="critical-fraction" class="pill">--</span>
+          </div>
+          <div class="critical-meter"><span id="critical-bar"></span></div>
+          <dl class="detail-list">
+            <div><dt>학습 토큰</dt><dd id="active-tokens">--</dd></div>
+            <div><dt>Critical 토큰</dt><dd id="critical-tokens">--</dd></div>
+            <div><dt>비가중 NLL</dt><dd id="critical-nll">--</dd></div>
+            <div><dt>가중 Loss</dt><dd id="weighted-loss">--</dd></div>
+            <div><dt>평균 가중치</dt><dd id="mean-weight">--</dd></div>
+            <div><dt>최대 가중치</dt><dd id="max-weight">--</dd></div>
+          </dl>
+        </article>
+
+        <article class="panel checkpoint-panel">
+          <div class="panel-title">
+            <div><p class="label">체크포인트</p><h2>저장 상태</h2></div>
+            <span id="checkpoint-health" class="pill neutral">기록 없음</span>
+          </div>
+          <div class="checkpoint-main">
+            <span>최근 저장 스텝</span>
+            <strong id="last-checkpoint">--</strong>
+          </div>
+          <div class="checkpoint-counts">
+            <div><span class="dot ok"></span><p>성공</p><strong id="saved-count">0</strong></div>
+            <div><span class="dot error"></span><p>실패</p><strong id="failed-count">0</strong></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel events-panel">
+        <div class="panel-title">
+          <div><p class="label">학습 이벤트</p><h2>최근 기록</h2></div>
+          <span id="updated" class="updated">--</span>
+        </div>
+        <ol id="events" class="events"><li class="empty">로그 이벤트를 기다리는 중입니다.</li></ol>
+      </section>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
