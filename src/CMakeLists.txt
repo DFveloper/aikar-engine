@@ -21,6 +21,8 @@ set(LLAMA_CORE_SOURCES
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp
+    llama-block-manager.cpp
+    llama-kv-cache-paged.cpp
     llama-kv-cache.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp
@@ -64,7 +66,7 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR} ../ggml/src)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

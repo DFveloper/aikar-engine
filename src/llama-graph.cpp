@@ -7,6 +7,7 @@
 #include "llama-sampler.h"
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsa-iswa.h"
@@ -17,6 +18,8 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <algorithm>
+#include <stdexcept>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -1576,6 +1579,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     if (w_s) {
+        if (w_s->type != res->type) {
+            w_s = ggml_cast(ctx0, w_s, res->type);
+        }
         res = ggml_mul(ctx0, res, w_s);
     }
 
@@ -1701,6 +1707,9 @@ ggml_tensor * llm_graph_context::build_norm(
     }
 
     if (mw) {
+        if (mw->type != cur->type) {
+            mw = ggml_cast(ctx0, mw, cur->type);
+        }
         cur = ggml_mul(ctx0, cur, mw);
         if (mb) {
             cb(cur, "norm_w", il);
@@ -1708,6 +1717,9 @@ ggml_tensor * llm_graph_context::build_norm(
     }
 
     if (mb) {
+        if (mb->type != cur->type) {
+            mb = ggml_cast(ctx0, mb, cur->type);
+        }
         cur = ggml_add(ctx0, cur, mb);
     }
 
@@ -2726,6 +2738,8 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+#include "ggml-turboquant.h"
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2736,7 +2750,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * turboquant_parameters) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     if (is_turbo_kv_type(k->type)) {
@@ -2753,6 +2768,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    if (turboquant_parameters) {
+        GGML_ASSERT(kq_b == nullptr && v_mla == nullptr);
+        const int32_t head_dim = q->ne[0];
+        const int32_t bits_k = (k->ne[0] - 8)*8/head_dim;
+        const int32_t bits_v = (v->ne[0] - 4)*8/head_dim;
+        auto * packed = ggml_turboquant_attn(ctx0, q, k, v, kq_mask, sinks, turboquant_parameters,
+                head_dim, bits_k, bits_v, kq_scale, hparams.f_max_alibi_bias,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f, k->ne[2]);
+        return ggml_reshape_2d(ctx0, packed, packed->ne[0]*packed->ne[1], packed->ne[2]*packed->ne[3]);
+    }
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
@@ -3046,7 +3071,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, mctx_cur->get_turboquant_parameters(il));
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3302,7 +3327,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     const int64_t n_kv_max = is_swa ? std::min<int64_t>(hparams.n_swa, k->ne[2]) : 0;
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il, mctx_cur->get_turboquant_parameters(il));
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -4036,6 +4061,95 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+}
+
+static int32_t paged_attn_n_kv(const llama_ubatch & ubatch, const llama_kv_cache_paged & kv, bool causal) {
+    const int64_t limit = int64_t(kv.max_blocks) * kv.block_size;
+    if (!ubatch.pos || !ubatch.n_tokens) { return limit; }
+    const int64_t n_kv = int64_t(*std::max_element(ubatch.pos, ubatch.pos + ubatch.n_tokens)) + 1;
+    return causal ? std::min(limit, ((n_kv + 255) / 256) * 256) : n_kv;
+}
+
+bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & params) {
+    const auto * next = static_cast<const llama_kv_cache_paged_context *>(params.mctx);
+    if (!next) { return false; }
+    const auto * kv = next->kv;
+    bool res = queries->ne[1] == params.ubatch.n_tokens;
+    for (int dom = 0; dom < 2; ++dom) {
+        res &= tables[dom]->ne[1] == kv->table_blocks() && tables[dom]->ne[2] == kv->n_seq_max;
+        res &= slots[dom]->ne[0] == kv->n_seq_max && slots[dom]->ne[1] == params.ubatch.n_tokens;
+    }
+    res &= n_kv == paged_attn_n_kv(params.ubatch, *kv, params.cparams.causal_attn);
+    mctx = next;
+    return res;
+}
+
+void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch *) {
+    GGML_ASSERT(mctx && !mctx->plans.empty());
+    const auto & plan = mctx->plans.at(mctx->index);
+    for (int dom = 0; dom < 2; ++dom) {
+        const auto table_data = mctx->kv->table(dom != 0);
+        ggml_backend_tensor_set(tables[dom], table_data.data(), 0, ggml_nbytes(tables[dom]));
+        ggml_backend_tensor_set(slots[dom], plan.slots[dom].data(), 0, ggml_nbytes(slots[dom]));
+    }
+    ggml_backend_tensor_set(queries, plan.queries.data(), 0, ggml_nbytes(queries));
+}
+
+llm_graph_input_i * llm_graph_context::build_attn_inp_kv_paged() const {
+    const auto * mc = static_cast<const llama_kv_cache_paged_context *>(mctx);
+    auto inp = std::make_unique<llm_graph_input_attn_kv_paged>();
+    inp->mctx = mc;
+    inp->n_kv = paged_attn_n_kv(ubatch, *mc->kv, cparams.causal_attn);
+    for (int dom = 0; dom < 2; ++dom) {
+        inp->tables[dom] = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 2, mc->kv->table_blocks(), mc->kv->n_seq_max);
+        inp->slots[dom] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mc->kv->n_seq_max, n_tokens);
+        ggml_set_input(inp->tables[dom]);
+        ggml_set_input(inp->slots[dom]);
+    }
+    inp->queries = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens);
+    ggml_set_input(inp->queries);
+    return res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_attn(
+        llm_graph_input_i * inp,
+        ggml_tensor * wo, ggml_tensor * wo_b, ggml_tensor * wo_s,
+        ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * kq_b,
+        ggml_tensor * sinks, ggml_tensor * v_mla, float scale, int il) const {
+    if (!cparams.kv_paged) {
+        return build_attn(static_cast<llm_graph_input_attn_kv_iswa *>(inp), wo, wo_b, wo_s, q, k, v, kq_b, sinks, v_mla, scale, il);
+    }
+    GGML_ASSERT(k && v && !kq_b && !sinks && !v_mla);
+    const auto * paged = static_cast<llm_graph_input_attn_kv_paged *>(inp);
+    const auto & layer = paged->mctx->kv->layers.at(il);
+    const int dom = layer.swa ? 1 : 0;
+    ggml_tensor * cur = ggml_paged_attn(ctx0, ggml_cont(ctx0, q), ggml_cont(ctx0, k), ggml_cont(ctx0, v),
+            layer.cache, paged->tables[dom], paged->slots[dom], paged->queries,
+            scale, paged->mctx->kv->block_size, layer.swa ? paged->mctx->kv->window : 0);
+    ggml_paged_attn_set_n_kv(cur, paged->n_kv);
+    const bool causal = cparams.causal_attn || (!layer.swa && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY);
+    ggml_paged_attn_set_causal(cur, causal);
+    cb(cur, "paged_kqv_out", il);
+    ggml_backend_t owner = backend_cpu;
+    if (layer.device && ggml_backend_dev_type(layer.device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        owner = nullptr;
+        for (int backend_index = 0; backend_index < ggml_backend_sched_get_n_backends(sched); ++backend_index) {
+            auto * backend = ggml_backend_sched_get_backend(sched, backend_index);
+            if (ggml_backend_get_device(backend) == layer.device) { owner = backend; break; }
+        }
+    }
+    if (!owner || !ggml_backend_supports_op(owner, cur)) { throw std::runtime_error("paged KV operation is unsupported by its cache device"); }
+    layer.backend = owner;
+    ggml_backend_sched_set_tensor_backend(sched, cur, owner);
+    ggml_build_forward_expand(gf, cur);
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], n_tokens);
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+    return cur;
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

@@ -30,7 +30,10 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                      int32_t   turboquant_bits = 0,
+                      int32_t   turboquant_bits_swa = 0,
+                     uint64_t   turboquant_seed = 42);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -50,7 +53,10 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                      int32_t   turboquant_bits = 0,
+                      int32_t   turboquant_bits_swa = 0,
+                     uint64_t   turboquant_seed = 42);
 
     ~llama_kv_cache_iswa() = default;
 

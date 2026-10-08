@@ -1,6 +1,7 @@
 #include "moe-prune.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
@@ -128,6 +129,17 @@ json model_info_json(const common_moe_prune_model_info & model) {
 
 }
 
+void common_moe_prune_expert_stats::record_selection(double gate, bool collect_reap) {
+    if (!collect_reap) return;
+    if (!std::isfinite(gate) || gate < 0.0 || !std::isfinite(probability_sum + gate) ||
+        selection_count == UINT64_MAX || reap_selection_count == UINT64_MAX) {
+        throw std::runtime_error("invalid routing gate or selection accumulator overflow");
+    }
+    ++selection_count;
+    probability_sum += gate;
+    ++reap_selection_count;
+}
+
 double common_moe_prune_expert_stats::mean_probability() const {
     return selection_count == 0 ? 0.0 : probability_sum / selection_count;
 }
@@ -138,6 +150,106 @@ double common_moe_prune_expert_stats::mean_output_norm() const {
 
 double common_moe_prune_expert_stats::importance() const {
     return selection_count == 0 ? 0.0 : weighted_output_sum / selection_count;
+}
+
+double common_moe_prune_expert_stats::reap_score() const {
+    return reap_count == 0 ? 0.0 : reap_sum / reap_count;
+}
+
+double common_moe_prune_expert_stats::mean_reap_output_norm() const {
+    return reap_count == 0 ? 0.0 : reap_output_norm_sum / reap_count;
+}
+
+std::vector<int32_t> common_moe_prune_selected_ids(const ggml_tensor * ids) {
+    if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) {
+        throw std::runtime_error("unsupported Top-K expert ID tensor");
+    }
+    std::vector<int32_t> result(ids->ne[0] * ids->ne[1]);
+    const size_t row_bytes = ids->ne[0] * sizeof(int32_t);
+    const bool host = !ids->buffer || ggml_backend_buffer_is_host(ids->buffer);
+    std::vector<uint8_t> download;
+    const uint8_t * source = static_cast<const uint8_t *>(ids->data);
+    if (!host) {
+        download.resize(ggml_nbytes(ids));
+        ggml_backend_tensor_get(ids, download.data(), 0, download.size());
+        source = download.data();
+    }
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        std::memcpy(result.data() + token * ids->ne[0], source + token * ids->nb[1], row_bytes);
+    }
+    return result;
+}
+
+void common_moe_prune_collect_output(
+        const ggml_tensor * output,
+        const std::vector<int32_t> & ids,
+        const std::vector<float> & weights,
+        std::vector<common_moe_prune_expert_stats> & stats,
+        bool collect_legacy) {
+    if (output->type != GGML_TYPE_F32 && output->type != GGML_TYPE_F16 && output->type != GGML_TYPE_BF16) {
+        throw std::runtime_error("unsupported REAP activation type");
+    }
+    const size_t element_size = ggml_type_size(output->type);
+    if (output->nb[0] != element_size || output->ne[3] != 1 ||
+        ids.size() != (size_t) (output->ne[1] * output->ne[2]) || weights.size() != ids.size()) {
+        throw std::runtime_error("REAP output and routing shapes differ");
+    }
+    // Read bounded chunks; do not retain expert activations.
+    std::array<float, 4096> scratch;
+    const bool host = !output->buffer || ggml_backend_buffer_is_host(output->buffer);
+    for (int64_t token = 0; token < output->ne[2]; ++token) {
+        for (int64_t slot = 0; slot < output->ne[1]; ++slot) {
+            const size_t route = token * output->ne[1] + slot;
+            const int32_t expert = ids[route];
+            const double gate = weights[route];
+            if (expert < 0 || (size_t) expert >= stats.size() || !std::isfinite(gate) || gate < 0.0) {
+                throw std::runtime_error("invalid REAP route or gate weight");
+            }
+            double sum_sq = 0.0;
+            const size_t row_offset = token * output->nb[2] + slot * output->nb[1];
+            for (int64_t start = 0; start < output->ne[0];) {
+                const size_t count = std::min<size_t>(output->ne[0] - start, sizeof(scratch) / element_size);
+                const size_t offset = row_offset + start * element_size;
+                const void * data;
+                if (host) {
+                    data = (const char *) output->data + offset;
+                } else {
+                    ggml_backend_tensor_get(output, scratch.data(), offset, count * element_size);
+                    data = scratch.data();
+                }
+                for (size_t i = 0; i < count; ++i) {
+                    const double value = output->type == GGML_TYPE_F32 ? ((const float *) data)[i] :
+                        output->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) data)[i]) :
+                        ggml_bf16_to_fp32(((const ggml_bf16_t *) data)[i]);
+                    sum_sq += value * value;
+                }
+                start += count;
+            }
+            const double norm = std::sqrt(sum_sq);
+            auto & stat = stats[expert];
+            if (!std::isfinite(norm) || !std::isfinite(stat.reap_sum + gate * norm) ||
+                !std::isfinite(stat.reap_output_norm_sum + norm) || stat.reap_count == UINT64_MAX ||
+                (collect_legacy && (!std::isfinite(stat.output_norm_sum + norm) || !std::isfinite(stat.weighted_output_sum + gate * norm)))) {
+                throw std::runtime_error("non-finite REAP activation or accumulator overflow");
+            }
+            ++stat.reap_count;
+            stat.reap_output_norm_sum += norm;
+            stat.reap_sum += gate * norm;
+            if (collect_legacy) {
+                stat.output_norm_sum += norm;
+                stat.weighted_output_sum += gate * norm;
+            }
+        }
+    }
+}
+
+std::string common_moe_prune_sha256_data(const void * data, size_t size) {
+    sha256_t hash;
+    sha256_init(&hash);
+    if (size > 0) hash_bytes(hash, data, size);
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_final(&hash, digest);
+    return digest_hex(digest);
 }
 
 std::string common_moe_prune_sha256_file(const std::string & path) {
@@ -347,6 +459,15 @@ common_moe_prune_profile common_moe_prune_profile_load(const std::string & path)
     profile.ppl_mask = calibration.at("ppl_mask").get<std::string>();
     profile.metric = calibration.at("metric").get<std::string>();
     profile.evaluated_tokens = calibration.at("evaluated_tokens").get<int64_t>();
+    profile.calibration_tokens = calibration.value("processed_tokens", int64_t(0));
+    profile.calibration_collector_version = calibration.value("collector_version", int32_t(0));
+    profile.calibration_tokenized_hash = calibration.value("tokenized_hash", "");
+    profile.calibration_execution_hash = calibration.value("execution_hash", "");
+    profile.calibration_fingerprint = calibration.value("fingerprint", "");
+    profile.calibration_seed = calibration.value("seed", int32_t(-1));
+    profile.calibration_context = calibration.value("ctx_size", int32_t(0));
+    profile.calibration_batch = calibration.value("batch_size", int32_t(0));
+    profile.calibration_ubatch = calibration.value("ubatch_size", int32_t(0));
     const json & pruning = root.at("pruning");
     profile.requested_ratio = pruning.at("requested_ratio").get<double>();
     profile.actual_ratio = pruning.at("actual_ratio").get<double>();
@@ -382,6 +503,15 @@ void common_moe_prune_profile_write(const common_moe_prune_profile & profile, co
             { "ppl_mask", profile.ppl_mask },
             { "metric", profile.metric },
             { "evaluated_tokens", profile.evaluated_tokens },
+            { "processed_tokens", profile.calibration_tokens },
+            { "collector_version", profile.calibration_collector_version },
+            { "tokenized_hash", profile.calibration_tokenized_hash },
+            { "execution_hash", profile.calibration_execution_hash },
+            { "fingerprint", profile.calibration_fingerprint },
+            { "seed", profile.calibration_seed },
+            { "ctx_size", profile.calibration_context },
+            { "batch_size", profile.calibration_batch },
+            { "ubatch_size", profile.calibration_ubatch },
         } },
         { "pruning", {
             { "requested_ratio", profile.requested_ratio },
@@ -399,6 +529,10 @@ void common_moe_prune_profile_validate(const common_moe_prune_profile & profile,
     if (profile.expert_count != model.expert_count) throw std::runtime_error("pruning profile expert count mismatch");
     if (profile.experts_used != model.experts_used) throw std::runtime_error("pruning profile router Top-K mismatch");
     if (profile.layers.size() != model.moe_layers.size()) throw std::runtime_error("pruning profile MoE layer count mismatch");
+    if (!profile.metric.empty() && (profile.calibration_collector_version != COMMON_MOE_PRUNE_STATS_VERSION ||
+        profile.calibration_fingerprint.empty() || profile.calibration_tokenized_hash.empty() || profile.calibration_execution_hash.empty())) {
+        throw std::runtime_error("profile has obsolete pruning statistics; regenerate from a new calibration cache");
+    }
     size_t expected_disabled = SIZE_MAX;
     for (int32_t layer : model.moe_layers) {
         auto it = profile.layers.find(layer);
@@ -440,13 +574,16 @@ std::vector<common_moe_prune_profile> common_moe_prune_make_profiles(
         const std::string & ppl_mask,
         const std::string & metric,
         int64_t evaluated_tokens) {
+    if (metric != "router-output" && metric != "reap" && metric != "frequency") {
+        throw std::runtime_error("unsupported importance metric: " + metric);
+    }
     if (ratios.empty()) throw std::runtime_error("no pruning ratios were requested");
-    if (max_layer_ratio < 0.0 || max_layer_ratio >= 1.0) throw std::runtime_error("max layer ratio must be in [0, 1)");
+    if (!std::isfinite(max_layer_ratio) || max_layer_ratio < 0.0 || max_layer_ratio >= 1.0) throw std::runtime_error("max layer ratio must be in [0, 1)");
     std::vector<double> sorted_ratios = ratios;
     std::sort(sorted_ratios.begin(), sorted_ratios.end());
     if (std::adjacent_find(sorted_ratios.begin(), sorted_ratios.end()) != sorted_ratios.end()) throw std::runtime_error("duplicate pruning ratio");
     for (double ratio : sorted_ratios) {
-        if (ratio <= 0.0 || ratio > max_layer_ratio) throw std::runtime_error("pruning ratio must be positive and no greater than max layer ratio");
+        if (!std::isfinite(ratio) || ratio <= 0.0 || ratio > max_layer_ratio) throw std::runtime_error("pruning ratio must be positive and no greater than max layer ratio");
     }
 
     std::map<int32_t, std::vector<int32_t>> ranking;
@@ -454,11 +591,20 @@ std::vector<common_moe_prune_profile> common_moe_prune_make_profiles(
         auto found = stats.find(layer);
         if (found == stats.end() || found->second.size() != (size_t) model.expert_count) throw std::runtime_error("missing expert statistics for layer " + std::to_string(layer));
         auto & ids = ranking[layer];
+        auto score = [&](int32_t expert) {
+            const auto & stat = found->second[expert];
+            if (metric == "frequency") return (double) (stat.reap_selection_count > 0 ? stat.reap_selection_count : stat.selection_count);
+            if (metric == "router-output") return stat.importance();
+            if (stat.reap_count != stat.reap_selection_count || !std::isfinite(stat.reap_sum) || stat.reap_sum < 0.0) {
+                throw std::runtime_error("missing or invalid REAP statistics for layer " + std::to_string(layer));
+            }
+            return stat.reap_score();
+        };
         ids.resize(model.expert_count);
-        for (int32_t i = 0; i < model.expert_count; ++i) ids[i] = i;
+        for (int32_t i = 0; i < model.expert_count; ++i) { ids[i] = i; score(i); }
         std::stable_sort(ids.begin(), ids.end(), [&](int32_t a, int32_t b) {
-            const double ia = found->second[a].importance();
-            const double ib = found->second[b].importance();
+            const double ia = score(a);
+            const double ib = score(b);
             return ia == ib ? a < b : ia < ib;
         });
     }

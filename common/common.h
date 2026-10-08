@@ -481,6 +481,7 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    int32_t n_prefill_chunk_size   =     0;
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -603,6 +604,9 @@ struct common_params {
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+    bool kv_paged           = false;
+    uint32_t kv_paged_block_size = 16;
+    uint32_t kv_paged_n_blocks = 0;
     bool kv_unified        = false; // enable unified KV cache
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
@@ -633,6 +637,11 @@ struct common_params {
     bool cache_hadamard_k_global = false;
     bool cache_hadamard_v_global = false;
     bool cache_hadamard_explicit = false;
+    int32_t kv_turboquant_bits = 0;
+    int32_t kv_turboquant_bits_swa = 0;
+    uint64_t kv_turboquant_seed = 42;
+    bool kv_turboquant_all_set = false;
+    bool kv_turboquant_global_set = false;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

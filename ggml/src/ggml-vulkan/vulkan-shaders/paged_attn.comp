@@ -89,9 +89,9 @@ void main() {
     int begin = p.window == 0 ? 0 : max(0, pos - int(p.window) + 1);
     int end = p.non_causal == 0 ? pos : int(p.n_kv) - 1;
     for (int token = begin; token <= end; ++token) {
-        uint ix = 2*(uint(seq)*p.NP + uint(token)/p.BS);
+        uint ix = 2*(uint(seq)*p.NP + (uint(token)/p.BS)*((p.BS + 31)/32) + (uint(token)%p.BS)/32);
         int physical = table[ix];
-        if (physical < 0 || (uint(table[ix + 1]) & (1u << (uint(token)%p.BS))) == 0) { continue; }
+        if (physical < 0 || (uint(table[ix + 1]) & (1u << (uint(token)%p.BS%32))) == 0) { continue; }
         uint kr = uint(physical)*p.page_stride + hk*p.head_stride + (uint(token)%p.BS)*p.token_stride;
         float dot = 0.0;
         for (uint i = lane; i < p.D; i += 128) { dot += q[(t*p.NH + h)*p.D + i]*load_value(kr, i); }

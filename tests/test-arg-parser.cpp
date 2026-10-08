@@ -320,6 +320,46 @@ static void test(void) {
 
     printf("test-arg-parser: test valid usage\n\n");
 
+    for (const std::string & block_size : {"1", "16", "32", "64", "128"}) {
+        common_params paged_params;
+        argv = {"binary_name", "-m", "model.gguf", "--kv-paged", "--kv-block-size", block_size, "--kv-blocks", "4096", "--prefill-chunk-size", "64"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), paged_params, LLAMA_EXAMPLE_SERVER));
+        const auto context_params = common_context_params_to_llama(paged_params);
+        assert(context_params.kv_paged);
+        assert(context_params.kv_paged_block_size == std::stoul(block_size));
+        assert(context_params.kv_paged_n_blocks == 4096);
+        assert(paged_params.n_prefill_chunk_size == 64);
+    }
+    for (const std::string & block_size : {"0", "33", "63", "129"}) {
+        common_params paged_params;
+        argv = {"binary_name", "--kv-block-size", block_size};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), paged_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    {
+        common_params turboquant_params;
+        argv = {"binary_name", "-m", "model.gguf", "--kv-turboquant-global", "3", "--kv-turboquant-seed", "42"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), turboquant_params, LLAMA_EXAMPLE_COMMON));
+        const auto context_params = common_context_params_to_llama(turboquant_params);
+        assert(context_params.kv_turboquant_bits == 3);
+        assert(context_params.kv_turboquant_bits_swa == 0);
+        assert(context_params.kv_turboquant_seed == 42);
+    }
+    for (const char * width : {"2", "5", "invalid"}) {
+        common_params turboquant_params;
+        argv = {"binary_name", "-m", "model.gguf", "--kv-turboquant", width};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), turboquant_params, LLAMA_EXAMPLE_COMMON));
+    }
+    for (const std::vector<std::string> & arguments : {
+        std::vector<std::string>{"binary_name", "-m", "model.gguf", "--kv-turboquant-global", "4", "-ctgk", "f16"},
+        std::vector<std::string>{"binary_name", "-m", "model.gguf", "-ctgv", "q8_kv", "--kv-turboquant-global", "4"},
+        std::vector<std::string>{"binary_name", "-m", "model.gguf", "--kv-turboquant", "3", "--kv-turboquant-global", "4"},
+        std::vector<std::string>{"binary_name", "-m", "model.gguf", "--k-cache-hadamard-global", "--kv-turboquant-global", "3"}}) {
+        common_params turboquant_params;
+        argv = arguments;
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), turboquant_params, LLAMA_EXAMPLE_COMMON));
+    }
+
     for (const char * type : { "mxfp4", "q4_0", "q8_0", "q4_0,q8_0", "mxfp4,q8_0" }) {
         common_params qat_params;
         argv = { "binary_name", "-m", "model.gguf", "--quant-type", type };

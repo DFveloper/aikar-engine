@@ -8,6 +8,8 @@
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
+    uint32_t kv_paged_block_size;
+    uint32_t kv_paged_n_blocks;
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
@@ -51,12 +53,16 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
+    bool kv_paged;
     bool kv_unified;
     bool kv_hadamard_k;
     bool kv_hadamard_v;
     bool kv_hadamard_k_swa;
     bool kv_hadamard_v_swa;
     bool kv_hadamard_explicit;
+    int32_t kv_turboquant_bits = 0;
+    int32_t kv_turboquant_bits_swa = 0;
+    uint64_t kv_turboquant_seed = 42;
     bool pipeline_parallel;
     enum llama_lora_qat_type lora_qat_type = LLAMA_LORA_QAT_TYPE_NONE;
     llama_opt_lora_qat_type_callback lora_qat_type_callback = nullptr;

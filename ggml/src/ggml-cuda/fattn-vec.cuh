@@ -85,7 +85,12 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    constexpr bool Q_turbo_f32 = false;
+#else
+    constexpr bool Q_turbo_f32 = type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0;
+#endif
+    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16 && !Q_turbo_f32;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -153,7 +158,23 @@ static __global__ void flash_attn_ext_vec(
     float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
 
     ggml_cuda_pdl_sync();
-    if constexpr (Q_q8_1) {
+    if constexpr (Q_turbo_f32) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const float * query = (const float *) (Q + (j % cols_per_block)*nb01 + (j / cols_per_block)*nb02);
+            float * registers = (float *) Q_reg[j];
+#pragma unroll
+            for (int offset = 0; offset < D/4; offset += nthreads_KQ) {
+                const int index = offset + threadIdx.x % nthreads_KQ;
+#pragma unroll
+                for (int component = 0; component < 4; ++component) {
+                    registers[4*(offset/nthreads_KQ) + component] =
+                        ic0 + j % cols_per_block < int(ne01.z) && head0 + j / cols_per_block < ne02
+                        ? query[4*index + component]*scale : 0.0f;
+                }
+            }
+        }
+    } else if constexpr (Q_q8_1) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + threadIdx.y;

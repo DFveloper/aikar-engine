@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsa-iswa.h"
@@ -2349,6 +2350,13 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    if (cparams.kv_paged) {
+        if (arch != LLM_ARCH_GEMMA4 || !cparams.causal_attn || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            throw std::runtime_error("paged KV requires a Gemma4 default decoder context initialized with causal attention");
+        }
+        return new llama_kv_cache_paged(*this, params, cparams);
+    }
+
     llama_memory_i * res;
 
     switch (arch) {
@@ -2817,7 +2825,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    cparams.kv_turboquant_bits,
+                                    cparams.kv_turboquant_bits_swa,
+                                    cparams.kv_turboquant_seed);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());

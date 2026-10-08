@@ -975,6 +975,22 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     const bool mcp_enabled = !params.mcp_servers_config.empty() || !params.mcp_servers_json.empty();
+    if (params.kv_turboquant_all_set && params.kv_turboquant_global_set) {
+        throw std::invalid_argument("--kv-turboquant and --kv-turboquant-global cannot be combined");
+    }
+    if (params.kv_turboquant_bits != 0) {
+        if (params.cache_type_k_set || params.cache_type_v_set || params.cache_type_k_global != GGML_TYPE_COUNT || params.cache_type_v_global != GGML_TYPE_COUNT) {
+            throw std::invalid_argument("TurboQuant global policy conflicts with explicit global cache types");
+        }
+        if (params.cache_hadamard_k || params.cache_hadamard_v || params.cache_hadamard_k_global || params.cache_hadamard_v_global) {
+            throw std::invalid_argument("TurboQuant performs its own rotations; global Hadamard policy conflicts");
+        }
+    }
+    if (params.kv_turboquant_bits_swa != 0) {
+        if (params.cache_type_k_local != GGML_TYPE_COUNT || params.cache_type_v_local != GGML_TYPE_COUNT || params.cache_hadamard_k_local || params.cache_hadamard_v_local) {
+            throw std::invalid_argument("TurboQuant local policy conflicts with explicit local cache types or Hadamard policy");
+        }
+    }
     if ((!params.server_tools.empty() || mcp_enabled) && !params.cors_origins_explicit) {
         LOG_WRN("server tools or MCP servers are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
         params.cors_origins = "localhost";
@@ -1753,6 +1769,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-paged"}, "use paged KV cache for inference (default: disabled)",
+        [](common_params & params) { params.kv_paged = true; }
+    ));
+    add_opt(common_arg(
+        {"--prefill-chunk-size"}, "N",
+        string_format("maximum added text prefill tokens per batch while generating (default: %d, 0 = disabled); image chunks remain atomic", params.n_prefill_chunk_size),
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("prefill chunk size must be non-negative"); }
+            params.n_prefill_chunk_size = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-block-size"}, "N", "paged KV tokens per block (1 to 32, 64 or 128; default: 16)",
+        [](common_params & params, int value) {
+            if (value < 1 || (value > 32 && value != 64 && value != 128)) {
+                throw std::invalid_argument("KV block size must be between 1 and 32, or 64 or 128");
+            }
+            params.kv_paged_block_size = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kv-blocks"}, "N", "paged KV physical block budget (0 = context-derived)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KV block budget must be nonnegative");
+            }
+            params.kv_paged_n_blocks = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
@@ -2490,6 +2536,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_k_set = true;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
+    add_opt(common_arg(
+        {"--kv-turboquant"}, "BITS",
+        "published TurboQuant for global and local KV: 3 or 4 payload bits (experimental CPU/CUDA)",
+        [](common_params & params, int value) {
+            if (value != 3 && value != 4) {
+                throw std::invalid_argument("TurboQuant width must be 3 or 4");
+            }
+            params.kv_turboquant_bits = value;
+            params.kv_turboquant_bits_swa = value;
+            params.kv_turboquant_all_set = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kv-turboquant-global"}, "BITS",
+        "published TurboQuant for global KV only: 3 or 4 payload bits (experimental CPU/CUDA)",
+        [](common_params & params, int value) {
+            if (value != 3 && value != 4) {
+                throw std::invalid_argument("TurboQuant width must be 3 or 4");
+            }
+            params.kv_turboquant_bits = value;
+            params.kv_turboquant_global_set = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kv-turboquant-seed"}, "SEED",
+        "seed for the independent Haar rotations and Gaussian QJL projection (default: 42)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty() || value.front() == '-' || value.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::invalid_argument("TurboQuant seed must be an unsigned integer");
+            }
+            params.kv_turboquant_seed = std::stoull(value);
+        }
+    ));
     add_opt(common_arg(
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(

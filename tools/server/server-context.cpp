@@ -925,6 +925,7 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
+    size_t prefill_cursor = 0;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -954,6 +955,9 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    std::vector<server_prompt_cache_state> system_prefixes;
+    std::vector<common_adapter_lora_info> system_prefix_lora;
 
     server_metrics metrics;
 
@@ -1042,6 +1046,74 @@ private:
         return true;
     }
 
+    bool init_system_prompt_cache() {
+        system_prefixes.clear();
+        system_prefix_lora = params_base.lora_adapters;
+        const char * system = getenv("LLAMA_SERVER_SYSTEM_PROMPT");
+        if (!system || !*system) {
+            return true;
+        }
+
+        try {
+            auto tmpls = common_chat_templates_init(model_tgt, params_base.chat_template);
+            for (bool thinking : {false, true}) {
+                common_chat_templates_inputs inputs;
+                inputs.messages = common_chat_msgs_parse_oaicompat(json::array({
+                    {{"role", "system"}, {"content", ""}},
+                    {{"role", "user"}, {"content", "cache initialization"}},
+                }));
+                inputs.use_jinja = params_base.use_jinja;
+                inputs.enable_thinking = thinking;
+                inputs.chat_template_kwargs = params_base.default_template_kwargs;
+                inputs.chat_template_kwargs["enable_thinking"] = thinking ? "true" : "false";
+                const std::string rendered = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+                const size_t end = rendered.find(system);
+                if (end == std::string::npos) {
+                    throw std::runtime_error("system prompt is absent from the rendered chat template");
+                }
+                auto tokens = common_tokenize(vocab, rendered.substr(0, end + strlen(system)), true, true);
+                // The next text can change the final token at the prefix boundary.
+                if (!tokens.empty()) {
+                    tokens.pop_back();
+                }
+                if (tokens.empty() || tokens.size() >= (size_t) n_ctx_slot()) {
+                    throw std::runtime_error("system prefix exceeds the available context or is empty");
+                }
+                if (!system_prefixes.empty() && tokens == system_prefixes.front().prompt.tokens.get_tokens()) {
+                    continue;
+                }
+
+                const llama_seq_id seq = 0;
+                const int32_t chunk = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+                llama_batch batch_sys = llama_batch_init(chunk, 0, 1);
+                for (size_t off = 0; off < tokens.size();) {
+                    common_batch_clear(batch_sys);
+                    for (int32_t i = 0; i < chunk && off < tokens.size(); ++i, ++off) {
+                        common_batch_add(batch_sys, tokens[off], off, {seq}, false);
+                    }
+                    if (llama_decode(ctx_tgt, batch_sys) != 0) {
+                        llama_batch_free(batch_sys);
+                        throw std::runtime_error("failed to prefill the system prefix");
+                    }
+                }
+                llama_batch_free(batch_sys);
+                llama_synchronize(ctx_tgt);
+                server_prompt_cache_state prefix;
+                prefix.prompt.tokens = server_tokens(tokens, false);
+                prefix.data.main.resize(llama_state_seq_get_size_ext(ctx_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE));
+                if (llama_state_seq_get_data_ext(ctx_tgt, prefix.data.main.data(), prefix.data.main.size(), seq, LLAMA_STATE_SEQ_FLAGS_NONE) != prefix.data.main.size()) {
+                    throw std::runtime_error("failed to save the system prefix in RAM");
+                }
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
+                system_prefixes.push_back(std::move(prefix));
+            }
+        } catch (const std::exception & e) {
+            SRV_ERR("system prefix cache initialization failed: %s\n", e.what());
+            return false;
+        }
+        return true;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1052,6 +1124,7 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        params_base.kv_unified = params.kv_unified || params.kv_paged;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1062,6 +1135,18 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        if (params_base.kv_paged) {
+            if (has_spec || std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                    [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; })) {
+                SRV_ERR("%s", "paged KV does not support speculative decoding\n");
+                return false;
+            }
+            if (params_base.n_ctx_checkpoints > 0) {
+                params_base.n_ctx_checkpoints = 0;
+                SRV_WRN("%s", "paged KV disables partial context checkpoints; full prompt state remains supported\n");
+            }
+        }
+
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1151,6 +1236,12 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        const char * system = getenv("LLAMA_SERVER_SYSTEM_PROMPT");
+        const bool cache_system = system && *system;
+        if (cache_system && (has_spec || !params_base.lora_adapters.empty())) {
+            SRV_ERR("%s", "system prefix caching does not support speculative decoding or LoRA\n");
+            return false;
+        }
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1437,6 +1528,10 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        if (!init_system_prompt_cache()) {
+            return false;
+        }
 
         // propagate new defaults back to caller
         params = params_base;
@@ -3241,6 +3336,11 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        const bool chunk_prefill = params_base.n_prefill_chunk_size > 0;
+        const int32_t text_batch_limit = chunk_prefill && !generating.empty()
+            ? std::min<int64_t>(n_batch, int64_t(batch.size()) + params_base.n_prefill_chunk_size)
+            : n_batch;
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3248,8 +3348,14 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+            std::vector<server_slot *> pending;
+            pending.reserve(slots.size());
+            for (size_t i = 0; i < slots.size(); ++i) {
+                pending.push_back(&slots[(i + (chunk_prefill ? prefill_cursor : 0)) % slots.size()]);
+            }
+
+            iterate(pending, [&](server_slot & slot) {
+                if (!add_ok || batch.size() >= text_batch_limit) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3483,7 +3589,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (pos_min >= pos_min_thold && !(params_base.kv_paged && pos_min == 0)) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3513,6 +3619,17 @@ private:
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
+                                    if (do_reset && params_base.kv_paged && prompt_cache && slot.task->params.cache_prompt) {
+                                        slot.prompt_clear();
+                                        if (slot.prompt_load(*prompt_cache, input_tokens)) {
+                                            n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                            pos_next = slot.prompt.tokens.pos_next(n_past);
+                                            const auto restored_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                            const auto restored_thold = std::max(0, pos_next - n_swa - (n_past < slot.task->n_tokens() ? 0 : 1));
+                                            do_reset = n_past == 0 || restored_min < 0 || (restored_min >= restored_thold && restored_min != 0);
+                                        }
+                                    }
+
                                     if (do_reset) {
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
@@ -3531,6 +3648,38 @@ private:
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.can_speculate() &&
+                                are_lora_equal(slot.lora, system_prefix_lora) && slot.alora_invocation_start < 0) {
+                            for (size_t i = 0; i < system_prefixes.size(); ++i) {
+                                const auto & prefix = system_prefixes[i].prompt.tokens.get_tokens();
+                                if (prefix.size() <= (size_t) n_past || prefix.size() >= input_tokens.size()) {
+                                    continue;
+                                }
+                                size_t matched = 0;
+                                while (matched < prefix.size() && input_tokens[matched] == prefix[matched]) {
+                                    ++matched;
+                                }
+                                if (matched == prefix.size()) {
+                                    slot.prompt_clear();
+                                    const auto & data = system_prefixes[i].data.main;
+                                    bool restored = llama_state_seq_set_data_ext(ctx_tgt, data.data(), data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == data.size();
+                                    if (!restored) {
+                                        slot.prompt_clear();
+                                        if (try_clear_idle_slots()) {
+                                            restored = llama_state_seq_set_data_ext(ctx_tgt, data.data(), data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == data.size();
+                                        }
+                                    }
+                                    if (restored) {
+                                        slot.prompt.tokens.insert(prefix);
+                                        n_past = prefix.size();
+                                    } else {
+                                        slot.prompt_clear();
+                                        n_past = 0;
                                     }
                                 }
                             }
@@ -3621,6 +3770,14 @@ private:
                             break;
                         }
 
+                        const auto & chunk = input_tokens.find_chunk(cur_token_idx);
+                        const int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
+                        if (mtmd_decode_use_non_causal(slot.mctx, chunk.get()) && (n_tokens > n_batch || n_tokens > n_ubatch)) {
+                            send_error(slot, string_format("multimodal chunk has %d tokens; bidirectional attention requires -b and -ub to be at least %d", n_tokens, n_tokens), ERROR_TYPE_INVALID_REQUEST);
+                            slot.release();
+                            return;
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
@@ -3658,7 +3815,8 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    const int32_t slot_batch_limit = slot.can_split() ? text_batch_limit : n_batch;
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < slot_batch_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3748,6 +3906,9 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    if (chunk_prefill && (n_tokens_cur > 0 || has_mtmd)) {
+                        prefill_cursor = (&slot - slots.data() + 1) % slots.size();
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 

@@ -209,7 +209,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
 template<int D, int nthreads, bool turbo4>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
     GGML_UNUSED(Q_v);
+#else
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+#endif
     float sum = 0.0f;
 
 #pragma unroll
@@ -217,20 +222,33 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo(
         const int kq = k0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int ib = (4*kq)/128;
         const int iq = (4*kq)%128;
+#ifdef V_DOT2_F32_F16_AVAILABLE
         const int q_packed = Q_q8[k0/nthreads];
         const int8_t * q = (const int8_t *) &q_packed;
         const float q_scale = ((const float2 *) Q_ds_v)[k0/nthreads].x;
+#else
+        const float * q = (const float *) Q_v + 4*(k0/nthreads);
+        constexpr float q_scale = 1.0f;
+#endif
         if constexpr (turbo4) {
             const block_turbo4_0 * K = (const block_turbo4_0 *) K_c;
+            const block_turbo4_0 * block = K + ib;
+            const float norm = __half2float(block->norm);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                sum += turbo4_dequant_cuda(K + ib, iq + i)*(float) q[i]*q_scale;
+                const int code = (block->qs[(iq + i)/2] >> (4*((iq + i) % 2))) & 15;
+                sum += norm*turbo_centroids_4_cuda[code]*(float) q[i]*q_scale;
             }
         } else {
             const block_turbo3_0 * K = (const block_turbo3_0 *) K_c;
+            const block_turbo3_0 * block = K + ib;
+            const float norm = __half2float(block->norm);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                sum += turbo3_dequant_cuda(K + ib, iq + i)*(float) q[i]*q_scale;
+                const int index = iq + i;
+                const int ql = (block->qs[index/4] >> (2*(index % 4))) & 3;
+                const int qh = (block->signs[index/8] >> (index % 8)) & 1;
+                sum += norm*turbo_centroids_3_cuda[ql | (qh << 2)]*(float) q[i]*q_scale;
             }
         }
     }

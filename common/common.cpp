@@ -1740,6 +1740,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
+    cparams.kv_paged          = params.kv_paged;
+    cparams.kv_paged_block_size = params.kv_paged_block_size;
+    cparams.kv_paged_n_blocks = params.kv_paged_n_blocks;
     cparams.kv_unified        = params.kv_unified;
     const bool has_hadamard_policy = params.cache_hadamard_k_local || params.cache_hadamard_v_local ||
         params.cache_hadamard_k_global || params.cache_hadamard_v_global;
@@ -1749,6 +1752,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_hadamard_v_swa = params.cache_hadamard_v || params.cache_hadamard_v_local;
     cparams.kv_hadamard_separate = has_hadamard_policy;
     cparams.kv_hadamard_explicit = params.cache_hadamard_explicit;
+    cparams.kv_turboquant_bits = params.kv_turboquant_bits;
+    cparams.kv_turboquant_bits_swa = params.kv_turboquant_bits_swa;
+    cparams.kv_turboquant_seed = params.kv_turboquant_seed;
 
     const bool has_k_policy = params.cache_type_k_local != GGML_TYPE_COUNT || params.cache_type_k_global != GGML_TYPE_COUNT;
     const bool has_v_policy = params.cache_type_v_local != GGML_TYPE_COUNT || params.cache_type_v_global != GGML_TYPE_COUNT;

@@ -18,3 +18,5 @@ aikar_hard_prune_report aikar_hard_prune_gemma4_q4_0(
         const common_moe_prune_profile & profile,
         const common_moe_prune_model_info & model_info,
         const std::string & output_path);
+
+void aikar_hard_prune_publish(const std::string & staging_path, const std::string & output_path);

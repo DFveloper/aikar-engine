@@ -586,6 +586,35 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
         return false;
     }
 
+    if (params_ctx.kv_turboquant_bits || params_ctx.kv_turboquant_bits_swa) {
+        for (int mismatch = 0; mismatch < 2; ++mismatch) {
+            auto different_params = params_ctx;
+            if (mismatch == 0) {
+                different_params.kv_turboquant_seed ^= 1;
+            } else {
+                different_params.kv_turboquant_bits_swa = params_ctx.kv_turboquant_bits_swa ? 0 : params_ctx.kv_turboquant_bits;
+            }
+            auto different = llama_context_ptr{llama_init_from_model(model, different_params)};
+            auto different_tokens = tokens;
+            std::reverse(different_tokens.begin(), different_tokens.end());
+            different_tokens.pop_back();
+            if (!different || llama_decode(different.get(), llama_batch_get_one(different_tokens.data(), (int32_t) different_tokens.size()))) {
+                return false;
+            }
+            std::vector<uint8_t> before(llama_state_seq_get_size(different.get(), 0));
+            if (llama_state_seq_get_data(different.get(), before.data(), before.size(), 0) != before.size() ||
+                llama_state_seq_set_data(different.get(), blob_a.data(), blob_a.size(), 0) != 0) {
+                LOG_ERR("%s: mismatched TurboQuant policy was accepted\n", __func__);
+                return false;
+            }
+            std::vector<uint8_t> after(llama_state_seq_get_size(different.get(), 0));
+            if (llama_state_seq_get_data(different.get(), after.data(), after.size(), 0) != after.size() || before != after) {
+                LOG_ERR("%s: mismatched TurboQuant policy modified the destination cache\n", __func__);
+                return false;
+            }
+        }
+    }
+
     if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
         LOG_ERR("\n%s: failed to erase seq 0\n", __func__);
         return false;
@@ -646,7 +675,8 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
     params_ctx.kv_unified = true;
 
     // without flash attention, corrupted data left behind by the restore shows up as NaN logits on the other sequences
-    params_ctx.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    params_ctx.flash_attn_type = params_ctx.kv_turboquant_bits || params_ctx.kv_turboquant_bits_swa
+            ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
     if (!ctx) {
@@ -782,9 +812,15 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 
 struct test_suite {
     std::vector<test_status> results;
+    bool host_only = false;
 
     bool all_passed() const {
-        return std::all_of(results.begin(), results.end(), [](test_status s) { return s == test_status::PASS; });
+        if (results.empty()) { return false; }
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto expected = host_only && (i == 4 || i == 6) ? test_status::SKIP : test_status::PASS;
+            if (results[i] != expected) { return false; }
+        }
+        return true;
     }
 };
 
@@ -797,6 +833,7 @@ static const std::vector<const char *> test_names = {
 // Returns the per-test results.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
+    suite.host_only = base_params.kv_paged;
 
     struct common_params params = base_params;
     params.model.path = model_path;
@@ -852,7 +889,7 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
         suite.results.push_back(test_seq_cp_host(model, params, tokens, result_baseline) ? test_status::PASS : test_status::FAIL);
 
         // Test 5: seq copy (device)
-        suite.results.push_back(test_seq_cp_device(model, params, tokens, result_baseline) ? test_status::PASS : test_status::FAIL);
+        suite.results.push_back(params.kv_paged ? test_status::SKIP : (test_seq_cp_device(model, params, tokens, result_baseline) ? test_status::PASS : test_status::FAIL));
     } else {
         // tests 3-5 depend on the baseline result and the state file it saves
         suite.results.push_back(test_status::SKIP);
@@ -864,7 +901,9 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
     suite.results.push_back(test_seq_cp_scatter(model, params, tokens, 6, false) ? test_status::PASS : test_status::FAIL);
 
     // Test 7: seq copy (device, scatter)
-    suite.results.push_back(test_seq_cp_scatter(model, params, tokens, 7, true) ? test_status::PASS : test_status::FAIL);
+    suite.results.push_back(params.kv_paged ? test_status::SKIP : (test_seq_cp_scatter(model, params, tokens, 7, true) ? test_status::PASS : test_status::FAIL));
+
+    if (params.kv_paged) { LOG_INF("Paged KV: device-only state tests 5 and 7 are skipped\n"); }
 
     // Test 8: state blob round-trip
     suite.results.push_back(test_state_roundtrip(model, params, tokens) ? test_status::PASS : test_status::FAIL);
@@ -1007,7 +1046,7 @@ int main(int argc, char ** argv) {
     const test_suite suite = run_save_load_tests_for_model(params.model.path, params);
     const bool all_passed = suite.all_passed();
     if (all_passed) {
-        LOG("\nAll tests passed.\n");
+        LOG("%s", params.kv_paged ? "\nAll supported tests passed (device-only state skipped).\n" : "\nAll tests passed.\n");
     }
     return all_passed ? 0 : 1;
 }

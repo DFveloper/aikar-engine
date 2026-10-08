@@ -25,6 +25,8 @@ struct aikar_dataset {
     int64_t total_tokens = 0;
 };
 
+std::string aikar_dataset_fingerprint(const aikar_dataset & dataset);
+
 aikar_ppl_mask aikar_ppl_mask_parse(const std::string & value);
 const char * aikar_ppl_mask_name(aikar_ppl_mask value);
 bool aikar_token_is_evaluated(const aikar_dataset_record & record, size_t token_index, aikar_ppl_mask mask);

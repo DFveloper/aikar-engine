@@ -61,6 +61,10 @@ def parse_args() -> argparse.Namespace:
         help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, mxfp4 for MXFP4, and auto for the highest-fidelity 16-bit float type",
     )
     parser.add_argument(
+        "--preserve-dtype", action="store_true",
+        help="preserve each tensor's F32/F16/BF16 dtype, including norms and scales; keep supported packed quantized tensors without requantizing (requires --outtype auto)",
+    )
+    parser.add_argument(
         "--bigendian", action="store_true",
         help="model is executed on big endian machine",
     )
@@ -171,6 +175,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if args.preserve_dtype and args.outtype != "auto":
+        parser.error("--preserve-dtype requires --outtype auto")
+    if args.preserve_dtype and args.fp8_as_q8:
+        parser.error("--preserve-dtype cannot be used with --fp8-as-q8")
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
     return args
@@ -296,6 +304,7 @@ def main() -> None:
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
                                      fuse_qkv=args.fuse_qkv,
+                                     preserve_dtype=args.preserve_dtype,
                                      )
 
         if args.vocab_only:

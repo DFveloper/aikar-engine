@@ -1,0 +1,18 @@
+{
+  "Lumen-3.1-Pulsar_S-LD-Q4_0_XL.gguf": {
+    "report_sha256": "096fa143a6378e408ff8656972dcdfa529a0c78c1381fd2b58596ff2743fce2b",
+    "router_rows_and_expert_scales_match_report_all_30_layers": true,
+    "expert_count": 116,
+    "bytes": 13121388640,
+    "report_inode": 43265027,
+    "report_symlink": false
+  },
+  "Lumen-3.5-Pulsar_S-LD-Q4_0_XL.gguf": {
+    "report_sha256": "69267ee3a62f4dc49b93ac232346b9f1b305880a64ac232f17ac18d56872a020",
+    "router_rows_and_expert_scales_match_report_all_30_layers": true,
+    "expert_count": 116,
+    "bytes": 13121388640,
+    "report_inode": 43267661,
+    "report_symlink": false
+  }
+}

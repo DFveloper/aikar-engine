@@ -1199,3 +1199,9 @@ static vk_op_binary_push_constants ggml_vk_rms_norm_push_constants(
     };
 }
 
+
+struct vk_op_paged_attn_push_constants {
+    uint32_t D, NH, HK, NS, NP, BS, window, n_kv, non_causal;
+    uint32_t token_stride, head_stride, page_stride;
+    float scale;
+};

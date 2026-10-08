@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "ggml-turboquant.h"
 
 #include <algorithm>
 #include <cassert>
@@ -84,12 +85,19 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                     bool   lazy) :
+                     bool   lazy,
+                  int32_t   turboquant_bits,
+                 uint64_t   turboquant_seed) :
     model(model), hparams(hparams), v_trans(v_trans),
+    turboquant_bits(turboquant_bits), turboquant_seed(turboquant_seed),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    if (other && (other->turboquant_bits != turboquant_bits || (turboquant_bits && other->turboquant_seed != turboquant_seed))) {
+        throw std::runtime_error("shared TurboQuant caches require identical bits and seed");
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -113,13 +121,14 @@ llama_kv_cache::llama_kv_cache(
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<std::pair<ggml_context *, uint32_t>, ggml_tensor *> parameter_tensors;
 
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + (turboquant_bits ? 1u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -230,6 +239,9 @@ llama_kv_cache::llama_kv_cache(
             const char * backend_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
             const bool turbo_backend = dev_type == GGML_BACKEND_DEVICE_TYPE_CPU ||
                     strcmp(backend_name, "CUDA") == 0 || strcmp(backend_name, "Vulkan") == 0;
+            if (turboquant_bits && dev_type != GGML_BACKEND_DEVICE_TYPE_CPU && strcmp(backend_name, "CUDA") != 0) {
+                throw std::runtime_error(std::string("native TurboQuant is unsupported on backend ") + backend_name);
+            }
             if ((is_turbo_kv_type(type_k) || is_turbo_kv_type(type_v)) && !turbo_backend) {
                 throw std::runtime_error(std::string("TurboQuant KV cache is unsupported on backend ") + backend_name);
             }
@@ -261,11 +273,13 @@ llama_kv_cache::llama_kv_cache(
 
         const bool k_rowwise = type_k == GGML_TYPE_Q8_KV;
         const bool v_rowwise = type_v == GGML_TYPE_Q8_KV;
+        const int64_t k_width = turboquant_bits ? ggml_turboquant_row_size(hparams.n_embd_head_k(il), turboquant_bits, true)*hparams.n_head_kv(il) : n_embd_k_gqa;
+        const int64_t v_width = turboquant_bits ? ggml_turboquant_row_size(hparams.n_embd_head_v(il), turboquant_bits, false)*hparams.n_head_kv(il) : n_embd_v_gqa;
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k,
-                k_rowwise ? hparams.n_embd_head_k(il) : n_embd_k_gqa,
+                k_rowwise ? hparams.n_embd_head_k(il) : k_width,
                 k_rowwise ? hparams.n_head_kv(il)*kv_size : kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v,
-                v_rowwise ? hparams.n_embd_head_v(il) : n_embd_v_gqa,
+                v_rowwise ? hparams.n_embd_head_v(il) : v_width,
                 v_rowwise ? hparams.n_head_kv(il)*kv_size : kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
@@ -276,16 +290,37 @@ llama_kv_cache::llama_kv_cache(
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(has_k ? ggml_view_2d(ctx, k,
-                    k_rowwise ? hparams.n_embd_head_k(il) : n_embd_k_gqa,
+                    k_rowwise ? hparams.n_embd_head_k(il) : k_width,
                     k_rowwise ? hparams.n_head_kv(il)*kv_size : kv_size, k->nb[1], s*k->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v,
-                    v_rowwise ? hparams.n_embd_head_v(il) : n_embd_v_gqa,
+                    v_rowwise ? hparams.n_embd_head_v(il) : v_width,
                     v_rowwise ? hparams.n_head_kv(il)*kv_size : kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        ggml_tensor * parameters = nullptr;
+        if (turboquant_bits) {
+            const uint32_t head_dim = hparams.n_embd_head_k(il);
+            LLAMA_LOG_INFO("%s: layer %u native TurboQuant v1 %s D%u K=%d+1 V=%d seed=%llu, K/V bytes per head=%zu/%zu\n", __func__,
+                    il, hparams.is_swa(il) ? "local" : "global", head_dim, turboquant_bits - 1, turboquant_bits,
+                    (unsigned long long) turboquant_seed, ggml_turboquant_row_size(head_dim, turboquant_bits, true),
+                    ggml_turboquant_row_size(head_dim, turboquant_bits, false));
+            parameters = parameter_tensors[{ctx, head_dim}];
+            if (!parameters) {
+                auto & host = turboquant_parameters_host[head_dim];
+                if (host.empty()) {
+                    host.resize(ggml_turboquant_params_size(head_dim));
+                    if (!ggml_turboquant_params_init(host.data(), head_dim, turboquant_seed)) {
+                        throw std::runtime_error("failed to generate TurboQuant parameters");
+                    }
+                }
+                parameters = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, host.size());
+                ggml_format_name(parameters, "cache_%sturboquant_d%u_l%u", name_tag, head_dim, il);
+                parameter_tensors[{ctx, head_dim}] = parameters;
+            }
+        }
+        layers.push_back({ il, k, v, k_stream, v_stream, parameters });
     }
 
     if ((type_k == GGML_TYPE_Q8_KV || type_v == GGML_TYPE_Q8_KV) && n_head_kv_all < 0) {
@@ -337,14 +372,26 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    if (turboquant_bits && !hparams.no_alloc) {
+        for (const auto & layer : layers) {
+            const auto & host = turboquant_parameters_host.at(hparams.n_embd_head_k(layer.il));
+            ggml_backend_tensor_set(layer.turboquant_parameters, host.data(), 0, host.size()*sizeof(float));
+        }
+        size_t parameter_bytes = 0;
+        for (const auto & entry : parameter_tensors) {
+            parameter_bytes += ggml_nbytes(entry.second);
+        }
+        LLAMA_LOG_INFO("%s: native TurboQuant immutable parameter storage = %.3f MiB\n", __func__, parameter_bytes/(1024.0*1024.0));
+    }
+
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
         size_t memory_f16_k = 0;
         size_t memory_f16_v = 0;
         for (const auto & layer : layers) {
-            memory_f16_k += layer.k ? ggml_nelements(layer.k)*sizeof(ggml_fp16_t) : 0;
-            memory_f16_v += layer.v ? ggml_nelements(layer.v)*sizeof(ggml_fp16_t) : 0;
+            memory_f16_k += layer.k ? (turboquant_bits ? size_t(hparams.n_embd_k_gqa(layer.il))*kv_size*n_stream : ggml_nelements(layer.k))*sizeof(ggml_fp16_t) : 0;
+            memory_f16_v += layer.v ? (turboquant_bits ? size_t(hparams.n_embd_v_gqa(layer.il))*kv_size*n_stream : ggml_nelements(layer.v))*sizeof(ggml_fp16_t) : 0;
         }
         const size_t memory_size = memory_size_k + memory_size_v;
         const size_t memory_f16 = memory_f16_k + memory_f16_v;
@@ -452,6 +499,12 @@ void llama_kv_cache::clear(bool data) {
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        if (turboquant_bits && !hparams.no_alloc) {
+            for (const auto & layer : layers) {
+                const auto & host = turboquant_parameters_host.at(hparams.n_embd_head_k(layer.il));
+                ggml_backend_tensor_set(layer.turboquant_parameters, host.data(), 0, host.size()*sizeof(float));
+            }
         }
     }
 }
@@ -1253,6 +1306,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (turboquant_bits) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1342,6 +1398,12 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
+    if (turboquant_bits) {
+        const int64_t row_bytes = ggml_turboquant_row_size(hparams.n_embd_head_k(il), turboquant_bits, true);
+        return ggml_view_4d(ctx, k, row_bytes, hparams.n_head_kv(il), n_kv, sinfo.s1 - sinfo.s0 + 1,
+                row_bytes, row_bytes*hparams.n_head_kv(il), k->nb[2], k->nb[2]*sinfo.s0);
+    }
+
     if (k->type == GGML_TYPE_Q8_KV) {
         const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
         return ggml_view_4d(ctx, k,
@@ -1368,6 +1430,12 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+    if (turboquant_bits) {
+        const int64_t row_bytes = ggml_turboquant_row_size(hparams.n_embd_head_v(il), turboquant_bits, false);
+        return ggml_view_4d(ctx, v, row_bytes, hparams.n_head_kv(il), n_kv, sinfo.s1 - sinfo.s0 + 1,
+                row_bytes, row_bytes*hparams.n_head_kv(il), v->nb[2], v->nb[2]*sinfo.s0);
+    }
 
     if (v->type == GGML_TYPE_Q8_KV) {
         const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
@@ -1413,6 +1481,15 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     const int64_t n_embd_gqa = n_embd_head*n_head;
 
+    if (turboquant_bits) {
+        const int64_t row_bytes = ggml_turboquant_row_size(n_embd_head, turboquant_bits, true);
+        k = ggml_reshape_4d(ctx, k, row_bytes, n_head, get_size()*k->ne[2], 1);
+        if (k_cur->type != GGML_TYPE_F32) {
+            k_cur = ggml_cast(ctx, k_cur, GGML_TYPE_F32);
+        }
+        return ggml_turboquant_pack(ctx, k_cur, k_idxs, k, layers[ikv].turboquant_parameters, n_embd_head, turboquant_bits, true);
+    }
+
     if (k->type == GGML_TYPE_Q8_KV) {
         GGML_ASSERT(k->ne[0] == n_embd_head);
         k_cur = ggml_view_2d(ctx, k_cur, n_embd_head, n_head*n_tokens, k_cur->nb[1], 0);
@@ -1454,6 +1531,15 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_tokens    = v_cur->ne[2];
 
     const int64_t n_embd_gqa = n_embd_head*n_head;
+
+    if (turboquant_bits) {
+        const int64_t row_bytes = ggml_turboquant_row_size(n_embd_head, turboquant_bits, false);
+        v = ggml_reshape_4d(ctx, v, row_bytes, n_head, get_size()*v->ne[2], 1);
+        if (v_cur->type != GGML_TYPE_F32) {
+            v_cur = ggml_cast(ctx, v_cur, GGML_TYPE_F32);
+        }
+        return ggml_turboquant_pack(ctx, v_cur, v_idxs, v, layers[ikv].turboquant_parameters, n_embd_head, turboquant_bits, false);
+    }
 
     if (v->type == GGML_TYPE_Q8_KV) {
         GGML_ASSERT(!v_trans);
@@ -2189,6 +2275,60 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (other) {
+        return;
+    }
+    if (turboquant_bits) {
+        state_write_policy(io);
+    }
+    state_write_payload(io, seq_id, flags);
+}
+
+void llama_kv_cache::state_write_policy(llama_io_write_i & io) const {
+    const uint32_t magic = 0x54514b56;
+    const uint32_t version = 1;
+    const uint32_t parameter_count = turboquant_parameters_host.size();
+    io.write(&magic, sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&turboquant_bits, sizeof(turboquant_bits));
+    io.write(&turboquant_seed, sizeof(turboquant_seed));
+    io.write(&parameter_count, sizeof(parameter_count));
+    for (const auto & entry : turboquant_parameters_host) {
+        io.write(&entry.first, sizeof(entry.first));
+        io.write(entry.second.data(), entry.second.size()*sizeof(float));
+    }
+}
+
+void llama_kv_cache::state_read_policy(llama_io_read_i & io) const {
+    uint32_t magic, version, parameter_count;
+    int32_t bits;
+    uint64_t seed;
+    io.read(&magic, sizeof(magic));
+    if (magic != 0x54514b56) {
+        throw std::runtime_error("TurboQuant state format mismatch");
+    }
+    io.read(&version, sizeof(version));
+    io.read(&bits, sizeof(bits));
+    io.read(&seed, sizeof(seed));
+    io.read(&parameter_count, sizeof(parameter_count));
+    if (version != 1 || bits != turboquant_bits || (turboquant_bits && seed != turboquant_seed) || parameter_count != turboquant_parameters_host.size()) {
+        throw std::runtime_error("TurboQuant state policy mismatch");
+    }
+    for (const auto & entry : turboquant_parameters_host) {
+        uint32_t head_dim;
+        io.read(&head_dim, sizeof(head_dim));
+        if (head_dim != entry.first) {
+            throw std::runtime_error("TurboQuant state head dimension mismatch");
+        }
+        std::vector<float> parameters(entry.second.size());
+        io.read(parameters.data(), parameters.size()*sizeof(float));
+        if (memcmp(parameters.data(), entry.second.data(), parameters.size()*sizeof(float)) != 0) {
+            throw std::runtime_error("TurboQuant state transform mismatch");
+        }
+    }
+}
+
+void llama_kv_cache::state_write_payload(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2267,7 +2407,8 @@ void llama_kv_cache::state_read_sinfo(
            llama_seq_id   seq_id,
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
+const slot_info_vec_t *   sinfos_in,
+                   bool   policy_validated) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2286,6 +2427,9 @@ const slot_info_vec_t *   sinfos_in) {
         throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
     }
 
+    if (turboquant_bits && !policy_validated) {
+        state_read_policy(io);
+    }
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
@@ -2390,7 +2534,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         io.write(&k_type_i, sizeof(k_type_i));
 
         // Write row size of key
-        const uint64_t k_size_row = k->type == GGML_TYPE_Q8_KV
+        const uint64_t k_size_row = turboquant_bits ? k->nb[1] : k->type == GGML_TYPE_Q8_KV
                 ? hparams.n_head_kv(il)*ggml_row_size(k->type, hparams.n_embd_head_k(il))
                 : ggml_row_size(k->type, n_embd_k_gqa);
         io.write(&k_size_row, sizeof(k_size_row));
@@ -2419,7 +2563,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             io.write(&v_type_i, sizeof(v_type_i));
 
             // Write row size of value
-            const uint64_t v_size_row = v->type == GGML_TYPE_Q8_KV
+            const uint64_t v_size_row = turboquant_bits ? v->nb[1] : v->type == GGML_TYPE_Q8_KV
                     ? hparams.n_head_kv(il)*ggml_row_size(v->type, hparams.n_embd_head_v(il))
                     : ggml_row_size(v->type, n_embd_v_gqa);
             io.write(&v_size_row, sizeof(v_size_row));
@@ -2710,7 +2854,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         // Read row size of key
         uint64_t k_size_row_ref;
         io.read(&k_size_row_ref, sizeof(k_size_row_ref));
-        const size_t k_size_row = k->type == GGML_TYPE_Q8_KV
+        const size_t k_size_row = turboquant_bits ? k->nb[1] : k->type == GGML_TYPE_Q8_KV
                 ? hparams.n_head_kv(il)*ggml_row_size(k->type, hparams.n_embd_head_k(il))
                 : ggml_row_size(k->type, n_embd_k_gqa);
         if (k_size_row != k_size_row_ref) {
@@ -2746,7 +2890,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             // Read row size of value
             uint64_t v_size_row_ref;
             io.read(&v_size_row_ref, sizeof(v_size_row_ref));
-            const size_t v_size_row = v->type == GGML_TYPE_Q8_KV
+            const size_t v_size_row = turboquant_bits ? v->nb[1] : v->type == GGML_TYPE_Q8_KV
                     ? hparams.n_head_kv(il)*ggml_row_size(v->type, hparams.n_embd_head_v(il))
                     : ggml_row_size(v->type, n_embd_v_gqa);
             if (v_size_row != v_size_row_ref) {
@@ -2863,7 +3007,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 
         auto * k = layer.k_stream[strm];
 
-        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+        const size_t k_size_row = turboquant_bits ? k->nb[1] : ggml_row_size(k->type, n_embd_k_gqa);
 
         if (is_contiguous) {
             llama_clear_tensor_data(k, sinfo.head() * k_size_row, cell_count * k_size_row);
@@ -2885,7 +3029,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
         }
 
         if (!v_trans) {
-            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+            const size_t v_size_row = turboquant_bits ? v->nb[1] : ggml_row_size(v->type, n_embd_v_gqa);
 
             if (is_contiguous) {
                 llama_clear_tensor_data(v, sinfo.head() * v_size_row, cell_count * v_size_row);
@@ -3013,6 +3157,14 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache::get_turboquant_parameters(int32_t il) const {
+    return layers.at(map_layer_ids.at(il)).turboquant_parameters;
+}
+
+ggml_tensor * llama_kv_cache_context::get_turboquant_parameters(int32_t il) const {
+    return kv->get_turboquant_parameters(il);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

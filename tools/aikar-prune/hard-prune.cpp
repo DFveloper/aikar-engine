@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -79,7 +80,8 @@ uint64_t file_size(const std::string & path) {
     return (uint64_t) in.tellg();
 }
 
-void write_report(const aikar_hard_prune_report & report, const std::string & output_path) {
+void write_report(const aikar_hard_prune_report & report, const std::string & model_path,
+                  const common_moe_prune_profile & profile, const std::string & output_path) {
     json mappings = json::array();
     for (const auto & layer : report.original_to_new) {
         json mapping = json::object();
@@ -89,6 +91,29 @@ void write_report(const aikar_hard_prune_report & report, const std::string & ou
     json root = {
         { "format", "aikar-moe-hard-prune-report" },
         { "version", 1 },
+        { "model_path", model_path },
+        { "model_sha256", profile.model_hash },
+        { "model_architecture", profile.architecture },
+        { "metric", profile.metric },
+        { "pruning_ratio", profile.requested_ratio },
+        { "actual_pruning_ratio", profile.actual_ratio },
+        { "calibration_fingerprint", {
+            { "model_sha256", profile.model_hash },
+            { "fingerprint", profile.calibration_fingerprint },
+            { "collector_version", profile.calibration_collector_version },
+            { "tokenized_hash", profile.calibration_tokenized_hash },
+            { "execution_hash", profile.calibration_execution_hash },
+            { "dataset_hash", profile.dataset_hash },
+            { "evaluated_tokens", profile.evaluated_tokens },
+            { "ppl_mask", profile.ppl_mask },
+            { "seed", profile.calibration_seed == -1 ? json(nullptr) : json(profile.calibration_seed) },
+            { "processed_tokens", profile.calibration_tokens == 0 ? json(nullptr) : json(profile.calibration_tokens) },
+            { "ctx_size", profile.calibration_context == 0 ? json(nullptr) : json(profile.calibration_context) },
+            { "batch_size", profile.calibration_batch == 0 ? json(nullptr) : json(profile.calibration_batch) },
+            { "ubatch_size", profile.calibration_ubatch == 0 ? json(nullptr) : json(profile.calibration_ubatch) },
+            { "metric", profile.metric },
+            { "pruning_ratio", profile.requested_ratio },
+        } },
         { "source_bytes", report.source_bytes },
         { "output_bytes", report.output_bytes },
         { "expert_bytes_removed", report.expert_bytes_removed },
@@ -100,6 +125,11 @@ void write_report(const aikar_hard_prune_report & report, const std::string & ou
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("failed to write hard-pruning report");
         out << root.dump(2) << '\n';
+        out.close();
+        if (!out) {
+            std::remove(tmp.c_str());
+            throw std::runtime_error("failed to flush hard-pruning report");
+        }
     }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
         std::remove(tmp.c_str());
@@ -114,7 +144,12 @@ aikar_hard_prune_report aikar_hard_prune_gemma4_q4_0(
         const common_moe_prune_profile & profile,
         const common_moe_prune_model_info & model_info,
         const std::string & output_path) {
-    if (model_path == output_path) throw std::runtime_error("hard pruning never modifies the source GGUF in place");
+    for (const std::string & target : { output_path, output_path + ".tmp", output_path + ".report.json", output_path + ".report.json.tmp",
+            output_path + ".tmp.report.json", output_path + ".tmp.report.json.tmp", output_path + ".tmp.previous-model", output_path + ".tmp.previous-report" }) {
+        if (std::filesystem::exists(target) && std::filesystem::equivalent(model_path, target)) {
+            throw std::runtime_error("hard pruning never modifies the source GGUF in place");
+        }
+    }
     common_moe_prune_profile_validate(profile, model_info);
     if (model_info.architecture != "gemma4" || model_info.layer_count != 30) {
         throw std::runtime_error("unsupported architecture: hard pruning supports Gemma 4 26B A4B only");
@@ -204,6 +239,14 @@ aikar_hard_prune_report aikar_hard_prune_gemma4_q4_0(
     }
 
     const std::string tmp_path = output_path + ".tmp";
+    struct temporary_guard {
+        std::string path;
+        ~temporary_guard() {
+            std::remove(path.c_str());
+            std::remove((path + ".report.json").c_str());
+            std::remove((path + ".report.json.tmp").c_str());
+        }
+    } guard { tmp_path };
     if (!gguf_write_to_file(output.get(), tmp_path.c_str(), true)) {
         throw std::runtime_error("failed to write pruned GGUF metadata");
     }
@@ -252,10 +295,62 @@ aikar_hard_prune_report aikar_hard_prune_gemma4_q4_0(
 
     report.source_bytes = file_size(model_path);
     report.output_bytes = file_size(tmp_path);
-    if (std::rename(tmp_path.c_str(), output_path.c_str()) != 0) {
-        std::remove(tmp_path.c_str());
-        throw std::runtime_error("failed to atomically replace hard-pruned GGUF output");
-    }
-    write_report(report, output_path);
+    write_report(report, model_path, profile, tmp_path);
+    aikar_hard_prune_publish(tmp_path, output_path);
     return report;
+}
+
+void aikar_hard_prune_publish(const std::string & staging_path, const std::string & output_path) {
+    const std::string staging_report = staging_path + ".report.json";
+    const std::string output_report = output_path + ".report.json";
+    const std::string backup_model = staging_path + ".previous-model";
+    const std::string backup_report = staging_path + ".previous-report";
+    if (staging_path == output_path || !std::filesystem::is_regular_file(staging_path) ||
+        !std::filesystem::is_regular_file(staging_report)) throw std::runtime_error("missing staged model or report");
+    for (const auto & path : { output_path, output_report }) {
+        if (std::filesystem::exists(std::filesystem::symlink_status(path)) &&
+            (!std::filesystem::is_regular_file(path) || std::filesystem::is_symlink(path))) {
+            throw std::runtime_error("hard-pruning output must be a regular file");
+        }
+    }
+    if (std::filesystem::exists(std::filesystem::symlink_status(backup_model)) ||
+        std::filesystem::exists(std::filesystem::symlink_status(backup_report))) {
+        throw std::runtime_error("previous hard-pruning publication needs recovery: " + staging_path);
+    }
+    const bool had_model = std::filesystem::exists(output_path);
+    const bool had_report = std::filesystem::exists(output_report);
+    bool saved_model = false;
+    bool saved_report = false;
+    bool model_replaced = false;
+    bool report_removed = false;
+    try {
+        if (had_model) {
+            std::filesystem::create_hard_link(output_path, backup_model);
+            saved_model = true;
+        }
+        if (had_report) {
+            std::filesystem::create_hard_link(output_report, backup_report);
+            saved_report = true;
+        }
+        // Invalidate the old report before the model changes, including on interruption.
+        if (had_report) {
+            if (std::remove(output_report.c_str()) != 0) throw std::runtime_error("failed to invalidate old pruning report");
+            report_removed = true;
+        }
+        if (std::rename(staging_path.c_str(), output_path.c_str()) != 0) throw std::runtime_error("failed to publish hard-pruned model");
+        model_replaced = true;
+        if (std::rename(staging_report.c_str(), output_report.c_str()) != 0) throw std::runtime_error("failed to publish hard-pruning report");
+    } catch (...) {
+        bool restored = true;
+        if (model_replaced) {
+            restored = had_model ? std::rename(backup_model.c_str(), output_path.c_str()) == 0 : std::remove(output_path.c_str()) == 0;
+        }
+        if (report_removed && restored) restored = std::rename(backup_report.c_str(), output_report.c_str()) == 0;
+        if (!restored) throw std::runtime_error("failed to restore previous pruning output; preserve recovery files at " + staging_path);
+        if (saved_model) std::remove(backup_model.c_str());
+        if (saved_report) std::remove(backup_report.c_str());
+        throw;
+    }
+    std::remove(backup_model.c_str());
+    std::remove(backup_report.c_str());
 }

@@ -546,3 +546,44 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+def test_system_prefix_cache_survives_slot_erase(monkeypatch, thinking):
+    global server
+    system = "Once upon a time there was a quiet village. " * 4
+    monkeypatch.setenv("LLAMA_SERVER_SYSTEM_PROMPT", system)
+    server.kv_unified = True
+    server.cache_ram = 0
+    server.jinja = True
+    server.n_predict = 4
+    server.chat_template = (
+        "{{ bos_token }}{% if enable_thinking %}thinking\n{% endif %}"
+        + system
+        + "{% for message in messages %}{{ message.role }}:{{ message.content }}\n{% endfor %}assistant:"
+    )
+    server.start()
+    body = {
+        "messages": [{"role": "system", "content": "Independent instruction"}, {"role": "user", "content": "Tell a story"}],
+        "chat_template_kwargs": {"enable_thinking": thinking},
+        "temperature": 0,
+        "seed": 42,
+        "max_tokens": 4,
+        "cache_prompt": False,
+    }
+    outputs = []
+    for slot in [0, 1, 0]:
+        assert server.make_request("POST", f"/slots/{slot}?action=erase", data={}).status_code == 200
+        res = server.make_request("POST", "/v1/chat/completions", data={**body, "id_slot": slot})
+        assert res.status_code == 200
+        assert res.body["timings"]["cache_n"] > 20
+        outputs.append(res.body["choices"][0]["message"]["content"])
+    assert outputs[0] == outputs[1] == outputs[2]
+
+    server.stop()
+    monkeypatch.delenv("LLAMA_SERVER_SYSTEM_PROMPT")
+    server.start()
+    res = server.make_request("POST", "/v1/chat/completions", data=body)
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] == 0
+    assert res.body["choices"][0]["message"]["content"] == outputs[0]

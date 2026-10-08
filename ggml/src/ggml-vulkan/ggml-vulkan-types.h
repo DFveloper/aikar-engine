@@ -1026,6 +1026,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_out_prod_id_f32;
     vk_pipeline pipeline_out_prod_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_contig_cpy_u8_u8;
+    vk_pipeline pipeline_paged_write[2];
+    vk_pipeline pipeline_paged_attn[2];
     vk_pipeline pipeline_flash_attn_back_f32_f32;
     vk_pipeline pipeline_flash_attn_back_f16_f32;
     vk_pipeline pipeline_flash_attn_back_f32_f16;
@@ -1454,4 +1456,3 @@ struct ggml_backend_vk_device_context {
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
-

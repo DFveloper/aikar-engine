@@ -207,6 +207,7 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             ggml-turbo-quant.c
+            ggml-turboquant.cpp
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES

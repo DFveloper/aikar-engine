@@ -115,7 +115,9 @@ public:
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
-                         bool   lazy = false);
+                         bool   lazy = false,
+                      int32_t   turboquant_bits = 0,
+                     uint64_t   turboquant_seed = 42);
 
     ~llama_kv_cache() = default;
 
@@ -153,6 +155,10 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    bool has_turboquant() const { return turboquant_bits != 0; }
+    void state_write_policy(llama_io_write_i & io) const;
+    void state_read_policy(llama_io_read_i & io) const;
+    void state_write_payload(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const;
 
     //
     // llama_kv_cache specific API
@@ -169,6 +175,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_turboquant_parameters(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -181,7 +188,8 @@ public:
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+    const slot_info_vec_t *   sinfos_in,
+                       bool   policy_validated = false);
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
@@ -266,9 +274,13 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        ggml_tensor * turboquant_parameters = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+    const int32_t turboquant_bits;
+    const uint64_t turboquant_seed;
+    std::map<uint32_t, std::vector<float>> turboquant_parameters_host;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -411,6 +423,7 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_turboquant_parameters(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

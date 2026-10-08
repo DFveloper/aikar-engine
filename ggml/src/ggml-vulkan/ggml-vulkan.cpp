@@ -3527,6 +3527,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16, "soft_max_f32_f16", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_wg512, "soft_max_f32_f16_wg512", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_back_f32, "soft_max_back_f32", soft_max_back_f32_len, soft_max_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_write[0], "paged_write_f16", paged_write_f16_len, paged_write_f16_data, "main", 8, sizeof(vk_op_paged_attn_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_write[1], "paged_write_q8_kv", paged_write_q8_kv_len, paged_write_q8_kv_data, "main", 8, sizeof(vk_op_paged_attn_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[0], "paged_attn_f16", paged_attn_f16_len, paged_attn_f16_data, "main", 8, sizeof(vk_op_paged_attn_push_constants), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[1], "paged_attn_q8_kv", paged_attn_q8_kv_len, paged_attn_q8_kv_data, "main", 8, sizeof(vk_op_paged_attn_push_constants), {128, 1, 1}, {}, 1);
+
+
     if (device->shader_atomic_float) {
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_f32_f32, "flash_attn_back_f32_f32", flash_attn_back_f32_f32_len, flash_attn_back_f32_f32_data, "main", 7, sizeof(vk_op_flash_attn_back_push_constants), {128, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_f16_f32, "flash_attn_back_f16_f32", flash_attn_back_f16_f32_len, flash_attn_back_f16_f32_data, "main", 7, sizeof(vk_op_flash_attn_back_push_constants), {128, 1, 1}, {}, 1);
@@ -11437,6 +11443,31 @@ void ggml_vk_soft_max_back(ggml_backend_vk_context * ctx, vk_context& subctx, co
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SOFT_MAX_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], op_params[1], 0.0f, 0.0f });
 }
 
+static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const auto * q = dst->src[0];
+    const auto * k = dst->src[1];
+    const auto * cache = dst->src[3];
+    const auto * table = dst->src[4];
+    const vk_op_paged_attn_push_constants pc = {
+        (uint32_t) q->ne[0], (uint32_t) q->ne[1], (uint32_t) k->ne[1], (uint32_t) table->ne[2], (uint32_t) table->ne[1],
+        (uint32_t) ggml_get_op_params_i32(dst, 1), (uint32_t) ggml_get_op_params_i32(dst, 2),
+        (uint32_t) ggml_get_op_params_i32(dst, 3), (uint32_t) ggml_get_op_params_i32(dst, 4),
+        (uint32_t) (cache->nb[1]/2), (uint32_t) (cache->nb[2]/2), (uint32_t) (cache->nb[3]/2), ggml_get_op_params_f32(dst, 0),
+    };
+    std::vector<vk_subbuffer> bufs;
+    for (int i = 0; i < 7; ++i) { bufs.push_back(ggml_vk_tensor_subbuffer(ctx, dst->src[i])); }
+    bufs.push_back(ggml_vk_tensor_subbuffer(ctx, dst));
+    const int type = cache->type == GGML_TYPE_Q8_KV;
+    auto write = ctx->device->pipeline_paged_write[type];
+    auto attn = ctx->device->pipeline_paged_attn[type];
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_pipeline_request_descriptor_sets(ctx, write, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, write, {bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7]}, pc, {uint32_t(64*k->ne[1]*q->ne[2]*table->ne[2]), 1, 1});
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_pipeline_request_descriptor_sets(ctx, attn, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, attn, {bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7]}, pc, {uint32_t(128*q->ne[1]*q->ne[2]), 1, 1});
+}
+
 static void ggml_vk_flash_attn_back(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -13085,6 +13116,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
 
+        break;
+
+    case GGML_OP_PAGED_ATTN:
+        ggml_vk_paged_attn(ctx, compute_ctx, node);
         break;
 
     case GGML_OP_FLASH_ATTN_BACK:
@@ -15945,6 +15980,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+        case GGML_OP_PAGED_ATTN:
+            return op->src[0]->ne[0] <= 1024 && op->src[0]->ne[0]%64 == 0 &&
+                (op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_Q8_KV) &&
+                ggml_nbytes(op->src[3])/2 <= UINT32_MAX;
         case GGML_OP_FLASH_ATTN_BACK: {
             if (!device->shader_atomic_float || ggml_nbytes(op) > UINT32_MAX) {
                 return false;

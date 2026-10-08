@@ -2,16 +2,219 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
 #include "quants.h"
+#include "ggml-turboquant.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
+
+void ggml_compute_forward_turboquant_pack(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_turboquant_op_params options;
+    memcpy(&options, dst->op_params, sizeof(options));
+    const ggml_tensor * input = dst->src[0];
+    const ggml_tensor * indices = dst->src[1];
+    const float * parameters = (const float *) dst->src[3]->data;
+    if (params->ith == 0) {
+        std::vector<bool> seen(dst->ne[2]);
+        for (int64_t stream = 0; stream < input->ne[3]; ++stream) {
+            std::fill(seen.begin(), seen.end(), false);
+            for (int64_t token = 0; token < input->ne[2]; ++token) {
+                int64_t slot;
+                memcpy(&slot, (const char *) indices->data + token*indices->nb[0] + stream*indices->nb[1], sizeof(slot));
+                GGML_ASSERT(slot >= 0 && slot < dst->ne[2] && !seen[slot]);
+                seen[slot] = true;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+    const int64_t count = input->ne[1]*input->ne[2]*input->ne[3];
+    for (int64_t flat = params->ith; flat < count; flat += params->nth) {
+        const int64_t head = flat % input->ne[1];
+        const int64_t token = flat/input->ne[1] % input->ne[2];
+        const int64_t stream = flat/(input->ne[1]*input->ne[2]);
+        int64_t slot;
+        memcpy(&slot, (const char *) indices->data + token*indices->nb[0] + stream*indices->nb[1], sizeof(slot));
+        const float * source = (const float *) ((const char *) input->data + head*input->nb[1] + token*input->nb[2] + stream*input->nb[3]);
+        uint8_t * destination = (uint8_t *) dst->data + head*dst->nb[1] + slot*dst->nb[2] + stream*dst->nb[3];
+        GGML_ASSERT(ggml_turboquant_pack_row(source, destination, parameters, options.head_dim, options.bits_k, options.key != 0));
+    }
+}
+
+static float turboquant_mask_value(const ggml_tensor * mask, int64_t token, int64_t query_token, int64_t head, int64_t stream) {
+    if (mask == nullptr) {
+        return 0.0f;
+    }
+    const char * address = (const char *) mask->data + token*mask->nb[0] + query_token*mask->nb[1] + (head % mask->ne[2])*mask->nb[2] + (stream % mask->ne[3])*mask->nb[3];
+    if (mask->type == GGML_TYPE_F16) {
+        ggml_fp16_t value;
+        memcpy(&value, address, sizeof(value));
+        return GGML_FP16_TO_FP32(value);
+    }
+    float value;
+    memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+static int turboquant_value_index(const uint8_t * row, int component, int bits) {
+    const int bit_offset = component*bits;
+    const int shift = bit_offset % 8;
+    unsigned packed = row[4 + bit_offset/8];
+    if (shift + bits > 8) {
+        packed |= unsigned(row[5 + bit_offset/8]) << 8;
+    }
+    return (packed >> shift) & ((1 << bits) - 1);
+}
+
+void ggml_compute_forward_turboquant_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_turboquant_op_params options;
+    memcpy(&options, dst->op_params, sizeof(options));
+    const ggml_tensor * query = dst->src[0];
+    const ggml_tensor * cache_k = dst->src[1];
+    const ggml_tensor * cache_v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const float * sinks = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
+    const float * parameters = (const float *) dst->src[5]->data;
+    const float * rotation_k = ggml_turboquant_matrix(parameters, options.head_dim, GGML_TURBOQUANT_ROTATION_K);
+    const float * rotation_v = ggml_turboquant_matrix(parameters, options.head_dim, GGML_TURBOQUANT_ROTATION_V);
+    const float * projection = ggml_turboquant_matrix(parameters, options.head_dim, GGML_TURBOQUANT_PROJECTION);
+    const float * value_codebook = ggml_turboquant_codebook(parameters, options.head_dim, options.bits_v, false);
+    std::vector<float> rotated_query(options.head_dim), projected_query(options.head_dim);
+    std::vector<double> accumulated(options.head_dim);
+    const int64_t count = query->ne[1]*query->ne[2]*query->ne[3];
+    const int head_log2 = 1 << int(std::floor(std::log2(double(query->ne[2]))));
+    const float slope_first = std::pow(2.0f, -options.max_bias/head_log2);
+    const float slope_second = std::pow(2.0f, -0.5f*options.max_bias/head_log2);
+    for (int64_t flat = params->ith; flat < count; flat += params->nth) {
+        const int64_t query_token = flat % query->ne[1];
+        const int64_t head = flat/query->ne[1] % query->ne[2];
+        const int64_t stream = flat/(query->ne[1]*query->ne[2]);
+        const int64_t kv_head = head/(query->ne[2]/cache_k->ne[1]);
+        const float slope = options.max_bias > 0.0f ? (head < head_log2 ? std::pow(slope_first, head + 1) : std::pow(slope_second, 2*(head - head_log2) + 1)) : 1.0f;
+        const float * source = (const float *) ((const char *) query->data + query_token*query->nb[1] + head*query->nb[2] + stream*query->nb[3]);
+        for (int row = 0; row < options.head_dim; ++row) {
+            double rotated = 0.0, projected = 0.0;
+            for (int column = 0; column < options.head_dim; ++column) {
+                rotated += double(rotation_k[row*options.head_dim + column])*source[column];
+                projected += double(projection[row*options.head_dim + column])*source[column];
+            }
+            rotated_query[row] = float(rotated);
+            projected_query[row] = float(projected);
+        }
+        double maximum = sinks ? sinks[head] : -INFINITY;
+        double denominator = sinks ? 1.0 : 0.0;
+        std::fill(accumulated.begin(), accumulated.end(), 0.0);
+        for (int token = 0; token < options.n_kv_max; ++token) {
+            const float mask_value = slope*turboquant_mask_value(mask, token, query_token, head, stream);
+            if (mask_value == -INFINITY) {
+                continue;
+            }
+            const uint8_t * key_row = (const uint8_t *) cache_k->data + kv_head*cache_k->nb[1] + token*cache_k->nb[2] + stream*cache_k->nb[3];
+            double score = options.scale*ggml_turboquant_dot_row(key_row, rotated_query.data(), projected_query.data(), parameters, options.head_dim, options.bits_k);
+            if (options.logit_softcap > 0.0f) {
+                score = options.logit_softcap*std::tanh(score/options.logit_softcap);
+            }
+            score += mask_value;
+            const double updated_maximum = std::max(maximum, score);
+            const double previous_weight = std::exp(maximum - updated_maximum);
+            const double weight = std::exp(score - updated_maximum);
+            denominator = denominator*previous_weight + weight;
+            const uint8_t * value_row = (const uint8_t *) cache_v->data + kv_head*cache_v->nb[1] + token*cache_v->nb[2] + stream*cache_v->nb[3];
+            const uint32_t representation = uint32_t(value_row[0]) | (uint32_t(value_row[1]) << 8) | (uint32_t(value_row[2]) << 16) | (uint32_t(value_row[3]) << 24);
+            float norm;
+            memcpy(&norm, &representation, sizeof(norm));
+            for (int component = 0; component < options.head_dim; ++component) {
+                const double value = norm*value_codebook[turboquant_value_index(value_row, component, options.bits_v)];
+                accumulated[component] = accumulated[component]*previous_weight + weight*value;
+            }
+            maximum = updated_maximum;
+        }
+        float * output = (float *) ((char *) dst->data + head*dst->nb[1] + query_token*dst->nb[2] + stream*dst->nb[3]);
+        for (int column = 0; column < options.head_dim; ++column) {
+            double value = 0.0;
+            for (int row = 0; row < options.head_dim; ++row) {
+                value += rotation_v[row*options.head_dim + column]*accumulated[row];
+            }
+            output[column] = denominator > 0.0 ? float(value/denominator) : 0.0f;
+        }
+    }
+}
+
+void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * q = dst->src[0];
+    const auto * kn = dst->src[1];
+    const auto * vn = dst->src[2];
+    auto * cache = dst->src[3];
+    const auto * table = dst->src[4];
+    const int32_t * slots = (const int32_t *) dst->src[5]->data;
+    const int32_t * queries = (const int32_t *) dst->src[6]->data;
+    const int32_t * pages = (const int32_t *) table->data;
+    const int d = q->ne[0], nh = q->ne[1], hk = kn->ne[1], nt = q->ne[2];
+    const int ns = table->ne[2], np = table->ne[1];
+    const int bs = ggml_get_op_params_i32(dst, 1);
+    const int table_words = (bs + 31)/32;
+    const int window = ggml_get_op_params_i32(dst, 2);
+    const int n_kv = ggml_get_op_params_i32(dst, 3);
+    const bool causal = !ggml_get_op_params_i32(dst, 4);
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    for (int row = params->ith; row < nt*ns*hk; row += params->nth) {
+        const int h = row%hk, t = row/hk/ns, seq = row/hk%ns;
+        const int slot = slots[t*ns + seq];
+        if (slot < 0) { continue; }
+        GGML_ASSERT(slot < bs*cache->ne[3]);
+        for (int kv = 0; kv < 2; ++kv) {
+            const auto * input = kv ? vn : kn;
+            const float * src = (const float *) input->data + (t*hk + h)*d;
+            char * out = (char *) cache->data + (slot/bs)*cache->nb[3] + (h + kv*hk)*cache->nb[2] + (slot%bs)*cache->nb[1];
+            if (cache->type == GGML_TYPE_Q8_KV) {
+                quantize_row_q8_kv_ref(src, out, d);
+            } else {
+                ggml_fp32_to_fp16_row(src, (ggml_fp16_t *) out, d);
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+    std::vector<float> k(d), v(d), acc(d);
+    for (int row = params->ith; row < nt*nh; row += params->nth) {
+        const int t = row/nh, h = row%nh, hkv = h/(nh/hk);
+        const int pos = queries[2*t], seq = queries[2*t + 1];
+        GGML_ASSERT(pos >= 0 && seq >= 0 && seq < ns && (pos/bs)*table_words + (pos%bs)/32 < np);
+        const float * qr = (const float *) q->data + row*d;
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        float m = -INFINITY, sum = 0.0f;
+        const int begin = window ? std::max(0, pos - window + 1) : 0;
+        const int end = causal ? pos : n_kv - 1;
+        for (int p = begin; p <= end; ++p) {
+            const int ix = 2*(seq*np + (p/bs)*table_words + (p%bs)/32);
+            const int physical = pages[ix];
+            if (physical < 0 || !((uint32_t) pages[ix + 1] & (1u << ((p%bs)%32)))) { continue; }
+            GGML_ASSERT(physical < cache->ne[3]);
+            for (int kv = 0; kv < 2; ++kv) {
+                const char * src = (const char *) cache->data + physical*cache->nb[3] + (hkv + kv*hk)*cache->nb[2] + (p%bs)*cache->nb[1];
+                float * out = kv ? v.data() : k.data();
+                if (cache->type == GGML_TYPE_Q8_KV) { dequantize_row_q8_kv(src, out, d); }
+                else { ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, out, d); }
+            }
+            float dot = 0.0f;
+            for (int i = 0; i < d; ++i) { dot += qr[i]*k[i]; }
+            dot *= scale;
+            const float next = std::max(m, dot);
+            const float old = expf(m - next), weight = expf(dot - next);
+            for (int i = 0; i < d; ++i) { acc[i] = acc[i]*old + v[i]*weight; }
+            sum = sum*old + weight; m = next;
+        }
+        GGML_ASSERT(sum > 0.0f);
+        float * out = (float *) dst->data + row*d;
+        for (int i = 0; i < d; ++i) { out[i] = acc[i]/sum; }
+    }
+}
 
 void ggml_compute_forward_turbo_wht(
         const ggml_compute_params * params,

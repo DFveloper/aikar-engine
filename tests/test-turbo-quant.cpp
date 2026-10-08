@@ -1,12 +1,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-quants.h"
+#include "ggml-turboquant.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <utility>
 #include <vector>
@@ -487,6 +489,9 @@ static bool test_backend_attention(
         ggml_backend_tensor_get(out, actual.data(), 0, actual.size()*sizeof(float));
         const metrics result = measure(expected, actual);
         ok = result.cosine > 0.999 && result.norm_error < 0.02 && result.max_error < 0.02;
+        if (turbo_k && std::strncmp(label, "CUDA", 4) == 0) {
+            ok = ok && result.max_error < 2e-6;
+        }
         std::printf("%s attention D%d/KV%d/Q%d %s/%s: mse=%g max=%g cosine=%.7f %s\n",
             label, d, kv, nq, ggml_type_name(type_k), ggml_type_name(type_v), result.mse, result.max_error, result.cosine,
             ok ? "ok" : "FAILED");
@@ -496,6 +501,184 @@ static bool test_backend_attention(
         ggml_backend_buffer_free(buffer);
     }
     ggml_free(ctx);
+    return ok;
+}
+
+static void reference_google_turboquant(const float * input, uint8_t * packed, float * decoded,
+        const float * parameters, int head_dim, int total_bits, bool key) {
+    const int base_bits = total_bits - int(key);
+    const int header_bytes = key ? 8 : 4;
+    const int book_offset = key ? (total_bits == 3 ? 0 : 4) : (total_bits == 3 ? 12 : 20);
+    const float * book = parameters + 3*head_dim*head_dim + book_offset;
+    const float * rotation = parameters + (key ? 0 : head_dim*head_dim);
+    const float * projection = parameters + 2*head_dim*head_dim;
+    const int row_bytes = header_bytes + head_dim*total_bits/8;
+    std::fill(packed, packed + row_bytes, uint8_t(0));
+    std::vector<long double> reconstruction(head_dim, 0.0L), residual(head_dim);
+    long double norm_squared = 0.0L;
+    for (int component = 0; component < head_dim; ++component) norm_squared += (long double) input[component]*input[component];
+    const long double norm = std::sqrt(norm_squared);
+    const float stored_norm = float(norm);
+    std::memcpy(packed, &stored_norm, sizeof(stored_norm));
+    if (norm == 0.0L) {
+        std::fill(decoded, decoded + head_dim, 0.0f);
+        return;
+    }
+    for (int row = 0; row < head_dim; ++row) {
+        long double rotated = 0.0L;
+        for (int component = 0; component < head_dim; ++component) rotated += (long double) rotation[row*head_dim + component]*input[component]/norm;
+        int nearest = 0;
+        for (int candidate = 1; candidate < (1 << base_bits); ++candidate) {
+            if (std::abs(rotated - book[candidate]) < std::abs(rotated - book[nearest])) nearest = candidate;
+        }
+        for (int bit = 0; bit < base_bits; ++bit) {
+            const int position = row*base_bits + bit;
+            packed[header_bytes + position/8] |= uint8_t(((nearest >> bit) & 1) << (position % 8));
+        }
+        for (int component = 0; component < head_dim; ++component) reconstruction[component] += norm*book[nearest]*rotation[row*head_dim + component];
+    }
+    long double residual_squared = 0.0L;
+    for (int component = 0; component < head_dim; ++component) {
+        residual[component] = input[component] - reconstruction[component];
+        residual_squared += residual[component]*residual[component];
+        decoded[component] = float(reconstruction[component]*stored_norm/norm);
+    }
+    if (key) {
+        const float residual_norm = float(std::sqrt(residual_squared));
+        std::memcpy(packed + 4, &residual_norm, sizeof(residual_norm));
+        std::vector<long double> correction(head_dim, 0.0L);
+        for (int row = 0; row < head_dim; ++row) {
+            long double product = 0.0L;
+            for (int component = 0; component < head_dim; ++component) product += projection[row*head_dim + component]*residual[component];
+            const int sign = product >= 0.0L ? 1 : -1;
+            if (sign > 0) packed[header_bytes + head_dim*base_bits/8 + row/8] |= uint8_t(1 << (row % 8));
+            for (int component = 0; component < head_dim; ++component) correction[component] += sign*(long double) projection[row*head_dim + component];
+        }
+        for (int component = 0; component < head_dim; ++component) {
+            decoded[component] = float(reconstruction[component]*stored_norm/norm + residual_norm*std::sqrt(std::acos(-1.0L)/2.0L)/head_dim*correction[component]);
+        }
+    }
+}
+
+static bool test_google_turboquant_backend(ggml_backend_t backend, const char * label, int head_dim, int bits_k, int bits_v,
+        int cached_tokens = 17, int query_tokens = 3, bool noncontiguous_query = false, bool use_sinks = true) {
+    constexpr int kv_heads = 2;
+    constexpr int query_heads = 4;
+    constexpr int streams = 2;
+    const size_t row_k = ggml_turboquant_row_size(head_dim, bits_k, true);
+    const size_t row_v = ggml_turboquant_row_size(head_dim, bits_v, false);
+    ggml_init_params init { 8*1024*1024, nullptr, true };
+    ggml_context * context = ggml_init(init);
+    ggml_tensor * query = noncontiguous_query
+            ? ggml_permute(context, ggml_new_tensor_4d(context, GGML_TYPE_F32, head_dim, query_heads, query_tokens, streams), 0, 2, 1, 3)
+            : ggml_new_tensor_4d(context, GGML_TYPE_F32, head_dim, query_tokens, query_heads, streams);
+    ggml_tensor * input_k = ggml_new_tensor_4d(context, GGML_TYPE_F32, head_dim, kv_heads, cached_tokens, streams);
+    ggml_tensor * input_v = ggml_new_tensor_4d(context, GGML_TYPE_F32, head_dim, kv_heads, cached_tokens, streams);
+    ggml_tensor * cache_k = ggml_new_tensor_4d(context, GGML_TYPE_I8, row_k, kv_heads, cached_tokens, streams);
+    ggml_tensor * cache_v = ggml_new_tensor_4d(context, GGML_TYPE_I8, row_v, kv_heads, cached_tokens, streams);
+    ggml_tensor * indices = ggml_new_tensor_2d(context, GGML_TYPE_I64, cached_tokens, streams);
+    ggml_tensor * parameters = ggml_new_tensor_1d(context, GGML_TYPE_F32, ggml_turboquant_params_size(head_dim));
+    ggml_tensor * mask = ggml_new_tensor_4d(context, GGML_TYPE_F32, cached_tokens, query_tokens, 1, streams);
+    ggml_tensor * sinks = ggml_new_tensor_1d(context, GGML_TYPE_F32, query_heads);
+    ggml_tensor * write_k = ggml_turboquant_pack(context, input_k, indices, cache_k, parameters, head_dim, bits_k, true);
+    ggml_tensor * write_v = ggml_turboquant_pack(context, input_v, indices, cache_v, parameters, head_dim, bits_v, false);
+    ggml_tensor * output = ggml_turboquant_attn(context, query, write_k, write_v, mask, use_sinks ? sinks : nullptr, parameters,
+        head_dim, bits_k, bits_v, 0.5f/std::sqrt(float(head_dim)), 0.0f, 2.0f, cached_tokens);
+    if (write_k == nullptr || write_v == nullptr || output == nullptr) {
+        std::printf("%s Google TurboQuant graph construction FAILED\n", label);
+        ggml_free(context);
+        return false;
+    }
+    std::vector<float> parameters_host(ggml_turboquant_params_size(head_dim));
+    ggml_turboquant_params_init(parameters_host.data(), head_dim, 42);
+    std::vector<float> query_host(ggml_nelements(query)), key_host(ggml_nelements(input_k)), value_host(ggml_nelements(input_v));
+    std::vector<float> mask_host(ggml_nelements(mask)), sinks_host(query_heads, -0.75f);
+    std::vector<int64_t> indices_host(ggml_nelements(indices));
+    std::mt19937 generator(1267);
+    std::normal_distribution<float> normal(0.0f, 0.5f);
+    for (float & value : query_host) value = normal(generator);
+    for (float & value : key_host) value = normal(generator);
+    for (float & value : value_host) value = normal(generator);
+    for (int stream = 0; stream < streams; ++stream) {
+        for (int token = 0; token < cached_tokens; ++token) {
+            indices_host[stream*cached_tokens + token] = cached_tokens - 1 - token;
+        }
+        for (int query_token = 0; query_token < query_tokens; ++query_token) {
+            for (int token = 0; token < cached_tokens; ++token) {
+                mask_host[(stream*query_tokens + query_token)*cached_tokens + token] = token > cached_tokens - 5 + query_token || query_token == query_tokens - 1 ? -INFINITY : -0.01f*token;
+            }
+        }
+    }
+    std::vector<uint8_t> packed_keys(ggml_nbytes(cache_k)), packed_values(ggml_nbytes(cache_v));
+    std::vector<float> decoded_keys(key_host.size()), decoded_values(value_host.size());
+    for (int stream = 0; stream < streams; ++stream) {
+        for (int token = 0; token < cached_tokens; ++token) {
+            for (int head = 0; head < kv_heads; ++head) {
+                const int source_row = (stream*cached_tokens + token)*kv_heads + head;
+                const int cache_row = (stream*cached_tokens + cached_tokens - 1 - token)*kv_heads + head;
+                reference_google_turboquant(key_host.data() + source_row*head_dim, packed_keys.data() + cache_row*row_k,
+                        decoded_keys.data() + cache_row*head_dim, parameters_host.data(), head_dim, bits_k, true);
+                reference_google_turboquant(value_host.data() + source_row*head_dim, packed_values.data() + cache_row*row_v,
+                        decoded_values.data() + cache_row*head_dim, parameters_host.data(), head_dim, bits_v, false);
+            }
+        }
+    }
+    std::vector<float> expected(ggml_nelements(output), 0.0f);
+    for (int stream = 0; stream < streams; ++stream) {
+        for (int query_token = 0; query_token < query_tokens; ++query_token) {
+            for (int head = 0; head < query_heads; ++head) {
+                const int query_row_index = noncontiguous_query ? (stream*query_tokens + query_token)*query_heads + head
+                        : (stream*query_heads + head)*query_tokens + query_token;
+                const float * query_row = query_host.data() + query_row_index*head_dim;
+                std::vector<double> scores(cached_tokens);
+                double maximum = use_sinks ? sinks_host[head] : -INFINITY;
+                for (int token = 0; token < cached_tokens; ++token) {
+                    const float * key_row = decoded_keys.data() + ((stream*cached_tokens + token)*kv_heads + head/(query_heads/kv_heads))*head_dim;
+                    double product = 0.0;
+                    for (int component = 0; component < head_dim; ++component) product += double(query_row[component])*key_row[component];
+                    scores[token] = 2.0*std::tanh(product*0.25/std::sqrt(double(head_dim))) + mask_host[(stream*query_tokens + query_token)*cached_tokens + token];
+                    maximum = std::max(maximum, scores[token]);
+                }
+                double denominator = use_sinks ? std::exp(double(sinks_host[head]) - maximum) : 0.0;
+                for (double & score : scores) {
+                    score = score == -INFINITY ? 0.0 : std::exp(score - maximum);
+                    denominator += score;
+                }
+                float * result = expected.data() + ((stream*query_tokens + query_token)*query_heads + head)*head_dim;
+                for (int token = 0; token < cached_tokens; ++token) {
+                    const float * value_row = decoded_values.data() + ((stream*cached_tokens + token)*kv_heads + head/(query_heads/kv_heads))*head_dim;
+                    for (int component = 0; component < head_dim; ++component) result[component] += denominator > 0.0 ? float(scores[token]/denominator*value_row[component]) : 0.0f;
+                }
+            }
+        }
+    }
+    ggml_cgraph * graph = ggml_new_graph(context);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(context, backend);
+    bool ok = buffer != nullptr && ggml_backend_supports_op(backend, output) && ggml_backend_supports_op(backend, write_k);
+    if (ok) {
+        ggml_backend_tensor_set(parameters, parameters_host.data(), 0, ggml_nbytes(parameters));
+        ggml_backend_tensor_set(query, query_host.data(), 0, ggml_nbytes(query));
+        ggml_backend_tensor_set(input_k, key_host.data(), 0, ggml_nbytes(input_k));
+        ggml_backend_tensor_set(input_v, value_host.data(), 0, ggml_nbytes(input_v));
+        ggml_backend_tensor_set(indices, indices_host.data(), 0, ggml_nbytes(indices));
+        ggml_backend_tensor_set(mask, mask_host.data(), 0, ggml_nbytes(mask));
+        ggml_backend_tensor_set(sinks, sinks_host.data(), 0, ggml_nbytes(sinks));
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        std::vector<float> actual(expected.size());
+        ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+        std::vector<uint8_t> actual_keys(packed_keys.size()), actual_values(packed_values.size());
+        ggml_backend_tensor_get(cache_k, actual_keys.data(), 0, actual_keys.size());
+        ggml_backend_tensor_get(cache_v, actual_values.data(), 0, actual_values.size());
+        ok = ok && actual_keys == packed_keys && actual_values == packed_values;
+        const metrics result = measure(expected, actual);
+        ok = result.max_error < 3e-6 && ok;
+        std::printf("%s Google TurboQuant D%d K%d/V%d: max=%g cosine=%.9f %s\n", label, head_dim, bits_k, bits_v, result.max_error, result.cosine, ok ? "ok" : "FAILED");
+    } else {
+        std::printf("%s Google TurboQuant backend support FAILED\n", label);
+    }
+    if (buffer) ggml_backend_buffer_free(buffer);
+    ggml_free(context);
     return ok;
 }
 
@@ -515,6 +698,14 @@ static bool test_backend_kind(const char * prefix) {
             continue;
         }
         ok = test_backend_wht(backend, name) && ok;
+        if (std::strcmp(prefix, "CPU") == 0 || std::strcmp(prefix, "CUDA") == 0) {
+            ok = test_google_turboquant_backend(backend, name, 256, 3, 3) && ok;
+            ok = test_google_turboquant_backend(backend, name, 512, 4, 4) && ok;
+            ok = test_google_turboquant_backend(backend, name, 256, 4, 3, 33, 5, true, false) && ok;
+            ok = test_google_turboquant_backend(backend, name, 512, 3, 4, 257, 2, true, false) && ok;
+            ok = test_google_turboquant_backend(backend, name, 512, 4, 4, 1025, 2, true, false) && ok;
+            ok = test_google_turboquant_backend(backend, name, 256, 3, 3, 513, 3, false, true) && ok;
+        }
         ok = test_backend_set_rows(backend, name, GGML_TYPE_TURBO3_0) && ok;
         ok = test_backend_set_rows(backend, name, GGML_TYPE_TURBO4_0) && ok;
         ok = test_backend_set_rows(backend, name, GGML_TYPE_MXFP4) && ok;
@@ -544,6 +735,8 @@ static bool test_backend_kind(const char * prefix) {
             ok = test_backend_attention(backend, name, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV, 512) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_F16, GGML_TYPE_F16, 256, 256, 32) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV, 256, 256, 32) && ok;
+            ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 256, 256, 32) && ok;
+            ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, 512, 256, 32) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 512) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, 512) && ok;
             ok = test_backend_attention(backend, name, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 512, 16384) && ok;
@@ -563,9 +756,157 @@ static bool test_backend_kind(const char * prefix) {
     return ok;
 }
 
+static bool test_google_turboquant() {
+    bool ok = true;
+    ok = ggml_turboquant_params_size(128) == 0 && ok;
+    ok = ggml_turboquant_row_size(256, 2, true) == 0 && ok;
+    for (const int head_dim : {256, 512}) {
+        std::vector<float> parameters(ggml_turboquant_params_size(head_dim));
+        if (!ggml_turboquant_params_init(parameters.data(), head_dim, 0x12345678)) {
+            std::printf("Google TurboQuant D%d parameter generation FAILED\n", head_dim);
+            return false;
+        }
+        double orthogonality_error = 0.0;
+        for (const auto matrix_kind : {GGML_TURBOQUANT_ROTATION_K, GGML_TURBOQUANT_ROTATION_V}) {
+            const float * rotation = ggml_turboquant_matrix(parameters.data(), head_dim, matrix_kind);
+            for (int row = 0; row < head_dim; ++row) {
+                for (int other = 0; other < head_dim; ++other) {
+                    double product = 0.0;
+                    for (int column = 0; column < head_dim; ++column) {
+                        product += double(rotation[row*head_dim + column])*rotation[other*head_dim + column];
+                    }
+                    orthogonality_error = std::max(orthogonality_error, std::abs(product - double(row == other)));
+                }
+            }
+        }
+        ok = orthogonality_error < 2e-7 && ok;
+        std::mt19937 generator(83);
+        std::normal_distribution<float> normal;
+        std::vector<float> input(head_dim), query(head_dim), output(head_dim), rotated_query(head_dim), projected_query(head_dim);
+        for (int component = 0; component < head_dim; ++component) {
+            input[component] = normal(generator);
+            query[component] = normal(generator);
+        }
+        for (int row = 0; row < head_dim; ++row) {
+            double rotated = 0.0, projected = 0.0;
+            for (int column = 0; column < head_dim; ++column) {
+                rotated += double(ggml_turboquant_matrix(parameters.data(), head_dim, GGML_TURBOQUANT_ROTATION_K)[row*head_dim + column])*query[column];
+                projected += double(ggml_turboquant_matrix(parameters.data(), head_dim, GGML_TURBOQUANT_PROJECTION)[row*head_dim + column])*query[column];
+            }
+            rotated_query[row] = float(rotated);
+            projected_query[row] = float(projected);
+        }
+        double input_norm_sq = 0.0;
+        for (const float value : input) {
+            input_norm_sq += double(value)*value;
+        }
+        for (const int total_bits : {3, 4}) {
+            for (const bool key : {false, true}) {
+                const size_t row_size = ggml_turboquant_row_size(head_dim, total_bits, key);
+                ok = row_size == size_t((key ? 8 : 4) + head_dim*total_bits/8) && ok;
+                std::vector<uint8_t> packed(row_size + 16, 0xa5);
+                ok = ggml_turboquant_pack_row(input.data(), packed.data(), parameters.data(), head_dim, total_bits, key) && ok;
+                float stored_norm;
+                std::memcpy(&stored_norm, packed.data(), sizeof(stored_norm));
+                ok = std::abs(stored_norm/std::sqrt(input_norm_sq) - 1.0) < 1e-7 && ok;
+                ok = std::all_of(packed.begin() + row_size, packed.end(), [](uint8_t value) { return value == 0xa5; }) && ok;
+                ggml_turboquant_unpack_row(packed.data(), output.data(), parameters.data(), head_dim, total_bits, key);
+                const metrics result = measure(input, output);
+                if (!key) {
+                    const double relative_mse = result.mse*head_dim/input_norm_sq;
+                    ok = relative_mse < (total_bits == 3 ? 0.045 : 0.014) && ok;
+                } else {
+                    double oracle_dot = 0.0;
+                    for (int component = 0; component < head_dim; ++component) {
+                        oracle_dot += double(query[component])*output[component];
+                    }
+                    const double packed_dot = ggml_turboquant_dot_row(packed.data(), rotated_query.data(), projected_query.data(), parameters.data(), head_dim, total_bits);
+                    ok = std::abs(packed_dot - oracle_dot) < 2e-5*std::max(1.0, std::abs(oracle_dot)) && ok;
+                }
+                std::printf("Google TurboQuant D%d %s%d: relative_mse=%g norm=%g %s\n", head_dim, key ? "K" : "V", total_bits,
+                    result.mse*head_dim/input_norm_sq, stored_norm, ok ? "ok" : "FAILED");
+                std::fill(input.begin(), input.end(), 0.0f);
+                ok = ggml_turboquant_pack_row(input.data(), packed.data(), parameters.data(), head_dim, total_bits, key) && ok;
+                ok = std::all_of(packed.begin(), packed.begin() + row_size, [](uint8_t value) { return value == 0; }) && ok;
+                ggml_turboquant_unpack_row(packed.data(), output.data(), parameters.data(), head_dim, total_bits, key);
+                ok = std::all_of(output.begin(), output.end(), [](float value) { return value == 0.0f; }) && ok;
+                input[0] = std::numeric_limits<float>::infinity();
+                ok = !ggml_turboquant_pack_row(input.data(), packed.data(), parameters.data(), head_dim, total_bits, key) && ok;
+                input[0] = std::numeric_limits<float>::quiet_NaN();
+                ok = !ggml_turboquant_pack_row(input.data(), packed.data(), parameters.data(), head_dim, total_bits, key) && ok;
+                for (float & value : input) {
+                    value = normal(generator);
+                }
+                input_norm_sq = 0.0;
+                for (const float value : input) {
+                    input_norm_sq += double(value)*value;
+                }
+            }
+        }
+        std::printf("Google TurboQuant D%d orthogonality=%g %s\n", head_dim, orthogonality_error, ok ? "ok" : "FAILED");
+        for (const int total_bits : {3, 4}) {
+            for (const bool key : {false, true}) {
+                const float * codebook = ggml_turboquant_codebook(parameters.data(), head_dim, total_bits, key);
+                const int count = 1 << (total_bits - int(key));
+                for (int center = 0; center < count; ++center) {
+                    const double lower = center == 0 ? -1.0 : 0.5*(double(codebook[center - 1]) + codebook[center]);
+                    const double upper = center + 1 == count ? 1.0 : 0.5*(double(codebook[center]) + codebook[center + 1]);
+                    constexpr int intervals = 8192;
+                    double mass = 0.0, moment = 0.0;
+                    for (int point = 0; point <= intervals; ++point) {
+                        const double coordinate = lower + (upper - lower)*point/intervals;
+                        const double density = std::abs(coordinate) >= 1.0 ? 0.0 : std::pow(1.0 - coordinate*coordinate, 0.5*(head_dim - 3));
+                        const int weight = point == 0 || point == intervals ? 1 : (point % 2 == 0 ? 2 : 4);
+                        mass += weight*density;
+                        moment += weight*density*coordinate;
+                    }
+                    ok = std::abs(moment/mass - codebook[center]) < 1e-6 && ok;
+                }
+                std::vector<uint8_t> packed(ggml_turboquant_row_size(head_dim, total_bits, key));
+                for (const float magnitude : {1e-20f, 1e20f}) {
+                    std::fill(input.begin(), input.end(), 0.0f);
+                    input[0] = magnitude;
+                    ok = ggml_turboquant_pack_row(input.data(), packed.data(), parameters.data(), head_dim, total_bits, key) && ok;
+                    ggml_turboquant_unpack_row(packed.data(), output.data(), parameters.data(), head_dim, total_bits, key);
+                    ok = std::all_of(output.begin(), output.end(), [](float value) { return std::isfinite(value); }) && ok;
+                }
+                std::fill(input.begin(), input.end(), std::numeric_limits<float>::max());
+                ok = !ggml_turboquant_pack_row(input.data(), packed.data(), parameters.data(), head_dim, total_bits, key) && ok;
+            }
+        }
+        if (head_dim == 256) {
+            std::fill(input.begin(), input.end(), 0.0f);
+            std::fill(query.begin(), query.end(), 0.0f);
+            input[0] = query[0] = 1.0f;
+            const float * rotation = ggml_turboquant_matrix(parameters.data(), head_dim, GGML_TURBOQUANT_ROTATION_K);
+            for (int row = 0; row < head_dim; ++row) rotated_query[row] = rotation[row*head_dim];
+            float * projection = parameters.data() + 2*head_dim*head_dim;
+            std::vector<uint8_t> packed(ggml_turboquant_row_size(head_dim, 3, true));
+            constexpr int samples = 256;
+            double sum = 0.0, sum_sq = 0.0;
+            for (int sample = 0; sample < samples; ++sample) {
+                std::mt19937 sample_generator(3000 + sample);
+                for (int index = 0; index < head_dim*head_dim; ++index) projection[index] = normal(sample_generator);
+                for (int row = 0; row < head_dim; ++row) projected_query[row] = projection[row*head_dim];
+                ok = ggml_turboquant_pack_row(input.data(), packed.data(), parameters.data(), head_dim, 3, true) && ok;
+                const double error = ggml_turboquant_dot_row(packed.data(), rotated_query.data(), projected_query.data(), parameters.data(), head_dim, 3) - 1.0;
+                sum += error;
+                sum_sq += error*error;
+            }
+            const double mean = sum/samples;
+            const double variance = (sum_sq - sum*sum/samples)/(samples - 1);
+            const double standard_error = std::sqrt(variance/samples);
+            ok = std::abs(mean) < 5.0*standard_error + 1e-6 && variance < 0.003 && ok;
+            std::printf("Google QJL D256: bias=%g standard_error=%g variance=%g samples=%d %s\n", mean, standard_error, variance, samples, ok ? "ok" : "FAILED");
+        }
+    }
+    return ok;
+}
+
 int main() {
     ggml_backend_load_all();
     bool ok = true;
+    ok = test_google_turboquant() && ok;
     ok = test_wht_round_trip() && ok;
     ok = test_codec(GGML_TYPE_TURBO3_0, 0.94, 0.01) && ok;
     ok = test_codec(GGML_TYPE_TURBO4_0, 0.98, 0.01) && ok;

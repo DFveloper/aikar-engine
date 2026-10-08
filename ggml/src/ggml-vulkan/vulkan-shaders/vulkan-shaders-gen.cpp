@@ -1184,6 +1184,10 @@ void process_shaders() {
     string_to_spv("mul_mat_id_back_mxfp4", "mul_mat_id_back.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}}));
     string_to_spv("mul_mat_id_back_q4_0", "mul_mat_id_back.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "0"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+    string_to_spv("paged_write_f16", "paged_attn.comp", {{"WRITE", "1"}});
+    string_to_spv("paged_write_q8_kv", "paged_attn.comp", {{"WRITE", "1"}, {"Q8_KV", "1"}});
+    string_to_spv("paged_attn_f16", "paged_attn.comp", {});
+    string_to_spv("paged_attn_q8_kv", "paged_attn.comp", {{"Q8_KV", "1"}});
     string_to_spv("flash_attn_back_f32_f32", "flash_attn_back.comp", {});
     string_to_spv("flash_attn_back_f16_f32", "flash_attn_back.comp", {{"K_F16", "1"}}, true);
     string_to_spv("flash_attn_back_f32_f16", "flash_attn_back.comp", {{"V_F16", "1"}}, true);

@@ -168,7 +168,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos = build_inp_pos();
 
     // TODO: is causal == true correct? might need some changes
-    auto * inp_attn = build_attn_inp_kv_iswa();
+    llm_graph_input_i * inp_attn;
+    if (cparams.kv_paged) { inp_attn = build_attn_inp_kv_paged(); }
+    else { inp_attn = build_attn_inp_kv_iswa(); }
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -319,7 +321,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             // custom MoE logits calculation (router operates on attn_out, not cur)
             ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
             tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
-            tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
+            ggml_tensor * router_scale = model.layers[il].ffn_gate_inp_s;
+            if (router_scale->type != tmp->type) {
+                router_scale = ggml_cast(ctx0, router_scale, tmp->type);
+            }
+            tmp = ggml_mul(ctx0, tmp, router_scale);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
 
@@ -400,7 +406,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // layer_scalar
         if (model.layers[il].out_scale) {
-            cur = ggml_mul(ctx0, cur, model.layers[il].out_scale);
+            ggml_tensor * out_scale = model.layers[il].out_scale;
+            if (out_scale->type != cur->type) {
+                out_scale = ggml_cast(ctx0, out_scale, cur->type);
+            }
+            cur = ggml_mul(ctx0, cur, out_scale);
             cb(cur, "out_scaled", il);
         }
 

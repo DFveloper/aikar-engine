@@ -2,6 +2,7 @@
 #include "hard-prune.h"
 
 #include "chat.h"
+#include "build-info.h"
 #include "common.h"
 #include "log.h"
 #include "moe-prune.h"
@@ -20,10 +21,12 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -31,6 +34,10 @@
 using json = nlohmann::ordered_json;
 
 namespace {
+
+constexpr int32_t routing_stats_version = COMMON_MOE_PRUNE_STATS_VERSION;
+
+std::string profile_name(double ratio);
 
 struct options {
     std::string command;
@@ -41,6 +48,7 @@ struct options {
     std::string output_dir;
     std::string importance_cache;
     std::string metric = "router-output";
+    bool metric_explicit = false;
     aikar_ppl_mask mask = aikar_ppl_mask::ASSISTANT;
     std::vector<double> ratios;
     double max_layer_ratio = 0.25;
@@ -51,6 +59,8 @@ struct options {
     int32_t n_threads = -1;
     int32_t dataset_threads = 0;
     int32_t n_gpu_layers = -1;
+    bool cpu_moe = false;
+    int32_t n_cpu_moe = -1;
     bool evaluate_ratios = true;
 };
 
@@ -95,6 +105,10 @@ struct importance_cache_data {
     std::string dataset_hash;
     std::string metric;
     int32_t n_ctx = 0;
+    bool reap_available = false;
+    int32_t routing_stats_version = 0;
+    json execution = json::object();
+    std::string tokenized_hash;
 };
 
 void usage() {
@@ -105,14 +119,16 @@ void usage() {
         "  aikar-prune inspect --model MODEL --profile PROFILE\n"
         "  aikar-prune hard --model MODEL --profile PROFILE --output MODEL [--dataset DATA]\n\n"
         "options:\n"
-        "  --metric router-output\n"
+        "  --metric router-output|reap|frequency\n"
         "  --ppl-mask all|assistant|reasoning|content\n"
         "  --max-layer-ratio RATIO\n"
         "  --importance-cache FNAME\n"
         "  --evaluate | --no-evaluate  evaluate each generated ratio (default: evaluate)\n"
         "  --seed N\n"
         "  --ctx-size N --batch-size N --ubatch-size N\n"
-        "  --threads N --dataset-threads N --n-gpu-layers N\n";
+        "  --threads N --dataset-threads N --n-gpu-layers N\n"
+        "  -cmoe, --cpu-moe  keep all routed MoE weights on the CPU\n"
+        "  -ncmoe, --n-cpu-moe N  keep routed experts in the first N model layers on the CPU\n";
 }
 
 std::vector<double> parse_ratios(const std::string & value) {
@@ -154,7 +170,7 @@ options parse_options(int argc, char ** argv) {
         else if (arg == "--output-dir") result.output_dir = value(i);
         else if (arg == "--importance-cache") result.importance_cache = value(i);
         else if (arg == "--ratios") result.ratios = parse_ratios(value(i));
-        else if (arg == "--metric") result.metric = value(i);
+        else if (arg == "--metric") { result.metric = value(i); result.metric_explicit = true; }
         else if (arg == "--ppl-mask") result.mask = aikar_ppl_mask_parse(value(i));
         else if (arg == "--max-layer-ratio") result.max_layer_ratio = std::stod(value(i));
         else if (arg == "--seed") result.seed = std::stoi(value(i));
@@ -164,6 +180,11 @@ options parse_options(int argc, char ** argv) {
         else if (arg == "--threads") result.n_threads = std::stoi(value(i));
         else if (arg == "--dataset-threads") result.dataset_threads = std::stoi(value(i));
         else if (arg == "--n-gpu-layers" || arg == "-ngl") result.n_gpu_layers = std::stoi(value(i));
+        else if (arg == "--cpu-moe" || arg == "-cmoe") result.cpu_moe = true;
+        else if (arg == "--n-cpu-moe" || arg == "-ncmoe") {
+            result.n_cpu_moe = std::stoi(value(i));
+            if (result.n_cpu_moe < 0) throw std::runtime_error("n-cpu-moe must be non-negative");
+        }
         else if (arg == "--evaluate") result.evaluate_ratios = true;
         else if (arg == "--no-evaluate") result.evaluate_ratios = false;
         else if (arg == "--validate") {}
@@ -178,9 +199,22 @@ options parse_options(int argc, char ** argv) {
     }
     if ((result.command == "inspect" || result.command == "hard") && result.profile.empty()) throw std::runtime_error("--profile is required");
     if (result.command == "hard" && result.output.empty()) throw std::runtime_error("hard requires --output");
-    if (result.metric != "router-output") throw std::runtime_error("unsupported importance metric: " + result.metric);
+    if (result.metric != "router-output" && result.metric != "reap" && result.metric != "frequency") {
+        throw std::runtime_error("unsupported importance metric: " + result.metric);
+    }
     if (result.n_ctx < 2 || result.n_batch < 1 || result.n_ubatch < 1) throw std::runtime_error("invalid context or batch size");
     if (result.dataset_threads < 0) throw std::runtime_error("dataset threads must be non-negative");
+    if (result.cpu_moe && result.n_cpu_moe >= 0) throw std::runtime_error("--cpu-moe and --n-cpu-moe cannot be combined");
+    if (result.command == "analyze" || result.command == "profiles") {
+        if (!std::isfinite(result.max_layer_ratio) || result.max_layer_ratio <= 0.0 || result.max_layer_ratio >= 1.0) {
+            throw std::runtime_error("invalid maximum layer ratio");
+        }
+        std::set<std::string> names;
+        for (double ratio : result.ratios) {
+            if (!std::isfinite(ratio) || ratio <= 0.0 || ratio > result.max_layer_ratio) throw std::runtime_error("invalid pruning ratio");
+            if (!names.insert(profile_name(ratio)).second) throw std::runtime_error("ratios map to the same profile filename; use separate output directories");
+        }
+    }
     return result;
 }
 
@@ -191,6 +225,14 @@ common_params make_common_params(const options & opts) {
     params.n_batch = opts.n_batch;
     params.n_ubatch = opts.n_ubatch;
     params.n_gpu_layers = opts.n_gpu_layers;
+    if (opts.cpu_moe) {
+        params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+    } else if (opts.n_cpu_moe >= 0) {
+        llm_add_n_cpu_ffn_overrides(opts.n_cpu_moe, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
+    }
+    if (!params.tensor_buft_overrides.empty()) {
+        params.tensor_buft_overrides.push_back({ nullptr, nullptr });
+    }
     params.cpuparams.n_threads = opts.n_threads;
     params.cpuparams_batch.n_threads = opts.n_threads;
     params.sampling.seed = opts.seed;
@@ -206,7 +248,7 @@ int32_t tensor_layer(const char * name, const char * prefix) {
 
 std::vector<uint8_t> tensor_bytes(ggml_tensor * tensor) {
     std::vector<uint8_t> result(ggml_nbytes(tensor));
-    if (ggml_backend_buffer_is_host(tensor->buffer)) {
+    if (!tensor->buffer || ggml_backend_buffer_is_host(tensor->buffer)) {
         memcpy(result.data(), tensor->data, result.size());
     } else {
         ggml_backend_tensor_get(tensor, result.data(), 0, result.size());
@@ -221,11 +263,17 @@ float tensor_float(const std::vector<uint8_t> & data, ggml_type type, size_t ind
     throw std::runtime_error(std::string("unsupported calibration tensor type: ") + ggml_type_name(type));
 }
 
+bool named_layer_tensor(const std::string & name, const char * prefix) {
+    const int32_t layer = tensor_layer(name.c_str(), prefix);
+    return layer >= 0 && name == std::string(prefix) + "-" + std::to_string(layer);
+}
+
 bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     route_collector & collector = *static_cast<route_collector *>(user_data);
     const std::string name = tensor->name;
-    const bool wanted = name.rfind("ffn_moe_topk-", 0) == 0 || name.rfind("ffn_moe_weights_norm-", 0) == 0 ||
-                        (collector.collect_output_norm && name.rfind("ffn_moe_down-", 0) == 0);
+    const bool wanted = named_layer_tensor(name, "ffn_moe_topk") || named_layer_tensor(name, "ffn_moe_weights_norm") ||
+                        (collector.collect_output_norm && (named_layer_tensor(name, "ffn_moe_down") ||
+                            named_layer_tensor(name, "ffn_moe_down_scaled") || named_layer_tensor(name, "ffn_moe_down_biased")));
     if (ask) return wanted;
     if (!wanted) return true;
 
@@ -234,15 +282,16 @@ bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
         route_layer_state & state = collector.pending[layer];
         state.n_used = tensor->ne[0];
         state.n_tokens = tensor->ne[1];
-        const std::vector<uint8_t> data = tensor_bytes(tensor);
-        const int32_t * ids = reinterpret_cast<const int32_t *>(data.data());
-        state.ids.assign(ids, ids + state.n_used * state.n_tokens);
+        state.ids = common_moe_prune_selected_ids(tensor);
+        state.probabilities.clear();
         return true;
     }
     if (name.rfind("ffn_moe_weights_norm-", 0) == 0) {
         const int32_t layer = tensor_layer(name.c_str(), "ffn_moe_weights_norm");
+        const bool collect_reap = name == "ffn_moe_weights_norm-" + std::to_string(layer);
+        if (!collect_reap) return true;
         route_layer_state & state = collector.pending[layer];
-        if (state.ids.empty()) return true;
+        if (state.ids.empty()) throw std::runtime_error("missing routing IDs for layer " + std::to_string(layer));
         const std::vector<uint8_t> data = tensor_bytes(tensor);
         state.probabilities.resize(state.n_used * state.n_tokens);
         for (size_t i = 0; i < state.probabilities.size(); ++i) state.probabilities[i] = tensor_float(data, tensor->type, i);
@@ -254,12 +303,11 @@ bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
                 const size_t index = token * state.n_used + slot;
                 const int32_t expert = state.ids[index];
                 const float probability = state.probabilities[index];
-                if (expert < 0 || expert >= collector.n_expert || !std::isfinite(probability)) {
+                if (expert < 0 || expert >= collector.n_expert || !std::isfinite(probability) || probability < 0.0f) {
                     ++collector.invalid_routing;
-                    continue;
+                    throw std::runtime_error("invalid expert routing");
                 }
-                ++layer_stats[expert].selection_count;
-                layer_stats[expert].probability_sum += probability;
+                layer_stats[expert].record_selection(probability, collect_reap);
                 sum += std::max(0.0f, probability);
             }
             if (sum > 0.0) {
@@ -275,27 +323,16 @@ bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
         return true;
     }
 
-    const int32_t layer = tensor_layer(name.c_str(), "ffn_moe_down");
+    const bool legacy = name.rfind("ffn_moe_down-", 0) == 0;
+    const char * prefix = legacy ? "ffn_moe_down" :
+        name.rfind("ffn_moe_down_scaled-", 0) == 0 ? "ffn_moe_down_scaled" : "ffn_moe_down_biased";
+    const int32_t layer = tensor_layer(name.c_str(), prefix);
     route_layer_state & state = collector.pending[layer];
-    if (state.ids.empty() || state.probabilities.empty() || tensor->ne[1] != state.n_used || tensor->ne[2] != state.n_tokens) return true;
-    const std::vector<uint8_t> data = tensor_bytes(tensor);
-    auto & layer_stats = collector.stats[layer];
-    for (int64_t token = 0; token < state.n_tokens; ++token) {
-        for (int64_t slot = 0; slot < state.n_used; ++slot) {
-            const size_t route_index = token * state.n_used + slot;
-            const int32_t expert = state.ids[route_index];
-            if (expert < 0 || expert >= collector.n_expert) continue;
-            double sum_sq = 0.0;
-            const size_t base = (token * state.n_used + slot) * tensor->ne[0];
-            for (int64_t i = 0; i < tensor->ne[0]; ++i) {
-                const double value = tensor_float(data, tensor->type, base + i);
-                sum_sq += value * value;
-            }
-            const double norm = std::sqrt(sum_sq);
-            layer_stats[expert].output_norm_sum += norm;
-            layer_stats[expert].weighted_output_sum += norm * state.probabilities[route_index];
-        }
+    if (state.ids.empty() || state.probabilities.empty() || tensor->ne[1] != state.n_used || tensor->ne[2] != state.n_tokens) {
+        throw std::runtime_error("missing REAP routing data for layer " + std::to_string(layer));
     }
+    auto & layer_stats = collector.stats[layer];
+    common_moe_prune_collect_output(tensor, state.ids, state.probabilities, layer_stats, true);
     return true;
 }
 
@@ -432,6 +469,10 @@ json stats_json(const common_moe_prune_stats & stats) {
                 { "probability_sum", expert.probability_sum },
                 { "output_norm_sum", expert.output_norm_sum },
                 { "weighted_output_sum", expert.weighted_output_sum },
+                { "reap_count", expert.reap_count },
+                { "reap_output_norm_sum", expert.reap_output_norm_sum },
+                { "reap_sum", expert.reap_sum },
+                { "reap_selection_count", expert.reap_selection_count },
             });
         }
         result[std::to_string(layer.first)] = experts;
@@ -447,6 +488,8 @@ common_moe_prune_stats parse_stats(const json & value) {
             experts.push_back({
                 item.at("selection_count").get<uint64_t>(), item.at("probability_sum").get<double>(),
                 item.at("output_norm_sum").get<double>(), item.at("weighted_output_sum").get<double>(),
+                item.value("reap_count", uint64_t(0)), item.value("reap_output_norm_sum", 0.0), item.value("reap_sum", 0.0),
+                item.value("reap_selection_count", item.at("selection_count").get<uint64_t>()),
             });
         }
     }
@@ -474,6 +517,10 @@ json importance_cache_json(const importance_cache_data & cache, aikar_ppl_mask p
         { "calibration", {
             { "dataset_hash", cache.dataset_hash },
             { "metric", cache.metric },
+            { "reap_available", cache.reap_available },
+            { "routing_stats_version", cache.routing_stats_version },
+            { "execution", cache.execution },
+            { "tokenized_hash", cache.tokenized_hash },
             { "ctx_size", cache.n_ctx },
             { "primary_ppl_mask", aikar_ppl_mask_name(primary) },
         } },
@@ -513,6 +560,15 @@ importance_cache_data load_importance_cache(const std::string & path) {
     const json & calibration = root.at("calibration");
     result.dataset_hash = calibration.at("dataset_hash").get<std::string>();
     result.metric = calibration.at("metric").get<std::string>();
+    result.reap_available = calibration.value("reap_available", false);
+    result.routing_stats_version = calibration.value("routing_stats_version", 0);
+    result.execution = calibration.value("execution", json::object());
+    if (result.execution.is_object() && !result.execution.empty() &&
+        !result.execution.contains("cpu_moe") && !result.execution.contains("n_cpu_moe")) {
+        result.execution["cpu_moe"] = false;
+        result.execution["n_cpu_moe"] = -1;
+    }
+    result.tokenized_hash = calibration.value("tokenized_hash", "");
     result.n_ctx = calibration.at("ctx_size").get<int32_t>();
     const json & baseline = root.at("baseline");
     result.baseline.nll = baseline.at("nll").get<std::array<double, 4>>();
@@ -526,40 +582,6 @@ importance_cache_data load_importance_cache(const std::string & path) {
     result.baseline.invalid_routing = baseline.at("invalid_routing").get<uint64_t>();
     result.stats = parse_stats(root.at("stats"));
     return result;
-}
-
-std::optional<importance_cache_data> load_legacy_baseline_checkpoint(
-        const std::string & path,
-        const common_moe_prune_model_info & model,
-        const std::string & dataset_hash,
-        const options & opts) {
-    try {
-        std::ifstream in(path);
-        json root;
-        in >> root;
-        if (root.value("format", "") != "aikar-moe-prune-baseline-checkpoint" || root.value("version", 0) != 1 ||
-            root.value("model_hash", "") != model.model_hash || root.value("expert_tensor_hash", "") != model.expert_tensor_hash ||
-            root.value("dataset_hash", "") != dataset_hash || root.value("ppl_mask", "") != aikar_ppl_mask_name(opts.mask) ||
-            root.value("ctx_size", 0) != opts.n_ctx) return std::nullopt;
-        importance_cache_data result;
-        result.model = model;
-        result.dataset_hash = dataset_hash;
-        result.metric = opts.metric;
-        result.n_ctx = opts.n_ctx;
-        result.baseline.nll = root.at("nll").get<std::array<double, 4>>();
-        result.baseline.evaluated = root.at("evaluated").get<std::array<int64_t, 4>>();
-        result.baseline.total_tokens = root.at("total_tokens").get<int64_t>();
-        result.baseline.processed_tokens = root.at("processed_tokens").get<int64_t>();
-        result.baseline.elapsed_seconds = root.at("elapsed_seconds").get<double>();
-        result.baseline.throughput = root.at("throughput").get<double>();
-        result.baseline.router_load_imbalance = root.at("router_load_imbalance").get<double>();
-        result.baseline.router_entropy = root.at("router_entropy").get<double>();
-        result.baseline.invalid_routing = root.at("invalid_routing").get<uint64_t>();
-        result.stats = parse_stats(root.at("stats"));
-        return result;
-    } catch (const std::exception &) {
-        return std::nullopt;
-    }
 }
 
 void write_json_atomic(const std::string & path, const json & value, const std::string & description) {
@@ -576,6 +598,71 @@ void write_json_atomic(const std::string & path, const json & value, const std::
     }
 }
 
+json calibration_execution(const options & opts) {
+    json environment = json::object();
+    for (const char * key : { "CUDA_VISIBLE_DEVICES", "GGML_VK_VISIBLE_DEVICES", "GGML_CUDA_DISABLE_GRAPHS",
+            "GGML_CUDA_FORCE_MMQ", "GGML_CUDA_FORCE_CUBLAS", "GGML_BACKEND_DL_PATH" }) {
+        const char * value = std::getenv(key);
+        environment[key] = value ? json(value) : json(nullptr);
+    }
+    return {
+        { "seed", opts.seed }, { "batch_size", opts.n_batch }, { "ubatch_size", opts.n_ubatch },
+        { "n_gpu_layers", opts.n_gpu_layers }, { "cpu_moe", opts.cpu_moe }, { "n_cpu_moe", opts.n_cpu_moe },
+        { "threads", opts.n_threads }, { "dataset_threads", opts.dataset_threads },
+        { "build", llama_build_info() }, { "compiler", llama_compiler() }, { "build_target", llama_build_target() },
+        { "backend_features", llama_print_system_info() }, { "environment", environment },
+    };
+}
+
+void validate_importance_cache(const importance_cache_data & cache) {
+    if (cache.routing_stats_version != routing_stats_version || !cache.reap_available) {
+        throw std::runtime_error("cache has obsolete pruning statistics; recalibrate into a new cache");
+    }
+    if (!cache.execution.is_object() || cache.execution.empty() || cache.tokenized_hash.empty()) {
+        throw std::runtime_error("cache lacks calibration provenance");
+    }
+    for (const char * key : { "seed", "batch_size", "ubatch_size", "n_gpu_layers", "cpu_moe", "n_cpu_moe", "threads", "dataset_threads",
+            "build", "compiler", "build_target", "backend_features", "environment" }) {
+        if (!cache.execution.contains(key)) throw std::runtime_error("cache lacks execution setting: " + std::string(key));
+    }
+    if (cache.baseline.processed_tokens <= 0 || cache.model.experts_used <= 0 || cache.model.expert_count < cache.model.experts_used ||
+        cache.stats.size() != cache.model.moe_layers.size() || cache.baseline.invalid_routing != 0) {
+        throw std::runtime_error("invalid calibration cache metadata");
+    }
+    if (cache.baseline.total_tokens < cache.baseline.processed_tokens) throw std::runtime_error("invalid calibration token totals");
+    for (size_t mask = 0; mask < cache.baseline.nll.size(); ++mask) {
+        const int64_t count = cache.baseline.evaluated[mask];
+        const double nll = cache.baseline.nll[mask];
+        if (count < 0 || count > cache.baseline.processed_tokens || !std::isfinite(nll) || nll < 0.0 || (count == 0 && nll != 0.0)) {
+            throw std::runtime_error("invalid cached calibration loss");
+        }
+    }
+    const uint64_t tokens = cache.baseline.processed_tokens;
+    if (tokens > UINT64_MAX / cache.model.experts_used) throw std::runtime_error("calibration selection count overflow");
+    for (int32_t layer : cache.model.moe_layers) {
+        const auto found = cache.stats.find(layer);
+        if (found == cache.stats.end() || found->second.size() != (size_t) cache.model.expert_count) {
+            throw std::runtime_error("cache has missing experts or layers");
+        }
+        uint64_t selected = 0;
+        for (const auto & stat : found->second) {
+            if (stat.selection_count != stat.reap_selection_count || stat.reap_count != stat.selection_count ||
+                stat.output_norm_sum != stat.reap_output_norm_sum || stat.weighted_output_sum != stat.reap_sum ||
+                stat.selection_count > tokens || selected > UINT64_MAX - stat.selection_count) {
+                throw std::runtime_error("cache has inconsistent expert measurements");
+            }
+            for (double value : { stat.probability_sum, stat.output_norm_sum, stat.weighted_output_sum }) {
+                if (!std::isfinite(value) || value < 0.0) throw std::runtime_error("cache has invalid expert statistics");
+            }
+            if (stat.selection_count == 0 && (stat.probability_sum != 0.0 || stat.output_norm_sum != 0.0 || stat.weighted_output_sum != 0.0)) {
+                throw std::runtime_error("cache has statistics for an unselected expert");
+            }
+            selected += stat.selection_count;
+        }
+        if (selected != tokens * cache.model.experts_used) throw std::runtime_error("cache has incomplete calibration routes");
+    }
+}
+
 std::string importance_cache_mismatch(
         const importance_cache_data & cache,
         const common_moe_prune_model_info & model,
@@ -587,7 +674,9 @@ std::string importance_cache_mismatch(
         cache.model.experts_used != model.experts_used || cache.model.moe_layers != model.moe_layers) return "model metadata differs";
     if (cache.dataset_hash != dataset_hash) return "dataset hash differs";
     if (cache.n_ctx != opts.n_ctx) return "context size differs";
-    if (cache.metric != opts.metric) return "importance metric differs";
+    if (cache.routing_stats_version != routing_stats_version) return "cache has obsolete pruning statistics; recalibrate into a new cache";
+    if (cache.execution != calibration_execution(opts)) return "calibration execution settings differ";
+    if (opts.metric == "reap" && !cache.reap_available) return "cache lacks REAP statistics; recalibrate into a new cache";
     return {};
 }
 
@@ -618,13 +707,44 @@ void run_inspect(const options & opts) {
 std::vector<common_moe_prune_profile> make_and_write_profiles(
         const options & opts,
         const importance_cache_data & cache) {
+    if (opts.metric == "reap" && !cache.reap_available) {
+        throw std::runtime_error("cache lacks REAP statistics; recalibrate into a new cache");
+    }
+    validate_importance_cache(cache);
+    std::set<std::string> names;
+    for (double ratio : opts.ratios) {
+        if (!names.insert(profile_name(ratio)).second) throw std::runtime_error("ratios map to the same profile filename; use separate output directories");
+    }
+    if (opts.metric == "router-output") {
+        for (const auto & layer : cache.stats) {
+            if (std::all_of(layer.second.begin(), layer.second.end(), [](const common_moe_prune_expert_stats & s) { return s.importance() == 0.0; })) {
+                std::cerr << "aikar-prune: warning: router-output scores are all zero in layer " << layer.first << "; expert ID breaks ties\n";
+            }
+        }
+    }
     const int64_t evaluated_tokens = cache.baseline.evaluated[(size_t) opts.mask];
     if (evaluated_tokens == 0) throw std::runtime_error("the selected perplexity mask evaluates zero tokens");
     std::vector<common_moe_prune_profile> profiles = common_moe_prune_make_profiles(
         cache.model, cache.stats, opts.ratios, opts.max_layer_ratio, cache.dataset_hash,
-        aikar_ppl_mask_name(opts.mask), cache.metric, evaluated_tokens);
-    for (const common_moe_prune_profile & profile : profiles) {
+        aikar_ppl_mask_name(opts.mask), opts.metric, evaluated_tokens);
+    for (common_moe_prune_profile & profile : profiles) {
+        profile.calibration_tokens = cache.baseline.processed_tokens;
+        profile.calibration_collector_version = cache.routing_stats_version;
+        profile.calibration_tokenized_hash = cache.tokenized_hash;
+        const std::string execution = cache.execution.dump();
+        profile.calibration_execution_hash = common_moe_prune_sha256_data(execution.data(), execution.size());
+        const std::string fingerprint = json({ { "model", cache.model.model_hash }, { "dataset", cache.dataset_hash },
+            { "tokens", cache.tokenized_hash }, { "execution", cache.execution }, { "context", cache.n_ctx },
+            { "processed_tokens", cache.baseline.processed_tokens }, { "collector_version", cache.routing_stats_version } }).dump();
+        profile.calibration_fingerprint = common_moe_prune_sha256_data(fingerprint.data(), fingerprint.size());
+        profile.calibration_context = cache.n_ctx;
+        profile.calibration_seed = cache.execution.value("seed", int32_t(-1));
+        profile.calibration_batch = cache.execution.value("batch_size", int32_t(0));
+        profile.calibration_ubatch = cache.execution.value("ubatch_size", int32_t(0));
         common_moe_prune_profile_write(profile, opts.output_dir + "/" + profile_name(profile.requested_ratio));
+        std::cerr << "aikar-prune: calibration " << profile.calibration_fingerprint << ", model " << cache.model.model_hash
+                  << ", dataset " << cache.dataset_hash << ", tokens " << cache.baseline.processed_tokens
+                  << ", seed " << profile.calibration_seed << ", metric " << profile.metric << ", ratio " << profile.requested_ratio << '\n';
     }
     return profiles;
 }
@@ -632,7 +752,9 @@ std::vector<common_moe_prune_profile> make_and_write_profiles(
 void run_profiles(const options & opts) {
     std::filesystem::create_directories(opts.output_dir);
     const importance_cache_data cache = load_importance_cache(opts.importance_cache);
-    const std::vector<common_moe_prune_profile> profiles = make_and_write_profiles(opts, cache);
+    options profile_opts = opts;
+    if (!opts.metric_explicit) profile_opts.metric = cache.metric;
+    const std::vector<common_moe_prune_profile> profiles = make_and_write_profiles(profile_opts, cache);
     json result = {
         { "format", "aikar-moe-prune-profile-generation" },
         { "version", 1 },
@@ -641,6 +763,7 @@ void run_profiles(const options & opts) {
         { "expert_tensor_hash", cache.model.expert_tensor_hash },
         { "dataset_hash", cache.dataset_hash },
         { "ppl_mask", aikar_ppl_mask_name(opts.mask) },
+        { "metric", profile_opts.metric },
         { "profiles", json::array() },
     };
     for (const common_moe_prune_profile & profile : profiles) {
@@ -661,25 +784,36 @@ void run_analyze(const options & opts) {
         opts.model, opts.output_dir + "/model-info-cache.json", &model_cache_hit);
     std::cerr << "aikar-prune: " << (model_cache_hit ? "reused model hash cache" : "hashed GGUF and saved model cache") << '\n';
     aikar_dataset dataset;
+    {
+        llama_model_params params = llama_model_default_params();
+        params.vocab_only = true;
+        llama_model_ptr vocabulary(llama_model_load_from_file(opts.model.c_str(), params));
+        if (!vocabulary) throw std::runtime_error("failed to load calibration vocabulary");
+        auto templates = common_chat_templates_init(vocabulary.get(), "");
+        dataset = aikar_dataset_load(opts.dataset, vocabulary.get(), templates.get(), opts.dataset_threads);
+    }
+    const std::string tokenized_hash = aikar_dataset_fingerprint(dataset);
     const std::string dataset_hash = common_moe_prune_sha256_file(opts.dataset);
     const std::string cache_path = importance_cache_path(opts);
     std::optional<importance_cache_data> cache;
     if (std::filesystem::exists(cache_path)) {
-        importance_cache_data loaded = load_importance_cache(cache_path);
-        const std::string mismatch = importance_cache_mismatch(loaded, model_info, dataset_hash, opts);
+        std::optional<importance_cache_data> loaded;
+        std::string mismatch;
+        try {
+            loaded = load_importance_cache(cache_path);
+            mismatch = importance_cache_mismatch(*loaded, model_info, dataset_hash, opts);
+            if (mismatch.empty() && loaded->tokenized_hash != tokenized_hash) mismatch = "tokenized calibration inputs differ";
+            if (mismatch.empty()) validate_importance_cache(*loaded);
+        } catch (const std::exception & e) {
+            mismatch = e.what();
+        }
         if (mismatch.empty()) {
-            cache = std::move(loaded);
+            cache = std::move(*loaded);
             std::cerr << "aikar-prune: loaded importance cache " << cache_path << '\n';
         } else if (!opts.importance_cache.empty()) {
             throw std::runtime_error("importance cache is incompatible: " + mismatch);
         } else {
             std::cerr << "aikar-prune: ignoring incompatible automatic importance cache: " << mismatch << '\n';
-        }
-    } else if (opts.importance_cache.empty()) {
-        cache = load_legacy_baseline_checkpoint(opts.output_dir + "/baseline-checkpoint.json", model_info, dataset_hash, opts);
-        if (cache) {
-            write_json_atomic(cache_path, importance_cache_json(*cache, opts.mask), "importance cache");
-            std::cerr << "aikar-prune: migrated baseline checkpoint to " << cache_path << '\n';
         }
     }
     if (!cache) {
@@ -688,17 +822,31 @@ void run_analyze(const options & opts) {
         baseline_collector.collect_output_norm = true;
         std::cerr << "aikar-prune: loading baseline model\n";
         loaded_model baseline_model = load_model(opts, &baseline_collector, nullptr);
-        common_chat_templates_ptr templates = common_chat_templates_init(baseline_model.init->model(), "");
-        std::cerr << "aikar-prune: loading and tokenizing dataset\n";
-        dataset = aikar_dataset_load(opts.dataset, baseline_model.init->model(), templates.get(), opts.dataset_threads);
         std::cerr << "aikar-prune: dataset contains " << dataset.records.size() << " records and " << dataset.total_tokens << " tokens\n";
         importance_cache_data created;
         created.model = model_info;
         created.baseline = evaluate(baseline_model.context.get(), dataset, baseline_collector, opts, "baseline");
         created.stats = baseline_collector.stats;
+        for (int32_t layer : model_info.moe_layers) {
+            const auto found = created.stats.find(layer);
+            if (found == created.stats.end()) throw std::runtime_error("missing REAP layer " + std::to_string(layer));
+            for (size_t expert = 0; expert < found->second.size(); ++expert) {
+                const auto & stat = found->second[expert];
+                if (stat.reap_count != stat.reap_selection_count) {
+                    throw std::runtime_error("incomplete REAP outputs for layer " + std::to_string(layer) +
+                        ", expert " + std::to_string(expert) + ": selected " + std::to_string(stat.reap_selection_count) +
+                        ", measured " + std::to_string(stat.reap_count));
+                }
+            }
+        }
+        created.reap_available = true;
+        created.routing_stats_version = routing_stats_version;
+        created.tokenized_hash = aikar_dataset_fingerprint(dataset);
+        created.execution = calibration_execution(opts);
         created.dataset_hash = dataset_hash;
         created.metric = opts.metric;
         created.n_ctx = opts.n_ctx;
+        validate_importance_cache(created);
         write_json_atomic(cache_path, importance_cache_json(created, opts.mask), "importance cache");
         cache = std::move(created);
         std::cerr << "aikar-prune: saved importance cache " << cache_path << '\n';
@@ -719,7 +867,9 @@ void run_analyze(const options & opts) {
         } },
         { "baseline", result_json(baseline, opts.mask) },
         { "evaluation_enabled", opts.evaluate_ratios },
+        { "metric", opts.metric },
         { "importance_cache", cache_path },
+        { "calibration", importance_cache_json(*cache, opts.mask).at("calibration") },
         { "ratios", json::array() },
         { "importance", json::object() },
     };
@@ -731,12 +881,18 @@ void run_analyze(const options & opts) {
             const auto & stat = layer.second[expert];
             experts.push_back({
                 { "expert", expert },
-                { "selection_count", stat.selection_count },
-                { "selection_frequency", layer_total == 0 ? 0.0 : (double) stat.selection_count / layer_total },
+                { "selection_count", cache->reap_available ? stat.reap_selection_count : stat.selection_count },
+                { "legacy_selection_count", stat.selection_count },
+                { "selection_frequency", baseline.processed_tokens == 0 ? 0.0 : (double) stat.selection_count / baseline.processed_tokens },
+                { "routing_slot_fraction", layer_total == 0 ? 0.0 : (double) stat.selection_count / layer_total },
                 { "router_probability_sum", stat.probability_sum },
                 { "mean_router_probability", stat.mean_probability() },
                 { "mean_output_activation_norm", stat.mean_output_norm() },
                 { "weighted_output_importance", stat.importance() },
+                { "average_gate_weight", stat.mean_probability() },
+                { "average_output_norm", cache->reap_available ? json(stat.mean_reap_output_norm()) : json(nullptr) },
+                { "REAP_score", cache->reap_available ? json(stat.reap_score()) : json(nullptr) },
+                { "existing_aikar_score", stat.importance() },
             });
         }
         analysis["importance"][std::to_string(layer.first)] = experts;
@@ -756,6 +912,8 @@ void run_analyze(const options & opts) {
             { "number_of_remaining_experts", (model_info.expert_count - per_layer_pruned) * profile.layers.size() },
             { "per_layer_pruned_expert_count", per_layer },
             { "profile", std::filesystem::path(path).filename().string() },
+            { "metric", profile.metric },
+            { "expected_expert_bytes_removed", (uint64_t) (model_info.expert_bytes * profile.actual_ratio) },
             { "evaluated", false },
         };
         if (!opts.evaluate_ratios) {
@@ -802,7 +960,7 @@ void run_analyze(const options & opts) {
     std::ofstream out(opts.output_dir + "/analysis.json", std::ios::trunc);
     out << analysis.dump(2) << '\n';
     std::ofstream summary(opts.output_dir + "/README.txt", std::ios::trunc);
-    summary << "Gemma 4 26B A4B static MoE pruning analysis\nBaseline perplexity (" << aikar_ppl_mask_name(opts.mask) << "): " << baseline.ppl(opts.mask) << "\n";
+    summary << "Gemma 4 26B A4B static MoE pruning analysis\nMetric: " << opts.metric << "\nBaseline perplexity (" << aikar_ppl_mask_name(opts.mask) << "): " << baseline.ppl(opts.mask) << "\n";
     for (const auto & row : analysis["ratios"]) {
         summary << "ratio " << row["requested_ratio"];
         if (row["evaluated"].get<bool>()) summary << ": ppl " << row["ppl"] << ", delta " << row["absolute_perplexity_delta"];
@@ -812,10 +970,19 @@ void run_analyze(const options & opts) {
 }
 
 void run_hard(const options & opts) {
+    const std::string staging_output = opts.output + ".validation.tmp";
+    for (const std::string & target : { opts.output, opts.output + ".report.json", staging_output,
+            staging_output + ".tmp", staging_output + ".report.json", staging_output + ".report.json.tmp",
+            staging_output + ".previous-model", staging_output + ".previous-report",
+            staging_output + ".tmp.report.json", staging_output + ".tmp.report.json.tmp",
+            staging_output + ".tmp.previous-model", staging_output + ".tmp.previous-report" }) {
+        if (std::filesystem::exists(target) && std::filesystem::equivalent(opts.model, target)) {
+            throw std::runtime_error("hard pruning never replaces the source GGUF, including path aliases");
+        }
+    }
     const common_moe_prune_model_info model = common_moe_prune_inspect_model(opts.model);
     const common_moe_prune_profile profile = common_moe_prune_profile_load(opts.profile);
     common_moe_prune_profile_validate(profile, model);
-    const std::string staging_output = opts.output + ".validation.tmp";
     struct staging_guard {
         std::string model;
         bool committed = false;
@@ -885,12 +1052,17 @@ void run_hard(const options & opts) {
         }
         std::cout << "soft perplexity: " << soft_ppl << "\nhard perplexity: " << hard_ppl << "\nabsolute difference: " << difference << '\n';
     }
-    if (std::rename(staging_output.c_str(), opts.output.c_str()) != 0) {
-        throw std::runtime_error("failed to atomically replace hard-pruned GGUF output");
+    {
+        std::ifstream in(staging_output + ".report.json");
+        json provenance;
+        in >> provenance;
+        provenance["output_path"] = opts.output;
+        provenance["output_sha256"] = pruned_info.model_hash;
+        provenance["profile_path"] = opts.profile;
+        provenance["profile_sha256"] = common_moe_prune_sha256_file(opts.profile);
+        write_json_atomic(staging_output + ".report.json", provenance, "hard-pruning provenance report");
     }
-    if (std::rename((staging_output + ".report.json").c_str(), (opts.output + ".report.json").c_str()) != 0) {
-        throw std::runtime_error("failed to replace hard-pruning report");
-    }
+    aikar_hard_prune_publish(staging_output, opts.output);
     guard.committed = true;
     std::cout << "hard-pruned model validated\nsource bytes: " << report.source_bytes << "\noutput bytes: " << report.output_bytes
               << "\nexpert bytes removed: " << report.expert_bytes_removed << "\nreport: " << opts.output << ".report.json\n";
@@ -904,6 +1076,9 @@ int main(int argc, char ** argv) {
         common_init();
         const bool needs_backend = opts.command == "analyze" || opts.command == "hard";
         if (needs_backend) {
+            // Profiling splits retain separate CUDA graph activation caches.
+            common_set_env("GGML_CUDA_DISABLE_GRAPHS", "1");
+            std::cerr << "aikar-prune: CUDA graphs disabled for memory-bounded calibration\n";
             llama_backend_init();
             llama_numa_init(GGML_NUMA_STRATEGY_DISABLED);
         }

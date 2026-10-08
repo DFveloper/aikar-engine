@@ -274,12 +274,21 @@ llama_context::llama_context(
     }
 
     cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.kv_paged = params.kv_paged;
+    cparams.kv_paged_block_size = params.kv_paged_block_size;
+    cparams.kv_paged_n_blocks = params.kv_paged_n_blocks;
+    cparams.kv_unified = params.kv_unified || params.kv_paged;
+    if (params.kv_paged && (!params.kv_paged_block_size || (params.kv_paged_block_size > 32 && params.kv_paged_block_size != 64 && params.kv_paged_block_size != 128))) {
+        throw std::runtime_error("paged KV block size must be between 1 and 32, or 64 or 128");
+    }
     cparams.kv_hadamard_k = params.kv_hadamard_k;
     cparams.kv_hadamard_v = params.kv_hadamard_v;
     cparams.kv_hadamard_k_swa = params.kv_hadamard_separate ? params.kv_hadamard_k_swa : params.kv_hadamard_k;
     cparams.kv_hadamard_v_swa = params.kv_hadamard_separate ? params.kv_hadamard_v_swa : params.kv_hadamard_v;
     cparams.kv_hadamard_explicit = params.kv_hadamard_explicit;
+    cparams.kv_turboquant_bits = params.kv_turboquant_bits;
+    cparams.kv_turboquant_bits_swa = params.kv_turboquant_bits_swa;
+    cparams.kv_turboquant_seed = params.kv_turboquant_seed;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -479,7 +488,7 @@ llama_context::llama_context(
 
         sched_reserve();
 
-        if (!cparams.flash_attn) {
+        if (!cparams.kv_paged && !cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v) || ggml_is_quantized(params.type_v_swa)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
@@ -2450,7 +2459,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
-        model.arch == LLM_ARCH_HY_V4) {
+        model.arch == LLM_ARCH_HY_V4 ||
+        model.arch == LLM_ARCH_GEMMA4) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
@@ -3578,6 +3588,7 @@ static void llama_set_param(
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    if (cparams.kv_paged) { throw std::runtime_error("paged KV does not support training"); }
     GGML_ASSERT(!opt_ctx);
     opt_ctx_compute_cache.reset();
 
@@ -4429,13 +4440,19 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.type_k_swa                  =*/ GGML_TYPE_COUNT,
         /*.type_v_swa                  =*/ GGML_TYPE_COUNT,
+        /*.kv_turboquant_bits          =*/ 0,
+        /*.kv_turboquant_bits_swa      =*/ 0,
+        /*.kv_turboquant_seed          =*/ 42,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.kv_paged_block_size         =*/ 16,
+        /*.kv_paged_n_blocks           =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
+        /*.kv_paged                    =*/ false,
         /*.kv_unified                  =*/ false,
         /*.kv_hadamard_k               =*/ false,
         /*.kv_hadamard_v               =*/ false,
@@ -4479,6 +4496,37 @@ llama_context * llama_init_from_model(
     if (!params.kv_hadamard_separate) {
         params.kv_hadamard_k_swa = params.kv_hadamard_k;
         params.kv_hadamard_v_swa = params.kv_hadamard_v;
+    }
+
+    if (params.kv_turboquant_bits || params.kv_turboquant_bits_swa) {
+        const auto valid_bits = [](int32_t bits) { return bits == 0 || bits == 3 || bits == 4; };
+        if (!valid_bits(params.kv_turboquant_bits) || !valid_bits(params.kv_turboquant_bits_swa) ||
+            model->arch != LLM_ARCH_GEMMA4 || model->hparams.is_mla() ||
+            model->split_mode() == LLAMA_SPLIT_MODE_TENSOR || params.ctx_other ||
+            params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: native TurboQuant requires Gemma4, 3/4 bits, flash attention and an independent cache without tensor split\n", __func__);
+            return nullptr;
+        }
+        if ((params.kv_turboquant_bits && (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16 || params.kv_hadamard_k || params.kv_hadamard_v)) ||
+            (params.kv_turboquant_bits_swa && (params.type_k_swa != GGML_TYPE_F16 || params.type_v_swa != GGML_TYPE_F16 || params.kv_hadamard_k_swa || params.kv_hadamard_v_swa))) {
+            LLAMA_LOG_ERROR("%s: native TurboQuant cannot be combined with selected conventional cache types or Hadamard transforms\n", __func__);
+            return nullptr;
+        }
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            const int32_t bits = model->hparams.is_swa(il) ? params.kv_turboquant_bits_swa : params.kv_turboquant_bits;
+            const uint32_t head_dim = model->hparams.n_embd_head_k(il);
+            if (bits && ((head_dim != 256 && head_dim != 512) || head_dim != model->hparams.n_embd_head_v(il))) {
+                LLAMA_LOG_ERROR("%s: native TurboQuant requires matching D256/D512 K and V heads\n", __func__);
+                return nullptr;
+            }
+        }
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        if (params.kv_turboquant_bits) {
+            params.type_k = params.type_v = GGML_TYPE_I8;
+        }
+        if (params.kv_turboquant_bits_swa) {
+            params.type_k_swa = params.type_v_swa = GGML_TYPE_I8;
+        }
     }
 
     const auto is_turbo_kv_type = [](ggml_type type) {
@@ -4590,7 +4638,7 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if ((ggml_is_quantized(params.type_v) || ggml_is_quantized(params.type_v_swa)) &&
+    if (!params.kv_paged && (ggml_is_quantized(params.type_v) || ggml_is_quantized(params.type_v_swa)) &&
             params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);

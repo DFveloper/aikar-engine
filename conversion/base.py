@@ -131,7 +131,8 @@ class ModelBase:
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
-                 fuse_qkv: bool = False):
+                 fuse_qkv: bool = False,
+                 preserve_dtype: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -155,6 +156,7 @@ class ModelBase:
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
         self.fuse_qkv = fuse_qkv
+        self.preserve_dtype = preserve_dtype
         self._q_buffer: dict[int, Tensor] = {}
         self._k_buffer: dict[int, Tensor] = {}
         self._v_buffer: dict[int, Tensor] = {}
@@ -328,6 +330,9 @@ class ModelBase:
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
         if self._is_nvfp4 and not any(k.endswith((".weight_scale", ".weight_scale_inv")) for k in self.model_tensors):
             return
+
+        if self.preserve_dtype and self.hparams.get("quantization_config"):
+            raise ValueError("--preserve-dtype cannot dequantize this model's quantized tensors")
 
         tensors_to_remove: list[str] = []
         new_tensors: dict[str, Callable[[], Tensor]] = {}
@@ -1085,6 +1090,8 @@ class ModelBase:
                 continue
 
             old_dtype = data_torch.dtype
+            if self.preserve_dtype and old_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                raise ValueError(f"Cannot preserve dtype {old_dtype} for tensor {name!r}")
 
             # convert any unsupported data types to float32
             if data_torch.dtype not in (torch.float16, torch.float32):
@@ -1180,6 +1187,13 @@ class ModelBase:
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
+                if self.preserve_dtype:
+                    data_qtype = {
+                        torch.float32: gguf.GGMLQuantizationType.F32,
+                        torch.float16: gguf.GGMLQuantizationType.F16,
+                        torch.bfloat16: gguf.GGMLQuantizationType.BF16,
+                    }[old_dtype]
+
                 # a chunked tensor quantizes as one chunk at a time, while it is written
                 quantize = data.quantize if isinstance(data, gguf.LazyChunkedTensor) else (
                     lambda qtype, d=data: gguf.quants.quantize(d, qtype))
@@ -1187,6 +1201,8 @@ class ModelBase:
                 try:
                     data = quantize(data_qtype)
                 except gguf.QuantError as e:
+                    if self.preserve_dtype:
+                        raise
                     logger.warning("%s, %s", e, "falling back to F16")
                     data_qtype = gguf.GGMLQuantizationType.F16
                     data = quantize(data_qtype)

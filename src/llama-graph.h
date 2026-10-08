@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <array>
 #include <cstdlib>
 #include <vector>
 #include <memory>
@@ -23,6 +24,8 @@ struct llama_prec_policy;
 
 struct llama_memory_context_i;
 
+class llm_graph_input_attn_kv_paged;
+class llama_kv_cache_paged_context;
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
@@ -540,6 +543,18 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+};
+
+class llm_graph_input_attn_kv_paged : public llm_graph_input_i {
+public:
+    const llama_kv_cache_paged_context * mctx;
+    std::array<ggml_tensor *, 2> tables;
+    std::array<ggml_tensor *, 2> slots;
+    ggml_tensor * queries = nullptr;
+    int32_t n_kv = 0;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 };
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {
@@ -1224,7 +1239,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * turboquant_parameters = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1296,6 +1312,22 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
+
+    llm_graph_input_i * build_attn_inp_kv_paged() const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_i * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const;
 
     llm_graph_input_dsv4 * build_inp_dsv4() const;
 

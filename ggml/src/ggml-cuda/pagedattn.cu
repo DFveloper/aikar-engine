@@ -99,28 +99,53 @@ static __global__ void paged_decode(
     const int begin = first + (split ? int(blockIdx.y)*chunk : 0);
     const int last = causal ? pos : n_kv - 1;
     const int end = split ? min(last, begin + chunk - 1) : last;
-    for (int p = begin; p <= end; ++p) {
-        const int ix = 2*(seq*np + p/bs), physical = table[ix];
-        if (physical < 0 || !((uint32_t) table[ix + 1] & (1u << (p%bs)))) { continue; }
-        const char * kr = cache + physical*page_stride + hkv*head_stride + (p%bs)*token_stride;
-        const char * vr = kr + hk*head_stride;
-        float keys[(dimension ? dimension : 1024)/32], values[(dimension ? dimension : 1024)/32];
-        #pragma unroll
-        for (int component = 0; component < d/32; ++component) {
-            keys[component] = paged_read<quantized>(kr, lane + 32*component);
-            values[component] = paged_read<quantized>(vr, lane + 32*component);
-        }
-        #pragma unroll
-        for (int head = 0; head < head_group; ++head) {
-            float dot = 0.0f;
+    for (int page_begin = begin; page_begin <= end;) {
+        const int ix = 2*(seq*np + (page_begin/bs)*((bs + 31)/32) + (page_begin%bs)/32);
+        const int physical = table[ix];
+        const uint32_t mask = (uint32_t) table[ix + 1];
+        const int offset_begin = page_begin%bs;
+        const int offset_end = min(min(bs - 1, (offset_begin/32 + 1)*32 - 1), offset_begin + end - page_begin);
+        page_begin += offset_end - offset_begin + 1;
+        if (physical < 0 || !mask) { continue; }
+        const char * page = cache + physical*page_stride + hkv*head_stride;
+        for (int offset = offset_begin; offset <= offset_end; ++offset) {
+            if (!(mask & (1u << (offset%32)))) { continue; }
+            const char * kr = page + offset*token_stride;
+            const char * vr = kr + hk*head_stride;
+            float keys[(dimension ? dimension : 1024)/32], values[(dimension ? dimension : 1024)/32];
+            if constexpr (quantized) {
+                const auto * key_blocks = (const block_q8_kv *) kr;
+                const auto * value_blocks = (const block_q8_kv *) vr;
+                #pragma unroll
+                for (int component = 0; component < d/32; component += 2) {
+                    const auto & key_block = key_blocks[component/2];
+                    const auto & value_block = value_blocks[component/2];
+                    const float key_scale = __half2float(key_block.d);
+                    const float value_scale = __half2float(value_block.d);
+                    keys[component] = key_scale*key_block.qs[lane];
+                    keys[component + 1] = key_scale*key_block.qs[lane + 32];
+                    values[component] = value_scale*value_block.qs[lane];
+                    values[component + 1] = value_scale*value_block.qs[lane + 32];
+                }
+            } else {
+                #pragma unroll
+                for (int component = 0; component < d/32; ++component) {
+                    keys[component] = paged_read<false>(kr, lane + 32*component);
+                    values[component] = paged_read<false>(vr, lane + 32*component);
+                }
+            }
             #pragma unroll
-            for (int j = 0; j < d/32; ++j) { dot += query[head][j]*keys[j]; }
-            for (int delta = 16; delta; delta /= 2) { dot += __shfl_xor_sync(0xffffffffu, dot, delta); }
-            dot *= scale;
-            const float next = fmaxf(maxima[head], dot), old = expf(maxima[head] - next), weight = expf(dot - next);
-            #pragma unroll
-            for (int j = 0; j < d/32; ++j) { acc[head][j] = acc[head][j]*old + weight*values[j]; }
-            sums[head] = sums[head]*old + weight; maxima[head] = next;
+            for (int head = 0; head < head_group; ++head) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < d/32; ++j) { dot += query[head][j]*keys[j]; }
+                for (int delta = 16; delta; delta /= 2) { dot += __shfl_xor_sync(0xffffffffu, dot, delta); }
+                dot *= scale;
+                const float next = fmaxf(maxima[head], dot), old = expf(maxima[head] - next), weight = expf(dot - next);
+                #pragma unroll
+                for (int j = 0; j < d/32; ++j) { acc[head][j] = acc[head][j]*old + weight*values[j]; }
+                sums[head] = sums[head]*old + weight; maxima[head] = next;
+            }
         }
     }
     #pragma unroll
@@ -150,15 +175,24 @@ static __global__ void paged_decode_block(
     const int begin = first + (split ? int(blockIdx.y)*chunk : 0);
     const int last = causal ? pos : n_kv - 1;
     const int end = split ? min(last, begin + chunk - 1) : last;
-    for (int p = begin; p <= end; ++p) {
-        const int ix = 2*(seq*np + p/bs), physical = table[ix];
-        if (physical < 0 || !((uint32_t) table[ix + 1] & (1u << (p%bs)))) { continue; }
-        const char * kr = cache + physical*page_stride + hkv*head_stride + (p%bs)*token_stride;
-        const char * vr = kr + hk*head_stride;
-        const float dot = paged_sum(query*paged_read<quantized>(kr, i), scratch)*scale;
-        const float next = fmaxf(m, dot), old = expf(m - next), weight = expf(dot - next);
-        acc = acc*old + weight*paged_read<quantized>(vr, i);
-        sum = sum*old + weight; m = next;
+    for (int page_begin = begin; page_begin <= end;) {
+        const int ix = 2*(seq*np + (page_begin/bs)*((bs + 31)/32) + (page_begin%bs)/32);
+        const int physical = table[ix];
+        const uint32_t mask = (uint32_t) table[ix + 1];
+        const int offset_begin = page_begin%bs;
+        const int offset_end = min(min(bs - 1, (offset_begin/32 + 1)*32 - 1), offset_begin + end - page_begin);
+        page_begin += offset_end - offset_begin + 1;
+        if (physical < 0 || !mask) { continue; }
+        const char * page = cache + physical*page_stride + hkv*head_stride;
+        for (int offset = offset_begin; offset <= offset_end; ++offset) {
+            if (!(mask & (1u << (offset%32)))) { continue; }
+            const char * kr = page + offset*token_stride;
+            const char * vr = kr + hk*head_stride;
+            const float dot = paged_sum(query*paged_read<quantized>(kr, i), scratch)*scale;
+            const float next = fmaxf(m, dot), old = expf(m - next), weight = expf(dot - next);
+            acc = acc*old + weight*paged_read<quantized>(vr, i);
+            sum = sum*old + weight; m = next;
+        }
     }
     if constexpr (split) {
         const size_t row = (size_t(t*nh + h)*nsplits + blockIdx.y)*(d + 2);
@@ -199,12 +233,15 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int max_tokens = ggml_get_op_params_i32(dst, 3);
     const bool causal = !ggml_get_op_params_i32(dst, 4);
     const int span = causal && window ? std::min(window, max_tokens) : max_tokens;
-    const int nblocks = (nh*nt + 3)/4;
-    const int target_blocks = 4*ggml_cuda_info().devices[ctx.device].nsm;
-    const int nsplits = std::min((span - 1)/256 + 1, std::max(1, (target_blocks + nblocks - 1)/nblocks));
     const char * fused_setting = getenv("GGML_CUDA_PAGED_FUSED");
-    const bool fused = (d == 256 || d == 512) && nt > 8 &&
+    const bool fused = (d == 256 || d == 512) && (nt > 8 || (d == 512 && span >= 4096)) &&
             (fused_setting ? strcmp(fused_setting, "0") != 0 : nt >= 128);
+    const int head_group = fused && d == 512 && (nh/hk)%4 == 0 ? 4 :
+            fused && d == 256 && (nh/hk)%2 == 0 ? 2 : 1;
+    const int nblocks = (nh*nt + 3)/4;
+    const int launch_blocks = (nh*nt/head_group + 3)/4;
+    const int target_blocks = 4*ggml_cuda_info().devices[ctx.device].nsm;
+    const int nsplits = std::min((span - 1)/256 + 1, std::max(1, (target_blocks + launch_blocks - 1)/launch_blocks));
     ggml_cuda_pool_alloc<float> partial(ctx.pool());
     float * output = (float *) dst->data;
     if (nsplits > 1) { output = partial.alloc(size_t(nt)*nh*nsplits*(d + 2)); }
@@ -230,8 +267,8 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         (const float *) q->data, (const char *) cache->data, (const int *) table->data, queries, \
         output, d, nh, hk, nt, np, bs, window, scale, max_tokens, causal, cache->nb[1], cache->nb[2], cache->nb[3], nsplits)
 #define PAGED_DISPATCH(quantized, split) \
-    if (fused && d == 256 && (nh/hk)%2 == 0) { PAGED_FUSED(quantized, split, 256, 2); } \
-    else if (fused && d == 512 && (nh/hk)%4 == 0) { PAGED_FUSED(quantized, split, 512, 4); } \
+    if (head_group == 2) { PAGED_FUSED(quantized, split, 256, 2); } \
+    else if (head_group == 4) { PAGED_FUSED(quantized, split, 512, 4); } \
     else if (fused && d == 256) { PAGED_FUSED(quantized, split, 256, 1); } \
     else if (fused && d == 512) { PAGED_FUSED(quantized, split, 512, 1); } \
     else if (d == 256) { PAGED_PREFILL(quantized, split, 256); } \

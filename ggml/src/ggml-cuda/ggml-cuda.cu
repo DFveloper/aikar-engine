@@ -27,6 +27,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/diffusion-sampling.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/turboquant.cuh"
 #include "ggml-cuda/fattn-back.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -69,6 +70,7 @@
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
+#include "ggml-cuda/pagedattn.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
@@ -2478,6 +2480,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_TURBO_WHT:
             ggml_cuda_turbo_wht(ctx, dst);
             break;
+        case GGML_OP_TURBOQUANT_PACK:
+            ggml_cuda_op_turboquant_pack(ctx, dst);
+            break;
+        case GGML_OP_TURBOQUANT_ATTN:
+            ggml_cuda_op_turboquant_attn(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -2534,6 +2542,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
+            break;
+        case GGML_OP_PAGED_ATTN:
+            ggml_cuda_op_paged_attn(ctx, dst);
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
@@ -6094,6 +6105,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TURBO_WHT:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) && op->ne[0] % 128 == 0;
+        case GGML_OP_TURBOQUANT_PACK:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8;
+        case GGML_OP_TURBOQUANT_ATTN:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_PAGED_ATTN:
+            return op->src[0]->ne[0] <= 1024 && op->src[0]->ne[0] % 32 == 0 &&
+                (op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_Q8_KV);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_BACK:

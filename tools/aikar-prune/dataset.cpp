@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "jsonl.h"
+#include "moe-prune.h"
 
 #include "nlohmann/json.hpp"
 
@@ -253,4 +254,14 @@ aikar_dataset aikar_dataset_load(
     }
     if (result.records.empty()) throw std::runtime_error("JSONL dataset has no records");
     return result;
+}
+
+std::string aikar_dataset_fingerprint(const aikar_dataset & dataset) {
+    std::string records;
+    for (const auto & record : dataset.records) {
+        records += std::to_string(record.tokens.size()) + ":";
+        records += common_moe_prune_sha256_data(record.tokens.data(), record.tokens.size() * sizeof(llama_token));
+        records += common_moe_prune_sha256_data(record.token_fields.data(), record.token_fields.size());
+    }
+    return common_moe_prune_sha256_data(records.data(), records.size());
 }

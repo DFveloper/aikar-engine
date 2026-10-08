@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <array>
+#include <bitset>
 #include <map>
 #include <vector>
 
@@ -17,7 +18,7 @@ class llama_kv_cache_paged : public llama_memory_i {
 public:
     struct page {
         uint32_t id;
-        uint32_t mask;
+        std::bitset<128> mask;
     };
     struct domain {
         llama_block_manager pool;
@@ -59,6 +60,7 @@ public:
     void state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) override;
 
     uint32_t block_size, max_blocks, n_seq_max, window;
+    uint32_t table_blocks() const { return max_blocks*((block_size + 31)/32); }
     bool swa_full;
     std::vector<layer> layers;
     state current;
@@ -86,14 +88,4 @@ public:
     std::vector<llama_kv_cache_paged::batch_plan> plans;
     size_t index = 0;
     llama_memory_status status;
-};
-
-class llm_graph_input_attn_kv_paged : public llm_graph_input_i {
-public:
-    const llama_kv_cache_paged_context * mctx;
-    std::array<ggml_tensor *, 2> tables;
-    std::array<ggml_tensor *, 2> slots;
-    ggml_tensor * queries;
-    void set_input(const llama_ubatch * ubatch) override;
-    bool can_reuse(const llm_graph_params &) override { return false; }
 };

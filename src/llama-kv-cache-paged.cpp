@@ -21,7 +21,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     if (uint64_t(max_blocks)*block_size > INT_MAX) {
         throw std::runtime_error("paged KV logical token budget exceeds signed indexing range");
     }
-    if (!n_seq_max || uint64_t(max_blocks)*n_seq_max > INT_MAX/2) {
+    if (!n_seq_max || uint64_t(table_blocks())*n_seq_max > INT_MAX/2) {
         throw std::runtime_error("paged KV page table exceeds signed indexing range");
     }
     if (!base_pages || uint64_t(base_pages)*block_size > INT_MAX) {
@@ -113,7 +113,7 @@ bool llama_kv_cache_paged::prepare(batch_plan & plan, state & candidate) const {
                     if (active.count(other) || retained.empty()) { continue; }
                     const auto & last = *retained.rbegin();
                     uint32_t tail = block_size - 1;
-                    while (!(last.second.mask & (1u << tail))) { --tail; }
+                    while (!last.second.mask.test(tail)) { --tail; }
                     const int64_t limit = int64_t(last.first)*block_size + tail - window + 1;
                     for (auto old = retained.begin(); old != retained.end();) {
                         if (int64_t(old->first + 1)*block_size > limit) { break; }
@@ -144,7 +144,7 @@ bool llama_kv_cache_paged::prepare(batch_plan & plan, state & candidate) const {
                     plan.copies.push_back({uint32_t(dom), it->second.id, ids[0]});
                     value.pool.release_gpu_blocks({it->second.id}); it->second.id = ids[0];
                 }
-                it->second.mask |= 1u << (pos%block_size);
+                it->second.mask.set(pos%block_size);
                 if (written.insert(it->second.id).second) {
                     plan.slots[dom][size_t(t)*n_seq_max + seq] = it->second.id*block_size + pos%block_size;
                 }
@@ -220,12 +220,20 @@ bool llama_kv_cache_paged_context::apply() {
 }
 
 std::vector<int32_t> llama_kv_cache_paged::table(bool swa) const {
-    std::vector<int32_t> out(size_t(2)*max_blocks*n_seq_max, 0);
+    const uint32_t words = (block_size + 31)/32;
+    std::vector<int32_t> out(size_t(2)*table_blocks()*n_seq_max, 0);
     for (size_t i = 0; i < out.size(); i += 2) { out[i] = -1; }
     for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
         for (const auto & p : current[swa].seqs[seq]) {
-            out[2*(size_t(seq)*max_blocks + p.first)] = p.second.id;
-            out[2*(size_t(seq)*max_blocks + p.first) + 1] = p.second.mask;
+            for (uint32_t word = 0; word < words; ++word) {
+                uint32_t mask = 0;
+                for (uint32_t bit = 0; bit < 32 && word*32 + bit < block_size; ++bit) {
+                    if (p.second.mask.test(word*32 + bit)) { mask |= uint32_t(1) << bit; }
+                }
+                const size_t index = 2*(size_t(seq)*table_blocks() + p.first*words + word);
+                out[index] = p.second.id;
+                out[index + 1] = mask;
+            }
         }
     }
     return out;
@@ -240,9 +248,9 @@ void llama_kv_cache_paged::remove(state & value, llama_seq_id seq_id, llama_pos 
             for (auto it = pages.begin(); it != pages.end();) {
                 for (uint32_t j = 0; j < block_size; ++j) {
                     const int64_t pos = int64_t(it->first)*block_size + j;
-                    if (pos >= p0 && pos < p1) { it->second.mask &= ~(1u << j); }
+                    if (pos >= p0 && pos < p1) { it->second.mask.reset(j); }
                 }
-                if (!it->second.mask) {
+                if (it->second.mask.none()) {
                     dom.pool.release_gpu_blocks({it->second.id}); it = pages.erase(it);
                 } else { ++it; }
             }
@@ -277,12 +285,12 @@ void llama_kv_cache_paged::seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos 
     for (uint32_t d = 0; d < 2; ++d) {
         auto & dom = candidate[d];
         for (const auto & entry : dom.seqs[src]) {
-            uint32_t mask = 0;
+            std::bitset<128> mask;
             for (uint32_t j = 0; j < block_size; ++j) {
                 const int64_t pos = int64_t(entry.first)*block_size + j;
-                if (pos >= p0 && pos < p1) { mask |= entry.second.mask & (1u << j); }
+                if (pos >= p0 && pos < p1 && entry.second.mask.test(j)) { mask.set(j); }
             }
-            if (!mask) { continue; }
+            if (mask.none()) { continue; }
             auto it = dom.seqs[dst].find(entry.first);
             if (it == dom.seqs[dst].end()) {
                 dom.pool.retain_gpu_block(entry.second.id);
@@ -302,7 +310,7 @@ void llama_kv_cache_paged::seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos 
                         ggml_backend_tensor_get(l.cache, copy.bytes.data(), old_id*l.cache->nb[3], copy.bytes.size());
                         for (int64_t h = 0; h < l.cache->ne[2]; ++h) {
                             for (uint32_t j = 0; j < block_size; ++j) {
-                                if (!(mask & (1u << j))) { continue; }
+                                if (!mask.test(j)) { continue; }
                                 const size_t offset = h*l.cache->nb[2] + j*l.cache->nb[1];
                                 ggml_backend_tensor_get(l.cache, copy.bytes.data() + offset, entry.second.id*l.cache->nb[3] + offset, l.cache->nb[1]);
                             }
@@ -335,7 +343,7 @@ llama_pos llama_kv_cache_paged::seq_pos_min(llama_seq_id seq_id) const {
     if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) { return -1; }
     const auto & pages = current[window ? 1 : 0].seqs[seq_id];
     for (const auto & p : pages) {
-        for (uint32_t j = 0; j < block_size; ++j) { if (p.second.mask & (1u << j)) { return p.first*block_size + j; } }
+        for (uint32_t j = 0; j < block_size; ++j) { if (p.second.mask.test(j)) { return p.first*block_size + j; } }
     }
     return -1;
 }
@@ -344,7 +352,7 @@ llama_pos llama_kv_cache_paged::seq_pos_max(llama_seq_id seq_id) const {
     if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) { return -1; }
     const auto & pages = current[window ? 1 : 0].seqs[seq_id];
     for (auto it = pages.rbegin(); it != pages.rend(); ++it) {
-        for (int j = block_size - 1; j >= 0; --j) { if (it->second.mask & (1u << j)) { return it->first*block_size + j; } }
+        for (int j = block_size - 1; j >= 0; --j) { if (it->second.mask.test(j)) { return it->first*block_size + j; } }
     }
     return -1;
 }
@@ -362,7 +370,7 @@ void llama_kv_cache_paged::set_kv_hadamard_policy(bool k, bool v, bool ks, bool 
 
 void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (flags || seq_id >= (llama_seq_id) n_seq_max) { throw std::runtime_error("unsupported paged KV state flags or sequence"); }
-    const uint32_t header[3] = {0x504b5632, block_size, uint32_t(layers.size())};
+    const uint32_t header[3] = {block_size > 32 ? 0x504b5633u : 0x504b5632u, block_size, uint32_t(layers.size())};
     io.write(header, sizeof(header));
     for (const auto & l : layers) {
         const uint32_t geometry[4] = {uint32_t(l.cache->type), uint32_t(l.cache->ne[0]), uint32_t(l.cache->ne[2]), uint32_t(l.swa)};
@@ -370,7 +378,7 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
     const uint32_t count = seq_id < 0 ? n_seq_max : 1;
     io.write(&count, sizeof(count));
-    std::array<std::set<uint32_t>, 2> saved_pages;
+    std::array<std::map<uint32_t, uint32_t>, 2> saved_pages;
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t seq = seq_id < 0 ? i : seq_id;
         io.write(&seq, sizeof(seq));
@@ -379,9 +387,15 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
             const uint32_t n_pages = pages.size();
             io.write(&n_pages, sizeof(n_pages));
             for (const auto & p : pages) {
-                const bool first = saved_pages[dom].insert(p.second.id).second;
-                const uint32_t metadata[4] = {p.first, p.second.mask, p.second.id, uint32_t(first)};
+                const auto saved = saved_pages[dom].emplace(p.second.id, saved_pages[dom].size());
+                const bool first = saved.second;
+                uint32_t masks[4] = {};
+                for (uint32_t bit = 0; bit < block_size; ++bit) {
+                    if (p.second.mask.test(bit)) { masks[bit/32] |= uint32_t(1) << (bit%32); }
+                }
+                const uint32_t metadata[4] = {p.first, masks[0], saved.first->second, uint32_t(first)};
                 io.write(metadata, sizeof(metadata));
+                if (block_size > 32) { io.write(masks + 1, 3*sizeof(uint32_t)); }
                 if (first) {
                     for (const auto & l : layers) {
                         if (l.swa == bool(dom)) { io.write_tensor(l.cache, size_t(p.second.id)*l.cache->nb[3], l.cache->nb[3]); }
@@ -395,7 +409,7 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
 void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (flags || seq_id >= (llama_seq_id) n_seq_max) { throw std::runtime_error("unsupported paged KV state flags or sequence"); }
     uint32_t header[3]; io.read(header, sizeof(header));
-    if (header[0] != 0x504b5632 || header[1] != block_size || header[2] != layers.size()) {
+    if (header[0] != (block_size > 32 ? 0x504b5633u : 0x504b5632u) || header[1] != block_size || header[2] != layers.size()) {
         throw std::runtime_error("incompatible paged KV state header");
     }
     for (const auto & l : layers) {
@@ -423,8 +437,13 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             if (n_pages > max_blocks) { throw std::runtime_error("invalid paged KV state page count"); }
             for (uint32_t j = 0; j < n_pages; ++j) {
                 uint32_t metadata[4]; io.read(metadata, sizeof(metadata));
-                const uint32_t valid_mask = UINT32_MAX >> (32 - block_size);
-                if (metadata[0] >= max_blocks || !metadata[1] || (metadata[1] & ~valid_mask) || domain.seqs[seq].count(metadata[0])) {
+                uint32_t masks[4] = {metadata[1], 0, 0, 0};
+                if (block_size > 32) { io.read(masks + 1, 3*sizeof(uint32_t)); }
+                std::bitset<128> mask;
+                for (uint32_t bit = 0; bit < 128; ++bit) {
+                    if (masks[bit/32] & (uint32_t(1) << (bit%32))) { mask.set(bit); }
+                }
+                if (metadata[0] >= max_blocks || mask.none() || (mask >> block_size).any() || domain.seqs[seq].count(metadata[0])) {
                     throw std::runtime_error("invalid paged KV state page metadata");
                 }
                 auto & restored = restored_pages[dom];
@@ -432,14 +451,14 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                 if (!metadata[3]) {
                     if (old == restored.end() || old->second.second != metadata[0]) { throw std::runtime_error("invalid paged KV state page alias"); }
                     domain.pool.retain_gpu_block(old->second.first);
-                    domain.seqs[seq][metadata[0]] = {old->second.first, metadata[1]};
+                    domain.seqs[seq][metadata[0]] = {old->second.first, mask};
                     continue;
                 }
                 if (metadata[3] != 1 || old != restored.end()) { throw std::runtime_error("invalid paged KV state page record"); }
                 const auto ids = domain.pool.checkout_gpu_blocks(1);
                 if (ids.empty()) { throw std::runtime_error("paged KV state exceeds free page budget"); }
                 restored[metadata[2]] = {ids[0], metadata[0]};
-                domain.seqs[seq][metadata[0]] = {ids[0], metadata[1]};
+                domain.seqs[seq][metadata[0]] = {ids[0], mask};
                 pending_page p; p.physical = ids[0];
                 for (uint32_t il = 0; il < layers.size(); ++il) {
                     const auto & l = layers[il];

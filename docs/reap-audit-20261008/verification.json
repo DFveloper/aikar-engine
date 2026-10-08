@@ -1,0 +1,18 @@
+{
+  "cpu_build": "passed",
+  "cuda_vulkan_build": "passed",
+  "cpu_test_moe_prune": "passed",
+  "cuda_vulkan_test_moe_prune": "passed",
+  "real_cpu_calibration_processed_tokens": 26,
+  "independently_verified_routes_layer0": 208,
+  "max_weighted_norm_absolute_error": 1.0767887914653329e-08,
+  "cli_checks": [
+    "three metric profiles/counts/provenance",
+    "seed mismatch rejection",
+    "legacy REAP/frequency cache rejection",
+    "profile filename collision rejection",
+    "source and generated output aliases"
+  ],
+  "full_recalibration_rerun": false,
+  "corrected_kl_ppl_benchmark": false
+}

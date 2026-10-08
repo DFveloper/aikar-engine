@@ -1108,6 +1108,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "TURBO_WHT",
+    "TURBOQUANT_PACK",
+    "TURBOQUANT_ATTN",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1135,9 +1137,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "GLU_BACK",
+    "PAGED_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1234,6 +1237,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "turbo_wht(x)",
+    "turboquant_pack(x)",
+    "turboquant_attn(q,k,v)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1261,9 +1266,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "glu_back(dy,x,y)",
+    "paged_attn(q,k,v,cache,table,slots,queries)",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -8466,10 +8472,16 @@ void ggml_build_backward_expand_with_callback(
             // backward graph builder never tries to propagate through them.
             case GGML_OP_SSM_CONV:       // Mamba causal conv1d
             case GGML_OP_SSM_SCAN:       // Mamba selective scan
+            case GGML_OP_TURBOQUANT_PACK:
+            case GGML_OP_TURBOQUANT_ATTN:
                 ignore_src[0] = true;
                 ignore_src[1] = true;
                 ignore_src[2] = true;
                 ignore_src[3] = true;
+                if (node->op == GGML_OP_TURBOQUANT_ATTN) {
+                    ignore_src[4] = true;
+                    ignore_src[5] = true;
+                }
                 break;
 
             case GGML_OP_FLASH_ATTN_EXT:
@@ -9270,4 +9282,48 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->poll       != p1->poll       ) return false;
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
+}
+
+struct ggml_tensor * ggml_paged_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q, struct ggml_tensor * k_new, struct ggml_tensor * v_new,
+        struct ggml_tensor * cache, struct ggml_tensor * table,
+        struct ggml_tensor * slots, struct ggml_tensor * queries,
+        float scale, int32_t block_size, int32_t window) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k_new->type == GGML_TYPE_F32 && v_new->type == GGML_TYPE_F32);
+    GGML_ASSERT(cache->type == GGML_TYPE_F16 || cache->type == GGML_TYPE_Q8_KV);
+    GGML_ASSERT(table->type == GGML_TYPE_I32 && slots->type == GGML_TYPE_I32 && queries->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_size > 0 && (block_size <= 32 || block_size == 64 || block_size == 128) && window >= 0);
+    GGML_ASSERT(q->ne[0] == k_new->ne[0] && ggml_are_same_shape(k_new, v_new));
+    GGML_ASSERT(q->ne[1] % k_new->ne[1] == 0 && q->ne[2] == k_new->ne[2] && q->ne[3] == 1);
+    GGML_ASSERT(cache->ne[0] == q->ne[0] && cache->ne[1] == block_size && cache->ne[2] == 2*k_new->ne[1]);
+    GGML_ASSERT(table->ne[0] == 2 && table->ne[3] == 1);
+    GGML_ASSERT(slots->ne[0] == table->ne[2] && slots->ne[1] == q->ne[2] && ggml_is_matrix(slots));
+    GGML_ASSERT(queries->ne[0] == 2 && queries->ne[1] == q->ne[2] && ggml_is_matrix(queries));
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k_new) && ggml_is_contiguous(v_new));
+    GGML_ASSERT(ggml_is_contiguous(cache) && ggml_is_contiguous(table) && ggml_is_contiguous(slots) && ggml_is_contiguous(queries));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], q->ne[2]);
+    result->op = GGML_OP_PAGED_ATTN;
+    result->src[0] = q; result->src[1] = k_new; result->src[2] = v_new;
+    result->src[3] = cache; result->src[4] = table; result->src[5] = slots; result->src[6] = queries;
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, block_size);
+    ggml_set_op_params_i32(result, 2, window);
+    const int32_t table_block_size = MIN(block_size, 32);
+    GGML_ASSERT(table->ne[1]*table_block_size <= INT32_MAX && cache->ne[3]*block_size <= INT32_MAX);
+    GGML_ASSERT(ggml_nelements(table) <= INT32_MAX && ggml_nelements(slots) <= INT32_MAX && ggml_nelements(queries) <= INT32_MAX);
+    GGML_ASSERT(ggml_nelements(q) <= INT32_MAX && ggml_nelements(k_new) <= INT32_MAX);
+    ggml_set_op_params_i32(result, 3, (int32_t) (table->ne[1]*table_block_size));
+    ggml_set_op_params_i32(result, 4, 0);
+    return result;
+}
+
+void ggml_paged_attn_set_causal(struct ggml_tensor * a, bool causal) {
+    GGML_ASSERT(a->op == GGML_OP_PAGED_ATTN);
+    ggml_set_op_params_i32(a, 4, !causal);
+}
+
+void ggml_paged_attn_set_n_kv(struct ggml_tensor * a, int32_t n_kv) {
+    GGML_ASSERT(a->op == GGML_OP_PAGED_ATTN && n_kv > 0 && n_kv <= a->src[4]->ne[1]*MIN(ggml_get_op_params_i32(a, 1), 32));
+    ggml_set_op_params_i32(a, 3, n_kv);
 }

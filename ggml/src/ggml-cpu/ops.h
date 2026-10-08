@@ -109,6 +109,8 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_turbo_wht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_turboquant_pack(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_turboquant_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -117,6 +119,7 @@ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params,
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_custom(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_paged_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_cross_entropy_loss(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_cross_entropy_loss_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * params, struct ggml_tensor * dst);

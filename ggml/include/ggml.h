@@ -587,6 +587,8 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_TURBO_WHT,
+        GGML_OP_TURBOQUANT_PACK,
+        GGML_OP_TURBOQUANT_ATTN,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -614,6 +616,8 @@ extern "C" {
 
         GGML_OP_GLU,
         GGML_OP_GLU_BACK,
+
+        GGML_OP_PAGED_ATTN,
 
         GGML_OP_COUNT,
     };
@@ -2524,6 +2528,20 @@ extern "C" {
             float                 start,
             float                 stop,
             float                 step);
+
+    GGML_API struct ggml_tensor * ggml_paged_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor * q,
+            struct ggml_tensor * k_new,
+            struct ggml_tensor * v_new,
+            struct ggml_tensor * cache,
+            struct ggml_tensor * table,
+            struct ggml_tensor * slots,
+            struct ggml_tensor * queries,
+            float scale, int32_t block_size, int32_t window);
+
+    GGML_API void ggml_paged_attn_set_n_kv(struct ggml_tensor * a, int32_t n_kv);
+    GGML_API void ggml_paged_attn_set_causal(struct ggml_tensor * a, bool causal);
 
     // q:    [n_embd_k, n_batch, n_head,    ne3 ]
     // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]

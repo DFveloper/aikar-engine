@@ -407,9 +407,16 @@ extern "C" {
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
+        int32_t  kv_turboquant_bits;
+        int32_t  kv_turboquant_bits_swa;
+        uint64_t kv_turboquant_seed;
+
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        uint32_t kv_paged_block_size; // tokens per physical page, default 16
+        uint32_t kv_paged_n_blocks;   // physical page budget, 0 = derive from context
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -419,6 +426,7 @@ extern "C" {
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
                           // NOTE: setting to false when n_seq_max > 1 can cause bad performance in some cases
                           //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573
+        bool kv_paged;    // use paged KV for inference
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363

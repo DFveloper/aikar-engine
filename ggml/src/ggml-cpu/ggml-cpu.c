@@ -2186,6 +2186,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_TURBOQUANT_PACK:
+            {
+                ggml_compute_forward_turboquant_pack(params, tensor);
+            } break;
+        case GGML_OP_TURBOQUANT_ATTN:
+            {
+                ggml_compute_forward_turboquant_attn(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2297,6 +2305,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_PAGED_ATTN:
+            ggml_compute_forward_paged_attn(params, tensor);
+            break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2418,6 +2429,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_TURBO_WHT:
+        case GGML_OP_TURBOQUANT_PACK:
+        case GGML_OP_TURBOQUANT_ATTN:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2642,6 +2655,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = 1;
             } break;
+        case GGML_OP_PAGED_ATTN:
+            n_tasks = n_threads;
+            break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
