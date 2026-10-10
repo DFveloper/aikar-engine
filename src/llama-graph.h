@@ -846,9 +846,17 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    bool full_sequence = false;
+    std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> replace_weight;
+    bool smooth_gelu = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (cparams.ream_calibration_layer != other.cparams.ream_calibration_layer) return false;
+        if (replace_weight || other.replace_weight || full_sequence != other.full_sequence || smooth_gelu != other.smooth_gelu) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -1062,6 +1070,9 @@ struct llm_graph_context {
     const int64_t n_outputs;
     const bool training;
     const bool activation_recompute;
+    const bool full_sequence;
+    const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> replace_weight;
+    const bool smooth_gelu;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;
@@ -1112,6 +1123,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s = nullptr) const;
+
+    ggml_tensor * build_gelu(ggml_tensor * x) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

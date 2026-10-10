@@ -1252,6 +1252,17 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_ream_calibration_layer(int32_t layer) {
+    if (model.arch != LLM_ARCH_GEMMA4 || layer < -1 || layer >= (int32_t) model.hparams.n_layer()) {
+        throw std::runtime_error("invalid Gemma4 REAM calibration layer");
+    }
+    if (cparams.ream_calibration_layer == layer) return;
+    synchronize();
+    memory->clear(true);
+    cparams.ream_calibration_layer = layer;
+    sched_need_reserve = true;
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -2647,7 +2658,25 @@ llm_graph_params llama_context::graph_params(
         /*.activation_recompute =*/ opt_params.activation_recompute,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.full_sequence =*/ false,
+        /*.replace_weight =*/ {},
+        /*.smooth_gelu =*/ false,
     };
+}
+
+ggml_cgraph * llama_context::build_training_graph(llm_graph_result & result, const llama_ubatch & ubatch,
+        ggml_backend_sched_t scheduler,
+        const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> & replace_weight, bool smooth_gelu) const {
+    if (model.arch != LLM_ARCH_GEMMA4 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens > cparams.n_ubatch) {
+        throw std::runtime_error("full-sequence training graph requires a single Gemma 4 window");
+    }
+    auto params = graph_params(&result, ubatch, nullptr, ctx_type_to_graph_type(cparams.ctx_type), true);
+    params.n_outputs = ubatch.n_tokens;
+    params.full_sequence = true;
+    params.replace_weight = replace_weight;
+    params.smooth_gelu = smooth_gelu;
+    params.sched = scheduler;
+    return model.build_graph(params);
 }
 
 ggml_status llama_context::graph_compute(

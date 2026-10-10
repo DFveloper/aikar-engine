@@ -2822,6 +2822,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_grad);
+        return;
     }
 
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
@@ -3075,6 +3076,10 @@ struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_t
     return ggml_graph_get_grad_acc(opt_ctx->gb_opt, node);
 }
 
+struct ggml_tensor * ggml_opt_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
+    return ggml_graph_get_grad(opt_ctx->gb_grad, node);
+}
+
 // ====== Optimization Result ======
 
 ggml_opt_result_t ggml_opt_result_init() {
@@ -3173,7 +3178,8 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
-        opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
+        opt_ctx->build_type = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT && opt_i_next == 0
+            ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
     } else {
         opt_ctx->build_type = GGML_OPT_BUILD_TYPE_FORWARD;
     }

@@ -1,0 +1,8 @@
+add_library(llama-optimize-core STATIC optimize.cpp global-loss.cpp candidate-store.cpp)
+target_link_libraries(llama-optimize-core PUBLIC ggml PRIVATE vendor-hash)
+target_include_directories(llama-optimize-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(llama-optimize-core PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+target_compile_features(llama-optimize-core PUBLIC cxx_std_17)
+add_executable(llama-optimize main.cpp native-global.cpp)
+target_link_libraries(llama-optimize PRIVATE llama-optimize-core llama)
+target_include_directories(llama-optimize PRIVATE ${CMAKE_SOURCE_DIR}/vendor ${CMAKE_SOURCE_DIR}/src)

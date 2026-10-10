@@ -7401,9 +7401,13 @@ static void ggml_add_or_set(
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
     if (cgraph->grads[isrc]) {
+        if (cgraph->grads[isrc]->nb[0] != ggml_type_size(cgraph->grads[isrc]->type)) {
+            GGML_ASSERT(!cgraph->grad_accs[isrc]);
+            cgraph->grads[isrc] = ggml_cont(ctx, cgraph->grads[isrc]);
+        }
         cgraph->grads[isrc] = ggml_add_impl(ctx, cgraph->grads[isrc], tensor, /*inplace =*/ cgraph->grad_accs[isrc]);
     } else {
-        cgraph->grads[isrc] = tensor;
+        cgraph->grads[isrc] = tensor->nb[0] == ggml_type_size(tensor->type) ? tensor : ggml_cont(ctx, tensor);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
     if (!(cgraph->defer_quantized_param_grads && (src->flags & GGML_TENSOR_FLAG_PARAM) && ggml_is_quantized(src->type))) {

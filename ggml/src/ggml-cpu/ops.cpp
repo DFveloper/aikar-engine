@@ -4676,6 +4676,24 @@ static void ggml_compute_forward_out_prod_f32(
     const int64_t dps2 = ne2 / ne02;
     const int64_t dps3 = ne3 / ne03;
 
+    if (params->use_ref) {
+        std::vector<double> sums(ne0);
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t i3 = ir / (ne2 * ne1);
+            const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
+            const int64_t i1 = ir % ne1;
+            auto * result = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+            for (int64_t j = 0; j < ne0; ++j) { sums[j] = accumulate ? result[j] : 0; }
+            for (int64_t k = 0; k < ne01; ++k) {
+                const auto * row = (const float *) ((const char *) src0->data + k * nb01 + (i2 / dps2) * nb02 + (i3 / dps3) * nb03);
+                const double scale = *(const float *) ((const char *) src1->data + i1 * nb10 + k * nb11 + i2 * nb12 + i3 * nb13);
+                for (int64_t j = 0; j < ne0; ++j) { sums[j] += double(row[j]) * scale; }
+            }
+            for (int64_t j = 0; j < ne0; ++j) { result[j] = float(sums[j]); }
+        }
+        return;
+    }
+
     for (int64_t bir = ir0; bir < ir1; bir += blck_1) {
         const int64_t bir1 = MIN(bir + blck_1, ir1);
         for (int64_t bi01 = 0; bi01 < ne01; bi01 += blck_0) {

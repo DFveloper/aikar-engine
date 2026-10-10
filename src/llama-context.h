@@ -116,6 +116,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_ream_calibration_layer(int32_t layer);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
@@ -293,6 +294,10 @@ private:
 
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
+
+    ggml_cgraph * build_training_graph(llm_graph_result & result, const llama_ubatch & ubatch,
+        ggml_backend_sched_t scheduler,
+        const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> & replace_weight, bool smooth_gelu = false) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;

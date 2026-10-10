@@ -6,10 +6,12 @@ add_executable(${TARGET}
     hard-prune.cpp
     hard-prune.h
     main.cpp
+    ream.cpp
+    ream.h
 )
 
 target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 if(LLAMA_TOOLS_INSTALL)

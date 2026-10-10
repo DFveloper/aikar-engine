@@ -1,5 +1,8 @@
 #include "dataset.h"
 #include "hard-prune.h"
+#include "ream.h"
+#include "llama-model.h"
+#include "llama-context.h"
 
 #include "chat.h"
 #include "build-info.h"
@@ -8,6 +11,7 @@
 #include "moe-prune.h"
 
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -18,6 +22,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -25,6 +30,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <set>
 #include <stdexcept>
@@ -62,6 +68,24 @@ struct options {
     bool cpu_moe = false;
     int32_t n_cpu_moe = -1;
     bool evaluate_ratios = true;
+    std::string method = "reap";
+    std::string ream_merging = "logits+weights";
+    std::string ream_work_dir;
+    std::string ream_activation_dir;
+    int32_t target_experts = 64;
+    int32_t ream_group_size = 16;
+    int32_t ream_samples = 32768;
+    int32_t ream_chunk = 64;
+    int32_t ream_memory_mib = 4096;
+    int32_t ream_expert_cache_mib = 8192;
+    int32_t ream_input_cache_mib = 6144;
+    bool dry_run = false;
+    std::string save_logits;
+    std::string reference_logits;
+    std::string ream_compute_device = "cpu";
+    bool ream_full_forward = false;
+    bool ream_full_expert_forward = false;
+    std::string ream_feature_precision = "f32";
 };
 
 struct route_layer_state {
@@ -79,6 +103,12 @@ struct route_collector {
     uint64_t invalid_routing = 0;
     double entropy_sum = 0.0;
     uint64_t entropy_tokens = 0;
+    int32_t ream_layer = -1;
+    int32_t routing_layer = -1;
+    std::ofstream * ream_inputs = nullptr;
+    std::ofstream * ream_logits = nullptr;
+    uint64_t ream_input_tokens = 0;
+    uint64_t ream_logit_tokens = 0;
 };
 
 struct evaluation_result {
@@ -118,7 +148,24 @@ void usage() {
         "  aikar-prune profiles --importance-cache CACHE --ratios RATIO,... --output-dir DIR [options]\n"
         "  aikar-prune inspect --model MODEL --profile PROFILE\n"
         "  aikar-prune hard --model MODEL --profile PROFILE --output MODEL [--dataset DATA]\n\n"
+        "  aikar-prune hard --method ream --model MODEL --dataset DATA --output MODEL [options]\n\n"
+        "  aikar-prune verify --model MODEL [--dataset DATA] [--output METRICS] [options]\n\n"
         "options:\n"
+        "  --method reap|ream  (default: reap, unchanged legacy path)\n"
+        "  --target-experts N --ream-group-size N (default: 64, 16)\n"
+        "  --ream-merging logits|weights|logits+weights (default: logits+weights)\n"
+        "  --ream-sequential  sequential replay is always enabled for REAM\n"
+        "  --ream-feature-precision f32|f16  F16 GPU features use FP32 accumulation\n"
+        "  --ream-full-expert-forward  reference all-token Down projection\n"
+        "  --ream-full-forward  reference calibration without prefix graph truncation\n"
+        "  --ream-calibration DATA  alias for --dataset\n"
+        "  --ream-activation-samples N --ream-chunk-size N (default: 32768, 64)\n"
+        "  --ream-max-memory-mib N --ream-work-dir DIR --dry-run\n"
+        "  --ream-compute-device cpu|gpu  expert FFN and alignment cost backend (default: cpu)\n"
+        "  --ream-activation-dir DIR  Separate temporary sampled activation storage\n"
+        "  --ream-input-cache-mib N  GPU feature input cache (default: 6144, 0 disables)\n"
+        "  --ream-expert-cache-mib N  GPU cache for calibration Expert weights (default: 8192, 0 disables)\n"
+        "  --save-logits FILE | --reference-logits FILE  (verify: write baseline or measure KLD)\n"
         "  --metric router-output|reap|frequency\n"
         "  --ppl-mask all|assistant|reasoning|content\n"
         "  --max-layer-ratio RATIO\n"
@@ -153,7 +200,7 @@ options parse_options(int argc, char ** argv) {
     }
     options result;
     result.command = argv[1];
-    if (result.command != "analyze" && result.command != "profiles" && result.command != "inspect" && result.command != "hard") {
+    if (result.command != "analyze" && result.command != "profiles" && result.command != "inspect" && result.command != "hard" && result.command != "verify") {
         throw std::runtime_error("unknown subcommand: " + result.command);
     }
     auto value = [&](int & i) -> std::string {
@@ -165,6 +212,26 @@ options parse_options(int argc, char ** argv) {
         if (arg == "--help" || arg == "-h") { usage(); std::exit(0); }
         else if (arg == "--model" || arg == "-m") result.model = value(i);
         else if (arg == "--dataset") result.dataset = value(i);
+        else if (arg == "--ream-calibration") result.dataset = value(i);
+        else if (arg == "--method") result.method = value(i);
+        else if (arg == "--target-experts") result.target_experts = std::stoi(value(i));
+        else if (arg == "--ream-group-size") result.ream_group_size = std::stoi(value(i));
+        else if (arg == "--ream-merging") result.ream_merging = value(i);
+        else if (arg == "--ream-activation-samples") result.ream_samples = std::stoi(value(i));
+        else if (arg == "--ream-chunk-size") result.ream_chunk = std::stoi(value(i));
+        else if (arg == "--ream-max-memory-mib") result.ream_memory_mib = std::stoi(value(i));
+        else if (arg == "--ream-input-cache-mib") result.ream_input_cache_mib = std::stoi(value(i));
+        else if (arg == "--ream-expert-cache-mib") result.ream_expert_cache_mib = std::stoi(value(i));
+        else if (arg == "--ream-work-dir") result.ream_work_dir = value(i);
+        else if (arg == "--ream-activation-dir") result.ream_activation_dir = value(i);
+        else if (arg == "--ream-sequential") {}
+        else if (arg == "--ream-feature-precision") result.ream_feature_precision = value(i);
+        else if (arg == "--ream-full-expert-forward") result.ream_full_expert_forward = true;
+        else if (arg == "--ream-full-forward") result.ream_full_forward = true;
+        else if (arg == "--dry-run") result.dry_run = true;
+        else if (arg == "--save-logits") result.save_logits = value(i);
+        else if (arg == "--reference-logits") result.reference_logits = value(i);
+        else if (arg == "--ream-compute-device") result.ream_compute_device = value(i);
         else if (arg == "--profile") result.profile = value(i);
         else if (arg == "--output") result.output = value(i);
         else if (arg == "--output-dir") result.output_dir = value(i);
@@ -197,8 +264,19 @@ options parse_options(int argc, char ** argv) {
     if (result.command == "profiles" && (result.importance_cache.empty() || result.ratios.empty() || result.output_dir.empty())) {
         throw std::runtime_error("profiles requires --importance-cache, --ratios, and --output-dir");
     }
-    if ((result.command == "inspect" || result.command == "hard") && result.profile.empty()) throw std::runtime_error("--profile is required");
-    if (result.command == "hard" && result.output.empty()) throw std::runtime_error("hard requires --output");
+    if (result.method != "reap" && result.method != "ream") throw std::runtime_error("unsupported compression method");
+    if (result.method == "ream" && result.command != "hard") throw std::runtime_error("REAM requires the hard subcommand");
+    if (result.method == "ream" && (!result.profile.empty() || !result.importance_cache.empty())) throw std::runtime_error("REAM recalibrates each layer; profile and importance cache are unsupported");
+    if (result.ream_merging != "logits" && result.ream_merging != "weights" && result.ream_merging != "logits+weights") throw std::runtime_error("unsupported REAM alignment mode");
+    if (result.ream_compute_device != "cpu" && result.ream_compute_device != "gpu") throw std::runtime_error("unsupported REAM compute device");
+    if (result.method == "ream" && result.metric_explicit && result.metric != "reap") throw std::runtime_error("REAM shares the existing REAP metric; use --metric reap");
+    if ((result.command == "inspect" || (result.command == "hard" && result.method == "reap")) && result.profile.empty()) throw std::runtime_error("--profile is required");
+    if (result.command == "hard" && result.output.empty() && !result.dry_run) throw std::runtime_error("hard requires --output");
+    if (result.dry_run && result.method != "ream") throw std::runtime_error("--dry-run requires --method ream");
+    if ((!result.save_logits.empty() || !result.reference_logits.empty()) && (result.command != "verify" || result.dataset.empty())) throw std::runtime_error("logit comparison requires verify with --dataset");
+    if (result.ream_feature_precision != "f32" && result.ream_feature_precision != "f16") throw std::runtime_error("invalid REAM feature precision");
+    if (result.ream_feature_precision == "f16" && result.ream_compute_device != "gpu") throw std::runtime_error("F16 REAM features require --ream-compute-device gpu");
+    if (result.ream_group_size < 1 || result.ream_memory_mib < 1 || result.ream_expert_cache_mib < 0 || result.ream_input_cache_mib < 0) throw std::runtime_error("invalid REAM group size or memory budget");
     if (result.metric != "router-output" && result.metric != "reap" && result.metric != "frequency") {
         throw std::runtime_error("unsupported importance metric: " + result.metric);
     }
@@ -271,6 +349,40 @@ bool named_layer_tensor(const std::string & name, const char * prefix) {
 bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     route_collector & collector = *static_cast<route_collector *>(user_data);
     const std::string name = tensor->name;
+    if (collector.routing_layer >= 0) {
+        const auto id = "-" + std::to_string(collector.routing_layer);
+        if (name != "ffn_moe_topk" + id && name != "ffn_moe_weights_norm" + id &&
+            name != "ffn_moe_down" + id && name != "ffn_moe_down_scaled" + id && name != "ffn_moe_down_biased" + id) return !ask;
+    }
+    if (collector.ream_layer >= 0) {
+        const std::string id = "-" + std::to_string(collector.ream_layer);
+        const bool inputs = name == "ffn_norm_2" + id;
+        const bool logits = name == "ffn_moe_logits" + id;
+        if (inputs || logits) {
+            if (ask) return true;
+            if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->nb[0] != ggml_type_size(tensor->type)) throw std::runtime_error("unsupported REAM capture layout");
+            const auto data = tensor_bytes(tensor);
+            std::vector<float> row(tensor->ne[0]);
+            std::ofstream & stream = *(inputs ? collector.ream_inputs : collector.ream_logits);
+            if (tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor)) {
+                const auto * values = (const float *) data.data();
+                for (size_t i = 0; i < data.size() / sizeof(float); ++i) if (!std::isfinite(values[i])) throw std::runtime_error("non-finite REAM calibration capture");
+                stream.write((const char *) data.data(), data.size());
+            } else for (int64_t t = 0; t < tensor->ne[1]; ++t) {
+                for (int64_t d = 0; d < tensor->ne[0]; ++d) {
+                    row[d] = tensor_float(data, tensor->type, (t * tensor->nb[1]) / ggml_type_size(tensor->type) + d);
+                    if (!std::isfinite(row[d])) throw std::runtime_error("non-finite REAM calibration capture");
+                }
+                stream.write((const char *) row.data(), row.size() * sizeof(float));
+            }
+            if (!stream) throw std::runtime_error("REAM calibration disk write failed");
+            (inputs ? collector.ream_input_tokens : collector.ream_logit_tokens) += tensor->ne[1];
+            return true;
+        }
+        const bool layer_match = name == "ffn_moe_topk" + id || name == "ffn_moe_weights_norm" + id ||
+            name == "ffn_moe_down" + id || name == "ffn_moe_down_scaled" + id || name == "ffn_moe_down_biased" + id;
+        if (!layer_match) return !ask;
+    }
     const bool wanted = named_layer_tensor(name, "ffn_moe_topk") || named_layer_tensor(name, "ffn_moe_weights_norm") ||
                         (collector.collect_output_norm && (named_layer_tensor(name, "ffn_moe_down") ||
                             named_layer_tensor(name, "ffn_moe_down_scaled") || named_layer_tensor(name, "ffn_moe_down_biased")));
@@ -332,7 +444,12 @@ bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
         throw std::runtime_error("missing REAP routing data for layer " + std::to_string(layer));
     }
     auto & layer_stats = collector.stats[layer];
-    common_moe_prune_collect_output(tensor, state.ids, state.probabilities, layer_stats, true);
+    if ((collector.ream_layer >= 0 || collector.routing_layer >= 0) && tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
+        auto data = tensor_bytes(tensor);
+        ggml_tensor host = *tensor;
+        host.buffer = nullptr; host.data = (void *) data.data();
+        common_moe_prune_collect_output(&host, state.ids, state.probabilities, layer_stats, true);
+    } else common_moe_prune_collect_output(tensor, state.ids, state.probabilities, layer_stats, true);
     return true;
 }
 
@@ -341,8 +458,82 @@ struct loaded_model {
     llama_context_ptr context;
 };
 
+struct ream_expert_cache {
+    struct binding { ggml_tensor * tensor; ggml_backend_buffer_t buffer; void * data; };
+    struct entry {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        std::vector<binding> bindings;
+        ~entry() {
+            for (const auto & b : bindings) { b.tensor->buffer = b.buffer; b.tensor->data = b.data; }
+            if (buffer) ggml_backend_buffer_free(buffer);
+            if (ctx) ggml_free(ctx);
+        }
+    };
+    loaded_model & loaded;
+    ggml_backend_t backend;
+    uint64_t budget, used = 0, headroom;
+    std::map<int32_t, std::unique_ptr<entry>> layers;
+    uint64_t peak = 0, uploaded = 0, offloaded = 0;
+    size_t peak_layers = 0;
+    ~ream_expert_cache() { loaded.context.reset(); }
+
+    void offload() {
+        if (layers.empty()) return;
+        loaded.context.reset();
+        for (auto & item : layers) for (const auto & b : item.second->bindings) {
+            ggml_tensor device = *b.tensor;
+            b.tensor->buffer = b.buffer; b.tensor->data = b.data;
+            ggml_backend_tensor_copy(&device, b.tensor);
+        }
+        offloaded += used;
+        layers.clear(); used = 0;
+    }
+
+    bool add(int32_t layer) {
+        if (!backend || !budget || layers.count(layer)) return false;
+        auto item = std::make_unique<entry>();
+        item->ctx = ggml_init({64 * 1024, nullptr, true});
+        if (!item->ctx) throw std::runtime_error("cannot allocate REAM cache metadata");
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> copies;
+        const auto prefix = "blk." + std::to_string(layer) + ".";
+        for (const char * suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_gate_up_exps.weight", "ffn_down_exps.weight"}) {
+            auto * source = const_cast<ggml_tensor *>(loaded.init->model()->get_tensor((prefix + suffix).c_str()));
+            if (!source) continue;
+            auto * target = ggml_dup_tensor(item->ctx, source);
+            copies.push_back({source, target});
+        }
+        const uint64_t required = ggml_backend_alloc_ctx_tensors_from_buft_size(item->ctx, ggml_backend_get_default_buffer_type(backend));
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
+        if (used >= budget || required > budget - used || free_bytes < required + headroom) {
+            std::cerr << "REAM: calibration Expert cache keeps layer " << layer << " on CPU; cached_bytes=" << used << ", free_vram=" << free_bytes << '\n';
+            return false;
+        }
+        loaded.context.reset();
+        item->buffer = ggml_backend_alloc_ctx_tensors(item->ctx, backend);
+        if (!item->buffer) throw std::runtime_error("cannot allocate REAM calibration Expert cache");
+        ggml_backend_buffer_set_usage(item->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (const auto & pair : copies) ggml_backend_tensor_copy(pair.first, pair.second);
+        for (const auto & pair : copies) {
+            item->bindings.push_back({pair.first, pair.first->buffer, pair.first->data});
+            pair.first->buffer = pair.second->buffer; pair.first->data = pair.second->data;
+        }
+        used += ggml_backend_buffer_get_size(item->buffer);
+        layers[layer] = std::move(item);
+        peak = std::max(peak, used); peak_layers = std::max(peak_layers, layers.size()); uploaded += ggml_backend_buffer_get_size(layers[layer]->buffer);
+        std::cerr << "REAM: cached calibration layer " << layer << " Experts on GPU; cached_bytes=" << used << '\n';
+        return true;
+    }
+};
+
 loaded_model load_model(const options & opts, route_collector * collector, const common_moe_prune_profile * profile) {
     common_params params = make_common_params(opts);
+    if (opts.method == "ream") {
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+        params.no_extra_bufts = true;
+        params.n_outputs_max = 1;
+    }
     if (collector != nullptr) {
         params.cb_eval = route_callback;
         params.cb_eval_user_data = collector;
@@ -370,27 +561,32 @@ evaluation_result evaluate(
         const aikar_dataset & dataset,
         route_collector & collector,
         const options & opts,
-        const std::string & label) {
+        const std::string & label,
+        const std::function<void(const float *, int32_t)> & observe_logits = {},
+        bool calibration_only = false, uint64_t token_limit = 0,
+        const std::function<void(uint64_t)> & after_batch = {}) {
     evaluation_result result;
     result.total_tokens = dataset.total_tokens;
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(context)));
     const auto started = std::chrono::steady_clock::now();
     auto last_progress = started;
     llama_batch batch = llama_batch_init(opts.n_batch, 0, 1);
-    for (size_t record_index = 0; record_index < dataset.records.size(); ++record_index) {
+    for (size_t record_index = 0; record_index < dataset.records.size() && (!token_limit || (uint64_t) result.processed_tokens < token_limit); ++record_index) {
         const aikar_dataset_record & record = dataset.records[record_index];
-        for (size_t window_start = 0; window_start + 1 < record.tokens.size(); window_start += opts.n_ctx) {
+        for (size_t window_start = 0; window_start + 1 < record.tokens.size() && (!token_limit || (uint64_t) result.processed_tokens < token_limit); window_start += opts.n_ctx) {
             const size_t window_end = std::min(record.tokens.size(), window_start + (size_t) opts.n_ctx);
             llama_memory_clear(llama_get_memory(context), true);
-            for (size_t batch_start = window_start; batch_start + 1 < window_end; batch_start += opts.n_batch) {
-                const size_t batch_end = std::min(window_end - 1, batch_start + (size_t) opts.n_batch);
+            for (size_t batch_start = window_start; batch_start + 1 < window_end && (!token_limit || (uint64_t) result.processed_tokens < token_limit); batch_start += opts.n_batch) {
+                size_t batch_end = std::min(window_end - 1, batch_start + (size_t) opts.n_batch);
+                if (token_limit) batch_end = std::min<uint64_t>(batch_end, batch_start + token_limit - result.processed_tokens);
                 common_batch_clear(batch);
                 std::vector<size_t> targets;
                 for (size_t i = batch_start; i < batch_end; ++i) {
                     bool need_logits = false;
-                    for (size_t mask = 0; mask < 4; ++mask) need_logits |= aikar_token_is_evaluated(record, i + 1, (aikar_ppl_mask) mask);
+                    if (calibration_only) need_logits = i + 1 == batch_end;
+                    else for (size_t mask = 0; mask < 4; ++mask) need_logits |= aikar_token_is_evaluated(record, i + 1, (aikar_ppl_mask) mask);
                     common_batch_add(batch, record.tokens[i], (llama_pos) (i - window_start), { 0 }, need_logits);
-                    if (need_logits) targets.push_back(i + 1);
+                    if (need_logits && !calibration_only) targets.push_back(i + 1);
                 }
                 if (llama_decode(context, batch) != 0) {
                     llama_batch_free(batch);
@@ -398,6 +594,7 @@ evaluation_result evaluate(
                 }
                 const float * logits = llama_get_logits(context);
                 for (size_t output = 0; output < targets.size(); ++output) {
+                    if (observe_logits) observe_logits(logits + output * n_vocab, n_vocab);
                     const size_t target_index = targets[output];
                     const double nll = token_nll(logits + output * n_vocab, n_vocab, record.tokens[target_index]);
                     for (size_t mask = 0; mask < 4; ++mask) {
@@ -408,6 +605,7 @@ evaluation_result evaluate(
                     }
                 }
                 result.processed_tokens += batch.n_tokens;
+                if (after_batch) after_batch(result.processed_tokens);
                 const auto now = std::chrono::steady_clock::now();
                 if (now - last_progress >= std::chrono::seconds(5)) {
                     std::cerr << "aikar-prune: " << label << ": record " << record_index + 1 << '/' << dataset.records.size()
@@ -969,6 +1167,532 @@ void run_analyze(const options & opts) {
     }
 }
 
+std::vector<float> ream_read_floats(std::ifstream & stream, size_t count) {
+    std::vector<float> result(count);
+    stream.read((char *) result.data(), count * sizeof(float));
+    if ((size_t) stream.gcount() != count * sizeof(float)) throw std::runtime_error("short REAM activation file read");
+    return result;
+}
+
+std::vector<float> ream_load_hidden(const std::string & path, size_t count) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("missing sampled REAM activations");
+    return ream_read_floats(in, count);
+}
+
+std::vector<float> ream_group_distances(const std::vector<float> & means, const std::string & logit_path,
+                                       uint64_t tokens, int32_t experts, int32_t embedding) {
+    std::vector<double> gram((size_t) experts * experts, 0.0);
+    std::ifstream in(logit_path, std::ios::binary);
+    for (uint64_t t = 0; t < tokens; ++t) {
+        const auto row = ream_read_floats(in, experts);
+        for (int32_t i = 0; i < experts; ++i) for (int32_t j = i; j < experts; ++j) {
+            gram[i * experts + j] += (double) row[i] * row[j];
+        }
+    }
+    std::vector<float> gate_dist((size_t) experts * experts);
+    double maximum = 0.0;
+    for (int32_t i = 0; i < experts; ++i) for (int32_t j = i + 1; j < experts; ++j) {
+        const double ni = std::sqrt(gram[i * experts + i]) + 1e-8;
+        const double nj = std::sqrt(gram[j * experts + j]) + 1e-8;
+        const double d = std::sqrt(std::max(0.0, gram[i * experts + i] / (ni * ni) +
+            gram[j * experts + j] / (nj * nj) - 2 * gram[i * experts + j] / (ni * nj)));
+        gate_dist[i * experts + j] = gate_dist[j * experts + i] = d;
+        maximum = std::max(maximum, d);
+    }
+    std::vector<float> distance((size_t) experts * experts, 0.0f);
+    for (int32_t i = 0; i < experts; ++i) for (int32_t j = i + 1; j < experts; ++j) {
+        double dot = 0.0, ni = 0.0, nj = 0.0;
+        for (int32_t d = 0; d < embedding; ++d) {
+            const double a = means[i * embedding + d], b = means[j * embedding + d];
+            dot += a * b; ni += a * a; nj += b * b;
+        }
+        const double cosine = std::clamp(dot / (std::max(1e-8, std::sqrt(ni)) * std::max(1e-8, std::sqrt(nj))), -1.0, 1.0);
+        const double output_distance = (1.0 - cosine) / 2.0;
+        const double router_distance = maximum > 0 ? gate_dist[i * experts + j] / maximum : 0.0;
+        distance[i * experts + j] = distance[j * experts + i] = (output_distance + router_distance) / 2.0;
+    }
+    return distance;
+}
+
+void ream_set_expert(llama_model * model, int32_t layer, int32_t center, const aikar_ream_expert & merged) {
+    const std::string prefix = "blk." + std::to_string(layer) + ".";
+    auto set = [&](const std::string & name, const std::vector<float> & values) {
+        auto * tensor = const_cast<ggml_tensor *>(model->get_tensor(name.c_str()));
+        if (!tensor) throw std::runtime_error("missing REAM destination tensor: " + name);
+        const auto bytes = aikar_ream_encode(values, tensor->type, tensor->ne[0]);
+        const size_t slice = ggml_row_size(tensor->type, tensor->ne[0]) * tensor->ne[1];
+        if (bytes.size() != slice) throw std::runtime_error("REAM encoded slice size differs");
+        ggml_backend_tensor_set(tensor, bytes.data(), center * slice, slice);
+    };
+    if (model->get_tensor((prefix + "ffn_gate_up_exps.weight").c_str())) {
+        auto fused = merged.gate;
+        fused.insert(fused.end(), merged.up.begin(), merged.up.end());
+        set(prefix + "ffn_gate_up_exps.weight", fused);
+    } else {
+        set(prefix + "ffn_gate_exps.weight", merged.gate);
+        set(prefix + "ffn_up_exps.weight", merged.up);
+    }
+    set(prefix + "ffn_down_exps.weight", merged.down);
+    auto * scale = const_cast<ggml_tensor *>(model->get_tensor((prefix + "ffn_down_exps.scale").c_str()));
+    if (scale) {
+        const auto one = aikar_ream_encode({1.0f}, scale->type, 1);
+        ggml_backend_tensor_set(scale, one.data(), center * one.size(), one.size());
+    }
+}
+
+void run_ream(const options & opts) {
+    const auto layout = aikar_ream_inspect(opts.model, opts.target_experts, opts.ream_samples, opts.ream_chunk);
+    if ((int64_t) opts.target_experts * opts.ream_group_size < layout.experts) throw std::runtime_error("REAM groups cannot cover all experts");
+    const uint64_t estimated_output = layout.source_bytes - layout.expert_bytes + layout.expert_bytes * opts.target_experts / layout.experts;
+    json report = {{"method", "ream"}, {"architecture", "gemma4"}, {"source_experts", layout.experts},
+        {"target_experts", opts.target_experts}, {"top_k", layout.top_k}, {"layers", layout.layers}, {"calibration", opts.dataset},
+        {"source_bytes", layout.source_bytes}, {"estimated_output_bytes", estimated_output},
+        {"expert_reduction_fraction", 1.0 - (double) opts.target_experts / layout.experts},
+        {"workspace_ram_bytes_estimate", layout.workspace_bytes}, {"inference_weights_ram_bytes_upper_bound", layout.source_bytes},
+        {"hungarian_matrix_bytes", (uint64_t) layout.hidden * layout.hidden * sizeof(float)},
+        {"activation_disk_bytes_upper_bound_per_layer", (uint64_t) layout.experts * layout.hidden * opts.ream_samples * sizeof(float)},
+        {"calibration_disk_bytes_per_token", (layout.embedding + layout.experts) * sizeof(float) + layout.experts * sizeof(double)},
+        {"calibration_forward", opts.ream_full_forward ? "full reference, no intermediate PPL" : "prefix through target layer, no intermediate PPL"},
+        {"calibration_expert_cache_budget_bytes", (uint64_t) opts.ream_expert_cache_mib * 1024 * 1024},
+        {"feature_input_cache_budget_bytes", (uint64_t) opts.ream_input_cache_mib * 1024 * 1024},
+        {"device_memory_note", "Expert cache uses original quantization within budget and free VRAM headroom; other Experts stay on CPU; use -ngl 0 for CPU"},
+        {"formats", "F32,F16,BF16,Q4_0,Q4_1,Q5_0,Q5_1,Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K; other expert formats rejected"},
+        {"sequential", true}, {"merging", opts.ream_merging}, {"weight_reduction", "none (exact full weight features)"},
+        {"compute_device", opts.ream_compute_device}, {"compute_device_workspace_bytes_upper_bound", opts.ream_compute_device == "gpu" ? layout.workspace_bytes : 0},
+        {"expert_feature_precision", opts.ream_feature_precision}, {"expert_feature_accumulation", "f32"}, {"feature_mean_accumulation", "GPU f32 chunk sums, CPU f64 totals; CPU path f64"}, {"probability_cache_layout", "expert-major f64"},
+        {"expert_feature_forward", opts.ream_full_expert_forward ? "full reference" : "weighted hidden mean then one linear Down projection"},
+        {"group_size", opts.ream_group_size}, {"activation_samples", opts.ream_samples}, {"seed", opts.seed},
+        {"feature_chunk_size", opts.ream_chunk}, {"calibration_context_size", opts.n_ctx},
+        {"calibration_batch_size", opts.n_batch}, {"calibration_ubatch_size", opts.n_ubatch},
+        {"calibration_gpu_layers", opts.n_gpu_layers},
+        {"reap_semantics", "existing engine normalized Top-K gate times effective expert output norm, mean over selected tokens"},
+        {"reference_differences", {"no weight PCA", "common deterministic activation samples", "engine REAP saliency unchanged", "token-weighted output means"}}};
+    std::cout << report.dump(2) << '\n';
+    if (opts.dry_run) return;
+    const auto output_directory = std::filesystem::absolute(opts.output).parent_path();
+    const uint64_t output_free_bytes = std::filesystem::space(output_directory).available;
+    if (output_free_bytes < estimated_output + 16 * 1024 * 1024) {
+        throw std::runtime_error("REAM output directory has insufficient free space: available=" + std::to_string(output_free_bytes) +
+            ", estimated output=" + std::to_string(estimated_output));
+    }
+    if (layout.workspace_bytes > (uint64_t) opts.ream_memory_mib * 1024 * 1024) throw std::runtime_error("REAM estimated workspace exceeds --ream-max-memory-mib; reduce activation samples/chunk size");
+    if (std::filesystem::exists(opts.output) || std::filesystem::exists(opts.output + ".report.json")) throw std::runtime_error("REAM output already exists; select a new path");
+    if (opts.target_experts == layout.experts) {
+        std::map<int32_t, aikar_ream_groups> groups;
+        for (int32_t layer : layout.layers) groups[layer] = aikar_ream_pseudo_group(std::vector<double>(layout.experts, 0),
+            std::vector<float>((size_t) layout.experts * layout.experts, 0), layout.experts, opts.ream_group_size);
+        report["identity"] = true;
+        aikar_ream_export(opts.model, opts.output, groups, report.dump(), {});
+        return;
+    }
+    if (opts.dataset.empty()) throw std::runtime_error("REAM compression requires --dataset or --ream-calibration");
+    struct compute_guard {
+        ggml_backend_t backend = nullptr;
+        ~compute_guard() { aikar_ream_set_backend(nullptr); if (backend) ggml_backend_free(backend); }
+    } compute;
+    if (opts.ream_compute_device == "gpu") {
+        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!device) throw std::runtime_error("REAM GPU compute requested but no GPU backend is available");
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        if (layout.workspace_bytes > free_bytes) throw std::runtime_error("REAM device workspace exceeds available VRAM: free=" + std::to_string(free_bytes) + ", estimate=" + std::to_string(layout.workspace_bytes));
+        compute.backend = ggml_backend_dev_init(device, nullptr);
+        if (!compute.backend) throw std::runtime_error("cannot initialize REAM compute backend");
+        aikar_ream_set_backend(compute.backend);
+    }
+    const std::string work = opts.ream_work_dir.empty() ? opts.output + ".ream-work" : opts.ream_work_dir;
+    const auto work_path = std::filesystem::weakly_canonical(work);
+    const auto output_path = std::filesystem::weakly_canonical(opts.output);
+    auto part_work = work_path.begin(), part_output = output_path.begin();
+    while (part_work != work_path.end() && part_output != output_path.end() && *part_work == *part_output) { ++part_work; ++part_output; }
+    if (part_work == work_path.end()) throw std::runtime_error("REAM output must be outside the temporary work directory");
+    if (!std::filesystem::create_directory(work)) throw std::runtime_error("REAM work directory already exists; select an unused path");
+    struct work_guard {
+        std::string path;
+        ~work_guard() { if (!path.empty()) { std::error_code error; std::filesystem::remove_all(path, error); } }
+    } guard {work};
+    const std::string activation_work = opts.ream_activation_dir.empty() ? work : opts.ream_activation_dir;
+    work_guard activation_guard {""};
+    if (!opts.ream_activation_dir.empty()) {
+        const auto activation_path = std::filesystem::weakly_canonical(activation_work);
+        auto part_activation = activation_path.begin();
+        part_output = output_path.begin();
+        while (part_activation != activation_path.end() && part_output != output_path.end() && *part_activation == *part_output) { ++part_activation; ++part_output; }
+        if (part_activation == activation_path.end()) throw std::runtime_error("REAM output must be outside the activation directory");
+        if (!std::filesystem::create_directory(activation_work)) throw std::runtime_error("REAM activation directory already exists; select an unused path");
+        activation_guard.path = activation_work;
+    }
+    options runtime_opts = opts;
+    runtime_opts.cpu_moe = true; runtime_opts.n_cpu_moe = -1;
+    route_collector collector;
+    collector.n_expert = layout.experts; collector.collect_output_norm = true;
+    loaded_model loaded = load_model(runtime_opts, &collector, nullptr);
+    ream_expert_cache expert_cache {loaded, opts.n_gpu_layers == 0 ? nullptr : compute.backend,
+        (uint64_t) opts.ream_expert_cache_mib * 1024 * 1024, 0, std::max<uint64_t>(2ULL * 1024 * 1024 * 1024, layout.workspace_bytes + 1024 * 1024 * 1024), {}};
+    auto create_context = [&]() {
+        if (loaded.context) return;
+        auto params = make_common_params(runtime_opts);
+        params.n_outputs_max = 1;
+        params.cb_eval = route_callback; params.cb_eval_user_data = &collector;
+        loaded.context.reset(llama_init_from_model(loaded.init->model(), common_context_params_to_llama(params)));
+        if (!loaded.context) throw std::runtime_error("failed to create sequential REAM context");
+    };
+    expert_cache.add(layout.layers.front());
+    create_context();
+    auto templates = common_chat_templates_init(loaded.init->model(), "");
+    const auto dataset = aikar_dataset_load(opts.dataset, loaded.init->model(), templates.get(), opts.dataset_threads);
+    report["calibration_sha256"] = common_moe_prune_sha256_file(opts.dataset);
+    report["tokenized_sha256"] = aikar_dataset_fingerprint(dataset);
+    uint64_t baseline_tokens = 0;
+    for (const auto & record : dataset.records) if (record.tokens.size() > 1) {
+        baseline_tokens = std::min<uint64_t>(opts.n_batch, std::min<uint64_t>(record.tokens.size() - 1, opts.n_ctx - 1));
+        break;
+    }
+    if (!baseline_tokens) throw std::runtime_error("REAM calibration has no usable tokens");
+    collector.routing_layer = layout.layers.front();
+    if (!opts.ream_full_forward) loaded.context->set_ream_calibration_layer(layout.layers.front());
+    evaluate(loaded.context.get(), dataset, collector, runtime_opts, "REAM shared REAP first batch", {}, true, baseline_tokens);
+    const auto baseline_stats = collector.stats.at(layout.layers.front());
+    report["calibration_forward"] = opts.ream_full_forward ? "full reference, no intermediate PPL" : "prefix through target layer, no intermediate PPL";
+    std::map<int32_t, aikar_ream_groups> all_groups;
+    json layer_reports = json::array();
+    const int32_t threads = opts.n_threads > 0 ? opts.n_threads : 4;
+    for (int32_t layer : layout.layers) {
+        const auto started = std::chrono::steady_clock::now();
+        std::cerr << "REAM: calibrating layer " << layer << " with merged preceding layers\n";
+        for (int32_t previous : layout.layers) if (previous <= layer) expert_cache.add(previous);
+        create_context();
+        const std::string input_path = work + "/inputs.f32", logit_path = work + "/router.f32";
+        std::ofstream input_out(input_path, std::ios::binary), logit_out(logit_path, std::ios::binary);
+        if (!input_out || !logit_out) throw std::runtime_error("cannot create REAM calibration files");
+        collector = route_collector();
+        collector.n_expert = layout.experts; collector.collect_output_norm = true; collector.ream_layer = layer;
+        collector.ream_inputs = &input_out; collector.ream_logits = &logit_out;
+        if (!opts.ream_full_forward) loaded.context->set_ream_calibration_layer(layer);
+        const auto evaluation = evaluate(loaded.context.get(), dataset, collector, runtime_opts, "REAM layer " + std::to_string(layer), {}, true, 0, [&](uint64_t processed) {
+            if (layer != layout.layers.front() || processed != baseline_tokens) return;
+            const auto & stats = collector.stats.at(layer);
+            double maximum_relative_error = 0;
+            for (int32_t expert = 0; expert < layout.experts; ++expert) {
+                const auto & baseline = baseline_stats.at(expert);
+                const auto & captured = stats.at(expert);
+                if (baseline.reap_selection_count != captured.reap_selection_count || baseline.reap_count != captured.reap_count) {
+                    throw std::runtime_error("REAM capture differs from shared REAP selection counts at expert " + std::to_string(expert));
+                }
+                const double relative_error = std::abs(baseline.reap_sum - captured.reap_sum) / std::max(1.0, std::abs(baseline.reap_sum));
+                maximum_relative_error = std::max(maximum_relative_error, relative_error);
+                if (!std::isfinite(relative_error) || relative_error > 1e-5) {
+                    throw std::runtime_error("REAM capture differs from shared REAP saliency at expert " + std::to_string(expert));
+                }
+            }
+            report["shared_reap_saliency_check"] = {{"layer", layer}, {"checked_tokens", baseline_tokens}, {"selection_counts_equal", true}, {"maximum_relative_sum_error", maximum_relative_error}, {"relative_tolerance", 1e-5}};
+            std::cerr << "REAM: shared REAP saliency check passed, maximum relative sum error=" << maximum_relative_error << '\n';
+        });
+        input_out.close(); logit_out.close();
+        if (!input_out || !logit_out || collector.ream_input_tokens == 0 || collector.ream_input_tokens != collector.ream_logit_tokens) throw std::runtime_error("incomplete REAM input/router captures");
+        const uint64_t tokens = collector.ream_input_tokens;
+        const double calibration_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        const auto stats = collector.stats.at(layer);
+        std::vector<double> saliency(layout.experts);
+        for (int32_t e = 0; e < layout.experts; ++e) {
+            if (stats[e].reap_count != stats[e].reap_selection_count) throw std::runtime_error("incomplete shared REAP saliency");
+            saliency[e] = stats[e].reap_score();
+        }
+        const auto merge_saliency = aikar_ream_saliency_weights(saliency);
+        const size_t sample_count = std::min<uint64_t>(tokens, opts.ream_samples);
+        std::vector<uint64_t> sample(sample_count);
+        std::iota(sample.begin(), sample.end(), 0);
+        std::mt19937_64 random((uint32_t) opts.seed);
+        for (uint64_t i = sample_count; i < tokens; ++i) {
+            const uint64_t j = std::uniform_int_distribution<uint64_t>(0, i)(random);
+            if (j < sample.size()) sample[j] = i;
+        }
+        std::sort(sample.begin(), sample.end());
+        const auto offload_started = std::chrono::steady_clock::now();
+        expert_cache.offload();
+        const double offload_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - offload_started).count();
+        const auto features_started = std::chrono::steady_clock::now();
+        const std::string probability_path = work + "/probabilities.f64";
+        {
+            std::ifstream logits(logit_path, std::ios::binary);
+            std::ofstream probabilities(probability_path, std::ios::binary);
+            const uint64_t probability_chunk = 8192;
+            for (uint64_t t = 0; t < tokens; t += probability_chunk) {
+                const size_t count = std::min<uint64_t>(tokens - t, probability_chunk);
+                auto rows = ream_read_floats(logits, count * layout.experts);
+                std::vector<double> values(rows.size());
+                for (size_t j = 0; j < count; ++j) {
+                    auto * row = rows.data() + j * layout.experts;
+                    const float maximum = *std::max_element(row, row + layout.experts);
+                    double denominator = 0;
+                    for (int32_t e = 0; e < layout.experts; ++e) denominator += std::exp((double) row[e] - maximum);
+                    for (int32_t e = 0; e < layout.experts; ++e) values[e * count + j] = std::exp((double) row[e] - maximum) / denominator;
+                }
+                for (int32_t e = 0; e < layout.experts; ++e) {
+                    probabilities.seekp((e * tokens + t) * sizeof(double));
+                    probabilities.write((const char *) (values.data() + e * count), count * sizeof(double));
+                }
+            }
+            probabilities.close();
+            if (!probabilities) throw std::runtime_error("REAM router probability disk write failed");
+        }
+        const uint64_t activation_disk = (uint64_t) layout.experts * layout.hidden * sample_count * sizeof(float);
+        if (std::filesystem::space(activation_work).available < activation_disk + 16 * 1024 * 1024) throw std::runtime_error("REAM sampled activations exceed free temporary disk space: " + std::to_string(activation_disk));
+        struct input_cache_guard {
+            ggml_context * ctx = nullptr;
+            ggml_backend_buffer_t buffer = nullptr;
+            ~input_cache_guard() { if (buffer) ggml_backend_buffer_free(buffer); if (ctx) ggml_free(ctx); }
+        };
+        uint64_t input_cache_bytes = 0;
+        std::vector<float> means((size_t) layout.experts * layout.embedding, 0);
+        {
+        input_cache_guard input_cache;
+        ggml_tensor * cached_input = nullptr;
+        const auto feature_type = opts.ream_feature_precision == "f16" ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const uint64_t padded_tokens = ((tokens + opts.ream_chunk - 1) / opts.ream_chunk) * opts.ream_chunk;
+        if (compute.backend && opts.ream_input_cache_mib > 0) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(compute.backend), &free_bytes, &total_bytes);
+            const uint64_t headroom = layout.workspace_bytes + 512 * 1024 * 1024;
+            const uint64_t allowed = std::min<uint64_t>((uint64_t) opts.ream_input_cache_mib * 1024 * 1024, free_bytes > headroom ? free_bytes - headroom : 0);
+            const uint64_t bytes_per_chunk = (uint64_t) opts.ream_chunk * layout.embedding * ggml_type_size(feature_type);
+            const uint64_t cache_tokens = std::min<uint64_t>(padded_tokens, (allowed / bytes_per_chunk) * opts.ream_chunk);
+            if (cache_tokens) {
+                input_cache.ctx = ggml_init({64 * 1024, nullptr, true});
+                if (!input_cache.ctx) throw std::runtime_error("cannot allocate feature input cache metadata");
+                cached_input = ggml_new_tensor_2d(input_cache.ctx, feature_type, layout.embedding, cache_tokens);
+                input_cache.buffer = ggml_backend_alloc_ctx_tensors(input_cache.ctx, compute.backend);
+                if (!input_cache.buffer) throw std::runtime_error("cannot allocate feature input cache");
+                std::ifstream file(input_path, std::ios::binary);
+                std::vector<float> values((size_t) opts.ream_chunk * layout.embedding, 0);
+                std::vector<ggml_fp16_t> half(feature_type == GGML_TYPE_F16 ? values.size() : 0);
+                for (uint64_t t = 0; t < std::min<uint64_t>(tokens, cache_tokens); t += opts.ream_chunk) {
+                    const size_t count = std::min<uint64_t>(tokens - t, opts.ream_chunk) * layout.embedding;
+                    file.read((char *) values.data(), count * sizeof(float));
+                    if ((size_t) file.gcount() != count * sizeof(float)) throw std::runtime_error("short input cache read");
+                    std::fill(values.begin() + count, values.end(), 0);
+                    for (float x : values) if (!std::isfinite(x) || (feature_type == GGML_TYPE_F16 && std::abs(x) > 65504)) throw std::runtime_error("input cache has invalid values; use f32 features for F16 overflow");
+                    if (feature_type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(values.data(), half.data(), values.size());
+                    ggml_backend_tensor_set(cached_input, feature_type == GGML_TYPE_F16 ? (const void *) half.data() : values.data(), t * cached_input->nb[1], values.size() * ggml_type_size(feature_type));
+                }
+                input_cache_bytes = ggml_backend_buffer_get_size(input_cache.buffer);
+            }
+        }
+        std::cerr << "REAM: layer " << layer << " feature_input_cache_bytes=" << input_cache_bytes << '\n';
+        for (int32_t e = 0; e < layout.experts; ++e) {
+            const auto expert = aikar_ream_read_expert(opts.model, layer, e);
+            const bool summarize = compute.backend && !opts.ream_full_expert_forward;
+            aikar_ream_forward_runner runner(expert, std::min<uint64_t>(tokens, opts.ream_chunk), threads, !opts.ream_full_expert_forward, opts.ream_feature_precision == "f16" ? GGML_TYPE_F16 : GGML_TYPE_F32, summarize);
+            std::vector<float> sampled((size_t) layout.hidden * sample_count);
+            const int32_t mean_dimension = opts.ream_full_expert_forward ? layout.embedding : layout.hidden;
+            std::vector<double> sum(mean_dimension, 0.0);
+            std::ifstream inputs(input_path, std::ios::binary), logits(probability_path, std::ios::binary);
+            logits.seekg(e * tokens * sizeof(double));
+            size_t next_sample = 0;
+            for (uint64_t t = 0; t < tokens; t += opts.ream_chunk) {
+                const size_t count = std::min<uint64_t>(tokens - t, opts.ream_chunk);
+                std::vector<double> gate(count);
+                logits.read((char *) gate.data(), gate.size() * sizeof(double));
+                if ((size_t) logits.gcount() != gate.size() * sizeof(double)) throw std::runtime_error("short REAM probability file read");
+                std::vector<float> hidden, out;
+                if (summarize) {
+                    const size_t sample_begin = next_sample;
+                    std::vector<int32_t> ids;
+                    while (next_sample < sample_count && sample[next_sample] < t + count) ids.push_back(sample[next_sample++] - t);
+                    std::vector<float> probabilities(count);
+                    for (size_t j = 0; j < count; ++j) probabilities[j] = gate[j];
+                    const bool cached = cached_input && t + std::min<uint64_t>(tokens, opts.ream_chunk) <= (uint64_t) cached_input->ne[1];
+                    if (!cached) inputs.seekg(t * layout.embedding * sizeof(float));
+                    runner.run_summary(cached ? cached_input : nullptr, t, cached ? std::vector<float>() : ream_read_floats(inputs, count * layout.embedding), probabilities, ids, hidden, out);
+                    for (int32_t h = 0; h < layout.hidden; ++h) sum[h] += out[h];
+                    for (int32_t h = 0; h < layout.hidden; ++h) for (size_t j = 0; j < ids.size(); ++j) sampled[h * sample_count + sample_begin + j] = hidden[j * layout.hidden + h];
+                    continue;
+                }
+                if (cached_input && t + std::min<uint64_t>(tokens, opts.ream_chunk) <= (uint64_t) cached_input->ne[1]) runner.run_device(cached_input, t, count, hidden, out);
+                else {
+                    inputs.seekg(t * layout.embedding * sizeof(float));
+                    runner.run(ream_read_floats(inputs, count * layout.embedding), hidden, out);
+                }
+                for (size_t j = 0; j < count; ++j) {
+                    const double probability = gate[j];
+                    const auto * values = opts.ream_full_expert_forward ? out.data() : hidden.data();
+                    for (int32_t d = 0; d < mean_dimension; ++d) sum[d] += probability * values[j * mean_dimension + d];
+                    if (next_sample < sample_count && sample[next_sample] == t + j) {
+                        for (int32_t h = 0; h < layout.hidden; ++h) sampled[h * sample_count + next_sample] = hidden[j * layout.hidden + h];
+                        ++next_sample;
+                    }
+                }
+            }
+            for (auto & value : sum) value /= tokens;
+            const auto projected = opts.ream_full_expert_forward ? std::vector<float>(sum.begin(), sum.end()) : aikar_ream_project_mean(expert, sum);
+            std::copy(projected.begin(), projected.end(), means.begin() + e * layout.embedding);
+            std::ofstream act(activation_work + "/expert-" + std::to_string(e) + ".f32", std::ios::binary);
+            act.write((const char *) sampled.data(), sampled.size() * sizeof(float)); act.close();
+            if (!act || next_sample != sample_count) throw std::runtime_error("incomplete sampled hidden activations");
+            if (e % 8 == 0) std::cerr << "REAM: layer " << layer << " evaluated all-token expert " << e << '/' << layout.experts << ", feature_elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - features_started).count() << '\n';
+        }
+        }
+        const double features_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - features_started).count();
+        const auto grouping_started = std::chrono::steady_clock::now();
+        const auto distance = ream_group_distances(means, logit_path, tokens, layout.experts, layout.embedding);
+        auto groups = aikar_ream_pseudo_group(merge_saliency, distance, opts.target_experts, opts.ream_group_size);
+        const double grouping_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - grouping_started).count();
+        const auto merging_started = std::chrono::steady_clock::now();
+        double distance_seconds = 0, hungarian_seconds = 0;
+        const bool use_hidden = opts.ream_merging.find("logits") != std::string::npos;
+        const bool use_weights = opts.ream_merging.find("weights") != std::string::npos;
+        for (size_t g = 0; g < groups.members.size(); ++g) {
+            const auto & members = groups.members[g];
+            if (members.size() == 1) continue;
+            const int32_t center = members[0];
+            const auto centroid = aikar_ream_read_expert(opts.model, layer, center);
+            auto merged = centroid;
+            std::fill(merged.gate.begin(), merged.gate.end(), 0);
+            std::fill(merged.up.begin(), merged.up.end(), 0);
+            std::fill(merged.down.begin(), merged.down.end(), 0);
+            auto center_hidden = use_hidden ? ream_load_hidden(activation_work + "/expert-" + std::to_string(center) + ".f32", layout.hidden * sample_count) : std::vector<float>();
+            if (use_hidden && sample_count > 1) center_hidden = aikar_ream_normalize_features(center_hidden, layout.hidden, sample_count);
+            const auto center_weights = use_weights ? aikar_ream_normalize_features(aikar_ream_weight_features(centroid), layout.hidden, layout.embedding * 3) : std::vector<float>();
+            double maximum_saliency = 0;
+            for (int32_t id : members) maximum_saliency = std::max(maximum_saliency, merge_saliency[id]);
+            double total = 0;
+            for (int32_t id : members) total += merge_saliency[id] / maximum_saliency;
+            aikar_ream_accumulate(merged, centroid, (merge_saliency[center] / maximum_saliency) / total);
+            for (size_t j = 1; j < members.size(); ++j) {
+                const int32_t id = members[j];
+                const auto expert = aikar_ream_read_expert(opts.model, layer, id);
+                const auto distance_started = std::chrono::steady_clock::now();
+                std::vector<float> cost((size_t) layout.hidden * layout.hidden, 0);
+                if (use_hidden) {
+                    auto other_hidden = ream_load_hidden(activation_work + "/expert-" + std::to_string(id) + ".f32", layout.hidden * sample_count);
+                    if (sample_count > 1) other_hidden = aikar_ream_normalize_features(other_hidden, layout.hidden, sample_count);
+                    const auto dist = aikar_ream_distances(center_hidden, other_hidden, layout.hidden, sample_count, threads, false);
+                    for (size_t i = 0; i < cost.size(); ++i) cost[i] += dist[i];
+                }
+                if (use_weights) {
+                    const auto other_weights = aikar_ream_normalize_features(aikar_ream_weight_features(expert), layout.hidden, layout.embedding * 3);
+                    const auto dist = aikar_ream_distances(center_weights, other_weights, layout.hidden, layout.embedding * 3, threads, false);
+                    for (size_t i = 0; i < cost.size(); ++i) cost[i] += dist[i];
+                }
+                distance_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - distance_started).count();
+                const auto hungarian_started = std::chrono::steady_clock::now();
+                const auto perm = aikar_ream_hungarian(cost, layout.hidden);
+                hungarian_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - hungarian_started).count();
+                aikar_ream_accumulate(merged, aikar_ream_permute(expert, perm), (merge_saliency[id] / maximum_saliency) / total);
+                std::cerr << "REAM: layer " << layer << " aligned expert " << id << " -> " << center << '\n';
+            }
+            ream_set_expert(loaded.init->model(), layer, center, merged);
+        }
+        const double merging_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - merging_started).count();
+        const json timings = {{"calibration", calibration_seconds}, {"calibration_cache_offload", offload_seconds}, {"expert_features", features_seconds},
+            {"grouping", grouping_seconds}, {"merging", merging_seconds}, {"distance", distance_seconds}, {"hungarian", hungarian_seconds}};
+        std::cerr << "REAM: layer " << layer << " timing_seconds=" << timings.dump() << '\n';
+        all_groups[layer] = groups;
+        loaded.context.reset();
+        auto & mask = loaded.init->model()->hparams.moe_disabled_experts[layer];
+        mask.reset();
+        for (int32_t e = 0; e < layout.experts; ++e) if (std::find(groups.centers.begin(), groups.centers.end(), e) == groups.centers.end()) mask.set(e);
+        loaded.init->model()->hparams.moe_prune_active = true;
+        layer_reports.push_back({{"layer", layer}, {"calibration", result_json(evaluation, opts.mask)}, {"saliency", saliency},
+            {"merge_saliency", merge_saliency}, {"captured_tokens", tokens}, {"samples", sample_count}, {"feature_input_cache_bytes", input_cache_bytes},
+            {"timing_seconds", timings},
+            {"elapsed_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()}});
+        for (int32_t e = 0; e < layout.experts; ++e) std::filesystem::remove(activation_work + "/expert-" + std::to_string(e) + ".f32");
+        std::filesystem::remove(input_path); std::filesystem::remove(logit_path);
+        std::filesystem::remove(probability_path);
+    }
+    loaded.context.reset();
+    report["layer_measurements"] = layer_reports;
+    report["calibration_expert_cache_bytes"] = expert_cache.peak;
+    report["calibration_expert_cache_uploaded_bytes"] = expert_cache.uploaded;
+    report["calibration_expert_cache_offloaded_bytes"] = expert_cache.offloaded;
+    report["calibration_expert_cache_layers"] = expert_cache.peak_layers;
+    aikar_ream_export(opts.model, opts.output, all_groups, report.dump(), [&](const std::string & name, int32_t expert, size_t slice) {
+        auto * tensor = loaded.init->model()->get_tensor(name.c_str());
+        if (!tensor) throw std::runtime_error("missing compacted REAM tensor");
+        std::vector<uint8_t> bytes(slice);
+        ggml_backend_tensor_get(tensor, bytes.data(), expert * slice, slice);
+        return bytes;
+    });
+    std::cout << "REAM GGUF saved: " << opts.output << "\nRun aikar-prune verify in a new process to validate inference.\n";
+}
+
+void run_verify(const options & opts) {
+    std::set<std::filesystem::path> destinations;
+    for (const auto & path : {opts.output, opts.output.empty() ? std::string() : opts.output + ".tmp", opts.save_logits}) {
+        if (path.empty()) continue;
+        if (!destinations.insert(std::filesystem::weakly_canonical(path)).second) throw std::runtime_error("verification metrics, staging and baseline logits must use distinct paths");
+        if (std::filesystem::exists(std::filesystem::symlink_status(path))) throw std::runtime_error("verification output or staging path already exists: " + path);
+    }
+    route_collector collector;
+    loaded_model loaded = load_model(opts, nullptr, nullptr);
+    const auto * vocab = llama_model_get_vocab(loaded.init->model());
+    auto tokens = common_tokenize(vocab, "Hello", true, true);
+    if (tokens.empty() || llama_decode(loaded.context.get(), llama_batch_get_one(tokens.data(), tokens.size())) != 0) throw std::runtime_error("reloaded model prefill failed");
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 8; ++i) {
+        const float * logits = llama_get_logits_ith(loaded.context.get(), -1);
+        const int32_t nv = llama_vocab_n_tokens(vocab);
+        for (int32_t v = 0; v < nv; ++v) if (!std::isfinite(logits[v])) throw std::runtime_error("reloaded model has non-finite logits");
+        llama_token next = std::max_element(logits, logits + nv) - logits;
+        std::cout << common_token_to_piece(vocab, next);
+        if (llama_decode(loaded.context.get(), llama_batch_get_one(&next, 1)) != 0) throw std::runtime_error("reloaded model generation failed");
+    }
+    json metrics = {{"finite_logits", true}, {"generated_tokens", 8},
+        {"generation_tokens_per_second", 8.0 / std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()},
+        {"model_bytes", std::filesystem::file_size(opts.model)}};
+    if (!opts.dataset.empty()) {
+        auto templates = common_chat_templates_init(loaded.init->model(), "");
+        const auto data = aikar_dataset_load(opts.dataset, loaded.init->model(), templates.get(), opts.dataset_threads);
+        const json header = {{"format", "aikar-verification-logits-v1"}, {"vocab", llama_vocab_n_tokens(vocab)},
+            {"tokenized_sha256", aikar_dataset_fingerprint(data)}, {"context", opts.n_ctx}};
+        std::ofstream saved;
+        std::ifstream reference;
+        if (!opts.save_logits.empty()) {
+            if (std::filesystem::exists(opts.save_logits)) throw std::runtime_error("baseline logit file already exists");
+            saved.open(opts.save_logits, std::ios::binary);
+            saved << header.dump() << '\n';
+            if (!saved) throw std::runtime_error("cannot create baseline logits");
+        }
+        if (!opts.reference_logits.empty()) {
+            reference.open(opts.reference_logits, std::ios::binary);
+            std::string line;
+            if (!std::getline(reference, line) || json::parse(line) != header) throw std::runtime_error("reference logits have incompatible vocabulary, context or calibration tokens");
+        }
+        double kld_sum = 0.0;
+        uint64_t rows = 0;
+        const auto evaluation = evaluate(loaded.context.get(), data, collector, opts, "reload verification", [&](const float * logits, int32_t nv) {
+            for (int32_t i = 0; i < nv; ++i) if (!std::isfinite(logits[i])) throw std::runtime_error("non-finite calibration logits");
+            if (saved.is_open()) {
+                saved.write((const char *) logits, nv * sizeof(float));
+                if (!saved) throw std::runtime_error("cannot write baseline logits");
+            }
+            if (reference.is_open()) {
+                const auto original = ream_read_floats(reference, nv);
+                for (float value : original) if (!std::isfinite(value)) throw std::runtime_error("non-finite reference logits");
+                const double pm = *std::max_element(original.begin(), original.end());
+                const double qm = *std::max_element(logits, logits + nv);
+                double ps = 0.0, qs = 0.0;
+                for (int32_t i = 0; i < nv; ++i) { ps += std::exp(original[i] - pm); qs += std::exp(logits[i] - qm); }
+                const double pl = pm + std::log(ps), ql = qm + std::log(qs);
+                double kld = 0.0;
+                for (int32_t i = 0; i < nv; ++i) kld += std::exp(original[i] - pl) * (original[i] - pl - logits[i] + ql);
+                if (!std::isfinite(kld)) throw std::runtime_error("non-finite logit KLD");
+                kld_sum += std::max(0.0, kld);
+            }
+            ++rows;
+        });
+        if (reference.is_open() && reference.peek() != std::char_traits<char>::eof()) throw std::runtime_error("unused reference logit rows");
+        if (saved.is_open()) { saved.close(); if (!saved) throw std::runtime_error("cannot flush baseline logits"); }
+        metrics["evaluation"] = result_json(evaluation, opts.mask);
+        metrics["logit_rows"] = rows;
+        if (!opts.reference_logits.empty()) metrics["logit_kld_original_to_model"] = rows ? json(kld_sum / rows) : json(nullptr);
+    }
+    std::cout << '\n' << metrics.dump(2) << '\n';
+    if (!opts.output.empty()) write_json_atomic(opts.output, metrics, "verification metrics");
+}
+
 void run_hard(const options & opts) {
     const std::string staging_output = opts.output + ".validation.tmp";
     for (const std::string & target : { opts.output, opts.output + ".report.json", staging_output,
@@ -1074,7 +1798,7 @@ int main(int argc, char ** argv) {
     try {
         const options opts = parse_options(argc, argv);
         common_init();
-        const bool needs_backend = opts.command == "analyze" || opts.command == "hard";
+        const bool needs_backend = opts.command == "analyze" || opts.command == "verify" || (opts.command == "hard" && !opts.dry_run);
         if (needs_backend) {
             // Profiling splits retain separate CUDA graph activation caches.
             common_set_env("GGML_CUDA_DISABLE_GRAPHS", "1");
@@ -1085,6 +1809,8 @@ int main(int argc, char ** argv) {
         if (opts.command == "inspect") run_inspect(opts);
         else if (opts.command == "analyze") run_analyze(opts);
         else if (opts.command == "profiles") run_profiles(opts);
+        else if (opts.command == "verify") run_verify(opts);
+        else if (opts.method == "ream") run_ream(opts);
         else run_hard(opts);
         if (needs_backend) llama_backend_free();
         return 0;

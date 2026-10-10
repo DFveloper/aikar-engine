@@ -202,6 +202,7 @@ extern "C" {
 
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
+    GGML_API struct ggml_tensor * ggml_opt_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 

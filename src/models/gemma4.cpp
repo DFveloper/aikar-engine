@@ -169,10 +169,13 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
     // TODO: is causal == true correct? might need some changes
     llm_graph_input_i * inp_attn;
-    if (cparams.kv_paged) { inp_attn = build_attn_inp_kv_paged(); }
+    if (full_sequence) { inp_attn = build_attn_inp_no_cache(); }
+    else if (cparams.kv_paged) { inp_attn = build_attn_inp_kv_paged(); }
     else { inp_attn = build_attn_inp_kv_iswa(); }
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    std::vector<ggml_tensor *> sequence_k(n_layer, nullptr), sequence_v(n_layer, nullptr);
+
+    ggml_tensor * inp_out_ids = cparams.ream_calibration_layer >= 0 ? nullptr : build_inp_out_ids();
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -265,14 +268,22 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cb(Kcur, "Kcur_pos", il);
 
+            if (full_sequence) {
+                sequence_k[il] = Kcur;
+                sequence_v[il] = Vcur;
+            }
+
             cur = build_attn(inp_attn, model.layers[il].wo,
                     nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
+            const int source_layer = hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+            ggml_tensor * shared_k = full_sequence ? sequence_k.at(source_layer) : nullptr;
+            ggml_tensor * shared_v = full_sequence ? sequence_v.at(source_layer) : nullptr;
             cur = build_attn(inp_attn,
                     model.layers[il].wo, nullptr, model.layers[il].wo_s,
-                    Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+                    Qcur, shared_k, shared_v, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
@@ -386,7 +397,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "pe_in", il);
 
             cur = build_lora_mm(model.layers[il].per_layer_inp_gate, cur); // [n_embd_per_layer, n_tokens]
-            cur = ggml_gelu(ctx0, cur);
+            cur = build_gelu(cur);
 
             ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
@@ -416,6 +427,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        if (il == cparams.ream_calibration_layer) {
+            ggml_build_forward_expand(gf, cur);
+            return;
+        }
 
         // input for next layer
         inpL = cur;

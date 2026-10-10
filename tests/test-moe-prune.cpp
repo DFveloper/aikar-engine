@@ -1,6 +1,7 @@
 #include "moe-prune.h"
 #include "dataset.h"
 #include "hard-prune.h"
+#include "ream.h"
 
 #include "chat.h"
 
@@ -327,7 +328,191 @@ static void test_reap_routing_views() {
     require(profiles[0].layers.at(0).disabled_experts == std::vector<int32_t>({ 0 }));
 }
 
+static void test_ream() {
+    const auto groups = aikar_ream_pseudo_group({8, 7, 6, 5, 4, 3, 2, 1}, std::vector<float>(64, 0), 4, 2);
+    require(groups.centers == std::vector<int32_t>({0, 1, 2, 3}));
+    require(groups.labels == std::vector<int32_t>({0, 1, 2, 3, 0, 1, 2, 3}));
+    aikar_ream_validate_groups(groups, 8, 4);
+    for (int target : {64, 116}) {
+        std::vector<double> saliency(116);
+        for (int i = 0; i < 116; ++i) saliency[i] = 116 - i;
+        const auto g = aikar_ream_pseudo_group(saliency, std::vector<float>(116 * 116, 0), target, 16);
+        aikar_ream_validate_groups(g, 116, target);
+        require(g.centers.size() == (size_t) target);
+        std::vector<int> seen(116, 0);
+        for (const auto & members : g.members) for (int id : members) ++seen[id];
+        for (int count : seen) require(count == 1);
+        if (target == 64) {
+            require(g.members[0].size() == 16);
+            require(g.members[4].size() == 1);
+        } else for (int i = 0; i < 116; ++i) require(g.labels[i] == i && g.members[i].size() == 1);
+    }
+    require(aikar_ream_hungarian({4, 1, 3, 2, 0, 5, 3, 2, 2}, 3) == std::vector<int32_t>({1, 0, 2}));
+    require(aikar_ream_hungarian({1, 2, 1, 100}, 2) == std::vector<int32_t>({1, 0}));
+    require(aikar_ream_hungarian(std::vector<float>(64, 1), 8) == std::vector<int32_t>({0, 1, 2, 3, 4, 5, 6, 7}));
+    const auto distances = aikar_ream_distances({1, 0, 0, 1}, {0, 1, 1, 0}, 2, 2, 1);
+    require(std::abs(distances[0] - std::sqrt(2.0f)) < 1e-5f && distances[1] < 1e-5f);
+    require(aikar_ream_distances({0, 0}, {0, 0}, 1, 2, 1)[0] == 0);
+    const auto prepared = aikar_ream_distances(aikar_ream_normalize_features({1, 0, 0, 1}, 2, 2),
+        aikar_ream_normalize_features({0, 1, 1, 0}, 2, 2), 2, 2, 1, false);
+    require(prepared == distances);
+    const auto weights = aikar_ream_saliency_weights({3, 1, 0});
+    require(weights == std::vector<double>({3, 1, 0.5}));
+    require(aikar_ream_saliency_weights({0, 0}) == std::vector<double>({1, 1}));
+    aikar_ream_expert a {2, 3, {1, 2, 3, 4, 5, 6}, {2, 1, 4, 3, 6, 5}, {1, 2, 3, 4, 5, 6}};
+    const auto b = aikar_ream_permute(a, {2, 0, 1});
+    require(b.gate == std::vector<float>({5, 6, 1, 2, 3, 4}));
+    require(b.down == std::vector<float>({3, 1, 2, 6, 4, 5}));
+    std::vector<float> h1, h2, o1, o2;
+    aikar_ream_forward(a, {0.1f, -0.2f, 0.3f, 0.4f}, 1, h1, o1);
+    {
+        aikar_ream_forward_runner runner(a, 3, 1);
+        std::vector<float> hidden, output;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            runner.run({0.1f, -0.2f, 0.3f, 0.4f}, hidden, output);
+            require(hidden.size() == h1.size() && output.size() == o1.size());
+            for (size_t i = 0; i < output.size(); ++i) require(std::abs(output[i] - o1[i]) < 1e-5f);
+            for (size_t i = 0; i < hidden.size(); ++i) require(std::abs(hidden[i] - h1[i]) < 1e-5f);
+        }
+        expect_failure([&]() { runner.run({}, hidden, output); });
+        expect_failure([&]() { runner.run({NAN, 0, 0, 0}, hidden, output); });
+    }
+    {
+        expect_failure([&]() { aikar_ream_forward_runner unsupported(a, 3, 1, true, GGML_TYPE_F16); });
+        aikar_ream_forward_runner runner(a, 3, 1, true);
+        std::vector<float> hidden, output;
+        runner.run({0.1f, -0.2f, 0.3f, 0.4f}, hidden, output);
+        require(output.empty() && hidden == h1);
+        std::vector<double> mean(a.hidden, 0);
+        for (int h = 0; h < a.hidden; ++h) mean[h] = (0.25 * hidden[h] + 0.75 * hidden[a.hidden + h]) / 2;
+        const auto projected = aikar_ream_project_mean(a, mean);
+        for (int d = 0; d < a.embedding; ++d) require(std::abs(projected[d] - (0.25 * o1[d] + 0.75 * o1[a.embedding + d]) / 2) < 1e-5);
+        require(aikar_ream_project_mean(a, std::vector<double>(a.hidden, 0)) == std::vector<float>(a.embedding, 0));
+        expect_failure([&]() { aikar_ream_project_mean(a, {NAN, 0, 0}); });
+        expect_failure([&]() { runner.run_summary(nullptr, 0, {}, {1}, {0}, hidden, output); });
+        expect_failure([&]() { runner.run_device(nullptr, 0, 1, hidden, output); });
+        expect_failure([&]() { runner.run({}, hidden, output); });
+    }
+    aikar_ream_forward(b, {0.1f, -0.2f, 0.3f, 0.4f}, 1, h2, o2);
+    require(o1.size() == 4 && o2.size() == 4);
+    for (size_t i = 0; i < o1.size(); ++i) require(std::abs(o1[i] - o2[i]) < 1e-5f);
+    aikar_ream_expert merged = a;
+    aikar_ream_accumulate(merged, a, -0.75);
+    aikar_ream_accumulate(merged, b, 0.75);
+    require(std::abs(merged.gate[0] - 4.0f) < 1e-6f);
+    expect_failure([&]() { aikar_ream_hungarian({INFINITY}, 1); });
+    expect_failure([&]() { aikar_ream_permute(a, {0, 0, 1}); });
+    expect_failure([&]() { aikar_ream_pseudo_group({1, 2, 3}, std::vector<float>(9, 0), 1, 2); });
+    expect_failure([&]() { aikar_ream_saliency_weights({NAN}); });
+    auto bad = groups;
+    bad.members[0].push_back(0);
+    expect_failure([&]() { aikar_ream_validate_groups(bad, 8, 4); });
+}
+
+static void test_ream_gguf() {
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0}) {
+        const std::string source_path = "test-ream-" + std::string(ggml_type_name(type)) + ".gguf";
+        const std::string output_path = source_path + ".merged";
+        gguf_context * source = gguf_init_empty();
+        gguf_set_val_str(source, "general.architecture", "gemma4");
+        gguf_set_val_u32(source, "gemma4.block_count", 30);
+        gguf_set_val_u32(source, "gemma4.expert_count", 8);
+        gguf_set_val_u32(source, "gemma4.expert_used_count", 2);
+        auto * ctx = ggml_init({1024 * 1024, nullptr, false});
+        auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 8);
+        auto * gate_up = ggml_new_tensor_3d(ctx, type, 32, 64, 8);
+        auto * down = ggml_new_tensor_3d(ctx, type, 32, 32, 8);
+        auto * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        ggml_set_name(router, "blk.0.ffn_gate_inp.weight");
+        ggml_set_name(gate_up, "blk.0.ffn_gate_up_exps.weight");
+        ggml_set_name(down, "blk.0.ffn_down_exps.weight");
+        ggml_set_name(scale, "blk.0.ffn_down_exps.scale");
+        for (int32_t e = 0; e < 8; ++e) {
+            std::fill_n((float *) router->data + e * 32, 32, (float) e);
+            ((float *) scale->data)[e] = e + 1;
+            for (auto * t : {gate_up, down}) {
+                std::vector<float> values(t->ne[0] * t->ne[1], 0.01f * (e + 1));
+                const auto bytes = aikar_ream_encode(values, type, 32);
+                memcpy((char *) t->data + e * bytes.size(), bytes.data(), bytes.size());
+            }
+        }
+        for (auto * t : {router, gate_up, down, scale}) gguf_add_tensor(source, t);
+        require(gguf_write_to_file(source, source_path.c_str(), false));
+        const auto layout = aikar_ream_inspect(source_path, 4, 8, 4);
+        require(layout.experts == 8 && layout.top_k == 2 && layout.hidden == 32);
+        if (type == GGML_TYPE_F32) {
+            for (int scenario = 0; scenario < 4; ++scenario) {
+                auto * bad_meta = gguf_init_empty();
+                gguf_set_kv(bad_meta, source);
+                if (scenario == 3) gguf_set_val_u32(bad_meta, "gemma4.nextn_predict_layers", 1);
+                auto * bad_ctx = ggml_init({1024 * 1024, nullptr, true});
+                auto * bad_router = ggml_new_tensor_4d(bad_ctx, GGML_TYPE_F32, 32, 8, 1, scenario == 0 ? 2 : 1);
+                ggml_set_name(bad_router, router->name);
+                auto * bad_scale = ggml_new_tensor_3d(bad_ctx, GGML_TYPE_F32, 8, 1, scenario == 1 ? 2 : 1);
+                ggml_set_name(bad_scale, scale->name);
+                for (auto * t : {bad_router, gate_up, down, bad_scale}) gguf_add_tensor(bad_meta, t);
+                if (scenario == 2) {
+                    auto * bias = ggml_new_tensor_1d(bad_ctx, GGML_TYPE_F32, 8);
+                    ggml_set_name(bias, "blk.0.ffn_gate_inp.bias"); gguf_add_tensor(bad_meta, bias);
+                }
+                const std::string bad_path = source_path + ".invalid";
+                require(gguf_write_to_file(bad_meta, bad_path.c_str(), true));
+                expect_failure([&]() { aikar_ream_inspect(bad_path, 4, 8, 4); });
+                gguf_free(bad_meta); ggml_free(bad_ctx); std::remove(bad_path.c_str());
+            }
+        }
+        expect_failure([&]() { aikar_ream_inspect(source_path, 1, 8, 4); });
+        const auto expert = aikar_ream_read_expert(source_path, 0, 1);
+        require(std::abs(expert.gate[0] - 0.02f) < 0.005f);
+        require(std::abs(expert.down[0] - 0.04f) < 0.01f);
+        const auto groups = aikar_ream_pseudo_group({8, 7, 6, 5, 4, 3, 2, 1}, std::vector<float>(64, 0), 4, 16);
+        require(groups.members[0] == std::vector<int32_t>({0, 4, 5, 6, 7}));
+        auto merged = aikar_ream_read_expert(source_path, 0, 0);
+        std::fill(merged.gate.begin(), merged.gate.end(), 0);
+        std::fill(merged.up.begin(), merged.up.end(), 0);
+        std::fill(merged.down.begin(), merged.down.end(), 0);
+        for (int32_t e : groups.members[0]) aikar_ream_accumulate(merged, aikar_ream_read_expert(source_path, 0, e), (8.0 - e) / 18.0);
+        aikar_ream_export(source_path, output_path, {{0, groups}}, "{}", [&](const std::string & name, int32_t e, size_t slice) {
+            auto * t = ggml_get_tensor(ctx, name.c_str());
+            require(t != nullptr);
+            if (e == 0 && t == gate_up) {
+                auto fused = merged.gate; fused.insert(fused.end(), merged.up.begin(), merged.up.end());
+                return aikar_ream_encode(fused, type, 32);
+            }
+            if (e == 0 && t == down) return aikar_ream_encode(merged.down, type, 32);
+            if (e == 0 && t == scale) return aikar_ream_encode({1}, GGML_TYPE_F32, 1);
+            const auto * data = (const uint8_t *) t->data + e * slice;
+            return std::vector<uint8_t>(data, data + slice);
+        });
+        ggml_context * reload_ctx = nullptr;
+        auto * reload = gguf_init_from_file(output_path.c_str(), {false, &reload_ctx});
+        require(reload != nullptr);
+        require(gguf_get_val_u32(reload, gguf_find_key(reload, "gemma4.expert_count")) == 4);
+        require(gguf_get_val_u32(reload, gguf_find_key(reload, "gemma4.expert_used_count")) == 2);
+        auto * new_gate = ggml_get_tensor(reload_ctx, gate_up->name);
+        require(new_gate->ne[2] == 4);
+        require(ggml_get_tensor(reload_ctx, router->name)->ne[1] == 4);
+        const size_t slice = ggml_row_size(type, 32) * 64;
+        require(memcmp((char *) new_gate->data + slice, (char *) gate_up->data + slice, slice * 3) == 0);
+        const auto mapping = nlohmann::ordered_json::parse(gguf_get_val_str(reload, gguf_find_key(reload, "aikar.ream.mapping")));
+        require(mapping.at("0").at("original_to_new") == nlohmann::ordered_json::array({0, 1, 2, 3, 0, 0, 0, 0}));
+        require(ggml_get_tensor(reload_ctx, scale->name)->ne[0] == 4);
+        const auto result = aikar_ream_read_expert(output_path, 0, 0);
+        require(std::abs(result.gate[0] - 0.03777778f) < 0.01f);
+        expect_failure([&]() { aikar_ream_export(source_path, source_path, {{0, groups}}, "{}", {}); });
+        require(gguf_get_tensor_offset(reload, gguf_find_tensor(reload, down->name)) % gguf_get_alignment(reload) == 0);
+        ggml_free(reload_ctx); gguf_free(reload);
+        ggml_free(ctx); gguf_free(source);
+        std::remove(source_path.c_str()); std::remove(output_path.c_str()); std::remove((output_path + ".report.json").c_str());
+    }
+    expect_failure([&]() { aikar_ream_encode({INFINITY}, GGML_TYPE_F32, 1); });
+    expect_failure([&]() { aikar_ream_encode({1e10f}, GGML_TYPE_F16, 1); });
+    expect_failure([&]() { aikar_ream_encode(std::vector<float>(256), GGML_TYPE_IQ2_XXS, 256); });
+}
+
 int main() {
+    test_ream();
+    test_ream_gguf();
     test_metric_ranking();
     test_reap_collection();
     test_reap_routing_views();

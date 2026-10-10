@@ -1533,6 +1533,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_outputs        (params.n_outputs),
     training         (params.training),
     activation_recompute(params.activation_recompute),
+    full_sequence    (params.full_sequence),
+    replace_weight   (params.replace_weight),
+    smooth_gelu      (params.smooth_gelu),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -1565,11 +1568,20 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_gelu(ggml_tensor * x) const {
+    if (!smooth_gelu) { return ggml_gelu(ctx0, x); }
+    auto * one = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1.f);
+    auto * cubic = ggml_mul(ctx0, x, ggml_add(ctx0, ggml_scale(ctx0, ggml_sqr(ctx0, x), .044715f), one));
+    auto * gate = ggml_add(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cubic, .7978845608028654f)), one);
+    return ggml_mul(ctx0, ggml_scale(ctx0, x, .5f), gate);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * weight = replace_weight ? replace_weight(ctx0, w) : w;
+    ggml_tensor * res = ggml_mul_mat(ctx0, weight, cur);
     if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
     }
@@ -1645,7 +1657,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * weight = replace_weight ? replace_weight(ctx0, w) : w;
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, weight, cur, ids);
     if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
     }
@@ -1967,19 +1980,20 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cur = ggml_silu(ctx0, cur);
                 cb(cur, "ffn_silu", il);
             } break;
-        case LLM_FFN_GELU:
+        case LLM_FFN_GELU: {
             if (gate && type_gate == LLM_FFN_PAR) {
-                cur = ggml_geglu_split(ctx0, cur, tmp);
+                cur = smooth_gelu ? ggml_mul(ctx0, build_gelu(cur), tmp) : ggml_geglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_geglu", il);
                 type_gate = LLM_FFN_SEQ;
             } else {
-                cur = ggml_gelu(ctx0, cur);
+                cur = build_gelu(cur);
                 cb(cur, "ffn_gelu", il);
                 if (act_scales != NULL) {
                     cur = ggml_div(ctx0, cur, act_scales);
                     cb(cur, "ffn_act", il);
                 }
-            } break;
+            }
+        } break;
         case LLM_FFN_RELU:
             if (gate && type_gate == LLM_FFN_PAR) {
                 cur = ggml_reglu_split(ctx0, cur, tmp);
@@ -4116,6 +4130,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * wo, ggml_tensor * wo_b, ggml_tensor * wo_s,
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * kq_b,
         ggml_tensor * sinks, ggml_tensor * v_mla, float scale, int il) const {
+    if (full_sequence) {
+        return build_attn(static_cast<llm_graph_input_attn_no_cache *>(inp), wo, wo_b, wo_s, q, k, v, kq_b, sinks, v_mla, scale, il);
+    }
     if (!cparams.kv_paged) {
         return build_attn(static_cast<llm_graph_input_attn_kv_iswa *>(inp), wo, wo_b, wo_s, q, k, v, kq_b, sinks, v_mla, scale, il);
     }

@@ -1355,6 +1355,32 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
+    if (params->use_ref && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+        GGML_ASSERT(src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float));
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
+        GGML_ASSERT(src0->ne[0] == src1->ne[0]);
+        GGML_ASSERT(src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0);
+        const int64_t r2 = src1->ne[2] / src0->ne[2];
+        const int64_t r3 = src1->ne[3] / src0->ne[3];
+        for (int64_t index = params->ith; index < ggml_nelements(dst); index += params->nth) {
+            int64_t position = index;
+            const int64_t i0 = position % dst->ne[0]; position /= dst->ne[0];
+            const int64_t i1 = position % dst->ne[1]; position /= dst->ne[1];
+            const int64_t i2 = position % dst->ne[2];
+            const int64_t i3 = position / dst->ne[2];
+            const float * x = (const float *) ((const char *) src0->data + i0 * src0->nb[1] +
+                (i2 / r2) * src0->nb[2] + (i3 / r3) * src0->nb[3]);
+            const float * y = (const float *) ((const char *) src1->data + i1 * src1->nb[1] +
+                i2 * src1->nb[2] + i3 * src1->nb[3]);
+            double sum = 0;
+            for (int64_t k = 0; k < src0->ne[0]; ++k) { sum += (double) x[k] * (double) y[k]; }
+            float * output = (float *) ((char *) dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] +
+                i2 * dst->nb[2] + i3 * dst->nb[3]);
+            *output = (float) sum;
+        }
+        return;
+    }
+
     // If tiled is supported, it will execute the full op here and we return
     if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
         return;
