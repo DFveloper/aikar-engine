@@ -724,7 +724,12 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
         return false;
     }
 
-    const std::vector<std::pair<const char *, std::function<bool()>>> cases = {
+    struct state_case {
+        const char * name;
+        std::function<bool()> restore_failed;
+        bool retained = false;
+    };
+    std::vector<state_case> cases = {
         { "buffer", [&]() {
             std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
             GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
@@ -765,19 +770,66 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
         }},
     };
 
-    for (const auto & [name, restore_failed] : cases) {
+    if (params_ctx.kv_paged) {
+        const auto corrupt_paged = [&](int field) {
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
+            uint32_t header[3];
+            GGML_ASSERT(state.size() >= 8 + sizeof(header));
+            memcpy(header, state.data() + 8, sizeof(header));
+            if (header[0] != 0x504b5634u) {
+                LOG_ERR("%s: expected PKV4 state, got %08x\n", __func__, header[0]);
+                return false;
+            }
+            const size_t records_end = 8 + sizeof(header) + size_t(header[2])*6*sizeof(uint32_t);
+            GGML_ASSERT(records_end + 7*sizeof(uint32_t) <= state.size());
+            if (field == -2) {
+                state.resize(records_end - 1);
+            } else if (field == -3) {
+                state.pop_back();
+            } else {
+                size_t offset;
+                uint32_t value = UINT32_MAX;
+                if (field == -1) { offset = 8; }
+                else if (field == -4) { offset = records_end + 6*sizeof(uint32_t); value = 0; }
+                else { offset = 8 + sizeof(header) + size_t(field)*sizeof(uint32_t); }
+                memcpy(state.data() + offset, &value, sizeof(value));
+            }
+            return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
+        };
+        for (const auto & entry : std::vector<std::pair<const char *, int>>{
+                {"paged-header", -1}, {"paged-codec", 0}, {"paged-geometry", 1},
+                {"paged-key-rotation", 4}, {"paged-value-rotation", 5},
+                {"paged-alias", -4}, {"paged-truncated-metadata", -2}, {"paged-truncated-payload", -3}}) {
+            cases.push_back({entry.first, [corrupt_paged, field = entry.second]() { return corrupt_paged(field); }, true});
+        }
+    }
+
+    for (const auto & [name, restore_failed, retained] : cases) {
         llama_memory_clear(mem, true);
 
         if (!decode(tokens_save, 0, nullptr)) {
             return false;
         }
 
+        std::vector<uint8_t> before;
+        if (retained) {
+            before.resize(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), before.data(), before.size(), 0) == before.size());
+        }
         if (!restore_failed()) {
             LOG_ERR("%s: %s: restoring a corrupted state did not fail\n", __func__, name);
             return false;
         }
 
-        if (llama_memory_seq_pos_max(mem, 0) != -1) {
+        if (retained) {
+            std::vector<uint8_t> after(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), after.data(), after.size(), 0) == after.size());
+            if (after != before) {
+                LOG_ERR("%s: %s: occupied sequence changed after failed restore\n", __func__, name);
+                return false;
+            }
+        } else if (llama_memory_seq_pos_max(mem, 0) != -1) {
             LOG_ERR("%s: %s: sequence not empty after failed restore\n", __func__, name);
             return false;
         }

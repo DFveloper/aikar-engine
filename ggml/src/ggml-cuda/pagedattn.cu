@@ -1,5 +1,6 @@
 // Adapted from llama.cpp PR #22569 (matiaslin).
 #include "pagedattn.cuh"
+#include "cpy-utils.cuh"
 
 static __device__ float paged_sum(float value, float * scratch) {
     const int lane = threadIdx.x%32, warp = threadIdx.x/32;
@@ -62,17 +63,50 @@ static __global__ void paged_write(
     }
 }
 
-template<bool quantized>
-static __device__ float paged_read(const char * row, int i) {
-    if constexpr (quantized) {
+template<ggml_type cache_type>
+static __global__ void paged_write_q4(
+        const float * k, const float * v, char * cache, const int * slots,
+        int d, int hk, int ns, int bs, size_t token_stride, size_t head_stride, size_t page_stride) {
+    const int h = blockIdx.x%hk, t = blockIdx.x/hk, block = threadIdx.x;
+    if (block >= d/32) { return; }
+    using block_type = typename std::conditional<cache_type == GGML_TYPE_Q4_0, block_q4_0, block_iq4_nl>::type;
+    for (int kv = 0; kv < 2; ++kv) {
+        const char * src = (const char *) ((kv ? v : k) + (t*hk + h)*d + block*32);
+        block_type packed;
+        if constexpr (cache_type == GGML_TYPE_Q4_0) {
+            cpy_blck_f32_q4_0(src, (char *) &packed);
+        } else {
+            cpy_blck_f32_iq4_nl(src, (char *) &packed);
+        }
+        for (int seq = 0; seq < ns; ++seq) {
+            const int slot = slots[t*ns + seq];
+            if (slot < 0) { continue; }
+            char * row = cache + (slot/bs)*page_stride + (h + kv*hk)*head_stride + (slot%bs)*token_stride;
+            ((block_type *) row)[block] = packed;
+        }
+    }
+}
+
+template<ggml_type cache_type, bool warp_codebook = true>
+static __device__ float paged_read(const char * row, int i, float iq4_value) {
+    if constexpr (cache_type == GGML_TYPE_Q8_KV) {
         const block_q8_kv * block = (const block_q8_kv *) row + i/64;
         return __half2float(block->d)*block->qs[i%64];
+    } else if constexpr (cache_type == GGML_TYPE_Q4_0) {
+        const auto * block = (const block_q4_0 *) row + i/32;
+        const int index = (block->qs[i%16] >> (i%32 < 16 ? 0 : 4)) & 15;
+        return __half2float(block->d)*(index - 8);
+    } else if constexpr (cache_type == GGML_TYPE_IQ4_NL) {
+        const auto * block = (const block_iq4_nl *) row + i/32;
+        const int index = (block->qs[i%16] >> (i%32 < 16 ? 0 : 4)) & 15;
+        const float value = warp_codebook ? __shfl_sync(0xffffffffu, iq4_value, index) : kvalues_iq4nl[index];
+        return __half2float(block->d)*value;
     } else {
         return __half2float(((const half *) row)[i]);
     }
 }
 
-template<bool quantized, bool split = false, int dimension = 0, int head_group = 1>
+template<ggml_type cache_type, bool split = false, int dimension = 0, int head_group = 1>
 static __global__ void paged_decode(
         const float * __restrict__ q, const char * __restrict__ cache, const int * __restrict__ table, const int * __restrict__ queries,
         float * __restrict__ out, int runtime_d, int nh, int hk, int nt, int np, int bs, int window, float scale, int n_kv, bool causal,
@@ -82,6 +116,7 @@ static __global__ void paged_decode(
     if (row_id >= nh*nt) { return; }
     const int h = row_id%nh, t = row_id/nh;
     const int hkv = h/(nh/hk), pos = queries[2*t], seq = queries[2*t + 1];
+    const float iq4_value = cache_type == GGML_TYPE_IQ4_NL && head_group == 1 ? kvalues_iq4nl[lane%16] : 0.0f;
     float query[head_group][(dimension ? dimension : 1024)/32], acc[head_group][(dimension ? dimension : 1024)/32];
     #pragma unroll
     for (int head = 0; head < head_group; ++head) {
@@ -113,7 +148,7 @@ static __global__ void paged_decode(
             const char * kr = page + offset*token_stride;
             const char * vr = kr + hk*head_stride;
             float keys[(dimension ? dimension : 1024)/32], values[(dimension ? dimension : 1024)/32];
-            if constexpr (quantized) {
+            if constexpr (cache_type == GGML_TYPE_Q8_KV) {
                 const auto * key_blocks = (const block_q8_kv *) kr;
                 const auto * value_blocks = (const block_q8_kv *) vr;
                 #pragma unroll
@@ -130,8 +165,8 @@ static __global__ void paged_decode(
             } else {
                 #pragma unroll
                 for (int component = 0; component < d/32; ++component) {
-                    keys[component] = paged_read<false>(kr, lane + 32*component);
-                    values[component] = paged_read<false>(vr, lane + 32*component);
+                    keys[component] = paged_read<cache_type, head_group == 1>(kr, lane + 32*component, iq4_value);
+                    values[component] = paged_read<cache_type, head_group == 1>(vr, lane + 32*component, iq4_value);
                 }
             }
             #pragma unroll
@@ -159,13 +194,14 @@ static __global__ void paged_decode(
     }
 }
 
-template<bool quantized, bool split = false>
+template<ggml_type cache_type, bool split = false>
 static __global__ void paged_decode_block(
         const float * q, const char * cache, const int * table, const int * queries,
         float * out, int nh, int hk, int np, int bs, int window, float scale, int n_kv, bool causal,
         size_t token_stride, size_t head_stride, size_t page_stride, int nsplits = 1) {
     const int h = blockIdx.x%nh, t = blockIdx.x/nh, i = threadIdx.x, d = blockDim.x;
     const int hkv = h/(nh/hk), pos = queries[2*t], seq = queries[2*t + 1];
+    const float iq4_value = cache_type == GGML_TYPE_IQ4_NL ? kvalues_iq4nl[i%16] : 0.0f;
     const float query = q[(t*nh + h)*d + i];
     extern __shared__ float scratch[];
     float m = -INFINITY, sum = 0.0f, acc = 0.0f;
@@ -188,9 +224,9 @@ static __global__ void paged_decode_block(
             if (!(mask & (1u << (offset%32)))) { continue; }
             const char * kr = page + offset*token_stride;
             const char * vr = kr + hk*head_stride;
-            const float dot = paged_sum(query*paged_read<quantized>(kr, i), scratch)*scale;
+            const float dot = paged_sum(query*paged_read<cache_type>(kr, i, iq4_value), scratch)*scale;
             const float next = fmaxf(m, dot), old = expf(m - next), weight = expf(dot - next);
-            acc = acc*old + weight*paged_read<quantized>(vr, i);
+            acc = acc*old + weight*paged_read<cache_type>(vr, i, iq4_value);
             sum = sum*old + weight; m = next;
         }
     }
@@ -249,6 +285,14 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         paged_write<true><<<hk*nt, d, d/32*sizeof(float), ctx.stream()>>>(
             (const float *) k->data, (const float *) v->data, (char *) cache->data, slots,
             hk, ns, bs, cache->nb[1], cache->nb[2], cache->nb[3]);
+    } else if (cache->type == GGML_TYPE_Q4_0) {
+        paged_write_q4<GGML_TYPE_Q4_0><<<hk*nt, 32, 0, ctx.stream()>>>(
+            (const float *) k->data, (const float *) v->data, (char *) cache->data, slots,
+            d, hk, ns, bs, cache->nb[1], cache->nb[2], cache->nb[3]);
+    } else if (cache->type == GGML_TYPE_IQ4_NL) {
+        paged_write_q4<GGML_TYPE_IQ4_NL><<<hk*nt, 32, 0, ctx.stream()>>>(
+            (const float *) k->data, (const float *) v->data, (char *) cache->data, slots,
+            d, hk, ns, bs, cache->nb[1], cache->nb[2], cache->nb[3]);
     } else {
         paged_write<false><<<hk*nt, d, 0, ctx.stream()>>>(
             (const float *) k->data, (const float *) v->data, (char *) cache->data, slots,
@@ -275,13 +319,17 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     else if (d == 512) { PAGED_PREFILL(quantized, split, 512); } \
     else if (nt > 8) { PAGED_PREFILL(quantized, split, 0); } \
     else { PAGED_DECODE(quantized, split); }
-    if (cache->type == GGML_TYPE_Q8_KV) {
-        if (nsplits > 1) { PAGED_DISPATCH(true, true); }
-        else { PAGED_DISPATCH(true, false); }
-    } else {
-        if (nsplits > 1) { PAGED_DISPATCH(false, true); }
-        else { PAGED_DISPATCH(false, false); }
+#define PAGED_FORMAT(type) \
+    if (nsplits > 1) { PAGED_DISPATCH(type, true); } \
+    else { PAGED_DISPATCH(type, false); }
+    switch (cache->type) {
+        case GGML_TYPE_F16:    { PAGED_FORMAT(GGML_TYPE_F16);    } break;
+        case GGML_TYPE_Q8_KV:  { PAGED_FORMAT(GGML_TYPE_Q8_KV);  } break;
+        case GGML_TYPE_Q4_0:   { PAGED_FORMAT(GGML_TYPE_Q4_0);   } break;
+        case GGML_TYPE_IQ4_NL: { PAGED_FORMAT(GGML_TYPE_IQ4_NL); } break;
+        default: GGML_ABORT("unsupported paged KV type");
     }
+#undef PAGED_FORMAT
 #undef PAGED_DISPATCH
 #undef PAGED_FUSED
 #undef PAGED_PREFILL

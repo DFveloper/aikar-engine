@@ -4092,6 +4092,8 @@ bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & params) {
     for (int dom = 0; dom < 2; ++dom) {
         res &= tables[dom]->ne[1] == kv->table_blocks() && tables[dom]->ne[2] == kv->n_seq_max;
         res &= slots[dom]->ne[0] == kv->n_seq_max && slots[dom]->ne[1] == params.ubatch.n_tokens;
+        res &= (k_rot[dom] ? k_rot[dom]->ne[0] : 0) == kv->rotation_size(dom != 0, false);
+        res &= (v_rot[dom] ? v_rot[dom]->ne[0] : 0) == kv->rotation_size(dom != 0, true);
     }
     res &= n_kv == paged_attn_n_kv(params.ubatch, *kv, params.cparams.causal_attn);
     mctx = next;
@@ -4101,6 +4103,13 @@ bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch *) {
     GGML_ASSERT(mctx && !mctx->plans.empty());
     const auto & plan = mctx->plans.at(mctx->index);
+    if (!rotations_set) {
+        for (int dom = 0; dom < 2; ++dom) {
+            if (k_rot[dom]) { mctx->kv->set_input_rot(k_rot[dom]); }
+            if (v_rot[dom]) { mctx->kv->set_input_rot(v_rot[dom]); }
+        }
+        rotations_set = true;
+    }
     for (int dom = 0; dom < 2; ++dom) {
         const auto table_data = mctx->kv->table(dom != 0);
         ggml_backend_tensor_set(tables[dom], table_data.data(), 0, ggml_nbytes(tables[dom]));
@@ -4119,6 +4128,8 @@ llm_graph_input_i * llm_graph_context::build_attn_inp_kv_paged() const {
         inp->slots[dom] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mc->kv->n_seq_max, n_tokens);
         ggml_set_input(inp->tables[dom]);
         ggml_set_input(inp->slots[dom]);
+        inp->k_rot[dom] = mc->kv->build_input_k_rot(ctx0, dom != 0);
+        inp->v_rot[dom] = mc->kv->build_input_v_rot(ctx0, dom != 0);
     }
     inp->queries = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens);
     ggml_set_input(inp->queries);
@@ -4140,6 +4151,11 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * paged = static_cast<llm_graph_input_attn_kv_paged *>(inp);
     const auto & layer = paged->mctx->kv->layers.at(il);
     const int dom = layer.swa ? 1 : 0;
+    if (paged->k_rot[dom]) {
+        q = llama_mul_mat_hadamard(ctx0, q, paged->k_rot[dom]);
+        k = llama_mul_mat_hadamard(ctx0, k, paged->k_rot[dom]);
+    }
+    if (paged->v_rot[dom]) { v = llama_mul_mat_hadamard(ctx0, v, paged->v_rot[dom]); }
     ggml_tensor * cur = ggml_paged_attn(ctx0, ggml_cont(ctx0, q), ggml_cont(ctx0, k), ggml_cont(ctx0, v),
             layer.cache, paged->tables[dom], paged->slots[dom], paged->queries,
             scale, paged->mctx->kv->block_size, layer.swa ? paged->mctx->kv->window : 0);
@@ -4159,6 +4175,7 @@ ggml_tensor * llm_graph_context::build_attn(
     layer.backend = owner;
     ggml_backend_sched_set_tensor_backend(sched, cur, owner);
     ggml_build_forward_expand(gf, cur);
+    if (paged->v_rot[dom]) { cur = llama_mul_mat_hadamard(ctx0, cur, paged->v_rot[dom]); }
     cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], n_tokens);
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);

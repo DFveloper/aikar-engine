@@ -6112,7 +6112,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_PAGED_ATTN:
             return op->src[0]->ne[0] <= 1024 && op->src[0]->ne[0] % 32 == 0 &&
-                (op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_Q8_KV);
+                (op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_Q8_KV ||
+                 op->src[3]->type == GGML_TYPE_Q4_0 || op->src[3]->type == GGML_TYPE_IQ4_NL);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_BACK:

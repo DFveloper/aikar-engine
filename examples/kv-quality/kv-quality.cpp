@@ -99,7 +99,12 @@ int main(int argc, char ** argv) {
     ref_params.type_v_swa = GGML_TYPE_F16;
     ref_params.kv_hadamard_k        = false;
     ref_params.kv_hadamard_v        = false;
+    ref_params.kv_hadamard_k_swa    = false;
+    ref_params.kv_hadamard_v_swa    = false;
+    ref_params.kv_hadamard_separate = false;
     ref_params.kv_hadamard_explicit = false;
+    ref_params.kv_turboquant_bits     = 0;
+    ref_params.kv_turboquant_bits_swa = 0;
 
     llama_context * ctx_ref = llama_init_from_model(model, ref_params);
     if (ctx_ref == nullptr) {

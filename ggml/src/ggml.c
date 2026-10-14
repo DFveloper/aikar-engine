@@ -9295,7 +9295,8 @@ struct ggml_tensor * ggml_paged_attn(
         struct ggml_tensor * slots, struct ggml_tensor * queries,
         float scale, int32_t block_size, int32_t window) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && k_new->type == GGML_TYPE_F32 && v_new->type == GGML_TYPE_F32);
-    GGML_ASSERT(cache->type == GGML_TYPE_F16 || cache->type == GGML_TYPE_Q8_KV);
+    GGML_ASSERT(cache->type == GGML_TYPE_F16 || cache->type == GGML_TYPE_Q8_KV ||
+                cache->type == GGML_TYPE_Q4_0 || cache->type == GGML_TYPE_IQ4_NL);
     GGML_ASSERT(table->type == GGML_TYPE_I32 && slots->type == GGML_TYPE_I32 && queries->type == GGML_TYPE_I32);
     GGML_ASSERT(block_size > 0 && (block_size <= 32 || block_size == 64 || block_size == 128) && window >= 0);
     GGML_ASSERT(q->ne[0] == k_new->ne[0] && ggml_are_same_shape(k_new, v_new));

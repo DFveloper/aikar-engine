@@ -68,13 +68,15 @@ Calibration gathers both metrics in one forward pass. Added persistent storage i
 
 GGML reshape views inherit their source name with a ` (reshaped)` suffix. Calibration accepts only the exact original routing/output tensor names. Each selection, gate and entropy observation is recorded once; Top-K ID views are copied using their row stride. Scaled down-projection outputs populate both aikar and REAP sums. `router-output` retains its conditional-average formula, which equals REAP when both use these same correct observations. It is not frequency-weighted scoring.
 
+GPU expert outputs are downloaded in chunks of at most 4 MiB before CPU norm reduction. This avoids one synchronous device read per selected route while keeping temporary host memory bounded. Tensor strides, double accumulation order, and scoring formulas are preserved.
+
 REAP currently has the same architecture limits as the existing pruning implementation: Gemma 4 26B A4B with homogeneous expert counts. Other architectures and different numbers of experts per layer remain unsupported. Hard rewriting retains its Q4_0 QAT layout restriction.
 
 `analyze` and `hard` disable CUDA graphs before backend initialization. Profiling callbacks split graph execution into multiple segments; captured segments retain separate MMVQ activation caches in VRAM. On a nearly full GPU these extra buffers can cause OOM in `ggml_cuda_prepare_mmvq_activation_cache`, even after the model and compute buffers loaded successfully. Direct execution reuses temporary CUDA pool buffers and preserves routing and score semantics. This setting affects only the pruning process, not `llama-server`. For older binaries, prefix the command with `GGML_CUDA_DISABLE_GRAPHS=1`. Model weights, KV cache, and the active compute batch still need available memory; a GPU already occupied by a serving process requires CPU offload or stopping that service before GPU calibration.
 
 The first calibration writes `pruning-results/importance-cache.json`. The cache contains model and dataset identities, context size, baseline token/NLL aggregates, and the raw per-layer expert statistics. It does not contain a ratio-specific ranking. A later `analyze` command with compatible inputs loads this cache instead of running baseline calibration again. Use `--importance-cache FILE` to share one cache across output directories.
 
-Ratio evaluation is enabled by default. Use `--no-evaluate` to generate profiles without loading and evaluating each soft-pruned model:
+Baseline and ratio evaluation are enabled by default. Use `--no-evaluate` to collect routing statistics and generate profiles without computing PPL. Calibration still uses every input token and every MoE layer, but skips the final vocabulary projection and CPU NLL calculation. Reports mark `ppl_evaluated: false`, PPL values are null, and evaluated token counts are zero. A statistics-only cache can generate profiles; an evaluation run requires a cache with baseline PPL and recalibrates an automatic cache or rejects an explicit incompatible cache. Existing caches with PPL remain usable with `--no-evaluate`.
 
 ```sh
 build/bin/aikar-prune analyze \

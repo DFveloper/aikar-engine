@@ -164,6 +164,8 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     const int n_kv = ggml_get_op_params_i32(dst, 3);
     const bool causal = !ggml_get_op_params_i32(dst, 4);
     const float scale = ggml_get_op_params_f32(dst, 0);
+    const auto * traits = ggml_get_type_traits(cache->type);
+    GGML_ASSERT(traits->from_float_ref && traits->to_float);
     for (int row = params->ith; row < nt*ns*hk; row += params->nth) {
         const int h = row%hk, t = row/hk/ns, seq = row/hk%ns;
         const int slot = slots[t*ns + seq];
@@ -173,11 +175,7 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
             const auto * input = kv ? vn : kn;
             const float * src = (const float *) input->data + (t*hk + h)*d;
             char * out = (char *) cache->data + (slot/bs)*cache->nb[3] + (h + kv*hk)*cache->nb[2] + (slot%bs)*cache->nb[1];
-            if (cache->type == GGML_TYPE_Q8_KV) {
-                quantize_row_q8_kv_ref(src, out, d);
-            } else {
-                ggml_fp32_to_fp16_row(src, (ggml_fp16_t *) out, d);
-            }
+            traits->from_float_ref(src, out, d);
         }
     }
     ggml_barrier(params->threadpool);
@@ -199,8 +197,7 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
             for (int kv = 0; kv < 2; ++kv) {
                 const char * src = (const char *) cache->data + physical*cache->nb[3] + (hkv + kv*hk)*cache->nb[2] + (p%bs)*cache->nb[1];
                 float * out = kv ? v.data() : k.data();
-                if (cache->type == GGML_TYPE_Q8_KV) { dequantize_row_q8_kv(src, out, d); }
-                else { ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, out, d); }
+                traits->to_float(src, out, d);
             }
             float dot = 0.0f;
             for (int i = 0; i < d; ++i) { dot += qr[i]*k[i]; }

@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
+#include "ggml-cpp.h"
 #include "gguf.h"
 
 #include "arg.h"
@@ -8,22 +9,81 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <clocale>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 
 static bool g_verbose = false;
+
+static void quantize_tensor(ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int n_threads) {
+    const int64_t min_chunk_size = 32 * 1024;
+    const int64_t n_chunks = (nrows * n_per_row + min_chunk_size - 1) / min_chunk_size;
+    const int n_workers = (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0)
+        ? (int) std::min<int64_t>(n_threads, std::min(nrows, n_chunks)) : 1;
+    const size_t row_size = ggml_row_size(type, n_per_row);
+    ggml_quantize_init(type);
+
+    auto compute = [&](int worker) {
+        const int64_t first_row = nrows * worker / n_workers;
+        const int64_t last_row = nrows * (worker + 1) / n_workers;
+        const size_t size = ggml_quantize_chunk(type, src + first_row * n_per_row,
+            (char *) dst + first_row * row_size, 0, last_row - first_row, n_per_row, nullptr);
+        GGML_ASSERT(size == (last_row - first_row) * row_size);
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_workers - 1);
+    try {
+        for (int i = 1; i < n_workers; ++i) {
+            workers.emplace_back(compute, i);
+        }
+        compute(0);
+    } catch (...) {
+        for (auto & worker : workers) {
+            worker.join();
+        }
+        throw;
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    if (!ggml_validate_row_data(type, dst, nrows * row_size)) {
+        throw std::runtime_error("quantized data validation failed");
+    }
+}
+
+struct merge_worker {
+    int n_threads;
+    ggml_backend_ptr backend;
+    ggml_gallocr_ptr allocr;
+    std::vector<uint8_t> read_buf;
+    std::vector<uint8_t> graph_buf;
+
+    merge_worker(int n_threads) : n_threads(n_threads), backend(ggml_backend_cpu_init()) {
+        if (!backend) {
+            throw std::runtime_error("failed to initialize CPU backend");
+        }
+        ggml_backend_cpu_set_n_threads(backend.get(), n_threads);
+        allocr.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())));
+        graph_buf.resize(ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead());
+    }
+};
 
 struct tensor_transformation {
     struct ggml_tensor * in;
     struct ggml_tensor * out;
     bool is_copy;
     std::vector<size_t> adapter_indices;
+    size_t offset;
 };
 
 struct tensor_type_option {
@@ -193,6 +253,7 @@ struct file_input {
     std::vector<struct ggml_context *> ctx_metas;
     std::vector<struct gguf_context *> ctx_ggufs;
     std::map<std::string, tensor_ref> tensors;
+    std::mutex read_mutex;
     float alpha;
     float scale;
 
@@ -288,8 +349,12 @@ struct file_input {
         }
         auto i_tensor_in = gguf_find_tensor(ctx_ggufs[file_idx], name.c_str());
         auto offset = gguf_get_data_offset(ctx_ggufs[file_idx]) + gguf_get_tensor_offset(ctx_ggufs[file_idx], i_tensor_in);
+        std::lock_guard<std::mutex> lock(read_mutex);
         f_ins[file_idx]->seekg(offset);
         f_ins[file_idx]->read((char *) buf.data(), len);
+        if (!*f_ins[file_idx]) {
+            throw std::runtime_error("failed to read tensor: " + name);
+        }
     }
 
     ~file_input() {
@@ -307,11 +372,10 @@ struct lora_merge_ctx {
     std::vector<std::unique_ptr<file_input>> adapters;
 
     int n_threads;
+    int n_merge_jobs;
     ggml_type out_type; // requested output tensor type (e.g. Q4_0, F16, F32...)
     const std::vector<tensor_type_option> & tensor_types;
-    ggml_backend_t backend = nullptr;
-    ggml_gallocr_t allocr = nullptr;
-    std::vector<uint8_t> read_buf;
+    std::mutex write_mutex;
 
     struct gguf_context * ctx_out;
     struct ggml_context * ctx_out_ggml;
@@ -323,8 +387,9 @@ struct lora_merge_ctx {
             std::string & outfile,
             ggml_type target_out_type,
             const std::vector<tensor_type_option> & tensor_types,
-            int n_threads) :
-            base_model(base_fname, 0), n_threads(n_threads), out_type(target_out_type), tensor_types(tensor_types), fout(outfile, std::ios::binary) {
+            int n_threads,
+            int n_merge_jobs) :
+            base_model(base_fname, 0), n_threads(std::max(1, n_threads)), n_merge_jobs(n_merge_jobs), out_type(target_out_type), tensor_types(tensor_types), fout(outfile, std::ios::binary) {
 
         fout.exceptions(std::ofstream::failbit);
 
@@ -343,8 +408,6 @@ struct lora_merge_ctx {
             /*.no_alloc   =*/ true,
         };
         ctx_out_ggml = ggml_init(params);
-        backend = ggml_backend_cpu_init();
-        allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
 
     void check_metadata_lora(file_input * adapter) {
@@ -385,6 +448,10 @@ struct lora_merge_ctx {
 
     void run_merge() {
         gguf_set_kv(ctx_out, base_model.ctx_gguf);
+        if (gguf_find_key(ctx_out, GGUF_KEY_GENERAL_ALIGNMENT) >= 0) {
+            // The new output context uses the default alignment.
+            gguf_set_val_u32(ctx_out, GGUF_KEY_GENERAL_ALIGNMENT, gguf_get_alignment(ctx_out));
+        }
         gguf_set_val_u32(ctx_out, "general.file_type", ggml_type_to_llama_ftype(out_type));
         gguf_remove_key(ctx_out, LLM_KV_SPLIT_NO);
         gguf_remove_key(ctx_out, LLM_KV_SPLIT_COUNT);
@@ -407,52 +474,110 @@ struct lora_merge_ctx {
             if (adapter_indices.empty()) {
                 struct ggml_tensor * cpy_tensor = ggml_dup_tensor(ctx_out_ggml, base_tensor);
                 ggml_set_name(cpy_tensor, base_tensor->name);
-                trans.push_back({cpy_tensor, cpy_tensor, true, {}});
+                trans.push_back({cpy_tensor, cpy_tensor, true, {}, 0});
                 gguf_add_tensor(ctx_out, cpy_tensor);
             } else {
                 struct ggml_tensor * out_tensor = ggml_new_tensor(
                     ctx_out_ggml, get_out_tensor_type(base_tensor, it.first), GGML_MAX_DIMS, base_tensor->ne);
                 ggml_set_name(out_tensor, base_tensor->name);
-                trans.push_back({base_tensor, out_tensor, false, std::move(adapter_indices)});
+                trans.push_back({base_tensor, out_tensor, false, std::move(adapter_indices), 0});
                 gguf_add_tensor(ctx_out, out_tensor);
             }
         }
 
-        {
-            size_t meta_size = gguf_get_meta_size(ctx_out);
-            zeros(fout, meta_size);
-        }
+        const size_t meta_size = gguf_get_meta_size(ctx_out);
+        zeros(fout, meta_size);
 
         size_t n_merged = 0;
-        for (auto & it : trans) {
-            if (!it.is_copy) {
-                merge_tensor(it.in, it.out, it.adapter_indices);
-                n_merged++;
-            } else {
-                copy_tensor(it.in);
+        for (size_t i = 0; i < trans.size(); ++i) {
+            trans[i].offset = meta_size + gguf_get_tensor_offset(ctx_out, i);
+            n_merged += !trans[i].is_copy;
+        }
+
+        const int requested_jobs = n_merge_jobs > 0 ? n_merge_jobs : std::min(4, n_threads);
+        const int n_jobs = std::max<size_t>(1, std::min<size_t>(std::min(requested_jobs, n_threads), trans.size()));
+        printf("%s : parallel merge: %d jobs, %d total threads\n", __func__, n_jobs, n_threads);
+        std::vector<std::unique_ptr<merge_worker>> contexts;
+        for (int i = 0; i < n_jobs; ++i) {
+            contexts.emplace_back(new merge_worker(n_threads / n_jobs + (i < n_threads % n_jobs)));
+        }
+
+        std::atomic<size_t> next_tensor{0};
+        std::atomic<bool> failed{false};
+        std::mutex error_mutex;
+        std::exception_ptr error;
+        auto compute = [&](int job) {
+            try {
+                while (!failed.load()) {
+                    const size_t i = next_tensor.fetch_add(1);
+                    if (i >= trans.size()) {
+                        break;
+                    }
+                    const auto & it = trans[i];
+                    if (it.is_copy) {
+                        copy_tensor(it.in, it.offset, *contexts[job]);
+                    } else {
+                        merge_tensor(it.in, it.out, it.adapter_indices, it.offset, *contexts[job]);
+                    }
+                }
+            } catch (...) {
+                failed.store(true);
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!error) {
+                    error = std::current_exception();
+                }
             }
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(n_jobs - 1);
+        try {
+            for (int i = 1; i < n_jobs; ++i) {
+                workers.emplace_back(compute, i);
+            }
+            compute(0);
+        } catch (...) {
+            failed.store(true);
+            for (auto & worker : workers) {
+                worker.join();
+            }
+            throw;
+        }
+        for (auto & worker : workers) {
+            worker.join();
+        }
+        if (error) {
+            std::rethrow_exception(error);
         }
 
         {
-            std::vector<uint8_t> data(gguf_get_meta_size(ctx_out));
+            std::vector<uint8_t> data(meta_size);
             gguf_get_meta_data(ctx_out, data.data());
             fout.seekp(0);
             fout.write((const char *) data.data(), data.size());
+            fout.flush();
         }
 
         printf("%s : merged %zu tensors with lora adapters (output type: %s)\n",
                __func__, n_merged, ggml_type_name(out_type));
     }
 
-    void copy_tensor(struct ggml_tensor * base) {
-        printf("%s :  %s [%s]\n", __func__, base->name, ggml_ne_string(base).c_str());
-        size_t len = ggml_nbytes(base);
-        base_model.read_tensor_data(base->name, read_buf);
-        fout.write((char *) read_buf.data(), len);
-        zeros(fout, GGML_PAD(len, GGUF_DEFAULT_ALIGNMENT) - len);
+    void write_tensor(const void * data, size_t len, size_t offset) {
+        std::lock_guard<std::mutex> lock(write_mutex);
+        fout.seekp(offset);
+        fout.write((const char *) data, len);
+        zeros(fout, GGML_PAD(len, gguf_get_alignment(ctx_out)) - len);
     }
 
-    void merge_tensor(struct ggml_tensor * base, struct ggml_tensor * out, const std::vector<size_t> & adapter_indices) {
+    void copy_tensor(struct ggml_tensor * base, size_t offset, merge_worker & worker) {
+        printf("%s :  %s [%s]\n", __func__, base->name, ggml_ne_string(base).c_str());
+        size_t len = ggml_nbytes(base);
+        base_model.read_tensor_data(base->name, worker.read_buf);
+        write_tensor(worker.read_buf.data(), len, offset);
+    }
+
+    void merge_tensor(struct ggml_tensor * base, struct ggml_tensor * out, const std::vector<size_t> & adapter_indices, size_t offset, merge_worker & worker) {
+        auto backend = worker.backend.get();
+        auto & read_buf = worker.read_buf;
         std::string name_base(base->name);
         std::string name_lora_a = name_base + ".lora_a";
         std::string name_lora_b = name_base + ".lora_b";
@@ -466,16 +591,19 @@ struct lora_merge_ctx {
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
-        struct ggml_context * ctx = ggml_init(params);
+        ggml_context_ptr ctx(ggml_init(params));
 
-        struct ggml_tensor * inp_base = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, base->ne);
+        struct ggml_tensor * inp_base = ggml_new_tensor(ctx.get(), GGML_TYPE_F32, GGML_MAX_DIMS, base->ne);
         for (size_t i = 0; i < adapter_indices.size(); ++i) {
             auto t_a = adapters[adapter_indices[i]]->get_tensor(name_lora_a);
             auto t_b = adapters[adapter_indices[i]]->get_tensor(name_lora_b);
-            inp_a[i] = ggml_dup_tensor(ctx, t_a);
-            inp_b[i] = ggml_dup_tensor(ctx, t_b);
+            inp_a[i] = ggml_dup_tensor(ctx.get(), t_a);
+            inp_b[i] = ggml_dup_tensor(ctx.get(), t_b);
         }
-        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        if (!buffer) {
+            throw std::runtime_error("failed to allocate input tensors for " + name_base);
+        }
 
         base_model.read_tensor_data(name_base, read_buf);
         if (base->type != GGML_TYPE_F32) {
@@ -497,11 +625,9 @@ struct lora_merge_ctx {
 
         struct ggml_cgraph * gf;
         {
-            static size_t buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
-            static std::vector<uint8_t> buf(buf_size);
             struct ggml_init_params params0 = {
-                /*.mem_size   =*/ buf_size,
-                /*.mem_buffer =*/ buf.data(),
+                /*.mem_size   =*/ worker.graph_buf.size(),
+                /*.mem_buffer =*/ worker.graph_buf.data(),
                 /*.no_alloc   =*/ true,
             };
             struct ggml_context * ctx0 = ggml_init(params0);
@@ -542,9 +668,12 @@ struct lora_merge_ctx {
         }
 
         {
-            ggml_gallocr_alloc_graph(allocr, gf);
-            ggml_backend_cpu_set_n_threads(backend, n_threads);
-            ggml_backend_graph_compute(backend, gf);
+            if (!ggml_gallocr_alloc_graph(worker.allocr.get(), gf)) {
+                throw std::runtime_error("failed to allocate merge graph for " + name_base);
+            }
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to compute merge graph for " + name_base);
+            }
         }
 
         {
@@ -570,29 +699,22 @@ struct lora_merge_ctx {
                 size_t out_len = ggml_row_size(out->type, n_per_row) * nrows;
                 std::vector<uint8_t> q_buf(out_len);
 
-                ggml_quantize_chunk(out->type, f32_buf.data(), q_buf.data(), 0, nrows, n_per_row, nullptr);
+                quantize_tensor(out->type, f32_buf.data(), q_buf.data(), nrows, n_per_row, worker.n_threads);
 
                 // 3. write the quantized bytes to disk
-                fout.write((char *) q_buf.data(), out_len);
-                zeros(fout, GGML_PAD(out_len, GGUF_DEFAULT_ALIGNMENT) - out_len);
+                write_tensor(q_buf.data(), out_len, offset);
             } else {
                 size_t len = ggml_nbytes(result);
                 if (read_buf.size() < len) {
                     read_buf.resize(len);
                 }
                 ggml_backend_tensor_get(result, read_buf.data(), 0, len);
-                fout.write((char *) read_buf.data(), len);
-                zeros(fout, GGML_PAD(len, GGUF_DEFAULT_ALIGNMENT) - len);
+                write_tensor(read_buf.data(), len, offset);
             }
         }
-
-        ggml_free(ctx);
-        ggml_backend_buffer_free(buffer);
     }
 
     ~lora_merge_ctx() {
-        ggml_gallocr_free(allocr);
-        ggml_backend_free(backend);
         gguf_free(ctx_out);
         ggml_free(ctx_out_ggml);
     }
@@ -604,6 +726,8 @@ static void print_usage(int, char ** argv) {
     printf("\n  %s -m base-model.gguf --lora lora-file.gguf -o merged-model.gguf --qat q4_0\n", argv[0]);
     printf("\n  --tensor-type REGEX=TYPE       set the output type for matching merged tensors\n");
     printf("  --tensor-type-file FILE        read whitespace-separated REGEX=TYPE entries\n");
+    printf("  --merge-jobs N                 concurrent tensor merges (default: min(4, threads))\n");
+    printf("                                --threads is the total CPU thread budget\n");
     printf("\n--type accepts any ggml tensor type that can be produced from F32, e.g.:\n  ");
     auto names = list_supported_type_names();
     for (size_t i = 0; i < names.size(); ++i) {
@@ -655,11 +779,24 @@ static std::vector<std::string> extract_export_args(
         int argc,
         char ** argv,
         ggml_type & out_type,
-        std::vector<tensor_type_option> & tensor_types) {
+        std::vector<tensor_type_option> & tensor_types,
+        int & n_merge_jobs) {
     std::vector<std::string> filtered;
     filtered.reserve(argc);
 
     for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--merge-jobs") == 0) {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for --merge-jobs");
+            }
+            const std::string value = argv[++i];
+            size_t end = 0;
+            n_merge_jobs = std::stoi(value, &end);
+            if (end != value.size() || n_merge_jobs < 1) {
+                throw std::runtime_error("--merge-jobs must be a positive integer");
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--type") == 0) {
             if (i + 1 >= argc) {
                 throw std::runtime_error("missing value for --type");
@@ -718,10 +855,11 @@ int main(int argc, char ** argv) {
     params.out_file = "ggml-lora-merged.gguf";
     ggml_type target_out_type = GGML_TYPE_F16; // default kept for backward compatibility
     std::vector<tensor_type_option> tensor_types;
+    int n_merge_jobs = 0;
 
     std::vector<std::string> filtered_args;
     try {
-        filtered_args = extract_export_args(argc, argv, target_out_type, tensor_types);
+        filtered_args = extract_export_args(argc, argv, target_out_type, tensor_types, n_merge_jobs);
     } catch (const std::exception & err) {
         fprintf(stderr, "%s\n", err.what());
         print_usage(argc, argv);
@@ -744,7 +882,7 @@ int main(int argc, char ** argv) {
     g_verbose = (params.verbosity > 1);
     try {
         lora_merge_ctx ctx(
-            params.model.path, params.lora_adapters, params.out_file, target_out_type, tensor_types, params.cpuparams.n_threads);
+            params.model.path, params.lora_adapters, params.out_file, target_out_type, tensor_types, params.cpuparams.n_threads, n_merge_jobs);
         ctx.run_merge();
     } catch (const std::exception & err) {
         fprintf(stderr, "%s\n", err.what());

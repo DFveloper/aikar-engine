@@ -194,9 +194,11 @@ void common_moe_prune_collect_output(
         ids.size() != (size_t) (output->ne[1] * output->ne[2]) || weights.size() != ids.size()) {
         throw std::runtime_error("REAP output and routing shapes differ");
     }
-    // Read bounded chunks; do not retain expert activations.
-    std::array<float, 4096> scratch;
     const bool host = !output->buffer || ggml_backend_buffer_is_host(output->buffer);
+    const size_t output_bytes = ggml_nbytes(output);
+    // Batch device reads within a bounded host buffer.
+    std::vector<float> download(host ? 0 : (std::min<size_t>(output_bytes, 4 * 1024 * 1024) + sizeof(float) - 1) / sizeof(float));
+    size_t download_offset = 0, download_size = 0;
     for (int64_t token = 0; token < output->ne[2]; ++token) {
         for (int64_t slot = 0; slot < output->ne[1]; ++slot) {
             const size_t route = token * output->ne[1] + slot;
@@ -208,14 +210,18 @@ void common_moe_prune_collect_output(
             double sum_sq = 0.0;
             const size_t row_offset = token * output->nb[2] + slot * output->nb[1];
             for (int64_t start = 0; start < output->ne[0];) {
-                const size_t count = std::min<size_t>(output->ne[0] - start, sizeof(scratch) / element_size);
+                const size_t count = std::min<size_t>(output->ne[0] - start, 16384 / element_size);
                 const size_t offset = row_offset + start * element_size;
                 const void * data;
                 if (host) {
                     data = (const char *) output->data + offset;
                 } else {
-                    ggml_backend_tensor_get(output, scratch.data(), offset, count * element_size);
-                    data = scratch.data();
+                    if (offset < download_offset || offset + count * element_size > download_offset + download_size) {
+                        download_offset = offset;
+                        download_size = std::min(output_bytes - offset, download.size() * sizeof(float));
+                        ggml_backend_tensor_get(output, download.data(), download_offset, download_size);
+                    }
+                    data = (const char *) download.data() + offset - download_offset;
                 }
                 for (size_t i = 0; i < count; ++i) {
                     const double value = output->type == GGML_TYPE_F32 ? ((const float *) data)[i] :

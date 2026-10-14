@@ -40,8 +40,9 @@ llama_kv_cache_paged::llama_kv_cache_paged(
         const bool swa = model.hparams.is_swa(il);
         const ggml_type type_k = swa ? params.type_k_swa : params.type_k;
         const ggml_type type_v = swa ? params.type_v_swa : params.type_v;
-        if (type_k != type_v || (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_KV)) {
-            throw std::runtime_error("paged KV requires matching F16 or Q8_KV K/V in each cache domain");
+        if (type_k != type_v || (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_KV &&
+                type_k != GGML_TYPE_Q4_0 && type_k != GGML_TYPE_IQ4_NL)) {
+            throw std::runtime_error("paged KV requires matching F16, Q8_KV, Q4_0 or IQ4_NL K/V in each cache domain");
         }
         const int64_t dim = model.hparams.n_embd_head_k(il), hk = model.hparams.n_head_kv(il);
         if (dim != model.hparams.n_embd_head_v(il) || dim%64 || dim > 1024 || !hk) {
@@ -57,6 +58,9 @@ llama_kv_cache_paged::llama_kv_cache_paged(
             accelerators.insert(dev);
             const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
             if (strcmp(name, "CUDA") && strcmp(name, "Vulkan")) { throw std::runtime_error("paged KV supports CPU, CUDA and Vulkan only"); }
+            if (!strcmp(name, "Vulkan") && type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_KV) {
+                throw std::runtime_error("Vulkan paged KV supports F16 and Q8_KV only");
+            }
         }
         if (accelerators.size() > 1) { throw std::runtime_error("paged KV supports CPU plus one GPU device"); }
         ggml_init_params ip = {ggml_tensor_overhead(), nullptr, true};
@@ -364,16 +368,69 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_paged::memory_breakd
 }
 
 void llama_kv_cache_paged::set_kv_hadamard_policy(bool k, bool v, bool ks, bool vs, bool explicit_policy) {
-    GGML_UNUSED(explicit_policy);
-    if (k || v || ks || vs) { throw std::runtime_error("paged KV Hadamard rotation is not supported"); }
+    if (!explicit_policy) { return; }
+    const bool keys[2] = {k, ks}, values[2] = {v, vs};
+    std::array<int64_t, 2> next_k = {}, next_v = {};
+    for (const auto & l : layers) {
+        const int dom = l.swa;
+        if (keys[dom]) {
+            const int64_t d = l.cache->ne[0], n = d & -d;
+            next_k[dom] = next_k[dom] ? std::min(next_k[dom], n) : n;
+        }
+        if (values[dom]) { next_v[dom] = 64; }
+    }
+    if (next_k != k_rot_size || next_v != v_rot_size) {
+        for (const auto & dom : current) {
+            for (const auto & seq : dom.seqs) {
+                if (!seq.empty()) { throw std::runtime_error("cannot change paged KV rotation with occupied pages"); }
+            }
+        }
+    }
+    for (int dom = 0; dom < 2; ++dom) {
+        for (int64_t n : {next_k[dom], next_v[dom]}) {
+            if (!n || rotations.count(n)) { continue; }
+            std::vector<float> data(n*n);
+            ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            if (!ctx) { throw std::runtime_error("failed to create paged KV rotation context"); }
+            auto * matrix = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
+            matrix->data = data.data();
+            ggml_gen_hadamard(matrix);
+            rotations.emplace(n, std::move(data));
+        }
+    }
+    k_rot_size = next_k;
+    v_rot_size = next_v;
+}
+
+ggml_tensor * llama_kv_cache_paged::build_input_k_rot(ggml_context * ctx, bool swa) const {
+    const int64_t n = k_rot_size[swa];
+    if (!n) { return nullptr; }
+    auto * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+    ggml_set_input(result);
+    ggml_format_name(result, "paged_k_rot_%d", int(swa));
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_paged::build_input_v_rot(ggml_context * ctx, bool swa) const {
+    const int64_t n = v_rot_size[swa];
+    if (!n) { return nullptr; }
+    auto * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+    ggml_set_input(result);
+    ggml_format_name(result, "paged_v_rot_%d", int(swa));
+    return result;
+}
+
+void llama_kv_cache_paged::set_input_rot(ggml_tensor * dst) const {
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_F32 && dst->ne[0] == dst->ne[1]);
+    ggml_backend_tensor_set(dst, rotations.at(dst->ne[0]).data(), 0, ggml_nbytes(dst));
 }
 
 void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (flags || seq_id >= (llama_seq_id) n_seq_max) { throw std::runtime_error("unsupported paged KV state flags or sequence"); }
-    const uint32_t header[3] = {block_size > 32 ? 0x504b5633u : 0x504b5632u, block_size, uint32_t(layers.size())};
+    const uint32_t header[3] = {0x504b5634u, block_size, uint32_t(layers.size())};
     io.write(header, sizeof(header));
     for (const auto & l : layers) {
-        const uint32_t geometry[4] = {uint32_t(l.cache->type), uint32_t(l.cache->ne[0]), uint32_t(l.cache->ne[2]), uint32_t(l.swa)};
+        const uint32_t geometry[6] = {uint32_t(l.cache->type), uint32_t(l.cache->ne[0]), uint32_t(l.cache->ne[2]), uint32_t(l.swa), uint32_t(k_rot_size[l.swa]), uint32_t(v_rot_size[l.swa])};
         io.write(geometry, sizeof(geometry));
     }
     const uint32_t count = seq_id < 0 ? n_seq_max : 1;
@@ -409,13 +466,18 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
 void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (flags || seq_id >= (llama_seq_id) n_seq_max) { throw std::runtime_error("unsupported paged KV state flags or sequence"); }
     uint32_t header[3]; io.read(header, sizeof(header));
-    if (header[0] != (block_size > 32 ? 0x504b5633u : 0x504b5632u) || header[1] != block_size || header[2] != layers.size()) {
+    const bool legacy = header[0] == (block_size > 32 ? 0x504b5633u : 0x504b5632u);
+    if ((!legacy && header[0] != 0x504b5634u) || header[1] != block_size || header[2] != layers.size()) {
         throw std::runtime_error("incompatible paged KV state header");
     }
     for (const auto & l : layers) {
-        uint32_t geometry[4]; io.read(geometry, sizeof(geometry));
+        uint32_t geometry[6] = {}; io.read(geometry, (legacy ? 4 : 6)*sizeof(uint32_t));
+        if (legacy && (l.cache->type != GGML_TYPE_F16 && l.cache->type != GGML_TYPE_Q8_KV)) {
+            throw std::runtime_error("legacy paged KV state requires F16 or Q8_KV");
+        }
         if (geometry[0] != uint32_t(l.cache->type) || geometry[1] != l.cache->ne[0] ||
-                geometry[2] != l.cache->ne[2] || geometry[3] != uint32_t(l.swa)) {
+                geometry[2] != l.cache->ne[2] || geometry[3] != uint32_t(l.swa) ||
+                geometry[4] != k_rot_size[l.swa] || geometry[5] != v_rot_size[l.swa]) {
             throw std::runtime_error("incompatible paged KV state geometry");
         }
     }

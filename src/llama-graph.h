@@ -550,6 +550,8 @@ public:
     const llama_kv_cache_paged_context * mctx;
     std::array<ggml_tensor *, 2> tables;
     std::array<ggml_tensor *, 2> slots;
+    std::array<ggml_tensor *, 2> k_rot = {}, v_rot = {};
+    bool rotations_set = false;
     ggml_tensor * queries = nullptr;
     int32_t n_kv = 0;
 

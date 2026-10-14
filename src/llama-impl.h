@@ -54,6 +54,8 @@ static inline dst_t llama_cast(src_t v) {
     }
 }
 
+void ggml_gen_hadamard(ggml_tensor * tensor);
+
 static inline ggml_tensor * llama_mul_mat_hadamard(
         ggml_context * ctx,
         ggml_tensor * cur,

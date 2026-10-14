@@ -7,6 +7,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "gguf.h"
 #include "nlohmann/json.hpp"
 
@@ -223,6 +224,42 @@ static void test_reap_collection() {
     require(stats[0].reap_score() > 0.0 && stats[0].reap_score() < 2e-38);
     ((float *) extremes->data)[0] = std::numeric_limits<float>::infinity();
     expect_failure([&]() { common_moe_prune_collect_output(extremes, { 0 }, { 0.0f }, stats, false); });
+    ggml_free(ctx);
+}
+
+static void test_reap_device_reads() {
+    ggml_context * ctx = ggml_init({ 32 * 1024 * 1024, nullptr, false });
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        auto * storage = ggml_new_tensor_3d(ctx, type, 528, 8, 513);
+        auto * output = ggml_view_3d(ctx, storage, 512, 8, 513, storage->nb[1], storage->nb[2], 0);
+        for (size_t i = 0; i < ggml_nbytes(storage) / ggml_type_size(type); ++i) {
+            const float value = (int(i % 29) - 14) * 0.03125f;
+            if (type == GGML_TYPE_F32) ((float *) storage->data)[i] = value;
+            else if (type == GGML_TYPE_F16) ((ggml_fp16_t *) storage->data)[i] = ggml_fp32_to_fp16(value);
+            else ((ggml_bf16_t *) storage->data)[i] = ggml_fp32_to_bf16(value);
+        }
+        std::vector<int32_t> ids(8 * 513, 0);
+        std::vector<float> weights(ids.size(), 0.5f);
+        std::vector<common_moe_prune_expert_stats> stats(1);
+        std::vector<common_moe_prune_expert_stats> reference(1);
+        common_moe_prune_collect_output(output, ids, weights, reference, false);
+        size_t reads = 0;
+        ggml_backend_buffer_type buft = {};
+        ggml_backend_buffer buffer = {};
+        buffer.buft = &buft;
+        buffer.context = &reads;
+        buffer.iface.get_tensor = [](ggml_backend_buffer_t b, const ggml_tensor * t, void * data, size_t offset, size_t size) {
+            ++*static_cast<size_t *>(b->context);
+            require(size <= 4 * 1024 * 1024);
+            memcpy(data, static_cast<const char *>(t->data) + offset, size);
+        };
+        storage->buffer = output->buffer = &buffer;
+        common_moe_prune_collect_output(output, ids, weights, stats, false);
+        require(stats[0].reap_count == ids.size() && stats[0].reap_sum == reference[0].reap_sum);
+        require(stats[0].reap_output_norm_sum == reference[0].reap_output_norm_sum);
+        require(reads <= 4);
+        storage->buffer = output->buffer = nullptr;
+    }
     ggml_free(ctx);
 }
 
@@ -515,6 +552,7 @@ int main() {
     test_ream_gguf();
     test_metric_ranking();
     test_reap_collection();
+    test_reap_device_reads();
     test_reap_routing_views();
     test_pruning_publication();
     test_reap_hand_calculation();

@@ -112,6 +112,7 @@ struct route_collector {
 };
 
 struct evaluation_result {
+    bool ppl_evaluated = true;
     std::array<double, 4> nll = {};
     std::array<int64_t, 4> evaluated = {};
     int64_t total_tokens = 0;
@@ -170,7 +171,7 @@ void usage() {
         "  --ppl-mask all|assistant|reasoning|content\n"
         "  --max-layer-ratio RATIO\n"
         "  --importance-cache FNAME\n"
-        "  --evaluate | --no-evaluate  evaluate each generated ratio (default: evaluate)\n"
+        "  --evaluate | --no-evaluate  compute baseline and ratio PPL (default: evaluate)\n"
         "  --seed N\n"
         "  --ctx-size N --batch-size N --ubatch-size N\n"
         "  --threads N --dataset-threads N --n-gpu-layers N\n"
@@ -534,6 +535,9 @@ loaded_model load_model(const options & opts, route_collector * collector, const
         params.no_extra_bufts = true;
         params.n_outputs_max = 1;
     }
+    if (opts.command == "analyze" && !opts.evaluate_ratios) {
+        params.n_outputs_max = 1;
+    }
     if (collector != nullptr) {
         params.cb_eval = route_callback;
         params.cb_eval_user_data = collector;
@@ -566,6 +570,7 @@ evaluation_result evaluate(
         bool calibration_only = false, uint64_t token_limit = 0,
         const std::function<void(uint64_t)> & after_batch = {}) {
     evaluation_result result;
+    result.ppl_evaluated = !calibration_only;
     result.total_tokens = dataset.total_tokens;
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(context)));
     const auto started = std::chrono::steady_clock::now();
@@ -592,7 +597,7 @@ evaluation_result evaluate(
                     llama_batch_free(batch);
                     throw std::runtime_error("model evaluation failed at JSONL line " + std::to_string(record.line));
                 }
-                const float * logits = llama_get_logits(context);
+                const float * logits = calibration_only ? nullptr : llama_get_logits(context);
                 for (size_t output = 0; output < targets.size(); ++output) {
                     if (observe_logits) observe_logits(logits + output * n_vocab, n_vocab);
                     const size_t target_index = targets[output];
@@ -642,6 +647,7 @@ evaluation_result evaluate(
 
 json result_json(const evaluation_result & result, aikar_ppl_mask primary) {
     return {
+        { "ppl_evaluated", result.ppl_evaluated },
         { "ppl", result.ppl(primary) },
         { "ppl_all", result.ppl(aikar_ppl_mask::ALL) },
         { "ppl_assistant", result.ppl(aikar_ppl_mask::ASSISTANT) },
@@ -723,6 +729,7 @@ json importance_cache_json(const importance_cache_data & cache, aikar_ppl_mask p
             { "primary_ppl_mask", aikar_ppl_mask_name(primary) },
         } },
         { "baseline", {
+            { "ppl_evaluated", cache.baseline.ppl_evaluated },
             { "nll", cache.baseline.nll },
             { "evaluated", cache.baseline.evaluated },
             { "total_tokens", cache.baseline.total_tokens },
@@ -769,6 +776,7 @@ importance_cache_data load_importance_cache(const std::string & path) {
     result.tokenized_hash = calibration.value("tokenized_hash", "");
     result.n_ctx = calibration.at("ctx_size").get<int32_t>();
     const json & baseline = root.at("baseline");
+    result.baseline.ppl_evaluated = baseline.value("ppl_evaluated", true);
     result.baseline.nll = baseline.at("nll").get<std::array<double, 4>>();
     result.baseline.evaluated = baseline.at("evaluated").get<std::array<int64_t, 4>>();
     result.baseline.total_tokens = baseline.at("total_tokens").get<int64_t>();
@@ -831,7 +839,8 @@ void validate_importance_cache(const importance_cache_data & cache) {
     for (size_t mask = 0; mask < cache.baseline.nll.size(); ++mask) {
         const int64_t count = cache.baseline.evaluated[mask];
         const double nll = cache.baseline.nll[mask];
-        if (count < 0 || count > cache.baseline.processed_tokens || !std::isfinite(nll) || nll < 0.0 || (count == 0 && nll != 0.0)) {
+        if (count < 0 || count > cache.baseline.processed_tokens || !std::isfinite(nll) || nll < 0.0 ||
+            (count == 0 && nll != 0.0) || (!cache.baseline.ppl_evaluated && count != 0)) {
             throw std::runtime_error("invalid cached calibration loss");
         }
     }
@@ -872,6 +881,7 @@ std::string importance_cache_mismatch(
         cache.model.experts_used != model.experts_used || cache.model.moe_layers != model.moe_layers) return "model metadata differs";
     if (cache.dataset_hash != dataset_hash) return "dataset hash differs";
     if (cache.n_ctx != opts.n_ctx) return "context size differs";
+    if (opts.evaluate_ratios && !cache.baseline.ppl_evaluated) return "cache lacks baseline PPL; recalibrate with --evaluate";
     if (cache.routing_stats_version != routing_stats_version) return "cache has obsolete pruning statistics; recalibrate into a new cache";
     if (cache.execution != calibration_execution(opts)) return "calibration execution settings differ";
     if (opts.metric == "reap" && !cache.reap_available) return "cache lacks REAP statistics; recalibrate into a new cache";
@@ -921,7 +931,7 @@ std::vector<common_moe_prune_profile> make_and_write_profiles(
         }
     }
     const int64_t evaluated_tokens = cache.baseline.evaluated[(size_t) opts.mask];
-    if (evaluated_tokens == 0) throw std::runtime_error("the selected perplexity mask evaluates zero tokens");
+    if (cache.baseline.ppl_evaluated && evaluated_tokens == 0) throw std::runtime_error("the selected perplexity mask evaluates zero tokens");
     std::vector<common_moe_prune_profile> profiles = common_moe_prune_make_profiles(
         cache.model, cache.stats, opts.ratios, opts.max_layer_ratio, cache.dataset_hash,
         aikar_ppl_mask_name(opts.mask), opts.metric, evaluated_tokens);
@@ -1020,10 +1030,14 @@ void run_analyze(const options & opts) {
         baseline_collector.collect_output_norm = true;
         std::cerr << "aikar-prune: loading baseline model\n";
         loaded_model baseline_model = load_model(opts, &baseline_collector, nullptr);
+        if (!opts.evaluate_ratios) {
+            baseline_model.context->set_ream_calibration_layer(model_info.moe_layers.back());
+            std::cerr << "aikar-prune: collecting routing statistics without baseline PPL\n";
+        }
         std::cerr << "aikar-prune: dataset contains " << dataset.records.size() << " records and " << dataset.total_tokens << " tokens\n";
         importance_cache_data created;
         created.model = model_info;
-        created.baseline = evaluate(baseline_model.context.get(), dataset, baseline_collector, opts, "baseline");
+        created.baseline = evaluate(baseline_model.context.get(), dataset, baseline_collector, opts, "baseline", {}, !opts.evaluate_ratios);
         created.stats = baseline_collector.stats;
         for (int32_t layer : model_info.moe_layers) {
             const auto found = created.stats.find(layer);
@@ -1116,7 +1130,9 @@ void run_analyze(const options & opts) {
         };
         if (!opts.evaluate_ratios) {
             analysis["ratios"].push_back(row);
-            csv << profile.requested_ratio << ',' << profile.actual_ratio << ',' << baseline.ppl(opts.mask) << ",,,,,,,"
+            csv << profile.requested_ratio << ',' << profile.actual_ratio << ',';
+            if (baseline.ppl_evaluated) csv << baseline.ppl(opts.mask);
+            csv << ",,,,,,,"
                 << per_layer_pruned * profile.layers.size() << ',' << (model_info.expert_count - per_layer_pruned) * profile.layers.size() << ",,,\n";
             continue;
         }
@@ -1158,7 +1174,10 @@ void run_analyze(const options & opts) {
     std::ofstream out(opts.output_dir + "/analysis.json", std::ios::trunc);
     out << analysis.dump(2) << '\n';
     std::ofstream summary(opts.output_dir + "/README.txt", std::ios::trunc);
-    summary << "Gemma 4 26B A4B static MoE pruning analysis\nMetric: " << opts.metric << "\nBaseline perplexity (" << aikar_ppl_mask_name(opts.mask) << "): " << baseline.ppl(opts.mask) << "\n";
+    summary << "Gemma 4 26B A4B static MoE pruning analysis\nMetric: " << opts.metric << "\nBaseline perplexity (" << aikar_ppl_mask_name(opts.mask) << "): ";
+    if (baseline.ppl_evaluated) summary << baseline.ppl(opts.mask);
+    else summary << "not evaluated";
+    summary << '\n';
     for (const auto & row : analysis["ratios"]) {
         summary << "ratio " << row["requested_ratio"];
         if (row["evaluated"].get<bool>()) summary << ": ppl " << row["ppl"] << ", delta " << row["absolute_perplexity_delta"];

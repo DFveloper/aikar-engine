@@ -8,6 +8,7 @@
 #include <array>
 #include <bitset>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -67,8 +68,14 @@ public:
     bool prepare(batch_plan & plan, state & candidate) const;
     void apply(const batch_plan & plan);
     std::vector<int32_t> table(bool swa) const;
+    int64_t rotation_size(bool swa, bool value) const { return value ? v_rot_size[swa] : k_rot_size[swa]; }
+    ggml_tensor * build_input_k_rot(ggml_context * ctx, bool swa) const;
+    ggml_tensor * build_input_v_rot(ggml_context * ctx, bool swa) const;
+    void set_input_rot(ggml_tensor * dst) const;
 
 private:
+    std::array<int64_t, 2> k_rot_size = {}, v_rot_size = {};
+    std::unordered_map<int64_t, std::vector<float>> rotations;
     std::vector<ggml_context_ptr> contexts;
     std::vector<ggml_backend_buffer_ptr> buffers;
     void synchronize() const;

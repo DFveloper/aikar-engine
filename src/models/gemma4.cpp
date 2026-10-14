@@ -216,15 +216,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         if (model.layers[il].wqkv) {
             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
             cb(qkv_fused, "wqkv", il);
-            const int64_t q_dim = n_embd_head * n_head;
-            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
+            Qcur = ggml_view_3d(ctx0, qkv_fused, n_embd_head, n_head, n_tokens,
+                    n_embd_head * qkv_fused->nb[0], qkv_fused->nb[1], 0);
+            if (training) {
+                Qcur = ggml_cont(ctx0, Qcur);
+            }
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
         }
         {
             cb(Qcur, "Qcur", il);
-
-            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
@@ -241,21 +243,25 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             if (qkv_fused) {
                 const int64_t q_dim = n_embd_head * n_head;
                 const int64_t k_dim = n_embd_head * n_head_kv;
-                const int64_t v_dim = n_embd_head * n_head_kv;
                 const size_t  esize = ggml_element_size(qkv_fused);
-                Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
-                Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
+                Kcur = ggml_view_3d(ctx0, qkv_fused, n_embd_head, n_head_kv, n_tokens,
+                        n_embd_head * esize, qkv_fused->nb[1], q_dim * esize);
+                Vcur = ggml_view_3d(ctx0, qkv_fused, n_embd_head, n_head_kv, n_tokens,
+                        n_embd_head * esize, qkv_fused->nb[1], (q_dim + k_dim) * esize);
+                if (training) {
+                    Kcur = ggml_cont(ctx0, Kcur);
+                    Vcur = ggml_cont(ctx0, Vcur);
+                }
             } else {
                 Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
                 Vcur = model.layers[il].wv
                        ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
                        : Kcur; // if v_proj is not present, use Kcur as Vcur
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
             }
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
-
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
