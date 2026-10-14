@@ -7,6 +7,7 @@
 
 #include <array>
 #include <bitset>
+#include <cstdlib>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -28,12 +29,17 @@ public:
     };
     using state = std::array<domain, 2>;
     struct page_copy { uint32_t domain_id, src, dst; };
+    struct table_range { size_t offset, size; };
+    struct table_page { uint32_t seq, logical; };
     struct batch_plan {
         llama_ubatch ubatch;
         state after;
         std::array<std::vector<int32_t>, 2> slots;
         std::vector<int32_t> queries;
         std::vector<page_copy> copies;
+        std::array<std::vector<table_page>, 2> table_pages;
+        std::array<std::vector<table_range>, 2> table_ranges;
+        std::array<bool, 2> table_full = {};
     };
     struct layer {
         bool swa;
@@ -63,11 +69,12 @@ public:
     uint32_t block_size, max_blocks, n_seq_max, window;
     uint32_t table_blocks() const { return max_blocks*((block_size + 31)/32); }
     bool swa_full;
+    ggml_tensor * table_input(ggml_context * ctx, bool swa) const;
     std::vector<layer> layers;
     state current;
-    bool prepare(batch_plan & plan, state & candidate) const;
+    bool prepare(batch_plan & plan, state & candidate, bool force_full = false) const;
     void apply(const batch_plan & plan);
-    std::vector<int32_t> table(bool swa) const;
+    void set_table_input(ggml_tensor * tensor, bool swa, const batch_plan & plan) const;
     int64_t rotation_size(bool swa, bool value) const { return value ? v_rot_size[swa] : k_rot_size[swa]; }
     ggml_tensor * build_input_k_rot(ggml_context * ctx, bool swa) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx, bool swa) const;
@@ -78,9 +85,17 @@ private:
     std::unordered_map<int64_t, std::vector<float>> rotations;
     std::vector<ggml_context_ptr> contexts;
     std::vector<ggml_backend_buffer_ptr> buffers;
+    std::array<ggml_tensor *, 2> device_tables = {};
+    std::array<std::vector<int32_t>, 2> table_cache;
+    std::array<ggml_backend_buffer_ptr, 2> staging;
+    bool table_cache_valid = false;
+    const bool full_upload = std::getenv("LLAMA_PAGED_KV_FULL_UPLOAD") != nullptr;
     void synchronize() const;
     void copy_page(uint32_t domain_id, uint32_t src, uint32_t dst);
     void remove(state & value, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    void rebuild_table_cache(bool swa);
+    void update_table_page(bool swa, uint32_t seq, uint32_t logical);
+    void mark_table_page_dirty(batch_plan & plan, uint32_t dom, uint32_t seq, uint32_t logical) const;
 };
 
 class llama_kv_cache_paged_context : public llama_memory_context_i {

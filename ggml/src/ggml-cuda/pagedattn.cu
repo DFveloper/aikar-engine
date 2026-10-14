@@ -277,7 +277,13 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int nblocks = (nh*nt + 3)/4;
     const int launch_blocks = (nh*nt/head_group + 3)/4;
     const int target_blocks = 4*ggml_cuda_info().devices[ctx.device].nsm;
-    const int nsplits = std::min((span - 1)/256 + 1, std::max(1, (target_blocks + launch_blocks - 1)/launch_blocks));
+    // Short splits keep small Volta decode batches from leaving most SMs idle.
+    const char * split_setting = getenv("GGML_CUDA_PAGED_SHORT_SPLIT");
+    const bool short_split = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA &&
+            cache->type == GGML_TYPE_Q8_KV && (d == 256 || d == 512) && causal && nt <= 32 &&
+            (!split_setting || strcmp(split_setting, "0") != 0);
+    const int split_size = short_split ? 32 : 256;
+    const int nsplits = std::min((span - 1)/split_size + 1, std::max(1, (target_blocks + launch_blocks - 1)/launch_blocks));
     ggml_cuda_pool_alloc<float> partial(ctx.pool());
     float * output = (float *) dst->data;
     if (nsplits > 1) { output = partial.alloc(size_t(nt)*nh*nsplits*(d + 2)); }

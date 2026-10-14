@@ -4111,8 +4111,7 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch *) {
         rotations_set = true;
     }
     for (int dom = 0; dom < 2; ++dom) {
-        const auto table_data = mctx->kv->table(dom != 0);
-        ggml_backend_tensor_set(tables[dom], table_data.data(), 0, ggml_nbytes(tables[dom]));
+        mctx->kv->set_table_input(tables[dom], dom != 0, plan);
         ggml_backend_tensor_set(slots[dom], plan.slots[dom].data(), 0, ggml_nbytes(slots[dom]));
     }
     ggml_backend_tensor_set(queries, plan.queries.data(), 0, ggml_nbytes(queries));
@@ -4124,9 +4123,8 @@ llm_graph_input_i * llm_graph_context::build_attn_inp_kv_paged() const {
     inp->mctx = mc;
     inp->n_kv = paged_attn_n_kv(ubatch, *mc->kv, cparams.causal_attn);
     for (int dom = 0; dom < 2; ++dom) {
-        inp->tables[dom] = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 2, mc->kv->table_blocks(), mc->kv->n_seq_max);
+        inp->tables[dom] = mc->kv->table_input(ctx0, dom != 0);
         inp->slots[dom] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mc->kv->n_seq_max, n_tokens);
-        ggml_set_input(inp->tables[dom]);
         ggml_set_input(inp->slots[dom]);
         inp->k_rot[dom] = mc->kv->build_input_k_rot(ctx0, dom != 0);
         inp->v_rot[dom] = mc->kv->build_input_v_rot(ctx0, dom != 0);
