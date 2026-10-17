@@ -200,7 +200,7 @@ aikar_dataset aikar_dataset_load(
                 inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
                 std::string prompt;
                 try {
-                    prompt = common_chat_templates_apply(worker_templates[worker_index], inputs).prompt;
+                    prompt = common_chat_templates_apply(worker_templates[worker_index], inputs).prompt.str();
                 } catch (const std::exception & e) {
                     throw std::runtime_error(std::string("chat template failed: ") + e.what());
                 }

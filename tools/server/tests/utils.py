@@ -65,6 +65,7 @@ class ServerProcess:
     model_url: str | None = None
     model_file: str | None = None
     model_draft: str | None = None
+    model_draft_hf_repo: str | None = None
     n_threads: int | None = None
     n_gpu_layer: int | None = None
     n_batch: int | None = None
@@ -80,6 +81,7 @@ class ServerProcess:
     n_slots: int | None = None
     ctk: str | None = None
     ctv: str | None = None
+    ctkd: str | None = None
     fa: str | None = None
     server_continuous_batching: bool | None = False
     server_embeddings: bool | None = False
@@ -99,6 +101,7 @@ class ServerProcess:
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
+    spec_draft_n_ubatch: int | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
     no_ui: bool | None = None
@@ -115,6 +118,7 @@ class ServerProcess:
     cache_ram: int | None = None
     cache_prefix_gpu: bool = False
     kv_paged: bool = False
+    override_kv: str | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -173,6 +177,8 @@ class ServerProcess:
             server_args.extend(["--model-url", self.model_url])
         if self.model_draft:
             server_args.extend(["--model-draft", self.model_draft])
+        if self.model_draft_hf_repo:
+            server_args.extend(["--hf-repo-draft", self.model_draft_hf_repo])
         if self.model_hf_repo:
             server_args.extend(["--hf-repo", self.model_hf_repo])
         if self.model_hf_file:
@@ -223,6 +229,8 @@ class ServerProcess:
             server_args.extend(["-ctk", self.ctk])
         if self.ctv:
             server_args.extend(["-ctv", self.ctv])
+        if self.ctkd:
+            server_args.extend(["-ctkd", self.ctkd])
         if self.fa is not None:
             server_args.extend(["-fa", self.fa])
         if self.n_predict:
@@ -248,6 +256,8 @@ class ServerProcess:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
         if self.spec_draft_n_min:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
+        if self.spec_draft_n_ubatch:
+            server_args.extend(["--spec-draft-n-ubatch", self.spec_draft_n_ubatch])
         if self.spec_synth_len is not None:
             server_args.extend(["--spec-synth-len", self.spec_synth_len])
         if self.spec_synth_rates is not None:
@@ -283,6 +293,8 @@ class ServerProcess:
             server_args.append("--cache-prefix-gpu")
         if self.kv_paged:
             server_args.append("--kv-paged")
+        if self.override_kv:
+            server_args.extend(["--override-kv", self.override_kv])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
@@ -632,6 +644,37 @@ class ServerPreset:
         server.n_slots = 1
         server.seed = 42
         server.server_reranking = True
+        return server
+
+    @staticmethod
+    def tinylaya() -> ServerProcess:
+        server = ServerProcess()
+        server.offline = True # will be downloaded by load_all()
+        local_model = os.environ.get("TINYLAYA_LOCAL_MODEL")
+        server.model_hf_file = None
+        if local_model:
+            server.model_file = local_model
+            server.model_hf_repo = None
+        else:
+            server.model_hf_repo = "ggml-org/tinylaya-for-testing-gguf"
+        server.n_ctx = 1024
+        server.n_batch = 512
+        server.n_ubatch = 512
+        server.n_slots = 2
+        server.seed = 42
+        return server
+
+    @staticmethod
+    def tinyopenjev() -> ServerProcess:
+        server = ServerProcess()
+        server.offline = True # will be downloaded by load_all()
+        # mmproj is already provided by HF registry API
+        server.model_hf_file = None
+        server.model_hf_repo = "ggml-org/tinyopenjev-for-testing-gguf:Q8_0"
+        server.n_ctx = 4096
+        server.n_batch = 512
+        server.n_slots = 4
+        server.seed = 42
         return server
 
     @staticmethod

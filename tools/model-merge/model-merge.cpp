@@ -1394,10 +1394,10 @@ static std::vector<calibration_sample> load_calibration(
             common_chat_templates_inputs chat_inputs;
             chat_inputs.messages.assign(messages.begin(), messages.begin() + assistant_index);
             chat_inputs.add_generation_prompt = true;
-            const std::string prompt = common_chat_templates_apply(templates.get(), chat_inputs).prompt;
+            const std::string prompt = common_chat_templates_apply(templates.get(), chat_inputs).prompt.str();
             chat_inputs.messages.assign(messages.begin(), messages.begin() + assistant_index + 1);
             chat_inputs.add_generation_prompt = false;
-            const std::string full = common_chat_templates_apply(templates.get(), chat_inputs).prompt;
+            const std::string full = common_chat_templates_apply(templates.get(), chat_inputs).prompt.str();
             if (full.rfind(prompt, 0) != 0) {
                 throw std::runtime_error("chat template output is not prefixed by its generation prompt on calibration JSONL line " +
                         std::to_string(lines[i].number));

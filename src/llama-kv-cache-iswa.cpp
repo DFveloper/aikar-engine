@@ -178,8 +178,6 @@ void llama_kv_cache_iswa::set_kv_hadamard_policy(bool k, bool v, bool k_swa, boo
 }
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    GGML_UNUSED(embd_all);
-
     // first try simple split
     do {
         if (!unified) {
@@ -227,7 +225,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;

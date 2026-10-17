@@ -69,26 +69,9 @@ static bool get_current_logits(llama_context * ctx, std::vector<float> & out) {
     return true;
 }
 
-struct llama_batch_ptr {
-    llama_batch batch;
-
-    llama_batch_ptr(int32_t n_tokens, int32_t embd, int32_t n_seq_max)
-        : batch{llama_batch_init(n_tokens, embd, n_seq_max)} {}
-
-    ~llama_batch_ptr() { llama_batch_free(batch); }
-
-    llama_batch_ptr(const llama_batch_ptr &) = delete;
-    llama_batch_ptr & operator=(const llama_batch_ptr &) = delete;
-    llama_batch_ptr(llama_batch_ptr &&) = default;
-    llama_batch_ptr & operator=(llama_batch_ptr &&) = default;
-
-    llama_batch & get() { return batch; }
-    const llama_batch & get() const { return batch; }
-};
-
 static generation_result generate_tokens(llama_context * ctx, llama_sampler * smpl, int & n_past, int32_t n_predict, llama_seq_id seq_id) {
     generation_result result;
-    llama_batch_ptr batch(1, 0, 1);
+    common_batch batch(ctx);
 
     for (int i = 0; i < n_predict; i++) {
         std::vector<float> logits;
@@ -104,10 +87,10 @@ static generation_result generate_tokens(llama_context * ctx, llama_sampler * sm
         result.tokens.push_back(next_token);
         result.logits.push_back(std::move(logits));
 
-        common_batch_clear(batch.get());
-        common_batch_add(batch.get(), next_token, n_past, {seq_id}, true);
+        batch.clear();
+        batch.add(next_token, n_past, {seq_id}, true);
 
-        if (llama_decode(ctx, batch.get())) {
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("\n%s: failed to evaluate\n", __func__);
             return {};
         }
@@ -125,7 +108,7 @@ static bool generate_tokens_compare(
         return false;
     }
 
-    llama_batch_ptr batch(1, 0, 1);
+    common_batch batch(ctx);
 
     for (int i = 0; i < n_predict; i++) {
         std::vector<float> logits;
@@ -153,10 +136,10 @@ static bool generate_tokens_compare(
             LOG_TRC("%s: sampled token %d differs from expected %d, using expected token\n", __func__, next_token, expected_token);
         }
 
-        common_batch_clear(batch.get());
-        common_batch_add(batch.get(), expected_token, n_past, {seq_id}, true);
+        batch.clear();
+        batch.add(expected_token, n_past, {seq_id}, true);
 
-        if (llama_decode(ctx, batch.get())) {
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("\n%s: failed to evaluate\n", __func__);
             return false;
         }
@@ -184,16 +167,16 @@ static bool test_retained_prefix(struct llama_model * model, const common_params
     cparams.kv_paged_n_blocks = std::max<uint32_t>(cparams.kv_paged_n_blocks, (tokens.size() + cparams.kv_paged_block_size - 1)/cparams.kv_paged_block_size + 2);
     auto ctx = llama_context_ptr{llama_init_from_model(model, cparams)};
     if (!ctx) { return false; }
-    llama_batch_ptr input(params.n_batch, 0, 1);
+    common_batch input(ctx.get());
     for (size_t offset = 0; offset < tokens.size() - 1;) {
-        common_batch_clear(input.get());
+        input.clear();
         const size_t end = std::min(tokens.size() - 1, offset + params.n_batch);
-        for (; offset < end; ++offset) { common_batch_add(input.get(), tokens[offset], offset, {0}, false); }
-        if (llama_decode(ctx.get(), input.get())) { return false; }
+        for (; offset < end; ++offset) { input.add(tokens[offset], offset, {0}, false); }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, input.get())) { return false; }
     }
-    common_batch_clear(input.get());
-    common_batch_add(input.get(), tokens.back(), tokens.size() - 1, {0}, true);
-    if (llama_decode(ctx.get(), input.get())) { return false; }
+    input.clear();
+    input.add(tokens.back(), tokens.size() - 1, {0}, true);
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, input.get())) { return false; }
     std::vector<float> expected;
     if (!get_current_logits(ctx.get(), expected)) { return false; }
     auto mem = llama_get_memory(ctx.get());
@@ -203,14 +186,14 @@ static bool test_retained_prefix(struct llama_model * model, const common_params
     if (window && tokens.size() > size_t(window + 64) && llama_memory_prefix_retain(mem, 0, 32)) { return false; }
     llama_memory_seq_rm(mem, 0, -1, -1);
     for (int repeat = 0; repeat < 5; ++repeat) {
-        llama_batch_ptr occupied(1, 0, 1);
-        common_batch_add(occupied.get(), tokens.front(), 0, {1}, true);
-        if (llama_decode(ctx.get(), occupied.get())) { return false; }
+        common_batch occupied(ctx.get());
+        occupied.add(tokens.front(), 0, {1}, true);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, occupied.get())) { return false; }
         if (llama_memory_prefix_attach(mem, 0, 1) || llama_memory_seq_pos_max(mem, 1) != 0) { return false; }
         if (!llama_memory_prefix_attach(mem, prefix, 1)) { LOG_ERR("prefix attach failed at repeat %d\n", repeat); return false; }
-        llama_batch_ptr batch(1, 0, 1);
-        common_batch_add(batch.get(), tokens.back(), tokens.size() - 1, {1}, true);
-        if (llama_decode(ctx.get(), batch.get())) { return false; }
+        common_batch batch(ctx.get());
+        batch.add(tokens.back(), tokens.size() - 1, {1}, true);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) { return false; }
         std::vector<float> actual;
         if (!get_current_logits(ctx.get(), actual) || nmse(expected, actual) > NMSE_THRESHOLD) { LOG_ERR("prefix continuation mismatch at repeat %d: %.9f\n", repeat, nmse(expected, actual)); return false; }
         if (repeat < 4) { llama_memory_seq_rm(mem, 1, -1, -1); }
@@ -239,19 +222,19 @@ static bool test_retained_prefix(struct llama_model * model, const common_params
     auto pressure = llama_context_ptr{llama_init_from_model(model, pressure_params)};
     if (!pressure) { return false; }
     auto pressure_mem = llama_get_memory(pressure.get());
-    llama_batch_ptr pressure_batch(1, 0, 1);
-    common_batch_add(pressure_batch.get(), tokens.front(), 0, {0}, true);
-    if (llama_decode(pressure.get(), pressure_batch.get())) { return false; }
+    common_batch pressure_batch(pressure.get());
+    pressure_batch.add(tokens.front(), 0, {0}, true);
+    if (llama_process(pressure.get(), LLAMA_PROCESS_TYPE_DECODE, pressure_batch.get())) { return false; }
     const auto pressure_prefix = llama_memory_prefix_retain(pressure_mem, 0, 1);
     if (!pressure_prefix) { return false; }
     llama_memory_seq_rm(pressure_mem, 0, -1, -1);
-    common_batch_clear(pressure_batch.get());
-    common_batch_add(pressure_batch.get(), tokens.front(), 0, {1}, true);
-    if (llama_decode(pressure.get(), pressure_batch.get()) != 1) { return false; }
+    pressure_batch.clear();
+    pressure_batch.add(tokens.front(), 0, {1}, true);
+    if (llama_process(pressure.get(), LLAMA_PROCESS_TYPE_DECODE, pressure_batch.get()) != 1) { return false; }
     if (llama_memory_seq_pos_max(pressure_mem, 1) != -1) { return false; }
     if (!llama_memory_prefix_get_usage(pressure_mem, &usage) || usage.full_retry_pages != 1) { return false; }
     llama_memory_prefix_release(pressure_mem, pressure_prefix);
-    if (llama_decode(pressure.get(), pressure_batch.get())) { return false; }
+    if (llama_process(pressure.get(), LLAMA_PROCESS_TYPE_DECODE, pressure_batch.get())) { return false; }
     if (window && params.n_ctx >= 4096) {
         pressure.reset();
         pressure_params.kv_paged_n_blocks = 256;
@@ -259,12 +242,12 @@ static bool test_retained_prefix(struct llama_model * model, const common_params
         pressure.reset(llama_init_from_model(model, pressure_params));
         if (!pressure) { return false; }
         pressure_mem = llama_get_memory(pressure.get());
-        llama_batch_ptr swa_batch(32, 0, 1);
+        common_batch swa_batch(pressure.get());
         llama_memory_prefix_id earlier = 0, later = 0;
         for (int offset = 0; offset < 2048; offset += 32) {
-            common_batch_clear(swa_batch.get());
-            for (int token = 0; token < 32; ++token) { common_batch_add(swa_batch.get(), tokens.front(), offset + token, {0}, token == 31); }
-            if (llama_decode(pressure.get(), swa_batch.get())) { return false; }
+            swa_batch.clear();
+            for (int token = 0; token < 32; ++token) { swa_batch.add(tokens.front(), offset + token, {0}, token == 31); }
+            if (llama_process(pressure.get(), LLAMA_PROCESS_TYPE_DECODE, swa_batch.get())) { return false; }
             if (offset == 992) { earlier = llama_memory_prefix_retain(pressure_mem, 0, 1024); }
         }
         later = llama_memory_prefix_retain(pressure_mem, 0, 2048);
@@ -272,13 +255,13 @@ static bool test_retained_prefix(struct llama_model * model, const common_params
         llama_memory_seq_rm(pressure_mem, 0, -1, -1);
         bool exhausted = false;
         for (int offset = 0; offset < 1024; offset += 32) {
-            common_batch_clear(swa_batch.get());
-            for (int token = 0; token < 32; ++token) { common_batch_add(swa_batch.get(), tokens.front(), offset + token, {1}, token == 31); }
-            const int result = llama_decode(pressure.get(), swa_batch.get());
+            swa_batch.clear();
+            for (int token = 0; token < 32; ++token) { swa_batch.add(tokens.front(), offset + token, {1}, token == 31); }
+            const int result = llama_process(pressure.get(), LLAMA_PROCESS_TYPE_DECODE, swa_batch.get());
             if (!result) { continue; }
             if (result != 1 || !llama_memory_prefix_get_usage(pressure_mem, &usage) || usage.full_retry_pages || !usage.swa_retry_pages) { return false; }
             llama_memory_prefix_release(pressure_mem, earlier);
-            if (llama_decode(pressure.get(), swa_batch.get())) { return false; }
+            if (llama_process(pressure.get(), LLAMA_PROCESS_TYPE_DECODE, swa_batch.get())) { return false; }
             exhausted = true;
             break;
         }
@@ -339,33 +322,33 @@ static bool test_seq_rm_isolated(
 
     const size_t n_tokens = tokens.size() < 128 ? tokens.size() : 128;
     const size_t n_prefix = n_tokens/2;
-    llama_batch_ptr batch_prefix(n_prefix, 0, 1);
+    common_batch batch_prefix(ctx.get());
     for (size_t i = 0; i < n_prefix; ++i) {
-        common_batch_add(batch_prefix.get(), tokens[i], i, { 0 }, false);
+        batch_prefix.add(tokens[i], i, { 0 }, false);
     }
 
-    if (llama_decode(ctx.get(), batch_prefix.get())) {
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_prefix.get())) {
         LOG_ERR("%s: failed to decode prefix\n", __func__);
         return false;
     }
 
     llama_memory_seq_cp(llama_get_memory(ctx.get()), 0, 1, 0, n_prefix);
 
-    llama_batch_ptr batch_shared(1, 0, 2);
-    common_batch_add(batch_shared.get(), tokens[n_prefix], n_prefix, { 0, 1 }, false);
+    common_batch batch_shared(ctx.get());
+    batch_shared.add(tokens[n_prefix], n_prefix, { 0, 1 }, false);
 
-    if (llama_decode(ctx.get(), batch_shared.get())) {
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_shared.get())) {
         LOG_ERR("%s: failed to decode multi-sequence prefix\n", __func__);
         return false;
     }
 
-    llama_batch_ptr batch_suffix(2*(n_tokens - n_prefix - 1), 0, 1);
+    common_batch batch_suffix(ctx.get());
     for (size_t i = n_prefix + 1; i < n_tokens; ++i) {
-        common_batch_add(batch_suffix.get(), tokens[i], i, { 0 }, false);
-        common_batch_add(batch_suffix.get(), tokens[(i + 1) % n_tokens], i, { 1 }, false);
+        batch_suffix.add(tokens[i], i, { 0 }, false);
+        batch_suffix.add(tokens[(i + 1) % n_tokens], i, { 1 }, false);
     }
 
-    if (llama_decode(ctx.get(), batch_suffix.get())) {
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_suffix.get())) {
         LOG_ERR("%s: failed to decode independent suffixes\n", __func__);
         return false;
     }
@@ -606,9 +589,9 @@ static bool test_seq_cp_scatter(struct llama_model * model, const struct common_
     const uint32_t flags = on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
 
     auto decode_one = [&](llama_token tok, int pos, llama_seq_id seq) {
-        llama_batch_ptr batch(1, 0, 1);
-        common_batch_add(batch.get(), tok, pos, { seq }, false);
-        return llama_decode(ctx.get(), batch.get()) == 0;
+        common_batch batch(ctx.get());
+        batch.add(tok, pos, { seq }, false);
+        return llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
     };
 
     // seq 0 cells 0,1,4 interleave the seq 1 cells 2,3,5
@@ -810,12 +793,12 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
     }
 
     const auto decode = [&](const llama_tokens & inp, llama_seq_id seq_id, std::vector<float> * logits_out) {
-        llama_batch_ptr batch(inp.size(), 0, 1);
+        common_batch batch(ctx.get());
         for (size_t i = 0; i < inp.size(); ++i) {
-            common_batch_add(batch.get(), inp[i], i, { seq_id }, i == inp.size() - 1);
+            batch.add(inp[i], i, { seq_id }, i == inp.size() - 1);
         }
 
-        if (llama_decode(ctx.get(), batch.get())) {
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: failed to decode on sequence %d\n", __func__, seq_id);
             return false;
         }

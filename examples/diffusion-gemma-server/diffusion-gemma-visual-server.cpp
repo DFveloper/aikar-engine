@@ -188,7 +188,7 @@ int main(int argc, char ** argv) {
             common_chat_templates_inputs inputs;
             inputs.messages              = messages;
             inputs.add_generation_prompt = true;
-            const std::string prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+            const std::string prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt.str();
             prefix = common_tokenize(vocab, prompt, /*add special*/ true, /*parse special*/ true);
         } catch (const std::exception & e) {
             printf("ERR parse %s\n", e.what()); fflush(stdout); continue;

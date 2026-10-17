@@ -500,7 +500,7 @@ static std::string apply_qlora_chat_template(
 
     return common_chat_templates_apply(
         tmpls,
-        inputs).prompt;
+        inputs).prompt.str();
 }
 
 static void replace_chat_message_content_with_marker(

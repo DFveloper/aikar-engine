@@ -128,7 +128,7 @@ int main(int argc, char ** argv) {
         user.content = params.prompt;
         inputs.messages.push_back(std::move(user));
         inputs.add_generation_prompt = true;
-        prompt_text = common_chat_templates_apply(templates.get(), inputs).prompt;
+        prompt_text = common_chat_templates_apply(templates.get(), inputs).prompt.str();
     }
     std::vector<llama_token> prompt = common_tokenize(ctx_ref, prompt_text, llama_vocab_get_add_bos(vocab));
     if (prompt.empty()) {

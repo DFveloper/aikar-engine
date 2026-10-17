@@ -55,7 +55,7 @@ std::vector<heretic_dataset_entry> heretic_format_dataset(
         inputs.add_generation_prompt = true;
         inputs.enable_thinking = false;
         try {
-            entry.prompt = common_chat_templates_apply(templates.get(), inputs).prompt;
+            entry.prompt = common_chat_templates_apply(templates.get(), inputs).prompt.str();
         } catch (const std::exception & e) {
             throw std::runtime_error("failed to apply model chat template to JSONL line " + std::to_string(entry.line) + ": " + e.what());
         }

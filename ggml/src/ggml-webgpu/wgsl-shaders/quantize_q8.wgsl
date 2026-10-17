@@ -44,7 +44,7 @@ fn cluster_vmax_8(v: f32) -> f32 {
     return select(r, s, abs(r) < abs(s));
 }
 
-#if defined(MUL_ACC_Q4_0) || defined(MUL_ACC_Q4_1) || defined(MUL_ACC_Q4_K)
+#if defined(MUL_ACC_Q4_0) || defined(MUL_ACC_Q4_1) || defined(MUL_ACC_Q5_0) || defined(MUL_ACC_Q5_1) || defined(MUL_ACC_Q4_K) || defined(MUL_ACC_Q5_K)
 fn cluster_add_i4x8(v: i32) -> i32 {
     var r= v;
     r += subgroupShuffleXor(r, 1u);
@@ -131,7 +131,7 @@ fn main(
         src1q[src1q_idx].qs[qs_idx] = q4_quants;
     }
 
-#if defined(MUL_ACC_Q4_0) || defined(MUL_ACC_Q4_1) || defined(MUL_ACC_Q4_K)
+#if defined(MUL_ACC_Q4_0) || defined(MUL_ACC_Q4_1) || defined(MUL_ACC_Q5_0) || defined(MUL_ACC_Q5_1) || defined(MUL_ACC_Q4_K) || defined(MUL_ACC_Q5_K)
     let q4_quants_sum = dot4I8Packed(q4_quants, 0x01010101u);
     let s = f16(d * f32(cluster_add_i4x8(q4_quants_sum)));
 
@@ -190,7 +190,7 @@ fn main(
         }
     }
 
-#if defined(MUL_ACC_Q4_0) || defined(MUL_ACC_Q4_1) || defined(MUL_ACC_Q4_K)
+#if defined(MUL_ACC_Q4_0) || defined(MUL_ACC_Q4_1) || defined(MUL_ACC_Q5_0) || defined(MUL_ACC_Q5_1) || defined(MUL_ACC_Q4_K) || defined(MUL_ACC_Q5_K)
 
     partial_sums[cluster_id][qs_idx] = dot4I8Packed(q4_quants, 0x01010101u);
 

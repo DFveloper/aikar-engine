@@ -68,6 +68,9 @@ struct llama_cparams {
     enum llama_lora_qat_type lora_qat_type = LLAMA_LORA_QAT_TYPE_NONE;
     llama_opt_lora_qat_type_callback lora_qat_type_callback = nullptr;
     void * lora_qat_type_callback_ud = nullptr;
+    bool training;           // set by llama_opt_init()
+
+    size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -497,7 +497,72 @@ static void silu_f32(const void * restrict src,
     }
 }
 
-// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+// GELU uses the tanh approximation.
+static __attribute__((noinline)) HVX_Vector hvx_vec_gelu_f32(HVX_Vector x) {
+    const HVX_Vector half = hvx_vec_splat_f32(0.5f);
+    const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
+
+    HVX_Vector inner = hvx_vec_mul_f32_f32(x, x);
+    inner = hvx_vec_mul_f32_f32(inner, hvx_vec_splat_f32(0.044715f));
+    inner = hvx_vec_add_f32_f32(inner, one);
+    inner = hvx_vec_mul_f32_f32(inner, x);
+    inner = hvx_vec_mul_f32_f32(inner, hvx_vec_splat_f32(0.7978845608028654f));
+
+    return hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(half, x),
+                               hvx_vec_add_f32_f32(one, hvx_vec_tanh_f32(inner)));
+}
+
+static inline void hvx_gelu_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+
+    HVX_Vector * restrict vdst = (HVX_Vector *) dst;
+    HVX_Vector * restrict vsrc = (HVX_Vector *) src;
+
+    const uint32_t nvec = n / VLEN_FP32;
+    const uint32_t nloe = n % VLEN_FP32;
+
+    uint32_t i = 0;
+    _Pragma("unroll(4)")
+    for (; i < nvec; i++) {
+        vdst[i] = hvx_vec_gelu_f32(vsrc[i]);
+    }
+    if (nloe) {
+        hvx_vec_store_a(&vdst[i], nloe * sizeof(float), hvx_vec_gelu_f32(vsrc[i]));
+    }
+}
+
+// GELU_QUICK uses x * sigmoid(1.702 * x).
+static __attribute__((noinline)) HVX_Vector hvx_vec_gelu_quick_f32(HVX_Vector x) {
+    const HVX_Vector one     = hvx_vec_splat_f32(1.0f);
+    const HVX_Vector max_exp = hvx_vec_splat_f32(87.0f);
+    const HVX_Vector min_exp = hvx_vec_splat_f32(-87.0f);
+    const HVX_Vector scaled  = hvx_vec_mul_f32_f32(x, hvx_vec_splat_f32(1.702f));
+    const HVX_Vector sigmoid = hvx_vec_fast_sigmoid_f32_guard(scaled, one, max_exp, min_exp);
+
+    return hvx_vec_mul_f32_f32(x, sigmoid);
+}
+
+static inline void hvx_gelu_quick_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+
+    HVX_Vector * restrict vdst = (HVX_Vector *) dst;
+    HVX_Vector * restrict vsrc = (HVX_Vector *) src;
+
+    const uint32_t nvec = n / VLEN_FP32;
+    const uint32_t nloe = n % VLEN_FP32;
+
+    uint32_t i = 0;
+    _Pragma("unroll(4)")
+    for (; i < nvec; i++) {
+        vdst[i] = hvx_vec_gelu_quick_f32(vsrc[i]);
+    }
+    if (nloe) {
+        hvx_vec_store_a(&vdst[i], nloe * sizeof(float), hvx_vec_gelu_quick_f32(vsrc[i]));
+    }
+}
+
 static void gelu_f32(const void * restrict src,
                      void * restrict dst,
                      const uint32_t num_rows,
@@ -508,9 +573,35 @@ static void gelu_f32(const void * restrict src,
         const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
 
-        hvx_mul_scalar_f32(dst_local, src_local, 1.702f, ne0);
-        hvx_sigmoid_f32_aa(dst_local, dst_local, ne0);
-        hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
+        hvx_gelu_f32_aa(dst_local, src_local, ne0);
+    }
+}
+
+static void gelu_quick_f32(const void * restrict src,
+                           void * restrict dst,
+                           const uint32_t num_rows,
+                           const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_gelu_quick_f32_aa(dst_local, src_local, ne0);
+    }
+}
+
+static void gelu_erf_f32(const void * restrict src,
+                         void * restrict dst,
+                         const uint32_t num_rows,
+                         const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *) src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *) dst + (ir * dst_row_size_aligned);
+
+        hvx_gelu_erf_f32_aa(dst_local, src_local, ne0);
     }
 }
 
@@ -599,22 +690,48 @@ static void tri_f32(const void * restrict src,
     }
 }
 
+// softplus(x) = log(1 + exp(x))
+// Match CPU reference: return x for x > 20 to avoid overflow.
+static inline void hvx_softplus_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    const HVX_Vector * restrict v_src = (const HVX_Vector *) src;
+    HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
+
+    const HVX_Vector twenty = hvx_vec_splat_f32(20.0f);
+    const HVX_Vector one    = hvx_vec_splat_f32(1.0f);
+
+    const uint32_t nvec = n / VLEN_FP32;
+    const uint32_t nloe = n % VLEN_FP32;
+
+    #pragma unroll(4)
+    for (uint32_t i = 0; i < nvec; i++) {
+        HVX_Vector x              = v_src[i];
+        HVX_VectorPred pred_gt20  = Q6_Q_vcmp_gt_VsfVsf(x, twenty);
+        HVX_Vector expx           = hvx_vec_exp_f32(x);
+        HVX_Vector logv           = hvx_vec_log_f32(hvx_vec_add_f32_f32(one, expx));
+        v_dst[i]                  = Q6_V_vmux_QVV(pred_gt20, x, logv);
+    }
+
+    if (nloe > 0) {
+        HVX_Vector x             = v_src[nvec];
+        HVX_VectorPred pred_gt20 = Q6_Q_vcmp_gt_VsfVsf(x, twenty);
+        HVX_Vector expx          = hvx_vec_exp_f32(x);
+        HVX_Vector logv          = hvx_vec_log_f32(hvx_vec_add_f32_f32(one, expx));
+        HVX_Vector sp            = Q6_V_vmux_QVV(pred_gt20, x, logv);
+        hvx_vec_store_a((void *) &v_dst[nvec], nloe * sizeof(float), sp);
+    }
+}
+
 static void softplus_f32(const void * restrict src,
                          void * restrict dst,
                          const uint32_t num_rows,
                          const struct htp_unary_context * uctx) {
     htp_unary_op_preamble;
-    // softplus(x) = log(1 + exp(x))
-    // Match CPU reference: ggml_compute_softplus_f32() in ggml-impl.h
-    for (uint32_t ir = 0; ir < num_rows; ir++) {
-        const float * restrict src_f = (const float *)((const uint8_t *)src + (ir * src0_row_size_aligned));
-        float * restrict dst_f       = (float *)((uint8_t *)dst + (ir * dst_row_size_aligned));
 
-        for (uint32_t i = 0; i < ne0; i++) {
-            float x = src_f[i];
-            // For x > 20: softplus(x) ~ x (avoids exp overflow)
-            dst_f[i] = (x > 20.0f) ? x : logf(1.0f + expf(x));
-        }
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_softplus_f32_aa(dst_local, src_local, ne0);
     }
 }
 
@@ -760,19 +877,22 @@ static void tile_silu_f32(void * restrict dst, const void * restrict src, uint32
 
 static void tile_gelu_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
     (void) uctx;
-    hvx_mul_scalar_f32((uint8_t *) dst, (const uint8_t *) src, 1.702f, tw);
-    hvx_sigmoid_f32_aa((uint8_t *) dst, (uint8_t *) dst, tw);
-    hvx_mul_f32_aaa((uint8_t *) dst, (const uint8_t *) src, (uint8_t *) dst, tw);
+    hvx_gelu_f32_aa((uint8_t *) dst, (const uint8_t *) src, tw);
+}
+
+static void tile_gelu_quick_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
+    (void) uctx;
+    hvx_gelu_quick_f32_aa((uint8_t *) dst, (const uint8_t *) src, tw);
+}
+
+static void tile_gelu_erf_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
+    (void) uctx;
+    hvx_gelu_erf_f32_aa((uint8_t *) dst, (const uint8_t *) src, tw);
 }
 
 static void tile_softplus_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
     (void) uctx;
-    const float * restrict sf = (const float *) src;
-    float * restrict df       = (float *) dst;
-    for (uint32_t i = 0; i < tw; i++) {
-        float x = sf[i];
-        df[i] = (x > 20.0f) ? x : logf(1.0f + expf(x));
-    }
+    hvx_softplus_f32_aa((uint8_t *) dst, (const uint8_t *) src, tw);
 }
 
 static void tile_tanh_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
@@ -1514,6 +1634,8 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SIGMOID:   op_type = "sigmoid-f32";                                break;
         case HTP_OP_UNARY_SILU:      op_type = "silu-f32";                                   break;
         case HTP_OP_UNARY_GELU:      op_type = "gelu-f32";                                   break;
+        case HTP_OP_UNARY_GELU_QUICK: op_type = "gelu-quick-f32";                             break;
+        case HTP_OP_UNARY_GELU_ERF:  op_type = "gelu-erf-f32";                               break;
         case HTP_OP_UNARY_SOFTPLUS:  op_type = "softplus-f32";                               break;
         case HTP_OP_UNARY_TANH:      op_type = "tanh-f32";                                   break;
         case HTP_OP_UNARY_ABS:       op_type = is_f16 ? "abs-f16"      : "abs-f32";          break;
@@ -1664,6 +1786,8 @@ static int execute_op_unary(struct htp_ops_context * octx) {
             case HTP_OP_UNARY_SIGMOID:   compute_func = (void *) tile_sigmoid_f32;        break;
             case HTP_OP_UNARY_SILU:      compute_func = (void *) tile_silu_f32;           break;
             case HTP_OP_UNARY_GELU:      compute_func = (void *) tile_gelu_f32;           break;
+            case HTP_OP_UNARY_GELU_QUICK: compute_func = (void *) tile_gelu_quick_f32;     break;
+            case HTP_OP_UNARY_GELU_ERF:  compute_func = (void *) tile_gelu_erf_f32;       break;
             case HTP_OP_UNARY_SOFTPLUS:  compute_func = (void *) tile_softplus_f32;       break;
             case HTP_OP_UNARY_TANH:      compute_func = (void *) tile_tanh_f32;           break;
             case HTP_OP_UNARY_ABS:       compute_func = (void *) tile_abs_f32;            break;
@@ -1710,6 +1834,8 @@ static int execute_op_unary(struct htp_ops_context * octx) {
             case HTP_OP_UNARY_SIGMOID:   compute_func = (void *) sigmoid_f32;             break;
             case HTP_OP_UNARY_SILU:      compute_func = (void *) silu_f32;                break;
             case HTP_OP_UNARY_GELU:      compute_func = (void *) gelu_f32;                break;
+            case HTP_OP_UNARY_GELU_QUICK: compute_func = (void *) gelu_quick_f32;          break;
+            case HTP_OP_UNARY_GELU_ERF:  compute_func = (void *) gelu_erf_f32;            break;
             case HTP_OP_UNARY_SOFTPLUS:  compute_func = (void *) softplus_f32;            break;
             case HTP_OP_UNARY_TANH:      compute_func = (void *) tanh_f32;                break;
             case HTP_OP_UNARY_ABS:       compute_func = (void *) abs_f32;                 break;

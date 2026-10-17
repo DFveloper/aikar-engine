@@ -437,7 +437,7 @@ std::vector<CalibrationSample> load_calibration_jsonl(const std::string & path,
             inputs.messages = record.messages;
             inputs.add_generation_prompt = record.messages.back().role != "assistant";
             inputs.enable_thinking = true;
-            sample.text = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+            sample.text = common_chat_templates_apply(chat_templates.get(), inputs).prompt.str();
             if (sample.text.empty()) throw std::runtime_error("chat template rendered an empty calibration prompt");
         } else {
             sample.text = record.text;
