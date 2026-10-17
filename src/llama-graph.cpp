@@ -4154,7 +4154,10 @@ ggml_tensor * llm_graph_context::build_attn(
         k = llama_mul_mat_hadamard(ctx0, k, paged->k_rot[dom]);
     }
     if (paged->v_rot[dom]) { v = llama_mul_mat_hadamard(ctx0, v, paged->v_rot[dom]); }
-    ggml_tensor * cur = ggml_paged_attn(ctx0, ggml_cont(ctx0, q), ggml_cont(ctx0, k), ggml_cont(ctx0, v),
+    ggml_tensor * cur = ggml_paged_attn(ctx0,
+            ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q),
+            ggml_is_contiguous(k) ? k : ggml_cont(ctx0, k),
+            ggml_is_contiguous(v) ? v : ggml_cont(ctx0, v),
             layer.cache, paged->tables[dom], paged->slots[dom], paged->queries,
             scale, paged->mctx->kv->block_size, layer.swa ? paged->mctx->kv->window : 0);
     ggml_paged_attn_set_n_kv(cur, paged->n_kv);

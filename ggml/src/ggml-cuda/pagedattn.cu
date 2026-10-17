@@ -270,7 +270,9 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const bool causal = !ggml_get_op_params_i32(dst, 4);
     const int span = causal && window ? std::min(window, max_tokens) : max_tokens;
     const char * fused_setting = getenv("GGML_CUDA_PAGED_FUSED");
-    const bool fused = (d == 256 || d == 512) && (nt > 8 || (d == 512 && span >= 4096)) &&
+    const bool q8_decode = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA &&
+            cache->type == GGML_TYPE_Q8_KV && d == 256 && causal && nt <= 32 && window && span >= 512;
+    const bool fused = (d == 256 || d == 512) && (nt > 8 || (d == 512 && span >= 4096) || q8_decode) &&
             (fused_setting ? strcmp(fused_setting, "0") != 0 : nt >= 128);
     const int head_group = fused && d == 512 && (nh/hk)%4 == 0 ? 4 :
             fused && d == 256 && (nh/hk)%2 == 0 ? 2 : 1;
@@ -280,9 +282,10 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     // Short splits keep small Volta decode batches from leaving most SMs idle.
     const char * split_setting = getenv("GGML_CUDA_PAGED_SHORT_SPLIT");
     const bool short_split = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA &&
-            cache->type == GGML_TYPE_Q8_KV && (d == 256 || d == 512) && causal && nt <= 32 &&
+            ((cache->type == GGML_TYPE_Q8_KV && (d == 256 || d == 512)) ||
+             (cache->type == GGML_TYPE_IQ4_NL && d == 512 && span <= 16384)) && causal && nt <= 32 &&
             (!split_setting || strcmp(split_setting, "0") != 0);
-    const int split_size = short_split ? 32 : 256;
+    const int split_size = short_split ? (q8_decode && fused ? 16 : cache->type == GGML_TYPE_IQ4_NL && span >= 4096 ? 64 : 32) : 256;
     const int nsplits = std::min((span - 1)/split_size + 1, std::max(1, (target_blocks + launch_blocks - 1)/launch_blocks));
     ggml_cuda_pool_alloc<float> partial(ctx.pool());
     float * output = (float *) dst->data;

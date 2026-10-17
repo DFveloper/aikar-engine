@@ -1,4 +1,5 @@
 import pytest
+import re
 from utils import *
 import base64
 import requests
@@ -17,8 +18,100 @@ def create_server(tmp_path):
     server.temperature = 0.0
 
 
+def test_ram_prompt_cache_repeated_cross_slot_restore():
+    server.cache_ram = 16
+    server.no_cache_idle_slots = True
+    server.cache_prompt = True
+    server.start()
+    prompt = "What is the capital of France?"
+    first = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "id_slot": 0, "n_predict": 1,
+    })
+    assert first.status_code == 200
+    for repeat in range(5):
+        response = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "id_slot": repeat % 2, "n_predict": 1,
+        })
+        assert response.status_code == 200
+        assert response.body["timings"]["prompt_n"] == 1
+        assert response.body["content"] == first.body["content"]
+
+
+def test_resident_prefix_repeated_cross_slot_restore():
+    model = os.environ.get("PAGED_TEST_MODEL")
+    if not model:
+        pytest.skip("PAGED_TEST_MODEL must name a compatible Gemma4 model")
+    server.model_file = model
+    server.model_hf_repo = None
+    server.model_hf_file = None
+    server.n_gpu_layer = int(os.environ.get("N_GPU_LAYERS", "0"))
+    server.cache_ram = 0
+    server.cache_prefix_gpu = True
+    server.kv_paged = True
+    server.cache_prompt = True
+    server.server_metrics = True
+    server.n_ctx = 8192
+    server.n_batch = 128
+    server.n_ubatch = 128
+    server.ctk = "iq4_nl"
+    server.ctv = "iq4_nl"
+    server.start()
+    prompt = "Inventory records preserve dates, quantities, and source locations. " * 400
+    base_tokens = server.make_request("POST", "/tokenize", data={"content": prompt, "add_special": True}).body["tokens"][:2048]
+    assert len(base_tokens) == 2048
+    initial = server.make_request("POST", "/completion", data={
+        "prompt": base_tokens[:-1], "id_slot": 0, "n_predict": 1,
+    })
+    assert initial.status_code == 200
+    first = server.make_request("POST", "/completion", data={
+        "prompt": base_tokens, "id_slot": 0, "n_predict": 8,
+    })
+    assert first.status_code == 200
+    overwritten = server.make_request("POST", "/completion", data={
+        "prompt": [1000] * 1024, "id_slot": 0, "n_predict": 1,
+    })
+    assert overwritten.status_code == 200
+    for repeat in range(5):
+        response = server.make_request("POST", "/completion", data={
+            "prompt": base_tokens, "id_slot": (repeat + 1) % 2, "n_predict": 8,
+        })
+        assert response.status_code == 200
+        assert response.body["timings"]["prompt_n"] == 1
+        assert response.body["content"] == first.body["content"]
+    for suffix in ([10, 11], [12, 13], [10, 11]):
+        response = server.make_request("POST", "/completion", data={
+            "prompt": base_tokens + suffix, "id_slot": 1, "n_predict": 8,
+        })
+        assert response.status_code == 200
+        assert response.body["timings"]["prompt_n"] <= 3
+    divergent = base_tokens.copy()
+    divergent[1000] = 1001
+    response = server.make_request("POST", "/completion", data={
+        "prompt": divergent, "id_slot": 1, "n_predict": 8,
+    })
+    assert response.status_code == 200
+    assert response.body["timings"]["prompt_n"] >= 1048
+    with requests.post(f"http://{server.server_host}:{server.server_port}/completion", json={
+        "prompt": base_tokens, "id_slot": 0, "n_predict": 128, "stream": True,
+    }, stream=True, timeout=60) as cancelled:
+        assert cancelled.status_code == 200
+        next(cancelled.iter_lines())
+    response = server.make_request("POST", "/completion", data={
+        "prompt": base_tokens, "id_slot": 0, "n_predict": 8,
+    })
+    assert response.status_code == 200
+    assert response.body["timings"]["prompt_n"] == 1
+    assert response.body["content"] == first.body["content"]
+    metrics = server.make_request("GET", "/metrics")
+    assert metrics.status_code == 200
+    assert "llamacpp:prefix_gpu_hits_total" in metrics.body
+    counter = re.search(r"^llamacpp:prefix_gpu_hits_total (\d+)", metrics.body, re.MULTILINE)
+    assert counter and int(counter.group(1)) >= 5
+
+
 def test_slot_save_restore():
     global server
+    server.cache_ram = 0
     server.start()
 
     # First prompt in slot 1 should be fully processed
@@ -132,6 +225,7 @@ def test_slot_restore_legacy_token_list():
 
 def test_slot_erase():
     global server
+    server.cache_ram = 0
     server.start()
 
     res = server.make_request("POST", "/completion", data={
@@ -494,6 +588,7 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
 
 
 def test_slot_restore_media_file_without_mmproj(mmproj_server):
+    mmproj_server.cache_ram = 0
     server = mmproj_server
     server.start()
 

@@ -8,6 +8,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     for (int dom = 0; dom < 2; ++dom) {
         current[dom].capacity = dom ? swa_pages : base_pages;
         current[dom].pool.init(current[dom].capacity, 0, 0.0f);
+        retained_owners[dom].assign(current[dom].capacity, 0);
         current[dom].seqs.resize(n_seq_max);
         table_cache[dom].assign(size_t(2)*table_blocks()*n_seq_max, 0);
         for (size_t i = 0; i < table_cache[dom].size(); i += 2) { table_cache[dom][i] = -1; }
@@ -153,6 +155,7 @@ bool llama_kv_cache_paged::prepare(batch_plan & plan, state & candidate, bool fo
                 }
                 ids = value.pool.checkout_gpu_blocks(1);
             }
+            if (ids.empty()) { retry_pages[dom] = current[dom].pool.n_free_gpu_blocks() + 1; }
             return ids;
         };
         for (uint32_t t = 0; t < ub.n_tokens; ++t) {
@@ -222,6 +225,7 @@ bool llama_kv_cache_paged::prepare(batch_plan & plan, state & candidate, bool fo
 
 llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
+    retry_pages = {};
     balloc.split_reset();
     state candidate = current;
     std::vector<batch_plan> plans;
@@ -259,9 +263,12 @@ void llama_kv_cache_paged::synchronize() const {
 void llama_kv_cache_paged::copy_page(uint32_t dom, uint32_t src, uint32_t dst) {
     for (const auto & l : layers) {
         if (l.swa != bool(dom)) { continue; }
-        std::vector<uint8_t> bytes(l.cache->nb[3]);
-        ggml_backend_tensor_get(l.cache, bytes.data(), src*l.cache->nb[3], bytes.size());
-        ggml_backend_tensor_set(l.cache, bytes.data(), dst*l.cache->nb[3], bytes.size());
+        auto source = *l.cache;
+        auto target = *l.cache;
+        source.ne[3] = target.ne[3] = 1;
+        source.data = static_cast<char *>(l.cache->data) + src*l.cache->nb[3];
+        target.data = static_cast<char *>(l.cache->data) + dst*l.cache->nb[3];
+        ggml_backend_tensor_copy(&source, &target);
     }
 }
 
@@ -372,7 +379,90 @@ void llama_kv_cache_paged::remove(state & value, llama_seq_id seq_id, llama_pos 
     }
 }
 
+llama_memory_prefix_id llama_kv_cache_paged::prefix_retain(llama_seq_id src, llama_pos end) {
+    if (prepared_contexts || src < 0 || uint32_t(src) >= n_seq_max || end <= 0 || uint64_t(end) > uint64_t(max_blocks)*block_size) { return 0; }
+    prefix_pages saved;
+    for (uint32_t dom = 0; dom < 2; ++dom) {
+        const bool used = std::any_of(layers.begin(), layers.end(), [dom](const layer & value) { return value.swa == bool(dom); });
+        if (!used) { continue; }
+        const llama_pos begin = dom && window && !swa_full ? std::max<int64_t>(0, int64_t(end) - window + 1) : 0;
+        for (llama_pos pos = begin; pos < end; ++pos) {
+            const uint32_t logical = pos/block_size;
+            const auto found = current[dom].seqs[src].find(logical);
+            if (found == current[dom].seqs[src].end() || !found->second.mask.test(pos%block_size)) { return 0; }
+            auto inserted = saved[dom].emplace(logical, page{found->second.id, {}});
+            inserted.first->second.mask.set(pos%block_size);
+        }
+    }
+    static std::atomic<uint64_t> next_id{1};
+    uint64_t added_metadata = sizeof(std::pair<const llama_memory_prefix_id, prefix_pages>);
+    for (const auto & pages : saved) { added_metadata += pages.size()*(sizeof(page) + sizeof(uint32_t) + 4*sizeof(void *)); }
+    if (prefix_metadata_bytes + added_metadata > 16*1024*1024) { return 0; }
+    const auto id = next_id.fetch_add(1);
+    if (!id) { return 0; }
+    auto inserted = prefixes.emplace(id, std::move(saved));
+    prefix_metadata_bytes += sizeof(*inserted.first);
+    for (uint32_t dom = 0; dom < 2; ++dom) {
+        prefix_metadata_bytes += inserted.first->second[dom].size()*(sizeof(page) + sizeof(uint32_t) + 4*sizeof(void *));
+        for (const auto & entry : inserted.first->second[dom]) {
+            current[dom].pool.retain_gpu_block(entry.second.id);
+            if (!retained_owners[dom][entry.second.id]++) { ++retained_pages[dom]; }
+        }
+    }
+    return id;
+}
+
+bool llama_kv_cache_paged::prefix_attach(llama_memory_prefix_id id, llama_seq_id dst) {
+    if (prepared_contexts || dst < 0 || uint32_t(dst) >= n_seq_max) { return false; }
+    const auto found = prefixes.find(id);
+    if (found == prefixes.end()) { return false; }
+    state candidate = current;
+    remove(candidate, dst, -1, -1);
+    for (uint32_t dom = 0; dom < 2; ++dom) {
+        candidate[dom].seqs[dst] = found->second[dom];
+        for (const auto & entry : found->second[dom]) { candidate[dom].pool.retain_gpu_block(entry.second.id); }
+    }
+    current = std::move(candidate);
+    table_cache_valid = false;
+    return true;
+}
+
+void llama_kv_cache_paged::prefix_release(llama_memory_prefix_id id) {
+    if (prepared_contexts) { return; }
+    const auto found = prefixes.find(id);
+    if (found == prefixes.end()) { return; }
+    std::vector<uint32_t> released(1);
+    prefix_metadata_bytes -= sizeof(*found);
+    for (uint32_t dom = 0; dom < 2; ++dom) {
+        prefix_metadata_bytes -= found->second[dom].size()*(sizeof(page) + sizeof(uint32_t) + 4*sizeof(void *));
+        for (const auto & entry : found->second[dom]) {
+            released[0] = entry.second.id;
+            current[dom].pool.release_gpu_blocks(released);
+            if (!--retained_owners[dom][entry.second.id]) { --retained_pages[dom]; }
+        }
+    }
+    prefixes.erase(found);
+}
+
+bool llama_kv_cache_paged::prefix_get_usage(llama_memory_prefix_usage & out) const {
+    out = {};
+    out.metadata_bytes = prefix_metadata_bytes;
+    out.full_retry_pages = retry_pages[0];
+    out.swa_retry_pages = retry_pages[1];
+    for (const auto & owners : retained_owners) { out.metadata_bytes += owners.capacity()*sizeof(uint32_t); }
+    out.full_free_pages = current[0].pool.n_free_gpu_blocks();
+    out.swa_free_pages = current[1].pool.n_free_gpu_blocks();
+    out.full_retained_pages = retained_pages[0];
+    out.swa_retained_pages = retained_pages[1];
+    for (const auto & value : layers) { out.retained_bytes += retained_pages[value.swa]*value.cache->nb[3]; }
+    return true;
+}
+
 void llama_kv_cache_paged::clear(bool data) {
+    prefixes.clear();
+    prefix_metadata_bytes = 0;
+    retained_pages = {};
+    for (auto & owners : retained_owners) { std::fill(owners.begin(), owners.end(), 0); }
     if (data) { synchronize(); }
     for (auto & dom : current) {
         dom.pool.init(dom.capacity, 0, 0.0f); dom.seqs.assign(n_seq_max, {});
@@ -597,6 +687,13 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     if (count > n_seq_max || (seq_id >= 0 && count != 1)) { throw std::runtime_error("invalid paged KV state sequence count"); }
     state candidate = current;
     remove(candidate, seq_id, -1, -1);
+    if (seq_id < 0) {
+        for (const auto & prefix : prefixes) {
+            for (uint32_t dom = 0; dom < 2; ++dom) {
+                for (const auto & entry : prefix.second[dom]) { candidate[dom].pool.release_gpu_blocks({entry.second.id}); }
+            }
+        }
+    }
     struct pending_page { uint32_t physical; std::vector<std::pair<uint32_t, std::vector<uint8_t>>> data; };
     std::vector<pending_page> pending;
     std::set<uint32_t> seen;
@@ -644,6 +741,12 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                 pending.push_back(std::move(p));
             }
         }
+    }
+    if (seq_id < 0) {
+        prefixes.clear();
+        prefix_metadata_bytes = 0;
+        retained_pages = {};
+        for (auto & owners : retained_owners) { std::fill(owners.begin(), owners.end(), 0); }
     }
     for (const auto & p : pending) {
         for (const auto & data : p.data) {

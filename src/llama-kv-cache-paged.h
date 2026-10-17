@@ -53,6 +53,11 @@ public:
     llama_memory_context_ptr init_full() override;
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
     bool get_can_shift() const override { return false; }
+    llama_memory_prefix_id prefix_retain(llama_seq_id src, llama_pos end) override;
+    bool prefix_attach(llama_memory_prefix_id id, llama_seq_id dst) override;
+    void prefix_release(llama_memory_prefix_id id) override;
+    bool prefix_get_usage(llama_memory_prefix_usage & out) const override;
+    uint32_t prepared_contexts = 0;
     void clear(bool data) override;
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
     void seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) override;
@@ -81,6 +86,12 @@ public:
     void set_input_rot(ggml_tensor * dst) const;
 
 private:
+    using prefix_pages = std::array<std::map<uint32_t, page>, 2>;
+    std::map<llama_memory_prefix_id, prefix_pages> prefixes;
+    std::array<std::vector<uint32_t>, 2> retained_owners;
+    std::array<uint64_t, 2> retained_pages = {};
+    uint64_t prefix_metadata_bytes = 0;
+    mutable std::array<uint64_t, 2> retry_pages = {};
     std::array<int64_t, 2> k_rot_size = {}, v_rot_size = {};
     std::unordered_map<int64_t, std::vector<float>> rotations;
     std::vector<ggml_context_ptr> contexts;
@@ -101,7 +112,8 @@ private:
 class llama_kv_cache_paged_context : public llama_memory_context_i {
 public:
     llama_kv_cache_paged_context(llama_kv_cache_paged * kv, std::vector<llama_kv_cache_paged::batch_plan> plans,
-            llama_memory_status status = LLAMA_MEMORY_STATUS_SUCCESS) : kv(kv), plans(std::move(plans)), status(status) {}
+            llama_memory_status status = LLAMA_MEMORY_STATUS_SUCCESS) : kv(kv), plans(std::move(plans)), status(status) { ++kv->prepared_contexts; }
+    ~llama_kv_cache_paged_context() override { --kv->prepared_contexts; }
     bool next() override { return ++index < plans.size(); }
     bool apply() override;
     const llama_ubatch & get_ubatch() const override { return plans.at(index).ubatch; }

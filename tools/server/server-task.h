@@ -597,6 +597,7 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    llama_pos pos_min = -1;
 
     size_t size() const {
         size_t res = data.size();
@@ -632,6 +633,54 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+};
+
+struct server_resident_prefix_cache {
+    struct node {
+        llama_tokens edge;
+        std::map<llama_token, std::unique_ptr<node>> children;
+        node * parent = nullptr;
+        uint64_t entry_id = 0;
+    };
+    struct entry {
+        llama_memory_prefix_id handle;
+        llama_pos end;
+        node * boundary;
+        uint64_t touched;
+        uint32_t pins = 0;
+        int32_t chunk_slot = -1;
+    };
+    struct match_result {
+        server_resident_prefix_cache * owner = nullptr;
+        uint64_t entry_id = 0;
+        llama_memory_prefix_id memory_prefix_id = 0;
+        llama_pos end = 0;
+        match_result() = default;
+        match_result(const match_result &) = delete;
+        match_result & operator=(const match_result &) = delete;
+        match_result(match_result && other) noexcept;
+        ~match_result();
+    };
+    server_resident_prefix_cache(llama_memory_t memory, size_t budget) : memory(memory), budget(budget) {}
+    ~server_resident_prefix_cache() { clear(); }
+    match_result match(uint64_t key, const llama_tokens & tokens, llama_pos max_end);
+    bool publish(uint64_t key, const llama_tokens & tokens, llama_pos end, llama_memory_prefix_id handle, int32_t chunk_slot = -1);
+    void unpin(uint64_t id);
+    bool evict(uint64_t full_needed, uint64_t swa_needed);
+    bool evict_for_retry();
+    size_t metadata_bytes() const;
+    void clear();
+    uint64_t hits = 0, misses = 0, evictions = 0;
+private:
+    llama_memory_t memory;
+    size_t budget;
+    uint64_t clock = 0, next_id = 1;
+    std::map<uint64_t, node> roots;
+    std::map<uint64_t, entry> entries;
+    node * insert(node & root, const llama_tokens & tokens, llama_pos end);
+    bool erase_oldest();
+    void erase(uint64_t id);
+    size_t metadata_size(const node & value) const;
 };
 
 // used exclusively by router mode

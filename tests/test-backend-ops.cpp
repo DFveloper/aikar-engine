@@ -11081,6 +11081,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // FWHT tests
     for (int n : {64, 256, 512}) { test_cases.emplace_back(new test_hadamard_roundtrip(n)); }
+    for (int tokens : {1, 4, 12, 32}) {
+        for (int position : {31, 32, 63, 64, 127, 128, 255, 256, 4094, 4095, 4096}) {
+            const int blocks = (position + (tokens + 1)/2 + 31)/32;
+            test_cases.emplace_back(new test_paged_attn(GGML_TYPE_IQ4_NL, 512, 2, tokens, 0, blocks, position, true, 32));
+        }
+    }
     test_cases.emplace_back(new test_paged_attn_hadamard(512, 2));
     test_cases.emplace_back(new test_paged_attn_hadamard(256, 8));
 
@@ -12220,6 +12226,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_paged_attn(type, 512, 2, nt, 16));
             test_cases.emplace_back(new test_paged_attn_write(type, 512, 2, nt, 16));
         }
+    }
+
+    for (int head_size : {64, 128}) {
+        test_cases.emplace_back(new test_flash_attn_ext(head_size, head_size, 4, {8, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV));
     }
 
     // sparse attn (qwen4 shape - gqa 12)

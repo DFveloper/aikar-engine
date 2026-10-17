@@ -101,6 +101,10 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+    virtual llama_memory_prefix_id prefix_retain(llama_seq_id, llama_pos) { return 0; }
+    virtual bool prefix_attach(llama_memory_prefix_id, llama_seq_id) { return false; }
+    virtual void prefix_release(llama_memory_prefix_id) {}
+    virtual bool prefix_get_usage(llama_memory_prefix_usage &) const { return false; }
 
     //
     // ops

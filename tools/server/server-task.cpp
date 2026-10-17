@@ -1522,6 +1522,9 @@ json server_task_result_metrics::to_json() {
 // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
 std::string server_task_result_metrics::to_metrics() {
     const std::vector<metric_item> counters = {
+        {"prefix_gpu_hits_total", "Resident paged prefix hits", (double) metrics.prefix_gpu_hits},
+        {"prefix_gpu_misses_total", "Resident paged prefix misses", (double) metrics.prefix_gpu_misses},
+        {"prefix_gpu_evictions_total", "Resident paged prefix evictions", (double) metrics.prefix_gpu_evictions},
         {
             "prompt_tokens_total",
             "Number of prompt tokens processed, excluding cached tokens",
@@ -1566,6 +1569,8 @@ std::string server_task_result_metrics::to_metrics() {
     };
 
     const std::vector<metric_item> gauges = {
+        {"prefix_gpu_bytes", "Unique retained paged KV bytes", (double) metrics.prefix_gpu_bytes},
+        {"prefix_gpu_metadata_bytes", "Retained paged prefix metadata bytes", (double) metrics.prefix_gpu_metadata_bytes},
         {
             "prompt_tokens_seconds",
             "Average prompt throughput in tokens/s",
@@ -1713,7 +1718,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cur_lcp_len == (int) prompt.tokens.size() && (prompt.tokens.has_media() || it->prompt.tokens.size() == prompt.tokens.size())) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1738,7 +1743,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && (prompt.tokens.has_media() || it->prompt.tokens.size() == prompt.tokens.size())) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1790,8 +1795,177 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+server_resident_prefix_cache::match_result::match_result(match_result && other) noexcept :
+    owner(other.owner), entry_id(other.entry_id), memory_prefix_id(other.memory_prefix_id), end(other.end) {
+    other.owner = nullptr;
+}
+
+server_resident_prefix_cache::match_result::~match_result() {
+    if (owner) { owner->unpin(entry_id); }
+}
+
+server_resident_prefix_cache::node * server_resident_prefix_cache::insert(node & root, const llama_tokens & tokens, llama_pos end) {
+    node * current = &root;
+    llama_pos offset = 0;
+    while (offset < end) {
+        auto found = current->children.find(tokens[offset]);
+        if (found == current->children.end()) {
+            auto child = std::make_unique<node>();
+            child->parent = current;
+            child->edge.assign(tokens.begin() + offset, tokens.begin() + end);
+            auto * result = child.get();
+            current->children.emplace(tokens[offset], std::move(child));
+            return result;
+        }
+        auto * child = found->second.get();
+        size_t common = 0;
+        while (common < child->edge.size() && offset + common < size_t(end) && child->edge[common] == tokens[offset + common]) { ++common; }
+        if (common < child->edge.size()) {
+            auto branch = std::make_unique<node>();
+            branch->parent = current;
+            branch->edge.assign(child->edge.begin(), child->edge.begin() + common);
+            auto inserted = branch->children.emplace(child->edge[common], nullptr);
+            auto suffix = std::move(found->second);
+            suffix->edge.erase(suffix->edge.begin(), suffix->edge.begin() + common);
+            suffix->parent = branch.get();
+            inserted.first->second = std::move(suffix);
+            found->second = std::move(branch);
+        }
+        current = found->second.get();
+        offset += common;
+    }
+    return current;
+}
+
+server_resident_prefix_cache::match_result server_resident_prefix_cache::match(uint64_t key, const llama_tokens & tokens, llama_pos max_end) {
+    match_result result;
+    const auto root = roots.find(key);
+    if (root != roots.end()) {
+        const node * current = &root->second;
+        size_t offset = 0;
+        const size_t limit = std::min<size_t>(tokens.size(), std::max(0, max_end));
+        while (offset < limit) {
+            const auto found = current->children.find(tokens[offset]);
+            if (found == current->children.end()) { break; }
+            current = found->second.get();
+            if (current->edge.size() > limit - offset || !std::equal(current->edge.begin(), current->edge.end(), tokens.begin() + offset)) { break; }
+            offset += current->edge.size();
+            if (current->entry_id) { result.entry_id = current->entry_id; }
+        }
+    }
+    if (result.entry_id) {
+        auto & value = entries.at(result.entry_id);
+        ++value.pins;
+        value.touched = ++clock;
+        result.owner = this;
+        result.memory_prefix_id = value.handle;
+        result.end = value.end;
+    } else { ++misses; }
+    return result;
+}
+
+size_t server_resident_prefix_cache::metadata_size(const node & value) const {
+    size_t bytes = sizeof(node) + value.edge.capacity()*sizeof(llama_token) + value.children.size()*64;
+    for (const auto & child : value.children) { bytes += metadata_size(*child.second); }
+    return bytes;
+}
+
+size_t server_resident_prefix_cache::metadata_bytes() const {
+    llama_memory_prefix_usage usage = {};
+    llama_memory_prefix_get_usage(memory, &usage);
+    size_t bytes = usage.metadata_bytes + entries.size()*(sizeof(entry) + 64);
+    for (const auto & root : roots) { bytes += metadata_size(root.second); }
+    return bytes;
+}
+
+bool server_resident_prefix_cache::erase_oldest() {
+    auto oldest = entries.end();
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (!it->second.pins && (oldest == entries.end() || it->second.touched < oldest->second.touched)) { oldest = it; }
+    }
+    if (oldest == entries.end()) { return false; }
+    erase(oldest->first);
+    return true;
+}
+
+void server_resident_prefix_cache::erase(uint64_t id) {
+    const auto found = entries.find(id);
+    if (found == entries.end() || found->second.pins) { return; }
+    auto * boundary = found->second.boundary;
+    boundary->entry_id = 0;
+    llama_memory_prefix_release(memory, found->second.handle);
+    entries.erase(found);
+    while (boundary->parent && !boundary->entry_id && boundary->children.empty()) {
+        auto * parent = boundary->parent;
+        parent->children.erase(boundary->edge.front());
+        boundary = parent;
+    }
+    ++evictions;
+}
+
+bool server_resident_prefix_cache::publish(uint64_t key, const llama_tokens & tokens, llama_pos end, llama_memory_prefix_id handle, int32_t chunk_slot) {
+    if (!handle) { return false; }
+    if (end <= 0 || size_t(end) > tokens.size()) { llama_memory_prefix_release(memory, handle); return false; }
+    if (chunk_slot >= 0) {
+        for (auto it = entries.begin(); it != entries.end();) {
+            const auto id = (it++)->first;
+            const auto & value = entries.at(id);
+            if (value.chunk_slot == chunk_slot && !value.pins) { erase(id); }
+        }
+    }
+    node * boundary = nullptr;
+    try { boundary = insert(roots[key], tokens, end); }
+    catch (...) { llama_memory_prefix_release(memory, handle); return false; }
+    if (boundary->entry_id) {
+        entries.at(boundary->entry_id).touched = ++clock;
+        llama_memory_prefix_release(memory, handle);
+        return true;
+    }
+    const auto id = next_id++;
+    try { entries.emplace(id, entry{handle, end, boundary, ++clock, 0, chunk_slot}); }
+    catch (...) { llama_memory_prefix_release(memory, handle); return false; }
+    boundary->entry_id = id;
+    while (true) {
+        llama_memory_prefix_usage usage = {};
+        llama_memory_prefix_get_usage(memory, &usage);
+        if (usage.retained_bytes <= budget && metadata_bytes() <= 16*1024*1024) { return entries.count(id) != 0; }
+        if (!erase_oldest()) { return false; }
+    }
+}
+
+void server_resident_prefix_cache::unpin(uint64_t id) {
+    const auto found = entries.find(id);
+    if (found != entries.end() && found->second.pins) { --found->second.pins; }
+}
+
+bool server_resident_prefix_cache::evict(uint64_t full_needed, uint64_t swa_needed) {
+    llama_memory_prefix_usage usage = {};
+    while (llama_memory_prefix_get_usage(memory, &usage)) {
+        if (usage.full_free_pages >= full_needed && usage.swa_free_pages >= swa_needed) { return true; }
+        if (!erase_oldest()) { break; }
+    }
+    return false;
+}
+
+bool server_resident_prefix_cache::evict_for_retry() {
+    llama_memory_prefix_usage before = {}, after = {};
+    if (!llama_memory_prefix_get_usage(memory, &before)) { return false; }
+    if (!before.full_retry_pages && !before.swa_retry_pages) { return false; }
+    while (erase_oldest()) {
+        llama_memory_prefix_get_usage(memory, &after);
+        if (after.full_free_pages >= before.full_retry_pages && after.swa_free_pages >= before.swa_retry_pages) { return true; }
+    }
+    return false;
+}
+
+void server_resident_prefix_cache::clear() {
+    for (const auto & value : entries) { llama_memory_prefix_release(memory, value.second.handle); }
+    entries.clear();
+    roots.clear();
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
@@ -1802,7 +1976,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->prompt.tokens.has_media() != tokens_new.has_media()) { continue; }
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const int window = llama_model_n_swa(llama_get_model(ctx_tgt));
+        const int replay = std::min<int>(lcp_cur, std::max<int>(0, tokens_new.size() - 1));
+        const auto required_min = std::max(0, tokens_new.pos_next(replay) - window + 1);
+        if (window && it->pos_min > required_min) { continue; }
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
@@ -1813,7 +1992,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        const bool media = tokens_new.has_media();
+        if (media ? (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) :
+                (lcp_cur > lcp_best || (lcp_cur == lcp_best && f_keep_cur > f_keep_best))) {
+            lcp_best = lcp_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -1822,6 +2004,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
+        auto restored_prompt = it_best->prompt.clone();
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         {
@@ -1835,8 +2018,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
@@ -1853,14 +2034,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
+        prompt = std::move(restored_prompt);
+        if (tokens_new.has_media()) { states.erase(it_best); }
+        else { states.splice(states.end(), states, it_best); }
     }
 
     return true;

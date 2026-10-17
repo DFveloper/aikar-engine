@@ -320,6 +320,8 @@ struct server_slot {
     int32_t prefix_leader_id = -1;
     int32_t prefix_leader_task_id = -1;
     size_t prefix_share_end = 0;
+    llama_pos resident_prefix_end = 0;
+    llama_pos resident_chunk_end = 0;
 
     server_prompt prompt;
 
@@ -340,6 +342,7 @@ struct server_slot {
         if (cur == nullptr) {
             return false;
         }
+        cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
@@ -906,7 +909,21 @@ public:
     }
 
     server_metrics get_metrics() const {
-        return metrics;
+        auto result = metrics;
+        if (resident_prefix_cache) {
+            result.prefix_gpu_hits = resident_prefix_cache->hits;
+            result.prefix_gpu_misses = resident_prefix_cache->misses;
+            result.prefix_gpu_evictions = resident_prefix_cache->evictions;
+        }
+        return result;
+    }
+
+    void update_prefix_usage() {
+        if (!resident_prefix_cache) { return; }
+        llama_memory_prefix_usage usage = {};
+        llama_memory_prefix_get_usage(llama_get_memory(ctx_tgt), &usage);
+        metrics.prefix_gpu_bytes = usage.retained_bytes;
+        metrics.prefix_gpu_metadata_bytes = resident_prefix_cache->metadata_bytes();
     }
 
     void reset_metrics_bucket() {
@@ -955,6 +972,8 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_resident_prefix_cache> resident_prefix_cache;
+    uint64_t prefix_cache_epoch = 1;
 
     std::vector<server_prompt_cache_state> system_prefixes;
     std::vector<common_adapter_lora_info> system_prefix_lora;
@@ -981,6 +1000,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        resident_prefix_cache.reset();
         spec.reset();
         spec_init.reset();
 
@@ -1494,6 +1514,14 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd, params_base.n_parallel);
         }
 
+        resident_prefix_cache.reset();
+        if (params_base.cache_prefix_gpu) {
+            if (!params_base.kv_paged) {
+                SRV_ERR("%s", "--cache-prefix-gpu requires --kv-paged\n");
+                return false;
+            }
+            resident_prefix_cache = std::make_unique<server_resident_prefix_cache>(llama_get_memory(ctx_tgt), size_t(params_base.cache_prefix_gpu_mib)*1024*1024);
+        }
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1784,6 +1812,27 @@ private:
         }
 
         if (ret) {
+            ret->resident_prefix_end = 0;
+            ret->resident_chunk_end = 0;
+            if (resident_prefix_cache && !ret->is_processing() && task.type == SERVER_TASK_TYPE_COMPLETION &&
+                    task.params.cache_prompt && task.params.lora.empty() && params_base.lora_adapters.empty() && !ctx_dft &&
+                    !task.tokens.has_media()) {
+                auto match = resident_prefix_cache->match(prefix_cache_epoch, task.tokens.get_tokens(), task.tokens.size() - 1);
+                if (match.memory_prefix_id) {
+                    auto tokens = llama_tokens(task.tokens.get_tokens().begin(), task.tokens.get_tokens().begin() + match.end);
+                    server_prompt restored{server_tokens(tokens, task.tokens.has_mtmd), {}};
+                    if (resident_prefix_cache->evict(1, 1) && llama_memory_prefix_attach(llama_get_memory(ctx_tgt), match.memory_prefix_id, ret->id)) {
+                        ++resident_prefix_cache->hits;
+                        ret->prompt = std::move(restored);
+                        ret->resident_prefix_end = match.end;
+                        SLT_INF(*ret, "resident prefix hit: %d tokens\n", match.end);
+                    }
+                }
+                update_prefix_usage();
+            }
+            update_cache = update_cache || (task.id_slot != -1 && !ret->is_processing() && task.params.cache_prompt &&
+                    !task.tokens.has_media());
+            update_cache = update_cache && !ret->resident_prefix_end;
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -2704,7 +2753,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
-                    res->metrics             = metrics;
+                    res->metrics             = get_metrics();
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -2902,6 +2951,8 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
+                    if (resident_prefix_cache) { resident_prefix_cache->clear(); update_prefix_usage(); }
+                    ++prefix_cache_epoch;
                     auto new_loras = construct_lora_list(task.set_lora);
                     // logging
                     for (size_t i = 0; i < new_loras.size(); ++i) {
@@ -3589,7 +3640,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold && !(params_base.kv_paged && pos_min == 0)) {
+                                if (pos_min >= pos_min_thold && !(params_base.kv_paged && (pos_min == 0 || slot.resident_prefix_end == pos_next))) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3620,8 +3671,9 @@ private:
                                     }
 
                                     if (do_reset && params_base.kv_paged && prompt_cache && slot.task->params.cache_prompt) {
-                                        slot.prompt_clear();
-                                        if (slot.prompt_load(*prompt_cache, input_tokens)) {
+                                        server_prompt restored;
+                                        if (prompt_cache->load(restored, input_tokens, ctx_tgt, ctx_dft, slot.id) && !restored.tokens.empty()) {
+                                            slot.prompt = std::move(restored);
                                             n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                             pos_next = slot.prompt.tokens.pos_next(n_past);
                                             const auto restored_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -4015,6 +4067,12 @@ private:
         });
 
         if (ret != 0) {
+            if (ret == 1 && resident_prefix_cache) {
+                if (resident_prefix_cache->evict_for_retry()) {
+                    update_prefix_usage();
+                    return false;
+                }
+            }
             {
                 std::string err;
 
@@ -4132,6 +4190,18 @@ private:
         };
 
         iterate(slots, [&](server_slot & slot) {
+            if (resident_prefix_cache && slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                    slot.task->params.cache_prompt && slot.lora.empty() && !ctx_dft &&
+                    !slot.prompt.tokens.has_media()) {
+                const auto end = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1;
+                if (end > slot.resident_chunk_end && size_t(end) < slot.task->tokens.size() && size_t(end) <= slot.prompt.tokens.size()) {
+                    llama_synchronize(ctx_tgt);
+                    const auto handle = llama_memory_prefix_retain(llama_get_memory(ctx_tgt), slot.id, end);
+                    resident_prefix_cache->publish(prefix_cache_epoch, slot.prompt.tokens.get_tokens(), end, handle, slot.id);
+                    update_prefix_usage();
+                    slot.resident_chunk_end = end;
+                }
+            }
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
@@ -4145,7 +4215,18 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (prompt_cache && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt) {
+                bool published_resident = false;
+                if (resident_prefix_cache && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
+                        slot.lora.empty() && !ctx_dft &&
+                        !slot.prompt.tokens.has_media()) {
+                    const auto & tokens = slot.prompt.tokens.get_tokens();
+                    for (const llama_pos end : {llama_pos(tokens.size() - 1), llama_pos(tokens.size())}) {
+                        const auto handle = llama_memory_prefix_retain(llama_get_memory(ctx_tgt), slot.id, end);
+                        published_resident |= resident_prefix_cache->publish(prefix_cache_epoch, tokens, end, handle);
+                    }
+                    update_prefix_usage();
+                }
+                if (!published_resident && prompt_cache && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt) {
                     if (slot.prompt_save(*prompt_cache)) {
                         prompt_cache->update();
                     }

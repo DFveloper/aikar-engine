@@ -209,6 +209,7 @@ public:
 
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
+    bool has_media() const { return !map_idx_to_media.empty(); }
 
     llama_tokens get_text_tokens() const;
 
@@ -470,6 +471,8 @@ struct server_metrics {
 
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
+    uint64_t prefix_gpu_hits = 0, prefix_gpu_misses = 0, prefix_gpu_evictions = 0;
+    uint64_t prefix_gpu_bytes = 0, prefix_gpu_metadata_bytes = 0;
 
     uint64_t n_tokens_max = 0;
 

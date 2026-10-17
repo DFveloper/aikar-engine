@@ -826,6 +826,22 @@ extern "C" {
     // Memory
     //
 
+    typedef uint64_t llama_memory_prefix_id;
+    struct llama_memory_prefix_usage {
+        uint64_t full_free_pages;
+        uint64_t swa_free_pages;
+        uint64_t full_retained_pages;
+        uint64_t swa_retained_pages;
+        uint64_t retained_bytes;
+        uint64_t metadata_bytes;
+        uint64_t full_retry_pages;
+        uint64_t swa_retry_pages;
+    };
+    LLAMA_API llama_memory_prefix_id llama_memory_prefix_retain(llama_memory_t mem, llama_seq_id src, llama_pos end);
+    LLAMA_API bool llama_memory_prefix_attach(llama_memory_t mem, llama_memory_prefix_id id, llama_seq_id dst);
+    LLAMA_API void llama_memory_prefix_release(llama_memory_t mem, llama_memory_prefix_id id);
+    LLAMA_API bool llama_memory_prefix_get_usage(llama_memory_t mem, struct llama_memory_prefix_usage * out);
+
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata
     LLAMA_API void llama_memory_clear(

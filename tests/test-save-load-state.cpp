@@ -171,6 +171,123 @@ static bool generate_tokens_compare(
 // - save state to disk
 // - decode the last token
 // - generate n_predict tokens
+static bool test_retained_prefix(struct llama_model * model, const common_params & params, const llama_tokens & input_tokens) {
+    LOG_INF("retained prefix lifecycle test\n");
+    if (!params.kv_paged || input_tokens.size() < 2) { return true; }
+    auto tokens = input_tokens;
+    if (llama_model_n_swa(model) && params.n_ctx >= 4096 && params.kv_paged_n_blocks >= 64) {
+        while (tokens.size() < 2048) { tokens.push_back(input_tokens[tokens.size()%input_tokens.size()]); }
+        tokens.resize(2048);
+    }
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max = 2;
+    cparams.kv_paged_n_blocks = std::max<uint32_t>(cparams.kv_paged_n_blocks, (tokens.size() + cparams.kv_paged_block_size - 1)/cparams.kv_paged_block_size + 2);
+    auto ctx = llama_context_ptr{llama_init_from_model(model, cparams)};
+    if (!ctx) { return false; }
+    llama_batch_ptr input(params.n_batch, 0, 1);
+    for (size_t offset = 0; offset < tokens.size() - 1;) {
+        common_batch_clear(input.get());
+        const size_t end = std::min(tokens.size() - 1, offset + params.n_batch);
+        for (; offset < end; ++offset) { common_batch_add(input.get(), tokens[offset], offset, {0}, false); }
+        if (llama_decode(ctx.get(), input.get())) { return false; }
+    }
+    common_batch_clear(input.get());
+    common_batch_add(input.get(), tokens.back(), tokens.size() - 1, {0}, true);
+    if (llama_decode(ctx.get(), input.get())) { return false; }
+    std::vector<float> expected;
+    if (!get_current_logits(ctx.get(), expected)) { return false; }
+    auto mem = llama_get_memory(ctx.get());
+    const auto prefix = llama_memory_prefix_retain(mem, 0, tokens.size() - 1);
+    if (!prefix) { LOG_ERR("prefix retain failed\n"); return false; }
+    const int window = llama_model_n_swa(model);
+    if (window && tokens.size() > size_t(window + 64) && llama_memory_prefix_retain(mem, 0, 32)) { return false; }
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    for (int repeat = 0; repeat < 5; ++repeat) {
+        llama_batch_ptr occupied(1, 0, 1);
+        common_batch_add(occupied.get(), tokens.front(), 0, {1}, true);
+        if (llama_decode(ctx.get(), occupied.get())) { return false; }
+        if (llama_memory_prefix_attach(mem, 0, 1) || llama_memory_seq_pos_max(mem, 1) != 0) { return false; }
+        if (!llama_memory_prefix_attach(mem, prefix, 1)) { LOG_ERR("prefix attach failed at repeat %d\n", repeat); return false; }
+        llama_batch_ptr batch(1, 0, 1);
+        common_batch_add(batch.get(), tokens.back(), tokens.size() - 1, {1}, true);
+        if (llama_decode(ctx.get(), batch.get())) { return false; }
+        std::vector<float> actual;
+        if (!get_current_logits(ctx.get(), actual) || nmse(expected, actual) > NMSE_THRESHOLD) { LOG_ERR("prefix continuation mismatch at repeat %d: %.9f\n", repeat, nmse(expected, actual)); return false; }
+        if (repeat < 4) { llama_memory_seq_rm(mem, 1, -1, -1); }
+    }
+    llama_memory_prefix_usage usage = {};
+    if (!llama_memory_prefix_get_usage(mem, &usage) || !usage.full_retained_pages) { LOG_ERR("prefix usage missing\n"); return false; }
+    llama_memory_prefix_release(mem, prefix);
+    if (llama_memory_prefix_attach(mem, prefix, 1)) { return false; }
+    if (!llama_memory_prefix_get_usage(mem, &usage) || usage.full_retained_pages || usage.swa_retained_pages) { return false; }
+    const auto restored_stale = llama_memory_prefix_retain(mem, 1, tokens.size() - 1);
+    if (!restored_stale) { return false; }
+    std::vector<uint8_t> saved_state(llama_state_get_size(ctx.get()));
+    if (llama_state_get_data(ctx.get(), saved_state.data(), saved_state.size()) != saved_state.size()) { return false; }
+    if (llama_state_set_data(ctx.get(), saved_state.data(), saved_state.size()) != saved_state.size()) { return false; }
+    llama_memory_prefix_release(mem, restored_stale);
+    if (llama_memory_prefix_attach(mem, restored_stale, 0)) { return false; }
+    const auto stale = llama_memory_prefix_retain(mem, 1, tokens.size() - 1);
+    if (!stale) { LOG_ERR("prefix second retain failed\n"); return false; }
+    llama_memory_clear(mem, false);
+    llama_memory_prefix_release(mem, stale);
+    if (llama_memory_prefix_attach(mem, stale, 0)) { return false; }
+    if (!llama_memory_prefix_get_usage(mem, &usage) || usage.full_retained_pages || usage.swa_retained_pages) { return false; }
+    auto pressure_params = cparams;
+    pressure_params.kv_paged_n_blocks = 1;
+    pressure_params.n_batch = pressure_params.n_ubatch = 2;
+    auto pressure = llama_context_ptr{llama_init_from_model(model, pressure_params)};
+    if (!pressure) { return false; }
+    auto pressure_mem = llama_get_memory(pressure.get());
+    llama_batch_ptr pressure_batch(1, 0, 1);
+    common_batch_add(pressure_batch.get(), tokens.front(), 0, {0}, true);
+    if (llama_decode(pressure.get(), pressure_batch.get())) { return false; }
+    const auto pressure_prefix = llama_memory_prefix_retain(pressure_mem, 0, 1);
+    if (!pressure_prefix) { return false; }
+    llama_memory_seq_rm(pressure_mem, 0, -1, -1);
+    common_batch_clear(pressure_batch.get());
+    common_batch_add(pressure_batch.get(), tokens.front(), 0, {1}, true);
+    if (llama_decode(pressure.get(), pressure_batch.get()) != 1) { return false; }
+    if (llama_memory_seq_pos_max(pressure_mem, 1) != -1) { return false; }
+    if (!llama_memory_prefix_get_usage(pressure_mem, &usage) || usage.full_retry_pages != 1) { return false; }
+    llama_memory_prefix_release(pressure_mem, pressure_prefix);
+    if (llama_decode(pressure.get(), pressure_batch.get())) { return false; }
+    if (window && params.n_ctx >= 4096) {
+        pressure.reset();
+        pressure_params.kv_paged_n_blocks = 256;
+        pressure_params.n_batch = pressure_params.n_ubatch = 32;
+        pressure.reset(llama_init_from_model(model, pressure_params));
+        if (!pressure) { return false; }
+        pressure_mem = llama_get_memory(pressure.get());
+        llama_batch_ptr swa_batch(32, 0, 1);
+        llama_memory_prefix_id earlier = 0, later = 0;
+        for (int offset = 0; offset < 2048; offset += 32) {
+            common_batch_clear(swa_batch.get());
+            for (int token = 0; token < 32; ++token) { common_batch_add(swa_batch.get(), tokens.front(), offset + token, {0}, token == 31); }
+            if (llama_decode(pressure.get(), swa_batch.get())) { return false; }
+            if (offset == 992) { earlier = llama_memory_prefix_retain(pressure_mem, 0, 1024); }
+        }
+        later = llama_memory_prefix_retain(pressure_mem, 0, 2048);
+        if (!earlier || !later) { return false; }
+        llama_memory_seq_rm(pressure_mem, 0, -1, -1);
+        bool exhausted = false;
+        for (int offset = 0; offset < 1024; offset += 32) {
+            common_batch_clear(swa_batch.get());
+            for (int token = 0; token < 32; ++token) { common_batch_add(swa_batch.get(), tokens.front(), offset + token, {1}, token == 31); }
+            const int result = llama_decode(pressure.get(), swa_batch.get());
+            if (!result) { continue; }
+            if (result != 1 || !llama_memory_prefix_get_usage(pressure_mem, &usage) || usage.full_retry_pages || !usage.swa_retry_pages) { return false; }
+            llama_memory_prefix_release(pressure_mem, earlier);
+            if (llama_decode(pressure.get(), swa_batch.get())) { return false; }
+            exhausted = true;
+            break;
+        }
+        llama_memory_prefix_release(pressure_mem, later);
+        if (!exhausted) { return false; }
+    }
+    return true;
+}
+
 static generation_result test_baseline(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
@@ -878,7 +995,7 @@ struct test_suite {
 
 // column headers for the --models table, one per test, in the order they are run
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "prefix",
 };
 
 // Run the full save/load test suite (tests 1-9) for a single model.
@@ -962,6 +1079,7 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
 
     // Test 9: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+    suite.results.push_back(test_retained_prefix(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
     return suite;
 }

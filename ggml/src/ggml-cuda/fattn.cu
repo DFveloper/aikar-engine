@@ -730,7 +730,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
         static const char * disable_q8_kv_tile_env = getenv("GGML_CUDA_DISABLE_Q8_KV_TILE");
         static const bool disable_q8_kv_tile = disable_q8_kv_tile_env != nullptr && std::atoi(disable_q8_kv_tile_env) != 0;
-        if (!disable_q8_kv_tile && cc == GGML_CUDA_CC_VOLTA && Q->ne[1] > 1) {
+        if (!disable_q8_kv_tile && cc == GGML_CUDA_CC_VOLTA && Q->ne[1] > 1 && (K->ne[0] == 256 || K->ne[0] == 512)) {
             return BEST_FATTN_KERNEL_TILE;
         }
         return BEST_FATTN_KERNEL_VEC;

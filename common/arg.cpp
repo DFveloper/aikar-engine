@@ -1799,6 +1799,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--cache-prefix-gpu"},
+        "retain compatible text prompt prefixes in the paged KV pool",
+        [](common_params & params) { params.cache_prefix_gpu = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-gpu-mib"}, "N",
+        "maximum unique retained paged KV bytes in MiB (default: 256)",
+        [](common_params & params, int value) {
+            if (value <= 0) { throw std::invalid_argument("GPU prefix budget must be positive"); }
+            params.cache_prefix_gpu_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

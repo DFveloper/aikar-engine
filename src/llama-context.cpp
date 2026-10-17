@@ -4998,6 +4998,24 @@ int32_t llama_set_adapter_cvec(
 // memory
 //
 
+llama_memory_prefix_id llama_memory_prefix_retain(llama_memory_t mem, llama_seq_id src, llama_pos end) {
+    try { return mem ? mem->prefix_retain(src, end) : 0; } catch (...) { return 0; }
+}
+
+bool llama_memory_prefix_attach(llama_memory_t mem, llama_memory_prefix_id id, llama_seq_id dst) {
+    try { return mem && mem->prefix_attach(id, dst); } catch (...) { return false; }
+}
+
+void llama_memory_prefix_release(llama_memory_t mem, llama_memory_prefix_id id) {
+    try { if (mem) { mem->prefix_release(id); } } catch (...) {}
+}
+
+bool llama_memory_prefix_get_usage(llama_memory_t mem, llama_memory_prefix_usage * out) {
+    if (!out) { return false; }
+    *out = {};
+    try { return mem && mem->prefix_get_usage(*out); } catch (...) { return false; }
+}
+
 void llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {
         return;
