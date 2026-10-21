@@ -1,0 +1,21 @@
+# Harness² project settings. See docs/configuration.md for every key;
+# `harness2 config show --origin` prints the resolved values and where each comes from.
+
+[executor]
+# The agent CLI that runs your tasks, and the model it runs on (provider/model).
+name = "codex"
+model = "chatgpt-login/gpt-6.1-sol"
+
+[improver]
+# The agent that studies the runs and edits the harness.
+channel = "codex"
+model = "chatgpt-login/gpt-6.1-sol"
+
+# The selector picks the final harness when several candidates compete, and the judge
+# grades tasks that have a rubric.md. Both use the improver's settings unless set here.
+# [selector]
+# model = "chatgpt-login/gpt-6.1-sol"
+
+[paths]
+# Where the harness lives, relative to the project root.
+harness = "."
