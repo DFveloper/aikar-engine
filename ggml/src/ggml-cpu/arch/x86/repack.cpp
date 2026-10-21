@@ -9,6 +9,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "traits.h"
+#include "quantize-helpers.h"
 
 #include <cmath>
 #include <cstring>
@@ -139,7 +140,10 @@ static inline __m512i mul_sum_i8_pairs_acc_int32x16(const __m512i acc, const __m
     // Sign the values of the y vectors
     __mmask64 blt0 = _mm512_movepi8_mask(x);
     const __m512i sy = _mm512_mask_sub_epi8(y, blt0, zero, y);
-    return mul_sum_us8_pairs_acc_int32x16(acc, ax, sy);
+    const __mmask64 mask = blt0 & _mm512_cmpeq_epi8_mask(y, _mm512_set1_epi8(-128));
+    const __m512i correction = _mm512_maddubs_epi16(ax, _mm512_maskz_set1_epi8(mask, 1));
+    const __m512i dot = mul_sum_us8_pairs_acc_int32x16(acc, ax, sy);
+    return _mm512_add_epi32(dot, _mm512_slli_epi32(_mm512_madd_epi16(_mm512_set1_epi16(1), correction), 8));
 }
 #endif
 
@@ -171,7 +175,11 @@ static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m2
     const __m256i ax = _mm256_sign_epi8(x, x);
     // Sign the values of the y vectors
     const __m256i sy = _mm256_sign_epi8(y, x);
-    return mul_sum_us8_pairs_acc_int32x8(acc, ax, sy);
+    // Negating -128 wraps in a byte; apply the correction in int32 lanes.
+    const __m256i mask = _mm256_and_si256(_mm256_cmpgt_epi8(_mm256_setzero_si256(), x), _mm256_cmpeq_epi8(y, _mm256_set1_epi8(-128)));
+    const __m256i correction = _mm256_maddubs_epi16(ax, _mm256_and_si256(mask, _mm256_set1_epi8(1)));
+    const __m256i dot = mul_sum_us8_pairs_acc_int32x8(acc, ax, sy);
+    return _mm256_add_epi32(dot, _mm256_slli_epi32(_mm256_madd_epi16(_mm256_set1_epi16(1), correction), 8));
 #endif
 }
 #endif
@@ -196,7 +204,7 @@ void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTR
             __m256 v2 = _mm256_loadu_ps( x + row_iter * k + i * 32 + 16 );
             __m256 v3 = _mm256_loadu_ps( x + row_iter * k + i * 32 + 24 );
 
-            const float d = ggml_q8_0_scale(x + row_iter*k + i*QK8_0);
+            const float d = ggml_q8_0_scale_avx(v0, v1, v2, v3);
             id[row_iter] = d ? 1.0f / d : 0.0f;
 
             // Store the scale for the individual block
@@ -624,6 +632,33 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
     }
 }
 
+template<typename block_tx8>
+static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m256i x, const __m256i y) {
+    if constexpr (std::is_same_v<block_tx8, block_q4_0x8>) {
+        // Q4_0 weights plus eight are unsigned; the activation correction is shared across columns.
+        const __m256i offset = _mm256_set1_epi8(8);
+        const __m256i dot = mul_sum_us8_pairs_acc_int32x8(acc, _mm256_add_epi8(y, offset), x);
+        const __m256i correction = mul_sum_us8_pairs_acc_int32x8(_mm256_setzero_si256(), offset, x);
+        return _mm256_sub_epi32(dot, correction);
+    } else {
+        return mul_sum_i8_pairs_acc_int32x8(acc, x, y);
+    }
+}
+
+#if defined(__AVX512F__)
+template<typename block_tx8>
+static inline __m512i mul_sum_i8_pairs_acc_int32x16(const __m512i acc, const __m512i x, const __m512i y) {
+    if constexpr (std::is_same_v<block_tx8, block_q4_0x8>) {
+        const __m512i offset = _mm512_set1_epi8(8);
+        const __m512i dot = mul_sum_us8_pairs_acc_int32x16(acc, _mm512_add_epi8(y, offset), x);
+        const __m512i correction = mul_sum_us8_pairs_acc_int32x16(_mm512_setzero_si512(), offset, x);
+        return _mm512_sub_epi32(dot, correction);
+    } else {
+        return mul_sum_i8_pairs_acc_int32x16(acc, x, y);
+    }
+}
+#endif
+
 // GEMM for 8x blocks of 32 4-bit quants with a single scale factor per block
 template<typename block_tx8>
 static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i signextendlut) {
@@ -830,14 +865,14 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                     // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
                     // Resembles MMLAs into 2x2 matrices in ARM Version
                     const __m512i zero = _mm512_setzero_epi32();
-                    __m512i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_01_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_01_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_01_0_sp1, rhs_mat_014589CD_0_sp1);
-                    __m512i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367ABEF_0_sp1);
-                    __m512i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_23_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_23_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_23_0_sp1, rhs_mat_014589CD_0_sp1);
-                    __m512i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367ABEF_0_sp1);
-                    __m512i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_01_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_01_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_01_0_sp2, rhs_mat_014589CD_0_sp2);
-                    __m512i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367ABEF_0_sp2);
-                    __m512i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_23_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_23_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_23_0_sp2, rhs_mat_014589CD_0_sp2);
-                    __m512i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367ABEF_0_sp2);
+                    __m512i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_01_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_01_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_01_0_sp1, rhs_mat_014589CD_0_sp1);
+                    __m512i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367ABEF_0_sp1);
+                    __m512i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_23_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_23_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_23_0_sp1, rhs_mat_014589CD_0_sp1);
+                    __m512i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367ABEF_0_sp1);
+                    __m512i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_01_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_01_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_01_0_sp2, rhs_mat_014589CD_0_sp2);
+                    __m512i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367ABEF_0_sp2);
+                    __m512i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_23_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_23_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_23_0_sp2, rhs_mat_014589CD_0_sp2);
+                    __m512i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367ABEF_0_sp2);
 
                     // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
                     __m512i iacc_mat_00 = _mm512_add_epi32(iacc_mat_00_sp1, iacc_mat_00_sp2);
@@ -1038,14 +1073,14 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
                 // Resembles MMLAs into 2x2 matrices in ARM Version
                 const __m512i zero = _mm512_setzero_epi32();
-                __m512i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_01_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_01_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_01_0_sp1, rhs_mat_014589CD_0_sp1);
-                __m512i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367ABEF_0_sp1);
-                __m512i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_23_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_23_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_23_0_sp1, rhs_mat_014589CD_0_sp1);
-                __m512i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367ABEF_0_sp1);
-                __m512i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_01_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_01_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_01_0_sp2, rhs_mat_014589CD_0_sp2);
-                __m512i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_01_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367ABEF_0_sp2);
-                __m512i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_23_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_23_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_23_0_sp2, rhs_mat_014589CD_0_sp2);
-                __m512i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(mul_sum_i8_pairs_acc_int32x16(zero, lhs_mat_23_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367ABEF_0_sp2);
+                __m512i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_01_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_01_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_01_0_sp1, rhs_mat_014589CD_0_sp1);
+                __m512i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367ABEF_0_sp1);
+                __m512i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_014589CD_3_sp1), lhs_mat_23_2_sp1, rhs_mat_014589CD_2_sp1), lhs_mat_23_1_sp1, rhs_mat_014589CD_1_sp1), lhs_mat_23_0_sp1, rhs_mat_014589CD_0_sp1);
+                __m512i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_2367ABEF_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367ABEF_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367ABEF_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367ABEF_0_sp1);
+                __m512i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_01_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_01_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_01_0_sp2, rhs_mat_014589CD_0_sp2);
+                __m512i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367ABEF_0_sp2);
+                __m512i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_014589CD_3_sp2), lhs_mat_23_2_sp2, rhs_mat_014589CD_2_sp2), lhs_mat_23_1_sp2, rhs_mat_014589CD_1_sp2), lhs_mat_23_0_sp2, rhs_mat_014589CD_0_sp2);
+                __m512i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(mul_sum_i8_pairs_acc_int32x16<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_2367ABEF_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367ABEF_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367ABEF_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367ABEF_0_sp2);
 
                 // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
                 __m512i iacc_mat_00 = _mm512_add_epi32(iacc_mat_00_sp1, iacc_mat_00_sp2);
@@ -1221,14 +1256,14 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                     // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
                     // Resembles MMLAs into 2x2 matrices in ARM Version
                     const __m256i zero = _mm256_setzero_si256();
-                    __m256i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_01_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_01_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_01_0_sp1, rhs_mat_0145_0_sp1);
-                    __m256i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367_0_sp1);
-                    __m256i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_23_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_23_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_23_0_sp1, rhs_mat_0145_0_sp1);
-                    __m256i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367_0_sp1);
-                    __m256i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_01_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_01_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_01_0_sp2, rhs_mat_0145_0_sp2);
-                    __m256i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367_0_sp2);
-                    __m256i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_23_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_23_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_23_0_sp2, rhs_mat_0145_0_sp2);
-                    __m256i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367_0_sp2);
+                    __m256i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_01_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_01_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_01_0_sp1, rhs_mat_0145_0_sp1);
+                    __m256i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367_0_sp1);
+                    __m256i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_23_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_23_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_23_0_sp1, rhs_mat_0145_0_sp1);
+                    __m256i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367_0_sp1);
+                    __m256i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_01_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_01_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_01_0_sp2, rhs_mat_0145_0_sp2);
+                    __m256i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367_0_sp2);
+                    __m256i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_23_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_23_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_23_0_sp2, rhs_mat_0145_0_sp2);
+                    __m256i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367_0_sp2);
 
                     // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
                     __m256i iacc_mat_00 = _mm256_add_epi32(iacc_mat_00_sp1, iacc_mat_00_sp2);
@@ -1391,14 +1426,14 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
                 // Resembles MMLAs into 2x2 matrices in ARM Version
                 const __m256i zero = _mm256_setzero_si256();
-                __m256i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_01_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_01_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_01_0_sp1, rhs_mat_0145_0_sp1);
-                __m256i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367_0_sp1);
-                __m256i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_23_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_23_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_23_0_sp1, rhs_mat_0145_0_sp1);
-                __m256i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367_0_sp1);
-                __m256i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_01_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_01_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_01_0_sp2, rhs_mat_0145_0_sp2);
-                __m256i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_01_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367_0_sp2);
-                __m256i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_23_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_23_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_23_0_sp2, rhs_mat_0145_0_sp2);
-                __m256i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(mul_sum_i8_pairs_acc_int32x8(zero, lhs_mat_23_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367_0_sp2);
+                __m256i iacc_mat_00_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_01_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_01_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_01_0_sp1, rhs_mat_0145_0_sp1);
+                __m256i iacc_mat_01_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_01_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_01_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_01_0_sp1, rhs_mat_2367_0_sp1);
+                __m256i iacc_mat_10_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_0145_3_sp1), lhs_mat_23_2_sp1, rhs_mat_0145_2_sp1), lhs_mat_23_1_sp1, rhs_mat_0145_1_sp1), lhs_mat_23_0_sp1, rhs_mat_0145_0_sp1);
+                __m256i iacc_mat_11_sp1 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp1, rhs_mat_2367_3_sp1), lhs_mat_23_2_sp1, rhs_mat_2367_2_sp1), lhs_mat_23_1_sp1, rhs_mat_2367_1_sp1), lhs_mat_23_0_sp1, rhs_mat_2367_0_sp1);
+                __m256i iacc_mat_00_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_01_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_01_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_01_0_sp2, rhs_mat_0145_0_sp2);
+                __m256i iacc_mat_01_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_01_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_01_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_01_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_01_0_sp2, rhs_mat_2367_0_sp2);
+                __m256i iacc_mat_10_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_0145_3_sp2), lhs_mat_23_2_sp2, rhs_mat_0145_2_sp2), lhs_mat_23_1_sp2, rhs_mat_0145_1_sp2), lhs_mat_23_0_sp2, rhs_mat_0145_0_sp2);
+                __m256i iacc_mat_11_sp2 = mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(mul_sum_i8_pairs_acc_int32x8<block_tx8>(zero, lhs_mat_23_3_sp2, rhs_mat_2367_3_sp2), lhs_mat_23_2_sp2, rhs_mat_2367_2_sp2), lhs_mat_23_1_sp2, rhs_mat_2367_1_sp2), lhs_mat_23_0_sp2, rhs_mat_2367_0_sp2);
 
                 // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
                 __m256i iacc_mat_00 = _mm256_add_epi32(iacc_mat_00_sp1, iacc_mat_00_sp2);

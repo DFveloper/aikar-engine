@@ -4546,7 +4546,19 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    static constexpr int64_t moe_gemm_rows = 16;
+
+    static bool use_moe_gemm(const ggml_tensor * op) {
+        return PARAM_TYPE == GGML_TYPE_Q8_0 && op->src[0]->type == GGML_TYPE_Q4_0 && op->src[1]->ne[2] >= 4;
+    }
+
+    static size_t moe_gemm_stride(const ggml_tensor * op) {
+        const size_t input_size = moe_gemm_rows*ggml_row_size(GGML_TYPE_Q8_0, op->src[0]->ne[0]);
+        const int64_t rows = op->src[0]->ne[1];
+        return GGML_PAD(input_size + moe_gemm_rows*rows*sizeof(float), 64);
+    }
+
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -4565,6 +4577,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+                    if (use_moe_gemm(op)) {
+                        size = GGML_PAD(size, 64) + n_threads*moe_gemm_stride(op);
+                    }
 
                     return true;
                 }
@@ -4826,6 +4841,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
+        char * scratch = nullptr;
+        if (use_moe_gemm(op)) {
+            const size_t offset = GGML_PAD(GGML_PAD(nbw3, sizeof(int64_t)) + n_as*(ne12 + 1)*sizeof(mmid_row_mapping), 64);
+            const size_t stride = moe_gemm_stride(op);
+            GGML_ASSERT(params->wsize >= offset + nth*stride);
+            scratch = wdata + offset + ith*stride;
+        }
+
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
@@ -4884,7 +4907,39 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 return;
             }
 
-            for (int ir1 = 0; ir1 < nr1; ir1++) {
+            int64_t processed = 0;
+            if (scratch && nr1 >= 4) {
+                auto * packed = (block_q8_0x4 *) scratch;
+                float * output = (float *) (scratch + moe_gemm_rows*nbw1);
+                const int64_t ncols = src0_cur_end - src0_cur_start;
+                const int64_t nblocks = ne00/QK8_0;
+                while (processed + 4 <= nr1) {
+                    const int64_t nrows = MIN(moe_gemm_rows, (nr1 - processed)/4*4);
+                    for (int64_t group = 0; group < nrows/4; ++group) {
+                        const block_q8_0 * input[4];
+                        for (int row = 0; row < 4; ++row) {
+                            const mmid_row_mapping & mapping = MMID_MATRIX_ROW(cur_a, processed + group*4 + row);
+                            input[row] = (const block_q8_0 *) (wdata + (mapping.i1 % ne11)*nbw1 + mapping.i2*nbw2);
+                        }
+                        for (int64_t block = 0; block < nblocks; ++block) {
+                            block_q8_0 values[4];
+                            for (int row = 0; row < 4; ++row) {
+                                values[row] = input[row][block];
+                            }
+                            packed[group*nblocks + block] = make_block_q8_0x4(values, INTER_SIZE);
+                        }
+                    }
+                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, output, ncols,
+                            src0_cur + src0_cur_start*nb01, packed, nrows, ncols);
+                    for (int64_t row = 0; row < nrows; ++row) {
+                        const mmid_row_mapping & mapping = MMID_MATRIX_ROW(cur_a, processed + row);
+                        float * target = (float *) ((char *) dst->data + mapping.i1*nb1 + mapping.i2*nb2) + src0_cur_start;
+                        memcpy(target, output + row*ncols, ncols*sizeof(float));
+                    }
+                    processed += nrows;
+                }
+            }
+            for (int64_t ir1 = processed; ir1 < nr1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
                 const int id = row_mapping.i1;  // selected expert index

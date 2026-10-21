@@ -293,6 +293,58 @@ static int test_q8_0_full_byte(bool verbose) {
     return num_failed;
 }
 
+static int test_q8_0_signed_extrema(bool verbose) {
+    constexpr int qk = 32;
+    struct q8_0_block {
+        ggml_fp16_t d;
+        int8_t qs[qk];
+    };
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    const auto * traits_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    int num_failed = 0;
+
+    // Opposite extrema must use the first sign, including across SIMD lanes.
+    for (int first = 0; first < qk; ++first) {
+        for (int last = first + 1; last < qk; ++last) {
+            for (int sign : {-1, 1}) {
+                for (int exponent : {-120, -12, 0, 12, 120}) {
+                    float data[qk];
+                    for (int j = 0; j < qk; ++j) {
+                        data[j] = std::ldexp(float(j % 15 - 7), exponent - 4);
+                    }
+                    data[first] = std::ldexp(float(sign), exponent);
+                    data[last] = -data[first];
+                    q8_0_block ref = {};
+                    q8_0_block fast = {};
+                    traits->from_float_ref(data, &ref, qk);
+                    traits_cpu->from_float(data, &fast, qk);
+                    const ggml_fp16_t expected_d = ggml_fp32_to_fp16(-std::ldexp(float(sign), exponent - 7));
+                    const bool failed = fast.d != expected_d || fast.qs[first] != -128 || fast.qs[last] != 127 || memcmp(&fast, &ref, sizeof(fast)) != 0;
+                    num_failed += failed;
+                    if (failed) {
+                        printf(" q8_0 signed extrema: FAILED (first=%d last=%d sign=%d exponent=%d)\n", first, last, sign, exponent);
+                    }
+                }
+            }
+        }
+    }
+
+    float zeros[2*qk];
+    for (int j = 0; j < 2*qk; ++j) {
+        zeros[j] = j % 2 ? -0.0f : 0.0f;
+    }
+    q8_0_block fast[2] = {};
+    traits_cpu->from_float(zeros, fast, 2*qk);
+    for (const auto & block : fast) {
+        const bool failed = block.d != ggml_fp32_to_fp16(-0.0f) || std::any_of(block.qs, block.qs + qk, [](int8_t q) { return q != 0; });
+        num_failed += failed;
+    }
+    if (num_failed || verbose) {
+        printf(" q8_0 signed extrema and zeros:      %s\n", RESULT_STR[num_failed != 0]);
+    }
+    return num_failed;
+}
+
 static int test_q8_kv_row(bool verbose) {
     constexpr int n = 256;
 
@@ -377,6 +429,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_q8_0_full_byte(verbose);
+    num_failed += test_q8_0_signed_extrema(verbose);
     num_failed += test_q8_kv_row(verbose);
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);

@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <initializer_list>
 #include <time.h>
 #include <math.h>
 #include <stdio.h>
@@ -388,6 +389,126 @@ struct bench_row {
     bool have_repack;
 };
 
+static void test_matmul_q8_min(ggml_backend_t backend, ggml_type type, int64_t n, bool repack) {
+    const int64_t k = 256;
+    const int64_t m = 16;
+    struct ggml_init_params ip = { 1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
+    struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    struct ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf_rep = NULL;
+    if (repack) {
+        ggml_backend_buffer_type_t buft = get_cpu_repack_buft();
+        if (buft) {
+            buf_rep = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(a));
+            a->buffer = buf_rep;
+            a->data = ggml_backend_buffer_get_base(buf_rep);
+            ggml_backend_buffer_init_tensor(buf_rep, a);
+        }
+        if (!a->extra) {
+            ggml_backend_buffer_free(buf_rep);
+            ggml_free(ctx);
+            return;
+        }
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    float weights[k*m];
+    float input[k*20];
+    float result[m*20];
+    for (int64_t i = 0; i < k*m; ++i) {
+        weights[i] = -1.0f;
+    }
+    for (int64_t i = 0; i < k*n; ++i) {
+        input[i] = 1.0f;
+    }
+    fill_tensor(a, weights, m, k, type);
+    fill_tensor(b, input, n, k, GGML_TYPE_F32);
+    cpu_set_use_ref(backend, false);
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(out, result, 0, ggml_nbytes(out));
+    bool passed = true;
+    for (int64_t i = 0; i < m*n; ++i) {
+        if (!isfinite(result[i]) || fabsf(result[i] + k) > 0.05f) {
+            passed = false;
+        }
+    }
+    printf("TEST q8 minimum byte (%s, n=%lld, repack=%d): %s (expected=-256, actual=%f)\n",
+           ggml_type_name(type), (long long)n, repack, passed ? "PASS" : "FAIL", result[0]);
+    n_failed += !passed;
+    ggml_backend_buffer_free(buf);
+    ggml_backend_buffer_free(buf_rep);
+    ggml_free(ctx);
+}
+
+static void test_repack_moe(ggml_backend_t backend, int64_t tokens, int64_t slots, int64_t width) {
+    const int64_t rows = width == 32 ? 64 : 96;
+    const int64_t experts = 7;
+    const int64_t selected = 3;
+    struct ggml_init_params ip = { 1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width, rows, experts);
+    struct ggml_tensor * ar = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width, rows, experts);
+    const bool strided = tokens == 17;
+    struct ggml_tensor * base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width + (strided ? 32 : 0), slots, tokens);
+    struct ggml_tensor * b = strided ? ggml_view_3d(ctx, base, width, slots, tokens, base->nb[1], base->nb[2], 0) : base;
+    struct ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, selected, tokens);
+    struct ggml_tensor * out = ggml_mul_mat_id(ctx, a, b, ids);
+    struct ggml_tensor * outr = ggml_mul_mat_id(ctx, ar, b, ids);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    struct ggml_cgraph * gr = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gr, outr);
+    ggml_backend_buffer_type_t buft = get_cpu_repack_buft();
+    if (!buft) {
+        ggml_free(ctx);
+        return;
+    }
+    ggml_backend_buffer_t br = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(ar));
+    ar->buffer = br;
+    ar->data = ggml_backend_buffer_get_base(br);
+    ggml_backend_buffer_init_tensor(br, ar);
+    if (!ar->extra) {
+        ggml_backend_buffer_free(br);
+        ggml_free(ctx);
+        return;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    float * weights = gen_rand_f32(width*rows*experts);
+    float * input = gen_rand_f32(base->ne[0]*slots*tokens);
+    int32_t * routing = (int32_t *) malloc(selected*tokens*sizeof(int32_t));
+    for (int64_t t = 0; t < tokens; ++t) {
+        for (int64_t e = 0; e < selected; ++e) {
+            routing[t*selected + e] = (int32_t) ((t/5 + e) % (experts - 1));
+        }
+    }
+    fill_tensor(a, weights, rows*experts, width, GGML_TYPE_Q4_0);
+    fill_tensor(ar, weights, rows*experts, width, GGML_TYPE_Q4_0);
+    fill_tensor(base, input, slots*tokens, base->ne[0], GGML_TYPE_F32);
+    ggml_backend_tensor_set(ids, routing, 0, ggml_nbytes(ids));
+    cpu_set_use_ref(backend, true);
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    float * reference = (float *) malloc(ggml_nbytes(out));
+    float * actual = (float *) malloc(ggml_nbytes(outr));
+    ggml_backend_tensor_get(out, reference, 0, ggml_nbytes(out));
+    cpu_set_use_ref(backend, false);
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gr) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(outr, actual, 0, ggml_nbytes(outr));
+    float max_err, rms_err;
+    compare_f32(reference, actual, ggml_nelements(out), &max_err, &rms_err);
+    const bool passed = isfinite(rms_err) && max_err < 1e-3f;
+    printf("TEST repack MoE tokens=%lld slots=%lld width=%lld: %s (max_err=%f)\n",
+           (long long) tokens, (long long) slots, (long long) width, passed ? "PASS" : "FAIL", max_err);
+    n_failed += !passed;
+    free(weights); free(input); free(routing); free(reference); free(actual);
+    ggml_backend_buffer_free(buf);
+    ggml_backend_buffer_free(br);
+    ggml_free(ctx);
+}
+
 // MUL_MAT three-way bench: std (default optimized GEMM) vs repack (CPU_REPACK buffer) vs
 // tiled kernel. std is timed in-process with use_ref=true (bypasses the tiled gate); tiled
 // and repack with use_ref=false (repack's tiled gate declines on the buffer's extra). repack
@@ -678,6 +799,23 @@ int main(int argc, char ** argv) {
     if (!backend) {
         fprintf(stderr, "failed to initialize the CPU backend\n");
         return 1;
+    }
+    cpu_set_n_threads(backend, 8);
+    for (int64_t n : { 1, 2, 3, 4, 7, 8, 16, 20 }) {
+        for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+            test_matmul_q8_min(backend, type, n, false);
+            test_matmul_q8_min(backend, type, n, true);
+        }
+    }
+    for (int threads : { 1, 3, 8 }) {
+        cpu_set_n_threads(backend, threads);
+        for (int64_t tokens : { 1, 3, 4, 5, 17, 33 }) {
+            for (int64_t slots : { 1, 3 }) {
+                for (int64_t width : { 32, 288, 704 }) {
+                    test_repack_moe(backend, tokens, slots, width);
+                }
+            }
+        }
     }
     cpu_set_n_threads(backend, 8);
     // base case, smoke each quant type

@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "simd-mappings.h"
+#include "quantize-helpers.h"
 
 #include "../../quants.h"
 #include "../../ggml-cpu-impl.h"
@@ -308,7 +309,7 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         x += 32;
 
         // Quantize these floats
-        const float d = ggml_q8_0_scale(x - QK8_0);
+        const float d = ggml_q8_0_scale_avx(v0, v1, v2, v3);
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
         const float id = d ? 1.0f / d : 0.0f;
         const __m256 mul = _mm256_set1_ps( id );
