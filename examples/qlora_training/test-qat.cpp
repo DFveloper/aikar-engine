@@ -805,9 +805,8 @@ static void test_native_sparse_rows_accumulation(
     ggml_backend_free(backend);
 }
 
-static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t device, bool required, int64_t tokens = 3) {
-    constexpr int64_t cols = 32;
-    constexpr int64_t rows = 7;
+static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t device, bool required, int64_t tokens = 3,
+        int64_t cols = 32, int64_t rows = 7, bool strided = false, int n_threads = 4) {
     constexpr int64_t experts = 4;
     constexpr int64_t used = 2;
     const enum ggml_type weight_type = qat_weight_ggml_type(format);
@@ -848,6 +847,11 @@ static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t
         return;
     }
     check(backend != nullptr, "failed to create MoE dX test backend");
+    const auto reg = ggml_backend_dev_backend_reg(device);
+    auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (set_n_threads) {
+        set_n_threads(backend, n_threads);
+    }
     ggml_init_params params = {
         /*.mem_size   =*/ 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
         /*.mem_buffer =*/ nullptr,
@@ -855,16 +859,23 @@ static void test_native_moe_dx(enum qat_weight_format format, ggml_backend_dev_t
     };
     ggml_context * ctx = ggml_init(params);
     ggml_tensor * weight = ggml_new_tensor_3d(ctx, weight_type, cols, rows, experts);
-    ggml_tensor * grad_tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, used, tokens);
-    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
+    ggml_tensor * grad_storage = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows * (strided ? 2 : 1), used, tokens);
+    ggml_tensor * grad_tensor = ggml_view_3d(ctx, grad_storage, rows, used, tokens, grad_storage->nb[1], grad_storage->nb[2], 0);
+    ggml_tensor * ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used * (strided ? 2 : 1), tokens);
+    ggml_tensor * ids = ggml_view_2d(ctx, ids_storage, used, tokens, ids_storage->nb[1], 0);
     ggml_tensor * dx = ggml_mul_mat_id_back(ctx, weight, grad_tensor, ids);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
     ggml_build_forward_expand(graph, dx);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     check(buffer != nullptr, "failed to allocate MoE dX tensors");
     ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size());
-    ggml_backend_tensor_set(grad_tensor, grad.data(), 0, grad.size() * sizeof(float));
-    ggml_backend_tensor_set(ids, route_ids.data(), 0, route_ids.size() * sizeof(int32_t));
+    for (int64_t token = 0; token < tokens; ++token) {
+        for (int64_t route = 0; route < used; ++route) {
+            ggml_backend_tensor_set(grad_storage, grad.data() + rows * (route + used * token),
+                route * grad_storage->nb[1] + token * grad_storage->nb[2], rows * sizeof(float));
+        }
+        ggml_backend_tensor_set(ids_storage, route_ids.data() + used * token, token * ids_storage->nb[1], used * sizeof(int32_t));
+    }
     check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "native quantized MoE dX failed");
     std::vector<float> actual(expected.size());
     ggml_backend_tensor_get(dx, actual.data(), 0, actual.size() * sizeof(float));
@@ -1521,6 +1532,14 @@ int main() {
     test_native_moe_dx(QAT_WEIGHT_Q8_0, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true, 33);
     test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true, 129);
+    for (const auto format : { QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q4_0, QAT_WEIGHT_Q8_0 }) {
+        for (const int64_t cols : { 96, 256, 288, 704 }) {
+            for (const int n_threads : { 1, 4, 18 }) {
+                test_native_moe_dx(format, cpu_device, true, 3, cols, 35, true, n_threads);
+                test_native_moe_dx(format, cpu_device, true, 5, cols, 35, false, n_threads);
+            }
+        }
+    }
     test_native_routed_update(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_Q8_0, cpu_device, true);

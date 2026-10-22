@@ -3454,6 +3454,7 @@ int main(int argc, char ** argv) {
     }
 
     // --- Step 3: Load model + context (graph sized with LoRA nodes) ---
+    params.no_extra_bufts = true;
     params.offload_input = !params.grpo_phase_offload;
     common_init();
     llama_backend_init();

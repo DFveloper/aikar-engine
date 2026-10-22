@@ -1164,7 +1164,11 @@ static ggml_cgraph * ggml_opt_apply_recompute(ggml_opt_context_t opt_ctx, int n_
 
     ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, /*grads =*/ true);
     for (int i = 0; i < graph->n_nodes; ++i) {
-        ggml_build_forward_expand(reordered, graph->nodes[i]);
+        if (graph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            ggml_build_forward_expand(reordered, graph->nodes[i]);
+        } else {
+            ggml_build_forward_order(reordered, graph->nodes[i]);
+        }
     }
     for (size_t i = 0; i < graph->visited_hash_set.size; ++i) {
         if (!ggml_bitset_get(graph->visited_hash_set.used, i)) {

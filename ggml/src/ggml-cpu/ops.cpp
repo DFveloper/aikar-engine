@@ -5339,30 +5339,33 @@ void ggml_compute_forward_mul_mat_id_back(
 
     const ggml_type_traits * traits = ggml_get_type_traits(weight->type);
     GGML_ASSERT(traits->to_float && traits->blck_size == 32);
-    const int64_t n_blocks = weight->ne[0] / 32;
+    constexpr int64_t max_blocks_per_tile = 8;
     const int64_t n_routes = grad->ne[1] * grad->ne[2];
-    const int64_t n_tasks = n_routes * n_blocks;
+    const int64_t blocks_per_tile = n_routes >= params->nth ? max_blocks_per_tile : 1;
+    const int64_t n_blocks = weight->ne[0] / 32;
+    const int64_t n_tiles = (n_blocks + blocks_per_tile - 1) / blocks_per_tile;
+    const int64_t n_tasks = n_routes * n_tiles;
     const size_t block_bytes = ggml_type_size(weight->type);
 
     for (int64_t task = params->ith; task < n_tasks; task += params->nth) {
-        const int64_t route = task / n_blocks;
-        const int64_t block = task % n_blocks;
+        const int64_t route = task / n_tiles;
+        const int64_t block = (task % n_tiles) * blocks_per_tile;
+        const int64_t cols = MIN(blocks_per_tile, n_blocks - block) * 32;
         const int64_t used = route % grad->ne[1];
         const int64_t token = route / grad->ne[1];
         const int32_t expert = *(const int32_t *) ((const char *) ids->data + used * ids->nb[0] + token * ids->nb[1]);
         GGML_ASSERT(expert >= 0 && expert < weight->ne[2]);
-        float accum[32] = {};
-        float values[32];
+        float accum[max_blocks_per_tile * 32];
+        float values[max_blocks_per_tile * 32];
+        std::fill_n(accum, cols, 0.0f);
         for (int64_t row = 0; row < weight->ne[1]; ++row) {
             const void * weight_block = (const char *) weight->data + row * weight->nb[1] + expert * weight->nb[2] + block * block_bytes;
-            traits->to_float(weight_block, values, 32);
+            traits->to_float(weight_block, values, cols);
             const float g = *(const float *) ((const char *) grad->data + row * grad->nb[0] + used * grad->nb[1] + token * grad->nb[2]);
-            for (int lane = 0; lane < 32; ++lane) {
-                accum[lane] += values[lane] * g;
-            }
+            ggml_vec_mad_f32(cols, accum, values, g);
         }
         float * output = (float *) ((char *) dst->data + used * dst->nb[1] + token * dst->nb[2]) + block * 32;
-        memcpy(output, accum, sizeof(accum));
+        memcpy(output, accum, cols * sizeof(float));
     }
 }
 

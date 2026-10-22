@@ -1,0 +1,4 @@
+Started run cpu-opti-20261021 in the background (pid 504890).
+Follow it: harness2 status cpu-opti-20261021 --watch
+Stop it:   harness2 stop cpu-opti-20261021
+Log:       /home/user/aikar-engine/.harness2/runs/cpu-opti-20261021/run.log

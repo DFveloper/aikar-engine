@@ -6039,6 +6039,19 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+struct test_mul_mat_id_back : public test_mul_mat_id_dup {
+    using test_mul_mat_id_dup::test_mul_mat_id_dup;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * forward = test_mul_mat_id_dup::build_graph(ctx);
+        ggml_tensor * grad = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n);
+        ggml_set_name(grad, "grad");
+        ggml_tensor * out = ggml_mul_mat_id_back(ctx, forward->src[0], grad, forward->src[2]);
+        ggml_set_name(out, "out_back");
+        return out;
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -12284,6 +12297,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4096, 64, 4096));
     test_cases.emplace_back(new test_out_prod_id(32, 24, 8, 4, 10));
     test_cases.emplace_back(new test_out_prod_id(64, 32, 16, 4, 16));
+    for (const auto type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
+        for (const int64_t cols : { 32, 96, 256, 288, 704 }) {
+            test_cases.emplace_back(new test_mul_mat_id_back(type, GGML_TYPE_F32, 4, 2, false, 35, 3, cols));
+            test_cases.emplace_back(new test_mul_mat_id_back(type, GGML_TYPE_F32, 4, 2, false, 35, 5, cols, 1.0f, 40, true));
+        }
+    }
 
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {

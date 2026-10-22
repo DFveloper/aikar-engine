@@ -4023,17 +4023,6 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     cparams.lora_qat_type_callback       = lopt_params.lora_qat_type_callback;
     cparams.lora_qat_type_callback_ud    = lopt_params.lora_qat_type_callback_ud;
     opt_ctx = ggml_opt_init(opt_params);
-    if (lopt_params.qat_grad_accumulator_cpu && backend_cpu) {
-        for (const auto & set_n_threads_fn : set_n_threads_fns) {
-            set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads_batch);
-        }
-        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
-        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
-        if (set_threadpool_fn && threadpool_batch) {
-            set_threadpool_fn(backend_cpu, threadpool_batch);
-        }
-    }
-
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
 
@@ -4137,6 +4126,16 @@ void llama_context::opt_epoch_iter(
         int32_t                          position_offset,
         bool                             clear_memory) {
     GGML_ASSERT(opt_ctx);
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads_batch);
+    }
+    if (backend_cpu) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (set_threadpool_fn) {
+            set_threadpool_fn(backend_cpu, threadpool_batch);
+        }
+    }
     const uint32_t n_ctx    = (uint32_t)tokens.size();
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
