@@ -115,6 +115,7 @@ enum llm_type {
     LLM_TYPE_10B_128x3_66B,
     LLM_TYPE_57B_A14B,
     LLM_TYPE_816B_A42B,
+    LLM_TYPE_78B_A3_5B,  // Kolibri1
     LLM_TYPE_17B_16E, // llama4 Scout
     LLM_TYPE_17B_128E, // llama4 Maverick
     LLM_TYPE_A13B,
@@ -726,6 +727,7 @@ struct llama_model {
 
     // for classifier models
     std::vector<std::string> classifier_labels;
+    std::vector<std::string> decision_labels;
 
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;

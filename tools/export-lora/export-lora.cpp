@@ -353,7 +353,7 @@ struct file_input {
         f_ins[file_idx]->seekg(offset);
         f_ins[file_idx]->read((char *) buf.data(), len);
         if (!*f_ins[file_idx]) {
-            throw std::runtime_error("failed to read tensor: " + name);
+            throw std::runtime_error("failed to read data for tensor " + name + ", input file may be truncated");
         }
     }
 

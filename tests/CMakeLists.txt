@@ -348,6 +348,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-conv-1d.cpp LINK ggml)
     llama_build_and_test(test-turbo-quant.cpp LABEL "turbo" LINK ggml)
     target_include_directories(test-turbo-quant PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    llama_build_and_test(test-gelu-quick.cpp LINK ggml)
 endif()
 
 # libmtmd

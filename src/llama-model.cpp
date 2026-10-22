@@ -111,8 +111,12 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen2vl(params);
         case LLM_ARCH_QWEN2MOE:
             return new llama_model_qwen2moe(params);
+        case LLM_ARCH_SENSENOVA_U1:
+            return new llama_model_sensenova_u1(params);
         case LLM_ARCH_QWEN3:
             return new llama_model_qwen3(params);
+        case LLM_ARCH_FLINT:
+            return new llama_model_flint(params);
         case LLM_ARCH_QWEN3MOE:
             return new llama_model_qwen3moe(params);
         case LLM_ARCH_QWEN3VL:
@@ -363,6 +367,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_spark2_5(params);
         case LLM_ARCH_K2_HORIZON:
             return new llama_model_k2_horizon(params);
+        case LLM_ARCH_KOLIBRI1:
+            return new llama_model_kolibri1(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -1005,6 +1011,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_10B_128x3_66B: return "10B+128x3.66B";
         case LLM_TYPE_57B_A14B:      return "57B.A14B";
         case LLM_TYPE_816B_A42B:     return "816B.A42B";
+        case LLM_TYPE_78B_A3_5B:     return "78B.A3.5B";
         case LLM_TYPE_17B_16E:       return "17Bx16E (Scout)";
         case LLM_TYPE_17B_128E:      return "17Bx128E (Maverick)";
         case LLM_TYPE_A13B:          return "A13B";
@@ -1548,6 +1555,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     if (!classifier_labels.empty()) {
         hparams.n_cls_out = classifier_labels.size();
     }
+
+    // for decision models
+    ml.get_arr(LLM_KV_DECISION_LABELS, decision_labels, false);
 
     // per-arch hparams
     load_arch_hparams(ml);
@@ -3468,6 +3478,14 @@ const char * llama_model_cls_label(const struct llama_model * model, uint32_t i)
     return nullptr;
 }
 
+const char * llama_model_decision_label(const struct llama_model * model, uint32_t i) {
+    if (i < model->decision_labels.size()) {
+        return model->decision_labels[i].c_str();
+    }
+
+    return nullptr;
+}
+
 // deprecated
 int32_t llama_n_ctx_train(const llama_model * model) {
     return llama_model_n_ctx_train(model);
@@ -3588,6 +3606,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_VLLM_DECISION2:
+        case LLM_ARCH_FLINT:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
@@ -3649,6 +3668,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MAPLE:
         case LLM_ARCH_HRM_TEXT:
         case LLM_ARCH_BEAM:
+        case LLM_ARCH_KOLIBRI1:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:
@@ -3659,6 +3679,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
             // DSV4 DSpark drafters use DeepSeek-V4's normal RoPE; legacy DFlash backbones are NeoX
             return model->hparams.dsv4_hc_mult > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
 
+        case LLM_ARCH_SENSENOVA_U1:
         case LLM_ARCH_QWEN2VL:
         case LLM_ARCH_PADDLEOCR:
             return LLAMA_ROPE_TYPE_MROPE;
