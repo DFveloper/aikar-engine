@@ -398,8 +398,10 @@ struct case_state_restore_failure : ctx_test {
         opts.n_seq_max  = 4;
         opts.kv_unified = 1;
 
-        // without flash attention, corrupted data left behind by the restore shows up as NaN logits on the other sequences
+        // use F16 without flash attention so corrupted cache data can expose NaN logits on other sequences
         opts.fa = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        opts.type_k = GGML_TYPE_F16;
+        opts.type_v = GGML_TYPE_F16;
 
         auto ctx = mr.ctx(opts);
         if (!ctx) {

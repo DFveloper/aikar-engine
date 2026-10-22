@@ -3220,7 +3220,7 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            const int64_t n = winfo.size/ggml_element_size(winfo.tensor)*ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3351,7 +3351,7 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor)*ggml_blck_size(rinfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3419,7 +3419,7 @@ public:
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
                 const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                const int64_t n_el = (int64_t) (n_copy / el)*ggml_blck_size(src_t->type);
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);

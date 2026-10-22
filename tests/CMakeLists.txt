@@ -252,6 +252,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/q8-kv-state")
+    llama_test(
+        test-llama-context
+        NAME test-llama-context-q8-kv
+        LABEL main
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/q8-kv-state"
+        ARGS -m "${MODEL_DIR}/lfm2-dense.gguf" --test "^cp_[hd]_s$" -ngl 0 -fa on -ctk q8_kv -ctv q8_kv -t 2 -tb 2 -b 16 -ub 16
+    )
+    set_tests_properties(test-llama-context-q8-kv PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_build(test-fusion.cpp)
 endif()
 

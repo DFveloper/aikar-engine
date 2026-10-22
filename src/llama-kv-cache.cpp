@@ -1310,7 +1310,7 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 uint32_t llama_kv_cache::get_n_k_rows(uint32_t n_tokens) const {
-    return type_k() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
+    return !layers.empty() && type_k() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
 }
 
 bool llama_kv_cache::get_has_shift() const {
@@ -1581,7 +1581,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
-    const uint32_t n_rows = type_k() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
+    const uint32_t n_rows = !layers.empty() && type_k() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_rows);
 
     ggml_set_input(k_idxs);
@@ -1596,7 +1596,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     ggml_tensor * v_idxs;
 
     if (!v_trans) {
-        const uint32_t n_rows = type_v() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
+        const uint32_t n_rows = !layers.empty() && type_v() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_rows);
     } else {
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
@@ -1639,7 +1639,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
-    if (type_k() == GGML_TYPE_Q8_KV) {
+    if (!layers.empty() && type_k() == GGML_TYPE_Q8_KV) {
         GGML_ASSERT(n_head_kv_all > 0);
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
@@ -1669,7 +1669,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     if (!v_trans) {
-        if (type_v() == GGML_TYPE_Q8_KV) {
+        if (!layers.empty() && type_v() == GGML_TYPE_Q8_KV) {
             GGML_ASSERT(n_head_kv_all > 0);
             for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
                 const int64_t offs = sinfo.strm[s]*get_size();
