@@ -18774,3 +18774,7 @@
 "CUDA0","CROSS_ENTROPY_LOSS_BACK","type=f32,ne=[30000,1,1,1]","support","1","yes","CUDA"
 "CUDA0","OPT_STEP_ADAMW","type=f32,ne=[10,5,4,3]","support","1","yes","CUDA"
 "CUDA0","OPT_STEP_SGD","type=f32,ne=[10,5,4,3]","support","1","yes","CUDA"
+"CUDA0","QLION_QAT_STATS","n=32","support","1","yes","CUDA"
+"CUDA0","QLION_QAT_STATS","n=256","support","1","yes","CUDA"
+"CUDA0","QLION_QAT_STATS","n=544","support","1","yes","CUDA"
+"CUDA0","QLION_QAT_STATS","n=65536","support","1","yes","CUDA"

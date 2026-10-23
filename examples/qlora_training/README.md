@@ -42,6 +42,26 @@ Without microbatching, raw persistent state is 17.25 bits per weight for MXFP4 a
 
 The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). Only freshly-allocated F32 LoRA A/B tensors are trained. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
 
+### Gradient-adaptive QLion learning rate
+
+Native QLion optionally scales the learning rate using the RMS of the Q8_0 momentum restored at the start of the optimizer step:
+
+```text
+G = sqrt(mean(momentum * momentum))
+scale = G / (G + tau)
+target = weight + residual - learning_rate * scale * (direction + weight_decay * weight)
+```
+
+Use `--qat-lr-scale layer|256|32` to select one trainable tensor, 256 contiguous elements, or 32 contiguous elements. `layer` means one parameter tensor, including the entire expert tensor for routed weights. Groups use flat tensor indices, and a final partial 256-element group uses its actual element count. The default is `--qat-lr-scale off`, which retains the original five-parameter update path and allocates no adaptive state.
+
+`--qat-lr-tau F` selects a finite, nonnegative fixed threshold (default: 0.001). Alternatively, `--qat-lr-warmup N` estimates a separate threshold for each tensor as the arithmetic mean of its layer RMS over the first N updates, then freezes it. These warmup updates use the original learning rate. The estimate includes zero-momentum samples; an all-zero estimate is floored at `1e-30`. Collection happens once per optimizer update, after microbatch accumulation. LR schedule warmup (`--warmup-steps`) is independent.
+
+Scaling uses the old restored momentum; the direction still uses the current gradient and updated momentum. Consequently, the first fixed-threshold update with initially zero momentum has scale zero while momentum is initialized. Zero RMS always gives scale zero, including when tau is zero. A zero gradient can still produce an update when momentum remains nonzero. Weight decay is scaled together with the original update; residual feedback is added unchanged.
+
+CPU, CUDA, and Vulkan reduce Q8_0 momentum before updating it, without a full F32 momentum copy. Temporary statistics use `4 * (9 + number_of_elements / 32)` bytes per active tensor. The update kernel computes the scale directly from those statistics. The only new persistent data is two F32 values per tensor (warmup mean and sample count); checkpoints save these values and the scaling settings. Resume requires matching settings. Existing checkpoints remain usable with scaling off.
+
+For example, append `--qat-lr-scale layer --qat-lr-tau 0.01` to the native trainer command. A warmup estimate is optional and does not guarantee that the resulting threshold will suppress oscillation. See [the LR=1 comparisons](gradient-adaptive-lr.md) for measurements and their limits.
+
 ## Gemma MTP assistant training
 
 `llama-finetune-qlora` and `llama-finetune-qlion` can train a Gemma 4 MTP assistant GGUF alongside the target `--model`. The target forward pass exposes its `h_nextn` tensor directly to the assistant context on the selected backend; no hidden-state copy is staged through CPU memory. Use `joint` to train the target and assistant together, or `only` to leave the target frozen and train only the assistant LoRA.

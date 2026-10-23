@@ -115,6 +115,9 @@ extern "C" {
             float wd;    // weight decay
             float gclip; // element-wise gradient clipping threshold - 0.0f to disable
             bool  fast_state_scale;
+            int32_t lr_scale_unit; // 0 disables scaling; 1 is tensor-wise; 32 or 256 selects block size
+            float lr_scale_tau;
+            int32_t lr_scale_warmup; // collect this many layer RMS samples, then freeze tau
         } qlion_qat;
     };
 
@@ -213,6 +216,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_opt_qat_state_param(ggml_opt_context_t opt_ctx, int64_t index);
     GGML_API struct ggml_tensor * ggml_opt_qat_state_momentum(ggml_opt_context_t opt_ctx, int64_t index);
     GGML_API struct ggml_tensor * ggml_opt_qat_state_residual(ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor * ggml_opt_qat_state_lr_scale(ggml_opt_context_t opt_ctx, int64_t index);
     GGML_API struct ggml_tensor * ggml_opt_qat_state_gradient_accumulator(ggml_opt_context_t opt_ctx, int64_t index);
     GGML_API void ggml_opt_set_current_period(ggml_opt_context_t opt_ctx, int32_t period);
     GGML_API int64_t ggml_opt_step(ggml_opt_context_t opt_ctx);

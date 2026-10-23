@@ -19442,3 +19442,7 @@
 "Vulkan0","LIGHTNING_INDEXER","hsk=128,nh=64,kv=256,nb=512,ns=4,nm=1,type_K=q4_1","support","0","no","Vulkan"
 "Vulkan0","LIGHTNING_INDEXER","hsk=128,nh=64,kv=256,nb=512,ns=4,nm=1,type_K=q4_0","support","0","no","Vulkan"
 "Vulkan0","LIGHTNING_INDEXER","hsk=128,nh=64,kv=256,nb=512,ns=4,nm=1,type_K=iq4_nl","support","0","no","Vulkan"
+"Vulkan0","QLION_QAT_STATS","n=32","support","1","yes","Vulkan"
+"Vulkan0","QLION_QAT_STATS","n=256","support","1","yes","Vulkan"
+"Vulkan0","QLION_QAT_STATS","n=544","support","1","yes","Vulkan"
+"Vulkan0","QLION_QAT_STATS","n=65536","support","1","yes","Vulkan"

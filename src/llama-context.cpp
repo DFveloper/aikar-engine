@@ -5596,6 +5596,11 @@ struct ggml_tensor * llama_context::opt_qat_state_residual(int64_t index) const 
     return ggml_opt_qat_state_residual(opt_ctx, index);
 }
 
+struct ggml_tensor * llama_context::opt_qat_state_lr_scale(int64_t index) const {
+    GGML_ASSERT(opt_ctx);
+    return ggml_opt_qat_state_lr_scale(opt_ctx, index);
+}
+
 struct ggml_tensor * llama_context::opt_qat_state_gradient_accumulator(int64_t index) const {
     GGML_ASSERT(opt_ctx);
     return ggml_opt_qat_state_gradient_accumulator(opt_ctx, index);
@@ -5667,6 +5672,10 @@ struct ggml_tensor * llama_opt_qat_state_momentum(struct llama_context * ctx, in
 
 struct ggml_tensor * llama_opt_qat_state_residual(struct llama_context * ctx, int64_t index) {
     return ctx->opt_qat_state_residual(index);
+}
+
+struct ggml_tensor * llama_opt_qat_state_lr_scale(struct llama_context * ctx, int64_t index) {
+    return ctx->opt_qat_state_lr_scale(index);
 }
 
 struct ggml_tensor * llama_opt_qat_state_gradient_accumulator(struct llama_context * ctx, int64_t index) {

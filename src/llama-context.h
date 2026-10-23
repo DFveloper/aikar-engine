@@ -217,6 +217,7 @@ struct llama_context {
     struct ggml_tensor * opt_qat_state_param(int64_t index) const;
     struct ggml_tensor * opt_qat_state_momentum(int64_t index) const;
     struct ggml_tensor * opt_qat_state_residual(int64_t index) const;
+    struct ggml_tensor * opt_qat_state_lr_scale(int64_t index) const;
     struct ggml_tensor * opt_qat_state_gradient_accumulator(int64_t index) const;
     int64_t opt_step() const;
     void opt_set_step(int64_t step);

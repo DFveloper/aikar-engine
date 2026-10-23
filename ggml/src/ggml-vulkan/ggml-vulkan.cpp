@@ -3800,6 +3800,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_qlion_qat_stats, "qlion_qat_stats", qlion_qat_stats_len, qlion_qat_stats_data, "main", 4, sizeof(vk_op_push_constants), {32, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_qlion_qat_stats_finish, "qlion_qat_stats_finish", qlion_qat_stats_finish_len, qlion_qat_stats_finish_data, "main", 4, sizeof(vk_op_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_acc_qlion_qat, "acc_qlion_qat", acc_qlion_qat_len, acc_qlion_qat_data, "main", 2, sizeof(vk_op_push_constants), {32, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_qlion_qat_tied, "acc_qlion_qat_tied", acc_qlion_qat_tied_len, acc_qlion_qat_tied_data, "main", 5, sizeof(vk_op_qlion_qat_tied_acc_push_constants), {32, 1, 1}, {}, 1);
@@ -10751,6 +10753,22 @@ void ggml_vk_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, g
     );
 }
 
+static void ggml_vk_qlion_qat_stats(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const uint32_t nb = (uint32_t) (ggml_nelements(dst->src[0]) / 32);
+    const uint32_t nx = std::min(nb, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const uint32_t ny = (nb + nx - 1) / nx;
+    const std::initializer_list<vk::DescriptorBufferInfo> buffers = { ggml_vk_tensor_subbuffer(ctx, dst->src[0]), ggml_vk_tensor_subbuffer(ctx, dst->src[1]),
+        ggml_vk_tensor_subbuffer(ctx, dst->src[2]), ggml_vk_tensor_subbuffer(ctx, dst) };
+    const auto pc = vk_op_push_constants { nb, 0, 0, 0, 0, 0 };
+    auto blocks = ctx->device->pipeline_qlion_qat_stats;
+    auto finish = ctx->device->pipeline_qlion_qat_stats_finish;
+    ggml_pipeline_request_descriptor_sets(ctx, blocks, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, finish, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, blocks, buffers, pc, std::array<uint32_t, 3> { nx * 32, ny, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, finish, buffers, pc, std::array<uint32_t, 3> { 32, 1, 1 });
+}
+
 static void ggml_vk_acc_qlion_qat(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
     const ggml_tensor * accumulator = dst->src[0];
     const bool tied = dst->src[4] != nullptr;
@@ -10795,7 +10813,7 @@ static void ggml_vk_opt_step_qlion_qat(ggml_backend_vk_context * ctx, vk_context
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0);
     GGML_ASSERT((grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0) &&
         momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 5);
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && (ggml_nelements(params) == 5 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual) && ggml_is_contiguous(params));
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, weight, grad, momentum, dst, GGML_OP_OPT_STEP_QLION_QAT);
@@ -13328,6 +13346,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_QLION_QAT_STATS:
+        ggml_vk_qlion_qat_stats(ctx, compute_ctx, node);
+        break;
     case GGML_OP_ACC_QLION_QAT:
         ggml_vk_acc_qlion_qat(ctx, compute_ctx, node);
         break;
@@ -16403,6 +16424,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[3]) &&
                    ggml_is_contiguous(op->src[4]) &&
                    ggml_nelements(op->src[4]) == 8;
+        case GGML_OP_QLION_QAT_STATS:
+            return op->src[0]->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(op->src[0]) &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_nelements(op->src[1]) == 2 &&
+                op->src[2]->type == GGML_TYPE_F32 && ggml_nelements(op->src[2]) == 8;
         case GGML_OP_ACC_QLION_QAT:
             return op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
@@ -16417,7 +16442,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[2]) &&
                    ggml_is_contiguous(op->src[3]) &&
                    ggml_is_contiguous(op->src[4]) &&
-                   ggml_nelements(op->src[4]) == 5;
+                   (ggml_nelements(op->src[4]) == 5 || ggml_nelements(op->src[4]) == 9 + ggml_nelements(op->src[0]) / 32);
         case GGML_OP_OPT_STEP_QLION_QAT_ID:
             return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
@@ -17626,6 +17651,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
             src_clone[2], src_clone[3], src_clone[4]);
+        } else if (tensor->op == GGML_OP_QLION_QAT_STATS) {
+            tensor_clone = ggml_qlion_qat_stats(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_ACC_QLION_QAT) {
             if (src_clone[4]) {
                 tensor_clone = ggml_acc_qlion_qat_tied(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],

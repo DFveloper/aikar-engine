@@ -138,6 +138,9 @@ static bool qat_param_filter(const struct ggml_tensor * tensor, void * userdata)
 struct qat_opt_lr_context {
     qlora_lr_schedule * schedule;
     bool fast_state_scale;
+    int32_t lr_scale_unit;
+    float lr_scale_tau;
+    int32_t lr_scale_warmup;
 };
 
 static ggml_opt_optimizer_params qat_opt_lr_pars(
@@ -166,6 +169,9 @@ static ggml_opt_optimizer_params qat_opt_lr_pars(
     result.qlion_qat.fast_state_scale =
         opt.fast_state_scale;
 
+    result.qlion_qat.lr_scale_unit = opt.lr_scale_unit;
+    result.qlion_qat.lr_scale_tau = opt.lr_scale_tau;
+    result.qlion_qat.lr_scale_warmup = opt.lr_scale_warmup;
     return result;
 }
 
@@ -185,16 +191,22 @@ static bool qat_save_state(
         int64_t epoch,
         int64_t window,
         int64_t schedule_step,
-        const std::string & quant_type) {
+        const std::string & quant_type,
+        const common_params & config) {
     const int64_t count = llama_opt_qat_state_count(lctx);
     struct ggml_init_params meta_params = {
-        std::max<int64_t>(1, 2 * count) * ggml_tensor_overhead(), nullptr, true
+        std::max<int64_t>(1, 3 * count) * ggml_tensor_overhead(), nullptr, true
     };
     struct ggml_context * tensor_ctx = ggml_init(meta_params);
     struct gguf_context * gctx = gguf_init_empty();
     gguf_set_val_str(gctx, "general.type", "optimizer");
     gguf_set_val_u32(gctx, "training.qat.version", 1);
     gguf_set_val_str(gctx, "training.qat.quant_type", quant_type.c_str());
+    if (config.qat_lr_scale_unit) {
+        gguf_set_val_u32(gctx, "training.qat.lr.unit", config.qat_lr_scale_unit);
+        gguf_set_val_f32(gctx, "training.qat.lr.tau", config.qat_lr_scale_tau);
+        gguf_set_val_u32(gctx, "training.qat.lr.warmup", config.qat_lr_scale_warmup);
+    }
     gguf_set_val_str(gctx, "training.qat.momentum_type", "q8_0");
     gguf_set_val_str(gctx, "training.qat.residual_type", "q4_0");
     gguf_set_val_i64(gctx, "training.qat.state_count", count);
@@ -217,6 +229,12 @@ static bool qat_save_state(
         gguf_add_tensor(gctx, residual_meta);
         sources.push_back(momentum);
         sources.push_back(residual);
+        if (struct ggml_tensor * lr_state = llama_opt_qat_state_lr_scale(lctx, i)) {
+            struct ggml_tensor * meta = ggml_new_tensor_1d(tensor_ctx, GGML_TYPE_F32, 2);
+            ggml_format_name(meta, "qat.lr.%06ld", (long) i);
+            gguf_add_tensor(gctx, meta);
+            sources.push_back(lr_state);
+        }
     }
     const std::string path = qat_state_path(model_path);
     std::ofstream out(path, std::ios::binary);
@@ -259,13 +277,30 @@ static bool qat_load_state(
         struct llama_context * lctx,
         const std::string & model_path,
         const std::string & quant_type,
-        struct qat_resume_state & resume) {
+        struct qat_resume_state & resume,
+        const common_params & config) {
     struct ggml_context * data_ctx = nullptr;
     struct gguf_init_params params = { true, &data_ctx };
     const std::string path = qat_state_path(model_path);
     struct gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
     if (!gctx) {
         LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
+        return false;
+    }
+    const int64_t lr_unit = gguf_find_key(gctx, "training.qat.lr.unit");
+    const int64_t lr_tau = gguf_find_key(gctx, "training.qat.lr.tau");
+    const int64_t lr_warmup = gguf_find_key(gctx, "training.qat.lr.warmup");
+    const bool has_lr = lr_unit >= 0 && lr_tau >= 0 && lr_warmup >= 0 &&
+        gguf_get_kv_type(gctx, lr_unit) == GGUF_TYPE_UINT32 &&
+        gguf_get_kv_type(gctx, lr_tau) == GGUF_TYPE_FLOAT32 &&
+        gguf_get_kv_type(gctx, lr_warmup) == GGUF_TYPE_UINT32;
+    if ((config.qat_lr_scale_unit != 0 && !has_lr) ||
+        (has_lr && (gguf_get_val_u32(gctx, lr_unit) != (uint32_t) config.qat_lr_scale_unit ||
+                    gguf_get_val_f32(gctx, lr_tau) != config.qat_lr_scale_tau ||
+                    gguf_get_val_u32(gctx, lr_warmup) != (uint32_t) config.qat_lr_scale_warmup))) {
+        LOG_ERR("%s: adaptive LR settings differ from checkpoint\n", __func__);
+        gguf_free(gctx);
+        ggml_free(data_ctx);
         return false;
     }
     const int64_t count_key = gguf_find_key(gctx, "training.qat.state_count");
@@ -308,10 +343,20 @@ static bool qat_load_state(
         }
         const size_t momentum_bytes = ggml_nbytes(momentum);
         const size_t residual_bytes = ggml_nbytes(residual);
-        struct ggml_tensor * targets[] = { momentum, residual };
-        struct ggml_tensor * saved[] = { momentum_saved, residual_saved };
-        const size_t sizes[] = { momentum_bytes, residual_bytes };
-        for (int state = 0; state < 2; ++state) {
+        struct ggml_tensor * lr_state = llama_opt_qat_state_lr_scale(lctx, i);
+        char lr_name[32];
+        snprintf(lr_name, sizeof(lr_name), "qat.lr.%06ld", (long) i);
+        struct ggml_tensor * lr_saved = ggml_get_tensor(data_ctx, lr_name);
+        if (lr_state && (!lr_saved || lr_saved->type != GGML_TYPE_F32 || ggml_nelements(lr_saved) != 2)) {
+            LOG_ERR("%s: checkpoint lacks adaptive LR state for %s\n", __func__, param->name);
+            gguf_free(gctx);
+            ggml_free(data_ctx);
+            return false;
+        }
+        struct ggml_tensor * targets[] = { momentum, residual, lr_state };
+        struct ggml_tensor * saved[] = { momentum_saved, residual_saved, lr_saved };
+        const size_t sizes[] = { momentum_bytes, residual_bytes, 2 * sizeof(float) };
+        for (int state = 0; state < (lr_state ? 3 : 2); ++state) {
             const int64_t tensor_id = gguf_find_tensor(gctx, saved[state]->name);
             GGML_ASSERT(tensor_id >= 0);
             const size_t file_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tensor_id);
@@ -324,6 +369,17 @@ static bool qat_load_state(
                     gguf_free(gctx);
                     ggml_free(data_ctx);
                     return false;
+                }
+                if (state == 2) {
+                    float lr[2];
+                    memcpy(lr, data.data(), sizeof(lr));
+                    if (!std::isfinite(lr[0]) || lr[0] < 0 || !std::isfinite(lr[1]) ||
+                        lr[1] < 0 || lr[1] > 16777216 || lr[1] != std::floor(lr[1])) {
+                        LOG_ERR("%s: invalid adaptive LR checkpoint state\n", __func__);
+                        gguf_free(gctx);
+                        ggml_free(data_ctx);
+                        return false;
+                    }
                 }
                 ggml_backend_tensor_set(targets[state], data.data(), offset, chunk);
                 ggml_backend_tensor_get(targets[state], check_data.data(), offset, chunk);
@@ -453,12 +509,13 @@ static bool qat_save_checkpoint(
         int64_t epoch,
         int64_t window,
         int64_t schedule_step,
-        const std::string & quant_type) {
+        const std::string & quant_type,
+        const common_params & config) {
     llama_synchronize(lctx);
     if (!qat_save_model(model, source_path, path)) {
         return false;
     }
-    if (!qat_save_state(lctx, path, epoch, window, schedule_step, quant_type)) {
+    if (!qat_save_state(lctx, path, epoch, window, schedule_step, quant_type, config)) {
         return false;
     }
     LOG_INF("%s: saved %s and %s\n", __func__, path.c_str(), qat_state_path(path).c_str());
@@ -543,7 +600,7 @@ static void qat_epoch_callback(
             const std::string path = g_qat_callback->params->qat_out + ".step" + std::to_string(step) + ".gguf";
             saved = qat_save_checkpoint(g_qat_callback->lctx, g_qat_callback->model,
                 g_qat_callback->params->model.path, path, g_qat_callback->epoch, window,
-                g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type);
+                g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type, *g_qat_callback->params);
         }
         if (g_qat_callback->mtp_lctx) {
             checkpoint_state state;
@@ -811,7 +868,7 @@ int main(int argc, char ** argv) {
     };
     qat_opt_lr_context qat_lr_ctx {
         &schedule,
-        params.qat_fast_state_scale
+        params.qat_fast_state_scale, params.qat_lr_scale_unit, params.qat_lr_scale_tau, params.qat_lr_scale_warmup
     };
     struct llama_opt_params opt_params {
         0, params.mtp_mode == "only" ? lora_param_filter_none : qat_param_filter, &weight_types, qat_opt_lr_pars, &qat_lr_ctx,
@@ -834,7 +891,7 @@ int main(int argc, char ** argv) {
     qat_print_memory(lctx, model_info);
 
     struct qat_resume_state resume;
-    if (!params.qat_resume.empty() && !qat_load_state(lctx, params.qat_resume, params.qat_quant_type, resume)) {
+    if (!params.qat_resume.empty() && !qat_load_state(lctx, params.qat_resume, params.qat_quant_type, resume, params)) {
         return 1;
     }
 //    const int64_t idata_split = train_split_from_val_fraction(ndata, params.val_split);

@@ -9877,6 +9877,34 @@ struct test_opt_step_adamw : public test_case {
     }
 };
 
+// GGML_OP_QLION_QAT_STATS
+struct test_qlion_qat_stats : public test_case {
+    const int64_t n;
+    test_qlion_qat_stats(int64_t n) : n(n) {}
+    std::string vars() override { return VAR_TO_STR(n); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * m = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, n);
+        ggml_set_name(m, "momentum");
+        ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+        ggml_set_name(state, "warmup");
+        ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        ggml_set_name(p, "params");
+        return ggml_qlion_qat_stats(ctx, m, state, p);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "params") == 0) {
+                const float p[] = { 1, 0.9f, 0, 0, 0, 256, 1, 2 };
+                ggml_backend_tensor_set(t, p, 0, sizeof(p));
+            } else {
+                init_tensor_uniform(t, 0.0f, strcmp(t->name, "warmup") == 0 ? 0.0f : 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_OPT_STEP_SGD
 struct test_opt_step_sgd : public test_case {
     const ggml_type              type;
@@ -13435,6 +13463,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+    for (int64_t n : { 32, 256, 544, 65536 }) {
+        test_cases.emplace_back(new test_qlion_qat_stats(n));
+    }
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {

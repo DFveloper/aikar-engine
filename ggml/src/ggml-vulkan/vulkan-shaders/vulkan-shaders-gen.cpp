@@ -1174,6 +1174,8 @@ void process_shaders() {
     string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+    string_to_spv("qlion_qat_stats", "qlion_qat_stats.comp", base_dict);
+    string_to_spv("qlion_qat_stats_finish", "qlion_qat_stats.comp", merge_maps(base_dict, {{"FINALIZE", "1"}}));
     string_to_spv("acc_qlion_qat", "acc_qlion_qat.comp", base_dict);
     string_to_spv("acc_qlion_qat_tied", "acc_qlion_qat.comp", merge_maps(base_dict, {{"TIED", "1"}}));
     string_to_spv("opt_step_qlion_qat_mxfp4", "opt_step_qlion_qat.comp", merge_maps(base_dict, {{"DATA_A_MXFP4", "1"}, {"WEIGHT_MXFP4", "1"}}));

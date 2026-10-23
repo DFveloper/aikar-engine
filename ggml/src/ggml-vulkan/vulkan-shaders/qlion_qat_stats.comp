@@ -1,0 +1,56 @@
+#version 450
+#include "generic_head.glsl"
+#include "types.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer M { block_q8_0 momentum[]; };
+layout(binding = 1) buffer S { float state[]; };
+layout(binding = 2) readonly buffer P { float params[]; };
+layout(binding = 3) buffer O { float result[]; };
+shared float sums[32];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+#if FINALIZE
+    float sum = 0.0;
+    for (uint ib = lane; ib < p.KX; ib += 32) {
+        sum += result[9 + ib] / float(p.KX);
+    }
+    sums[lane] = sum;
+#else
+    const uint ib = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (ib >= p.KX) {
+        return;
+    }
+    const float d = float(momentum[ib].d);
+    const float v = isnan(d) || isinf(d) ? 0.0 : d * float(momentum[ib].qs[lane]);
+    sums[lane] = v * v / 32.0;
+#endif
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            sums[lane] += sums[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0) {
+#if FINALIZE
+        const float rms = sqrt(sums[0]);
+        for (uint i = 0; i < 8; ++i) {
+            result[i] = params[i];
+        }
+        result[8] = rms;
+        if (params[7] > 0.0) {
+            if (state[1] < params[7]) {
+                state[1] += 1.0;
+                state[0] += (rms - state[0]) / state[1];
+                result[6] = -1.0;
+            } else {
+                result[6] = max(state[0], 1e-30);
+            }
+        }
+#else
+        result[9 + ib] = sums[0];
+#endif
+    }
+}

@@ -1888,6 +1888,7 @@ extern "C" {
     LLAMA_API struct ggml_tensor * llama_opt_qat_state_param(struct llama_context * lctx, int64_t index);
     LLAMA_API struct ggml_tensor * llama_opt_qat_state_momentum(struct llama_context * lctx, int64_t index);
     LLAMA_API struct ggml_tensor * llama_opt_qat_state_residual(struct llama_context * lctx, int64_t index);
+    LLAMA_API struct ggml_tensor * llama_opt_qat_state_lr_scale(struct llama_context * lctx, int64_t index);
     LLAMA_API struct ggml_tensor * llama_opt_qat_state_gradient_accumulator(struct llama_context * lctx, int64_t index);
     LLAMA_API int64_t llama_opt_step(struct llama_context * lctx);
     LLAMA_API void llama_opt_set_step(struct llama_context * lctx, int64_t step);

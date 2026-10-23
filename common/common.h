@@ -727,6 +727,9 @@ struct common_params {
     std::string qat_update_granularity = "tensor";
     bool        preserve_thinking = true;
     bool        qat_fast_state_scale = false;
+    int32_t     qat_lr_scale_unit = 0;
+    float       qat_lr_scale_tau = 1e-3f;
+    int32_t     qat_lr_scale_warmup = 0;
     bool        kv_cache_training = false; // retain selected KV cache quantization during training
 
     // grpo training

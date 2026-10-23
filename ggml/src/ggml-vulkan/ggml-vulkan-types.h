@@ -1025,6 +1025,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_back_f32_f16;
     vk_pipeline pipeline_flash_attn_back_f16_f16;
     vk_pipeline pipeline_turbo_wht;
+    vk_pipeline pipeline_qlion_qat_stats;
+    vk_pipeline pipeline_qlion_qat_stats_finish;
     vk_pipeline pipeline_acc_qlion_qat;
     vk_pipeline pipeline_acc_qlion_qat_tied;
     vk_pipeline pipeline_opt_step_qlion_qat_mxfp4;

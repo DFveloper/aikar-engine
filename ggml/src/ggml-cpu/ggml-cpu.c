@@ -2286,6 +2286,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_QLION_QAT_STATS:
+            ggml_compute_forward_qlion_qat_stats(params, tensor);
+            break;
         case GGML_OP_ACC_QLION_QAT:
             {
                 ggml_compute_forward_acc_qlion_qat(params, tensor);
@@ -2678,6 +2681,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_QLION_QAT_STATS:
         case GGML_OP_ACC_QLION_QAT:
         case GGML_OP_ACC_QLION_QAT_ROWS:
         case GGML_OP_OPT_STEP_QLION_QAT:

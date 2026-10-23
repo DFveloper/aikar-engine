@@ -90,6 +90,8 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> qat_params;
     std::vector<struct ggml_tensor *> qat_momentum;
     std::vector<struct ggml_tensor *> qat_residual;
+    std::vector<struct ggml_tensor *> qat_lr_state;
+    int32_t qat_lr_scale_unit = 0;
     std::vector<struct ggml_tensor *> qat_grad_accumulator;
     bool qat_grad_accumulator_cpu = false;
     enum class qat_grad_state_kind { unclassified, dense, sparse_rows };
@@ -471,7 +473,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                 //
                 // Create replacement state metadata.
                 //
-                const size_t n_state_tensors = 2;
+                const size_t n_state_tensors = opt_ctx->qat_lr_scale_unit ? 3 : 2;
                 struct ggml_init_params state_params = {
                     /* .mem_size   = */
                         n_state_tensors * ggml_tensor_overhead(),
@@ -518,6 +520,8 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                     param->name
                 );
 
+                struct ggml_tensor * new_lr_state = opt_ctx->qat_lr_scale_unit
+                    ? ggml_new_tensor_1d(new_state_ctx, GGML_TYPE_F32, 2) : nullptr;
                 ggml_backend_buffer_t new_state_buffer =
                     ggml_backend_alloc_ctx_tensors_from_buft(
                         new_state_ctx,
@@ -545,6 +549,10 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                     new_residual
                 );
 
+                if (new_lr_state) {
+                    ggml_backend_tensor_copy(opt_ctx->qat_lr_state[i], new_lr_state);
+                }
+                opt_ctx->qat_lr_state[i] = new_lr_state;
                 if (opt_ctx->qat_grad_states[i].buffer) {
                     ggml_backend_sched_synchronize(opt_ctx->backend_sched);
                     const auto & old_state = opt_ctx->qat_grad_states[i];
@@ -642,7 +650,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
     ggml_backend_buffer_type_t param_buft = param->buffer
         ? ggml_backend_buffer_get_type(param->buffer)
         : ggml_backend_cpu_buffer_type();
-    const size_t n_state_tensors = 2;
+    const size_t n_state_tensors = opt_ctx->qat_lr_scale_unit ? 3 : 2;
     struct ggml_init_params state_params = {
         /*.mem_size   =*/ n_state_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -651,6 +659,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
     struct ggml_context * state_ctx = ggml_init(state_params);
     struct ggml_tensor * momentum = ggml_new_tensor(state_ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne);
     struct ggml_tensor * residual = ggml_new_tensor(state_ctx, GGML_TYPE_Q4_0, GGML_MAX_DIMS, param->ne);
+    struct ggml_tensor * lr_state = opt_ctx->qat_lr_scale_unit ? ggml_new_tensor_1d(state_ctx, GGML_TYPE_F32, 2) : nullptr;
     ggml_format_name(momentum, "QLion Q8_0 momentum for %s", param->name);
     ggml_format_name(residual, "QLion Q4_0 residual for %s", param->name);
     ggml_backend_buffer_t state_buffer = ggml_backend_alloc_ctx_tensors_from_buft(state_ctx, param_buft);
@@ -659,6 +668,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
     opt_ctx->qat_params.push_back(param);
     opt_ctx->qat_momentum.push_back(momentum);
     opt_ctx->qat_residual.push_back(residual);
+    opt_ctx->qat_lr_state.push_back(lr_state);
     opt_ctx->qat_grad_accumulator.push_back(nullptr);
     opt_ctx->qat_grad_states.emplace_back();
     opt_ctx->qat_aliases.push_back({ param });
@@ -948,6 +958,9 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     result.qlion_qat.wd    = 0.0f;
     result.qlion_qat.gclip = 0.0f;
     result.qlion_qat.fast_state_scale = false;
+    result.qlion_qat.lr_scale_unit = 0;
+    result.qlion_qat.lr_scale_tau = 1e-3f;
+    result.qlion_qat.lr_scale_warmup = 0;
 
     return result;
 }
@@ -1397,6 +1410,12 @@ ggml_opt_qlion_qat_backward_callback(
     const size_t i =
         found->second;
     
+    ggml_tensor * step_params = opt_ctx->opt_step_params;
+    if (opt_ctx->qat_lr_scale_unit && opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT) {
+        step_params = ggml_qlion_qat_stats(ctx, opt_ctx->qat_momentum[i], opt_ctx->qat_lr_state[i], step_params);
+        ggml_format_name(step_params, "QLion LR statistics for %s", opt_ctx->qat_params[i]->name);
+    }
+
     ggml_tensor * canonical_param =
         opt_ctx->qat_params[i];
 
@@ -1771,7 +1790,7 @@ if (!dumped_qat_placement &&
                     accumulated,
                     opt_ctx->qat_momentum[i],
                     opt_ctx->qat_residual[i],
-                    opt_ctx->opt_step_params);
+                    step_params);
             } else {
                 step = ggml_opt_step_qlion_qat_tied(
                     ctx,
@@ -1782,7 +1801,7 @@ if (!dumped_qat_placement &&
                     rows_back->src[1],
                     opt_ctx->qat_momentum[i],
                     opt_ctx->qat_residual[i],
-                    opt_ctx->opt_step_params);
+                    step_params);
             }
         }
     }
@@ -1820,7 +1839,7 @@ if (!dumped_qat_placement &&
             }
             step = ggml_opt_step_qlion_qat_sparse_rows(ctx, canonical_param, accumulated,
                 state.row_ids, state.row_count, opt_ctx->qat_momentum[i],
-                opt_ctx->qat_residual[i], opt_ctx->opt_step_params);
+                opt_ctx->qat_residual[i], step_params);
         }
 
     }
@@ -1867,7 +1886,7 @@ if (!dumped_qat_placement &&
                 accumulated,
                 opt_ctx->qat_momentum[i],
                 opt_ctx->qat_residual[i],
-                opt_ctx->opt_step_params);
+                step_params);
         } else if (combined->op ==
             GGML_OP_OUT_PROD_ID) {
 
@@ -1887,8 +1906,7 @@ if (!dumped_qat_placement &&
                     opt_ctx->
                         qat_residual[i],
 
-                    opt_ctx->
-                        opt_step_params
+                    step_params
                 );
 
         } else if (
@@ -1910,8 +1928,7 @@ if (!dumped_qat_placement &&
                     opt_ctx->
                         qat_residual[i],
 
-                    opt_ctx->
-                        opt_step_params
+                    step_params
                 );
 
         } else {
@@ -1929,8 +1946,7 @@ if (!dumped_qat_placement &&
                     opt_ctx->
                         qat_residual[i],
 
-                    opt_ctx->
-                        opt_step_params
+                    step_params
                 );
         }
     }
@@ -2691,7 +2707,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         const int64_t n_opt_params =
             ggml_opt_optimizer_is_adamw(optimizer)
                 ? 8
-                : (qlion_qat ? 5 : 2);
+                : (qlion_qat ? (opt_ctx->qat_lr_scale_unit ? 8 : 5) : 2);
         opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, n_opt_params);
         ggml_set_input(opt_ctx->opt_step_params);
         ggml_format_name(opt_ctx->opt_step_params, "%s_params", ggml_opt_optimizer_name(optimizer));
@@ -2901,6 +2917,11 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars              = params.get_opt_pars;
     result->get_opt_pars_ud           = params.get_opt_pars_ud;
     result->optimizer                 = params.optimizer;
+    if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+        result->qat_lr_scale_unit = params.get_opt_pars(params.get_opt_pars_ud).qlion_qat.lr_scale_unit;
+        GGML_ASSERT(result->qat_lr_scale_unit == 0 || result->qat_lr_scale_unit == 1 ||
+            result->qat_lr_scale_unit == 32 || result->qat_lr_scale_unit == 256);
+    }
     result->critical_token_weighting  = params.critical_token_weighting;
     result->critical_confidence_weighting = params.critical_confidence_weighting;
     result->critical_token_weight     = params.critical_token_weight;
@@ -3327,6 +3348,14 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 qlion_qat[2] = opt_pars.qlion_qat.wd;
                 qlion_qat[3] = opt_pars.qlion_qat.gclip;
                 qlion_qat[4] = opt_pars.qlion_qat.fast_state_scale ? 1.0f : 0.0f;
+                GGML_ASSERT(opt_pars.qlion_qat.lr_scale_unit == opt_ctx->qat_lr_scale_unit);
+                if (opt_ctx->qat_lr_scale_unit) {
+                    GGML_ASSERT(std::isfinite(opt_pars.qlion_qat.lr_scale_tau) && opt_pars.qlion_qat.lr_scale_tau >= 0);
+                    GGML_ASSERT(opt_pars.qlion_qat.lr_scale_warmup >= 0 && opt_pars.qlion_qat.lr_scale_warmup <= 16777216);
+                    qlion_qat[5] = opt_ctx->qat_lr_scale_unit;
+                    qlion_qat[6] = opt_pars.qlion_qat.lr_scale_tau;
+                    qlion_qat[7] = opt_pars.qlion_qat.lr_scale_warmup;
+                }
             } break;
             default:
                 GGML_ABORT("fatal error");
@@ -3718,6 +3747,11 @@ struct ggml_tensor * ggml_opt_qat_state_momentum(ggml_opt_context_t opt_ctx, int
 struct ggml_tensor * ggml_opt_qat_state_residual(ggml_opt_context_t opt_ctx, int64_t index) {
     GGML_ASSERT(index >= 0 && index < (int64_t) opt_ctx->qat_residual.size());
     return opt_ctx->qat_residual[index];
+}
+
+struct ggml_tensor * ggml_opt_qat_state_lr_scale(ggml_opt_context_t opt_ctx, int64_t index) {
+    GGML_ASSERT(index >= 0 && index < (int64_t) opt_ctx->qat_lr_state.size());
+    return opt_ctx->qat_lr_state[index];
 }
 
 struct ggml_tensor * ggml_opt_qat_state_gradient_accumulator(ggml_opt_context_t opt_ctx, int64_t index) {

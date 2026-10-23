@@ -36,13 +36,13 @@ layout (binding = 2) readonly buffer G {float grad[];};
 layout (binding = 3) readonly buffer IDS {int ids[];};
 layout (binding = 4) buffer M {block_q8_0 momentum[];};
 layout (binding = 5) buffer R {block_q4_0 residual[];};
-layout (binding = 6) readonly buffer P {float params[5];};
+layout (binding = 6) readonly buffer P {float params[];};
 #elif ROWS
 layout (binding = 1) readonly buffer G {float grad[];};
 layout (binding = 2) readonly buffer IDS {int ids[];};
 layout (binding = 3) buffer M {block_q8_0 momentum[];};
 layout (binding = 4) buffer R {block_q4_0 residual[];};
-layout (binding = 5) readonly buffer P {float params[5];};
+layout (binding = 5) readonly buffer P {float params[];};
 #else
 #if GRAD_Q8_0
 layout (binding = 1) readonly buffer G {block_q8_0 grad[];};
@@ -51,7 +51,7 @@ layout (binding = 1) readonly buffer G {float grad[];};
 #endif
 layout (binding = 2) buffer M {block_q8_0 momentum[];};
 layout (binding = 3) buffer R {block_q4_0 residual[];};
-layout (binding = 4) readonly buffer P {float params[5];};
+layout (binding = 4) readonly buffer P {float params[];};
 #endif
 
 shared float target_values[32];
@@ -151,7 +151,24 @@ void main() {
     momentum_new = isinf(momentum_new) || isnan(momentum_new) ? 0.0 : momentum_new;
     momentum_new = clamp(momentum_new, -128.0 * 65504.0, 128.0 * 65504.0);
     const float direction = momentum_new > 0.0 ? 1.0 : (momentum_new < 0.0 ? -1.0 : 0.0);
-    float target = weight_old + residual_old - params[0] * (direction + params[2] * weight_old);
+    float alpha = params[0];
+    if (params.length() > 5 && params[6] >= 0.0) {
+        float rms = params[8];
+        if (params[5] == 32.0) {
+            rms = sqrt(params[9 + state_ib]);
+        } else if (params[5] == 256.0) {
+            const uint begin = state_ib / 8 * 8;
+            const uint end = min(begin + 8, uint(params.length()) - 9);
+            float sum = 0.0;
+            for (uint j = begin; j < end; ++j) {
+                sum += params[9 + j];
+            }
+            rms = sqrt(sum / float(end - begin));
+        }
+        const float scale = !isnan(rms) && !isinf(rms) && rms > 0.0 ? 1.0 / (1.0 + params[6] / rms) : 0.0;
+        alpha *= scale;
+    }
+    float target = weight_old + residual_old - alpha * (direction + params[2] * weight_old);
     target = isinf(target) || isnan(target) ? weight_old : target;
 #if !WEIGHT_MXFP4
     target = clamp(target, -8.0 * 65504.0, 8.0 * 65504.0);

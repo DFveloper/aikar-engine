@@ -20410,3 +20410,7 @@
 "CPU","LIGHTNING_INDEXER","hsk=128,nh=64,kv=65,nb=32,ns=4,nm=1,type_K=q5_0","support","1","yes","CPU"
 "CPU","LIGHTNING_INDEXER","hsk=128,nh=64,kv=65,nb=32,ns=4,nm=1,type_K=q4_1","support","1","yes","CPU"
 "CPU","LIGHTNING_INDEXER","hsk=128,nh=64,kv=65,nb=32,ns=4,nm=1,type_K=q4_0","support","1","yes","CPU"
+"CPU","QLION_QAT_STATS","n=32","support","1","yes","CPU"
+"CPU","QLION_QAT_STATS","n=256","support","1","yes","CPU"
+"CPU","QLION_QAT_STATS","n=544","support","1","yes","CPU"
+"CPU","QLION_QAT_STATS","n=65536","support","1","yes","CPU"

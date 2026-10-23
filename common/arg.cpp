@@ -5315,6 +5315,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--qat-lr-scale"}, "off|layer|256|32",
+        "gradient-adaptive QLion LR scaling unit (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "layer" && value != "256" && value != "32") {
+                throw std::invalid_argument("unsupported --qat-lr-scale");
+            }
+            params.qat_lr_scale_unit = value == "off" ? 0 : value == "layer" ? 1 : std::stoi(value);
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-lr-tau"}, "F",
+        "fixed QLion momentum RMS threshold (default: 0.001; ignored during warmup estimation)",
+        [](common_params & params, const std::string & value) {
+            const float tau = std::stof(value);
+            if (!std::isfinite(tau) || tau < 0) {
+                throw std::invalid_argument("--qat-lr-tau must be finite and nonnegative");
+            }
+            params.qat_lr_scale_tau = tau;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-lr-warmup"}, "N",
+        "estimate and freeze a per-tensor threshold from N optimizer steps (default: 0, fixed tau)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 16777216) {
+                throw std::invalid_argument("--qat-lr-warmup must be between 0 and 16777216");
+            }
+            params.qat_lr_scale_warmup = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--qat-fast-state-scale"},
         "reuse Q4_0/Q8_0 QAT state scales while values remain representable; faster but not bit-identical",
         [](common_params & params) {

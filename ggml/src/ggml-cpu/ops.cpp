@@ -13243,6 +13243,66 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
     }
 }
 
+void ggml_compute_forward_qlion_qat_stats(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * m = (const block_q8_0 *) dst->src[0]->data;
+    float * state = (float *) dst->src[1]->data;
+    const float * p = (const float *) dst->src[2]->data;
+    float * out = (float *) dst->data;
+    const int64_t nb = ggml_nelements(dst->src[0]) / 32;
+    GGML_ASSERT(p[5] == 1 || p[5] == 32 || p[5] == 256);
+    GGML_ASSERT(std::isfinite(p[6]) && p[6] >= 0);
+    GGML_ASSERT(p[7] >= 0 && p[7] <= 16777216 && p[7] == std::floor(p[7]));
+    for (int64_t ib = params->ith; ib < nb; ib += params->nth) {
+        const float d = GGML_FP16_TO_FP32(m[ib].d);
+        float sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            const float v = std::isfinite(d) ? d * m[ib].qs[j] : 0.0f;
+            sum += v * v;
+        }
+        out[9 + ib] = sum / 32;
+    }
+    ggml_barrier(params->threadpool);
+    if (params->ith == 0) {
+        double sum = 0;
+        for (int64_t ib = 0; ib < nb; ++ib) {
+            sum += out[9 + ib];
+        }
+        const float rms = std::sqrt(sum / nb);
+        std::copy(p, p + 8, out);
+        out[8] = rms;
+        if (p[7] > 0) {
+            GGML_ASSERT(std::isfinite(state[0]) && state[0] >= 0 && std::isfinite(state[1]) && state[1] >= 0);
+            if (state[1] < p[7]) {
+                state[1] += 1;
+                state[0] += (rms - state[0]) / state[1];
+                out[6] = -1;
+            } else {
+                out[6] = std::max(state[0], 1e-30f);
+            }
+        }
+    }
+}
+
+static float ggml_qlion_qat_alpha(const float * p, int64_t nb, int64_t ib) {
+    if (nb == 0 || p[6] < 0) {
+        return p[0];
+    }
+    float rms = p[8];
+    if (p[5] == 32) {
+        rms = std::sqrt(p[9 + ib]);
+    } else if (p[5] == 256) {
+        const int64_t begin = ib / 8 * 8;
+        const int64_t end = std::min(begin + 8, nb);
+        float sum = 0;
+        for (int64_t j = begin; j < end; ++j) {
+            sum += p[9 + j];
+        }
+        rms = std::sqrt(sum / (end - begin));
+    }
+    const float scale = std::isfinite(rms) && rms > 0 ? 1.0f / (1.0f + p[6] / rms) : 0.0f;
+    return p[0] * scale;
+}
+
 static void ggml_qlion_qat_update_block(
         enum ggml_type weight_type,
         const ggml_type_traits * weight_traits,
@@ -13252,7 +13312,8 @@ static void ggml_qlion_qat_update_block(
         uint8_t * momentum_block,
         uint8_t * residual_block,
         const float * grad,
-        const float * p) {
+        const float * p,
+        float alpha) {
     float weight_f32[32];
     float momentum_f32[32];
     float residual_f32[32];
@@ -13274,7 +13335,7 @@ static void ggml_qlion_qat_update_block(
         momentum_f32[j] = m;
         //momentum_new[j] = m;
         const float direction = m > 0.0f ? 1.0f : (m < 0.0f ? -1.0f : 0.0f);
-        float value = weight_f32[j] + residual_f32[j] - p[0] * (direction + p[2] * weight_f32[j]);
+        float value = weight_f32[j] + residual_f32[j] - alpha * (direction + p[2] * weight_f32[j]);
         value = std::isfinite(value) ? value : weight_f32[j];
         if (weight_type == GGML_TYPE_Q4_0 || weight_type == GGML_TYPE_Q8_0) {
             const float limit = weight_type == GGML_TYPE_Q4_0 ? 8.0f * 65504.0f : 128.0f * 65504.0f;
@@ -13553,7 +13614,7 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
             grad_traits->to_float((const uint8_t *) grad->data + ib * grad_traits->type_size, grad_block, 32);
         }
         ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
-            weight_block, momentum_block, residual_block, grad_values, p);
+            weight_block, momentum_block, residual_block, grad_values, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
     }
 }
 
@@ -13616,7 +13677,7 @@ void ggml_compute_forward_opt_step_qlion_qat_tied(const ggml_compute_params * pa
             (uint8_t *) weight->data + ib * weight_traits->type_size,
             (uint8_t *) momentum->data + ib * momentum_traits->type_size,
             (uint8_t *) residual->data + ib * residual_traits->type_size,
-            grad_block, p);
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
     }
 }
 
@@ -13663,7 +13724,7 @@ void ggml_compute_forward_opt_step_qlion_qat_id(const ggml_compute_params * para
             (uint8_t *) weight->data + ib * weight_traits->type_size,
             (uint8_t *) momentum->data + ib * momentum_traits->type_size,
             (uint8_t *) residual->data + ib * residual_traits->type_size,
-            grad_block, p);
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
     }
 }
 
@@ -13677,7 +13738,7 @@ void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * pa
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(opt_params->type == GGML_TYPE_F32 && ggml_nelements(opt_params) == 5);
+    GGML_ASSERT(opt_params->type == GGML_TYPE_F32 && (ggml_nelements(opt_params) == 5 || ggml_nelements(opt_params) == 9 + ggml_nelements(weight) / 32));
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
 
@@ -13724,7 +13785,7 @@ void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * pa
             (uint8_t *) weight->data + ib * weight_traits->type_size,
             (uint8_t *) momentum->data + ib * momentum_traits->type_size,
             (uint8_t *) residual->data + ib * residual_traits->type_size,
-            grad_block, p);
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
     }
 }
 
@@ -13762,7 +13823,7 @@ void ggml_compute_forward_opt_step_qlion_qat_sparse_rows(const ggml_compute_para
             (uint8_t *) weight->data + weight_block_index * weight_traits->type_size,
             (uint8_t *) momentum->data + weight_block_index * momentum_traits->type_size,
             (uint8_t *) residual->data + weight_block_index * residual_traits->type_size,
-            grad_block, p);
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, weight_block_index));
     }
 }
 
