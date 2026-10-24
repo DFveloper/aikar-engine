@@ -2832,6 +2832,11 @@ llm_graph_params llama_context::graph_params(
                                   bool   training) const {
     llama_cparams graph_cparams = cparams;
     graph_cparams.training = training && ubatch.n_tokens == cparams.n_ctx;
+    const bool gemma4_qlion = training && model.arch == LLM_ARCH_GEMMA4 &&
+        opt_params.optimizer_type == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    if (gemma4_qlion && (ubatch.n_tokens != cparams.n_ctx || ubatch.n_seqs_unq != 1)) {
+        throw std::runtime_error("Gemma 4 full-parameter QLion requires -c == -b == -ub and one sequence");
+    }
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2855,7 +2860,7 @@ llm_graph_params llama_context::graph_params(
         /*.activation_recompute =*/ opt_params.activation_recompute,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
-        /*.full_sequence =*/ false,
+        /*.full_sequence =*/ gemma4_qlion,
         /*.replace_weight =*/ {},
         /*.smooth_gelu =*/ false,
     };

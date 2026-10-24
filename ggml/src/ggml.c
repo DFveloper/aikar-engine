@@ -8539,7 +8539,9 @@ void ggml_build_backward_expand_with_callback(
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
-                if (node->op == GGML_OP_CPY && (ggml_get_op_params_i32(node, 0) != 0 || ggml_is_quantized(node->src[0]->type))) {
+                if (node->op == GGML_OP_CPY && (ggml_get_op_params_i32(node, 0) != 0 ||
+                        (ggml_is_quantized(node->src[0]->type) &&
+                         !(callback && (node->src[0]->flags & GGML_TENSOR_FLAG_PARAM) && node->type == GGML_TYPE_F32)))) {
                     ignore_src[0] = true;
                 }
                 break;
