@@ -589,6 +589,34 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        if (params.cpu_les) {
+            if (model.arch != LLM_ARCH_GEMMA4 || cparams.n_seq_max != 1 ||
+                    params.cpu_les_prefetch_mib < 1 || params.cpu_les_prefetch_mib > 1024) {
+                throw std::runtime_error("CPU LES requires Gemma4, one sequence, and a 1 to 1024 MiB prefetch budget");
+            }
+            std::vector<llama_cpu_les_layer> layers;
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                auto * dev = model.dev_layer(il);
+                if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    throw std::runtime_error("CPU LES requires all decoder layers on CPU");
+                }
+                const auto & layer = model.layers[il];
+                std::vector<const ggml_tensor *> experts;
+                if (layer.ffn_gate_up_exps) {
+                    experts.push_back(layer.ffn_gate_up_exps);
+                } else {
+                    for (const auto * tensor : {layer.ffn_up_exps, layer.ffn_gate_exps}) {
+                        if (tensor) { experts.push_back(tensor); }
+                    }
+                }
+                if (layer.ffn_down_exps) { experts.push_back(layer.ffn_down_exps); }
+                layers.push_back({layer.ffn_gate_inp, layer.ffn_gate_inp_s, std::move(experts),
+                        hparams.f_norm_rms_eps, 1.0f/std::sqrt(float(hparams.n_embd))});
+            }
+            cpu_les = std::make_unique<llama_cpu_les>(std::move(layers), hparams.n_expert_used(),
+                    size_t(params.cpu_les_prefetch_mib)*1024*1024);
+            LLAMA_LOG_INFO("%s: CPU LES enabled, prefetch budget %u MiB per job\n", __func__, params.cpu_les_prefetch_mib);
+        }
         sched_reserve();
 
         if (!cparams.kv_paged && !cparams.flash_attn) {
@@ -612,6 +640,14 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (cpu_les) {
+        cpu_les->synchronize();
+        const auto stats = cpu_les->stats();
+        LLAMA_LOG_INFO("%s: CPU LES required=%" PRIu64 " predicted=%" PRIu64 " matched=%" PRIu64 " prepared_hits=%" PRIu64 " bytes=%" PRIu64 " cancelled=%" PRIu64 "\n",
+                __func__, stats.required_experts, stats.predicted_experts, stats.prediction_matches,
+                stats.ready_hits, stats.prepared_bytes, stats.cancelled_jobs);
+        cpu_les.reset();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2809,6 +2845,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.cpu_les     =*/ !training && loras->empty() ? cpu_les.get() : nullptr,
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -3892,6 +3929,7 @@ static void llama_set_param(
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    if (cpu_les) { throw std::runtime_error("CPU LES is not supported during training"); }
     if (cparams.kv_paged) { throw std::runtime_error("paged KV does not support training"); }
     GGML_ASSERT(!opt_ctx);
     opt_ctx_compute_cache.reset();
@@ -4738,6 +4776,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.type_k_swa                  =*/ GGML_TYPE_COUNT,
         /*.type_v_swa                  =*/ GGML_TYPE_COUNT,
+        /*.cpu_les_prefetch_mib        =*/ 16,
         /*.moe_cache_size              =*/ 0,
         /*.kv_turboquant_bits          =*/ 0,
         /*.kv_turboquant_bits_swa      =*/ 0,
@@ -4758,6 +4797,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_hadamard_k_swa           =*/ false,
         /*.kv_hadamard_v_swa           =*/ false,
         /*.kv_hadamard_separate        =*/ false,
+        /*.cpu_les                     =*/ false,
         /*.kv_hadamard_explicit        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,

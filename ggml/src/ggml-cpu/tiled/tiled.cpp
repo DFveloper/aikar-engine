@@ -758,14 +758,11 @@ static void tiled_store_window_scatter(const float * buf, int n_src0, int n_src1
 // rows points at this k window's routed src1 rows, row r at its base block
 template <typename B, int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
 static void tiled_mmid_gemm_window(struct ggml_tensor * dst, const struct ggml_tensor * src0,
-                                   const char * src0_cur, int64_t r, int64_t k, int64_t nrows,
+                                   const char * src0_cur, int64_t r, int64_t r_end, int64_t k, int64_t nrows,
                                    const int32_t * expert_rows,
                                    const block_q8_K * const * rows,
                                    tiled_ws * ws) {
     const int64_t ne00 = src0->ne[0];
-    const int64_t ne01 = src0->ne[1];
-
-    const int64_t r_end = MIN(r + TILED_MMID_GROUP, ne01);
     const int n_src0 = (int) (r_end - r);
 
     const size_t src0_bs = ggml_type_size(src0->type);
@@ -861,14 +858,12 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
     // this thread's workspace
     tiled_ws * ws = (tiled_ws *) (scratch + (size_t) ith * ggml_tiled_ws_size());
 
-    // groups of TILED_MMID_GROUP rows; rounded up, the window tail is clamped in the gemm
-    const int64_t ngroups = (ne01 + TILED_MMID_GROUP - 1) / TILED_MMID_GROUP;
-
-    const int64_t g0 = (ngroups * ith) / nth;
-    const int64_t g1 = (ngroups * (ith + 1)) / nth;
+    const int64_t ntiles = (ne01 + TILED_MICRO - 1) / TILED_MICRO;
+    const int64_t row_begin = (ntiles * ith / nth) * TILED_MICRO;
+    const int64_t row_end = MIN((ntiles * (ith + 1) / nth) * TILED_MICRO, ne01);
 
     // no rows for this thread; nothing to do
-    if (g0 >= g1) {
+    if (row_begin >= row_end) {
         return;
     }
 
@@ -884,10 +879,9 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
             rows[i] = (const block_q8_K *) ((const char *) wdata + (i11 + i12 * ne11) * nbw1);
         }
 
-        for (int64_t g = g0; g < g1; g++) {
-            const int64_t r = g * TILED_MMID_GROUP;
-
-            tiled_mmid_gemm_window<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(dst, src0, src0_cur, r, k, nrows, expert_rows, rows, ws);
+        for (int64_t r = row_begin; r < row_end; r += TILED_MMID_GROUP) {
+            const int64_t r_end = MIN(r + TILED_MMID_GROUP, row_end);
+            tiled_mmid_gemm_window<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(dst, src0, src0_cur, r, r_end, k, nrows, expert_rows, rows, ws);
         }
     }
 }

@@ -4881,7 +4881,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         ggml_barrier(params->threadpool);
 
         // compute each matrix multiplication in sequence
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        const float * priority = op->src[3] ? (const float *) op->src[3]->data : nullptr;
+        for (int64_t visit = 0; visit < (int64_t) n_as*(priority ? 2 : 1); ++visit) {
+            const int cur_a = ggml_cpu_moe_expert_for_visit(priority, n_as, visit);
+            if (cur_a < 0) { continue; }
             const int64_t cne1 = matrix_row_counts[cur_a];
 
             if (cne1 == 0) {

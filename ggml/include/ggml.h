@@ -1539,6 +1539,10 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    GGML_API void ggml_mul_mat_id_set_expert_priority(
+            struct ggml_tensor * result,
+            struct ggml_tensor * priority);
+
     GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,

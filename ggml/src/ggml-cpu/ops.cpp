@@ -12,7 +12,10 @@
 #include "ggml-turboquant.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <vector>
 
@@ -147,13 +150,51 @@ void ggml_compute_forward_turboquant_attn(const ggml_compute_params * params, gg
     }
 }
 
-void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_tensor * dst) {
-    const auto * q = dst->src[0];
+size_t ggml_paged_attn_work_size(const ggml_tensor * op, int n_threads) {
+    const auto * q = op->src[0];
+    const auto * k = op->src[1];
+    if (ggml_is_empty(op) || q->ne[0] > 1024) { return 0; }
+    GGML_ASSERT(q->ne[0] > 0 && q->ne[1] > 0 && q->ne[1] <= INT_MAX);
+    GGML_ASSERT(q->ne[2] > 0 && q->ne[2] <= INT_MAX && k->ne[1] > 0 && q->ne[1]%k->ne[1] == 0);
+    const size_t dim = q->ne[0];
+    const size_t keys = dim <= 512 ? 32 : 16;
+    const size_t queries = std::min<int64_t>(q->ne[2], dim <= 512 ? 8 : 4);
+    const size_t heads = q->ne[2] >= 8 ? std::min<int64_t>(q->ne[1]/k->ne[1], 4) : 1;
+    const size_t stride = GGML_PAD(sizeof(float)*dim*(2*keys + queries*heads), CACHE_LINE_SIZE);
+    GGML_ASSERT(n_threads > 0 && size_t(n_threads) <= SIZE_MAX/stride);
+    return stride*size_t(n_threads);
+}
+
+static void ggml_paged_attn_store(const ggml_compute_params * params, ggml_tensor * dst) {
     const auto * kn = dst->src[1];
     const auto * vn = dst->src[2];
     auto * cache = dst->src[3];
-    const auto * table = dst->src[4];
     const int32_t * slots = (const int32_t *) dst->src[5]->data;
+    const int64_t d = kn->ne[0], hk = kn->ne[1], nt = kn->ne[2];
+    const int64_t ns = dst->src[4]->ne[2];
+    const int bs = ggml_get_op_params_i32(dst, 1);
+    const auto * traits = ggml_get_type_traits(cache->type);
+    GGML_ASSERT(traits->from_float_ref && traits->to_float);
+    for (int64_t row = params->ith; row < nt*ns*hk; row += params->nth) {
+        const int64_t h = row%hk, t = row/hk/ns, seq = row/hk%ns;
+        const int slot = slots[t*ns + seq];
+        if (slot < 0) { continue; }
+        GGML_ASSERT(slot < bs*cache->ne[3]);
+        for (int kv = 0; kv < 2; ++kv) {
+            const auto * input = kv ? vn : kn;
+            const float * src = (const float *) input->data + (t*hk + h)*d;
+            char * out = (char *) cache->data + (slot/bs)*cache->nb[3] + (h + kv*hk)*cache->nb[2] + (slot%bs)*cache->nb[1];
+            traits->from_float_ref(src, out, d);
+        }
+    }
+    ggml_barrier(params->threadpool);
+}
+
+static void ggml_compute_forward_paged_attn_reference(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * q = dst->src[0];
+    const auto * kn = dst->src[1];
+    auto * cache = dst->src[3];
+    const auto * table = dst->src[4];
     const int32_t * queries = (const int32_t *) dst->src[6]->data;
     const int32_t * pages = (const int32_t *) table->data;
     const int d = q->ne[0], nh = q->ne[1], hk = kn->ne[1], nt = q->ne[2];
@@ -166,19 +207,7 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     const float scale = ggml_get_op_params_f32(dst, 0);
     const auto * traits = ggml_get_type_traits(cache->type);
     GGML_ASSERT(traits->from_float_ref && traits->to_float);
-    for (int row = params->ith; row < nt*ns*hk; row += params->nth) {
-        const int h = row%hk, t = row/hk/ns, seq = row/hk%ns;
-        const int slot = slots[t*ns + seq];
-        if (slot < 0) { continue; }
-        GGML_ASSERT(slot < bs*cache->ne[3]);
-        for (int kv = 0; kv < 2; ++kv) {
-            const auto * input = kv ? vn : kn;
-            const float * src = (const float *) input->data + (t*hk + h)*d;
-            char * out = (char *) cache->data + (slot/bs)*cache->nb[3] + (h + kv*hk)*cache->nb[2] + (slot%bs)*cache->nb[1];
-            traits->from_float_ref(src, out, d);
-        }
-    }
-    ggml_barrier(params->threadpool);
+    ggml_paged_attn_store(params, dst);
     std::vector<float> k(d), v(d), acc(d);
     for (int row = params->ith; row < nt*nh; row += params->nth) {
         const int t = row/nh, h = row%nh, hkv = h/(nh/hk);
@@ -210,6 +239,155 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
         GGML_ASSERT(sum > 0.0f);
         float * out = (float *) dst->data + row*d;
         for (int i = 0; i < d; ++i) { out[i] = acc[i]/sum; }
+    }
+}
+
+static void ggml_paged_attn_decode_row(const ggml_type_traits * traits, ggml_type type,
+        const char * source, float * target, int dim) {
+    if (type == GGML_TYPE_F16) {
+        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) source, target, dim);
+    } else if (type == GGML_TYPE_IQ4_NL) {
+        ggml_cpu_dequantize_row_iq4_nl((const block_iq4_nl *) source, target, dim);
+    } else {
+        traits->to_float(source, target, dim);
+    }
+}
+
+void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const char * reference = std::getenv("GGML_CPU_PAGED_ATTN_REFERENCE");
+    if (params->use_ref || dst->src[0]->ne[0] > 1024 || (reference && reference[0] != '0')) {
+        ggml_compute_forward_paged_attn_reference(params, dst);
+        return;
+    }
+    ggml_paged_attn_store(params, dst);
+    const auto * q = dst->src[0];
+    const auto * cache = dst->src[3];
+    const auto * table = dst->src[4];
+    const int32_t * queries = (const int32_t *) dst->src[6]->data;
+    const int32_t * pages = (const int32_t *) table->data;
+    const int d = q->ne[0], nh = q->ne[1], nt = q->ne[2];
+    const int hk = dst->src[1]->ne[1], ns = table->ne[2], np = table->ne[1];
+    const int bs = ggml_get_op_params_i32(dst, 1);
+    const int words = (bs + 31)/32;
+    const int window = ggml_get_op_params_i32(dst, 2);
+    const int n_kv = ggml_get_op_params_i32(dst, 3);
+    const bool causal = !ggml_get_op_params_i32(dst, 4);
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const auto * traits = ggml_get_type_traits(cache->type);
+    const int kv_tile = d <= 512 ? 32 : 16;
+    const int gqa = nh/hk;
+    const int head_tile = nt >= 8 ? std::min(gqa, 4) : 1;
+    int query_tile = std::min(nt, d <= 512 ? 8 : 4);
+    for (int t = 1; t < nt; ++t) {
+        if (queries[2*t + 1] != queries[1]) { query_tile = 1; break; }
+    }
+    const int groups = (gqa + head_tile - 1)/head_tile;
+    const int64_t query_tiles = (int64_t(nt) + query_tile - 1)/query_tile;
+    const int64_t jobs = int64_t(hk)*groups*query_tiles;
+    const size_t stride = ggml_paged_attn_work_size(dst, 1)/sizeof(float);
+    GGML_ASSERT(params->wdata && params->wsize >= ggml_paged_attn_work_size(dst, params->nth));
+    float * keys = (float *) params->wdata + size_t(params->ith)*stride;
+    float * values = keys + kv_tile*d;
+    float * accum = values + kv_tile*d;
+    std::array<float, 32> maxima, totals, scores;
+    std::array<float, 32*32> weights;
+    std::array<int, 32> positions;
+    for (int64_t job = params->ith; job < jobs; job += params->nth) {
+        const int t0 = int(job%query_tiles)*query_tile;
+        const int group = int(job/query_tiles);
+        const int hkv = group/groups;
+        const int h0 = hkv*gqa + (group%groups)*head_tile;
+        const int heads = std::min(head_tile, (hkv + 1)*gqa - h0);
+        const int count = std::min(query_tile, nt - t0);
+        const int rows = count*heads;
+        GGML_ASSERT(rows <= 32);
+        const int seq = queries[2*t0 + 1];
+        GGML_ASSERT(seq >= 0 && seq < ns);
+        int begin = INT_MAX, end = -1;
+        for (int t = t0; t < t0 + count; ++t) {
+            const int pos = queries[2*t];
+            GGML_ASSERT(pos >= 0 && queries[2*t + 1] == seq);
+            GGML_ASSERT(int64_t(pos/bs)*words + (pos%bs)/32 < np);
+            begin = std::min(begin, window ? std::max(0, pos - window + 1) : 0);
+            end = std::max(end, causal ? pos : n_kv - 1);
+        }
+        std::fill(accum, accum + rows*d, 0.0f);
+        std::fill(maxima.begin(), maxima.begin() + rows, -INFINITY);
+        std::fill(totals.begin(), totals.begin() + rows, 0.0f);
+        for (int64_t first = begin; first <= end; first += kv_tile) {
+            int n_keys = 0;
+            for (int offset = 0; offset < kv_tile && first + offset <= end; ++offset) {
+                const int pos = int(first + offset);
+                const int64_t ix = 2*(int64_t(seq)*np + int64_t(pos/bs)*words + (pos%bs)/32);
+                GGML_ASSERT(ix >= 0 && ix + 1 < ggml_nelements(table));
+                const int physical = pages[ix];
+                if (physical < 0 || !((uint32_t) pages[ix + 1] & (1u << ((pos%bs)%32)))) { continue; }
+                GGML_ASSERT(physical < cache->ne[3]);
+                const char * source = (const char *) cache->data + physical*cache->nb[3] + hkv*cache->nb[2] + (pos%bs)*cache->nb[1];
+                ggml_paged_attn_decode_row(traits, cache->type, source, keys + n_keys*d, d);
+                ggml_paged_attn_decode_row(traits, cache->type, source + hk*cache->nb[2], values + n_keys*d, d);
+                positions[n_keys++] = pos;
+            }
+            if (n_keys == 0) { continue; }
+            std::fill(weights.begin(), weights.begin() + rows*n_keys, 0.0f);
+            for (int qt = 0; qt < count; ++qt) {
+                const int t = t0 + qt, pos = queries[2*t];
+                const int lo = window ? std::max(0, pos - window + 1) : 0;
+                const int hi = causal ? pos : n_kv - 1;
+                for (int head = 0; head < heads; ++head) {
+                    const int row = qt*heads + head;
+                    const float * query = (const float *) q->data + (size_t(t)*nh + h0 + head)*d;
+                    float maximum = -INFINITY;
+                    for (int key = 0; key < n_keys; ++key) {
+                        scores[key] = -INFINITY;
+                        if (positions[key] >= lo && positions[key] <= hi) {
+                            ggml_vec_dot_f32(d, &scores[key], 0, query, 0, keys + key*d, 0, 1);
+                            scores[key] *= scale;
+                            maximum = std::max(maximum, scores[key]);
+                        }
+                    }
+                    if (maximum == -INFINITY) { continue; }
+                    maximum = std::max(maximum, maxima[row]);
+                    const float old = expf(maxima[row] - maximum);
+                    float * row_weights = weights.data() + row*n_keys;
+                    const float sum = ggml_vec_soft_max_f32(n_keys, row_weights, scores.data(), maximum);
+                    float * out = accum + row*d;
+                    ggml_vec_scale_f32(d, out, old);
+                    if (rows == 1) {
+                        for (int key = 0; key < n_keys; ++key) {
+                            if (row_weights[key] != 0.0f) { ggml_vec_mad_f32(d, out, values + key*d, row_weights[key]); }
+                        }
+                    }
+                    totals[row] = totals[row]*old + sum;
+                    maxima[row] = maximum;
+                }
+            }
+            if (rows > 1) {
+                bool finite_values = true;
+                for (int index = 0; index < n_keys*d; ++index) {
+                    if (!std::isfinite(values[index])) { finite_values = false; break; }
+                }
+                if (finite_values) {
+                    simd_gemm(accum, weights.data(), values, rows, n_keys, d);
+                } else {
+                    for (int row = 0; row < rows; ++row) {
+                        for (int key = 0; key < n_keys; ++key) {
+                            const float weight = weights[row*n_keys + key];
+                            if (weight != 0.0f) { ggml_vec_mad_f32(d, accum + row*d, values + key*d, weight); }
+                        }
+                    }
+                }
+            }
+        }
+        for (int qt = 0; qt < count; ++qt) {
+            for (int head = 0; head < heads; ++head) {
+                const int row = qt*heads + head;
+                GGML_ASSERT(totals[row] > 0.0f);
+                float * out = (float *) dst->data + (size_t(t0 + qt)*nh + h0 + head)*d;
+                ggml_vec_scale_f32(d, accum + row*d, 1.0f/totals[row]);
+                memcpy(out, accum + row*d, d*sizeof(float));
+            }
+        }
     }
 }
 

@@ -22,6 +22,29 @@
 
 #define UNUSED GGML_UNUSED
 
+void ggml_cpu_dequantize_row_iq4_nl(const block_iq4_nl * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#if defined(__AVX2__)
+    assert(k % QK4_NL == 0);
+    const __m128i values = _mm_loadu_si128((const __m128i *) kvalues_iq4nl);
+    const __m128i mask = _mm_set1_epi8(0x0f);
+
+    for (int64_t block = 0; block < k/QK4_NL; ++block) {
+        const __m256 scale = _mm256_set1_ps(GGML_FP16_TO_FP32(x[block].d));
+        const __m128i packed = _mm_loadu_si128((const __m128i *) x[block].qs);
+        const __m128i low = _mm_shuffle_epi8(values, _mm_and_si128(packed, mask));
+        const __m128i high = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(packed, 4), mask));
+
+        _mm256_storeu_ps(y +  0, _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low))));
+        _mm256_storeu_ps(y +  8, _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(low, 8)))));
+        _mm256_storeu_ps(y + 16, _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high))));
+        _mm256_storeu_ps(y + 24, _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(high, 8)))));
+        y += QK4_NL;
+    }
+#else
+    dequantize_row_iq4_nl(x, y, k);
+#endif
+}
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }

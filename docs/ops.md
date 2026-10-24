@@ -2,6 +2,8 @@
 
 List of GGML operations and backend support status.
 
+CPU `PAGED_ATTN` uses cache-sized tiles and SIMD helpers, with a scalar reference selectable through `GGML_CPU_PAGED_ATTN_REFERENCE=1`. CPU `MUL_MAT_ID` accepts optional expert-priority scheduling metadata. See [CPU LES and paged attention](pulsar-cpu-les-implementation.md) for supported configurations and numerical limits.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

@@ -1784,7 +1784,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    const float * priority = dst->src[3] ? (const float *) dst->src[3]->data : NULL;
+    for (int64_t visit = 0; visit < (int64_t) n_as*(priority ? 2 : 1); ++visit) {
+        const int cur_a = ggml_cpu_moe_expert_for_visit(priority, n_as, visit);
+        if (cur_a < 0) { continue; }
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
@@ -2489,7 +2492,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_STEP:
-                case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_SIGMOID:
@@ -2504,6 +2506,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_TRUNC:
                     {
                         n_tasks = 1;
+                    } break;
+
+                case GGML_UNARY_OP_TANH:
+                    {
+                        n_tasks = MIN(n_threads, MAX(1, ggml_nelements(node)/16384));
                     } break;
 
                 case GGML_UNARY_OP_GELU:
@@ -3185,6 +3192,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TOP_K:
                     {
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                    } break;
+                case GGML_OP_PAGED_ATTN:
+                    {
+                        cur = ggml_paged_attn_work_size(node, n_tasks);
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {

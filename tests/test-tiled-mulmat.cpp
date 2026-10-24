@@ -245,7 +245,7 @@ static void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, in
 // against expert ids[t*k+id]. b_slots = 1 is the common MoE case (all top-k experts see one input row).
 static void test_mul_mat_id(ggml_backend_t backend, int64_t K, int64_t R, int64_t n_experts,
                             int64_t k, int64_t b_slots, int64_t batch, ggml_type quant_type,
-                            bool src1_strided = false) {
+                            bool src1_strided = false, bool benchmark = false) {
     srand(0xBEEF);
 
     const int64_t n_as  = K * R * n_experts;
@@ -324,6 +324,16 @@ static void test_mul_mat_id(ggml_backend_t backend, int64_t K, int64_t R, int64_
             }
         }
         ++n_failed;
+    }
+
+    if (benchmark) {
+        for (int repeat = 0; repeat < 9; ++repeat) {
+            const int64_t start = ggml_time_us();
+            GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+            printf("BENCH mul_mat_id type=%s K=%lld R=%lld batch=%lld repeat=%d us=%lld\n",
+                   ggml_type_name(quant_type), (long long) K, (long long) R, (long long) batch,
+                   repeat, (long long) (ggml_time_us() - start));
+        }
     }
 
     ggml_backend_buffer_free(buf);
@@ -774,11 +784,14 @@ static void print_mmid_table(int64_t K, int64_t R, int64_t n_experts, int64_t k,
 int main(int argc, char ** argv) {
     bool run_bench = false;
     bool run_fuzz = false;
+    bool run_moe_bench = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--bench") == 0) {
             run_bench = true;
         } else if (strcmp(argv[i], "--fuzz") == 0) {
             run_fuzz = true;
+        } else if (strcmp(argv[i], "--bench-moe") == 0) {
+            run_moe_bench = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", argv[i]);
             return 1;
@@ -799,6 +812,24 @@ int main(int argc, char ** argv) {
     if (!backend) {
         fprintf(stderr, "failed to initialize the CPU backend\n");
         return 1;
+    }
+    if (run_moe_bench) {
+        cpu_set_n_threads(backend, 18);
+        for (ggml_type type : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S }) {
+            for (int64_t batch : { 8, 32 }) {
+                test_mul_mat_id(backend, 2816, 1408, 2, 2, 1, batch, type, false, true);
+            }
+        }
+        ggml_backend_free(backend);
+        return n_failed ? 1 : 0;
+    }
+    for (int threads : { 3, 18 }) {
+        cpu_set_n_threads(backend, threads);
+        for (int64_t rows : { 17, 1408, 1423 }) {
+            for (ggml_type type : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S }) {
+                test_mul_mat_id(backend, 256, rows, 2, 2, 1, 9, type);
+            }
+        }
     }
     cpu_set_n_threads(backend, 8);
     for (int64_t n : { 1, 2, 3, 4, 7, 8, 16, 20 }) {

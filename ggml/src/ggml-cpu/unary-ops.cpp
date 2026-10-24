@@ -102,8 +102,8 @@ static inline void vec_unary_op(int64_t n, dst_t * y, const src0_t * x) {
     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
-    for (int i = 0; i < n; i++) {
-        y[i] = f32_to_dst(op(src0_to_f32(x[i])));
+    for (int64_t index = 0; index < n; index++) {
+        y[index] = f32_to_dst(op(src0_to_f32(x[index])));
     }
 }
 
@@ -117,6 +117,16 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
 
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
+
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+        const int64_t count = ggml_nelements(src0);
+        const int64_t chunk = (count + params->nth - 1)/params->nth;
+        const int64_t begin = MIN(chunk*params->ith, count);
+        const int64_t end = MIN(begin + chunk, count);
+
+        vec_unary_op<op>(end - begin, (dst_t *) dst->data + begin, (const src0_t *) src0->data + begin);
+        return;
+    }
 
     const auto [ir0, ir1] = get_thread_range(params, src0);
 

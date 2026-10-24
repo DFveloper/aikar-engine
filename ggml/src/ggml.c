@@ -3512,6 +3512,13 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_expert_priority(struct ggml_tensor * result, struct ggml_tensor * priority) {
+    GGML_ASSERT(result->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(priority && priority->type == GGML_TYPE_F32 && ggml_is_contiguous(priority));
+    GGML_ASSERT(ggml_nelements(priority) == result->src[0]->ne[2]);
+    result->src[3] = priority;
+}
+
 struct ggml_tensor * ggml_mul_mat_id_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

@@ -9079,6 +9079,8 @@ struct test_paged_attn : public test_case {
     ggml_type cache_type;
     int dim, heads_kv, tokens, window, nblocks, query_start, block_size;
     bool causal;
+    bool single_seq;
+    bool missing_pages;
     int physical_blocks = 0;
     ggml_tensor * q_tensor = nullptr;
     ggml_tensor * k_tensor = nullptr;
@@ -9091,11 +9093,11 @@ struct test_paged_attn : public test_case {
     ggml_tensor * slots = nullptr;
     ggml_tensor * queries = nullptr;
 
-    test_paged_attn(ggml_type type, int d, int hk, int nt, int w, int nb = 4, int qp = 17, bool ca = true, int bs = 16) :
-        cache_type(type), dim(d), heads_kv(hk), tokens(nt), window(w), nblocks(nb), query_start(qp), block_size(bs), causal(ca) {}
+    test_paged_attn(ggml_type type, int d, int hk, int nt, int w, int nb = 4, int qp = 17, bool ca = true, int bs = 16, bool ss = false, bool mp = false) :
+        cache_type(type), dim(d), heads_kv(hk), tokens(nt), window(w), nblocks(nb), query_start(qp), block_size(bs), causal(ca), single_seq(ss), missing_pages(mp) {}
 
     std::string vars() override {
-        return VARS_TO_STR7(cache_type, dim, heads_kv, tokens, window, causal, block_size) + "," + VARS_TO_STR2(nblocks, query_start);
+        return VARS_TO_STR7(cache_type, dim, heads_kv, tokens, window, causal, block_size) + "," + VARS_TO_STR2(nblocks, query_start) + ",single_seq=" + std::to_string(single_seq) + ",missing_pages=" + std::to_string(missing_pages);
     }
 
     double max_nmse_err() override { return 1e-6; }
@@ -9104,7 +9106,7 @@ struct test_paged_attn : public test_case {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, 16, tokens);
         ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, heads_kv, tokens);
         ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, heads_kv, tokens);
-        physical_blocks = mode == MODE_PERF && window ? (window + (tokens + 1)/2 + 3*block_size - 1)/block_size : nblocks;
+        physical_blocks = mode == MODE_PERF && window ? (window + (single_seq ? tokens : (tokens + 1)/2) + 3*block_size - 1)/block_size : nblocks;
         ggml_tensor * cache = ggml_new_tensor_4d(ctx, cache_type, dim, block_size, 2*heads_kv, 2*physical_blocks);
         table = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, nblocks*((block_size + 31)/32), 2);
         slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, tokens);
@@ -9135,6 +9137,15 @@ struct test_paged_attn : public test_case {
             }
         }
         pages[1] &= ~(1 << 7);
+        if (missing_pages) {
+            GGML_ASSERT(block_size == 16 && query_start >= 32 && nblocks >= 4);
+            for (int seq = 0; seq < 2; ++seq) {
+                const int index = 2*seq*table_blocks;
+                pages[index] = -1;
+                pages[index + 1] = 0;
+                pages[index + 3] = 0;
+            }
+        }
         if (block_size > 32) {
             for (int pos : {31, 32, 63, 64, 95, 96, 127}) {
                 if (pos >= block_size) { continue; }
@@ -9142,8 +9153,8 @@ struct test_paged_attn : public test_case {
             }
         }
         for (int i = 0; i < tokens; ++i) {
-            const int seq = i%2;
-            const int pos = query_start + i/2;
+            const int seq = single_seq ? 0 : i%2;
+            const int pos = query_start + (single_seq ? i : i/2);
             writes[2*i + seq] = pages[2*(seq*table_blocks + pos/table_block_size)]*block_size + pos%block_size;
             info[2*i] = pos;
             info[2*i + 1] = seq;
@@ -9189,7 +9200,7 @@ struct test_paged_attn : public test_case {
 
         ggml_backend_tensor_get(cache_tensor, cache.data(), 0, cache.size());
         for (int t = 0; t < tokens; ++t) {
-            const int slot = writes[2*t + t%2];
+            const int slot = writes[2*t + (single_seq ? 0 : t%2)];
             for (int h = 0; h < heads_kv; ++h) {
                 for (int kv = 0; kv < 2; ++kv) {
                     const size_t offset = (slot/block_size)*cache_tensor->nb[3] + (h + kv*heads_kv)*cache_tensor->nb[2] + (slot%block_size)*cache_tensor->nb[1];
@@ -9209,7 +9220,7 @@ struct test_paged_attn : public test_case {
             expected_cache.resize(ggml_nelements(cache_tensor));
             traits->to_float(cache.data(), expected_cache.data(), expected_cache.size());
             for (int t = 0; t < tokens; ++t) {
-                const int slot = writes[2*t + t%2];
+                const int slot = writes[2*t + (single_seq ? 0 : t%2)];
                 for (int h = 0; h < heads_kv; ++h) {
                     for (int kv = 0; kv < 2; ++kv) {
                         const size_t row = ((slot/block_size)*2*heads_kv + h + kv*heads_kv)*block_size + slot%block_size;
@@ -11040,6 +11051,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 128, 2, 2, 2 }, v));
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 5, 7, 11, 13 }, v));
             }
+            if (v == 0) {
+                test_cases.emplace_back(new test_unary(GGML_UNARY_OP_TANH, type, { 262147, 1, 1, 1 }, v));
+            }
+            test_cases.emplace_back(new test_unary(GGML_UNARY_OP_TANH, type, { 8193, 5, 1, 1 }, v));
         }
     }
     test_cases.emplace_back(new test_glu_back(GGML_GLU_OP_SWIGLU));
@@ -13360,6 +13375,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    test_cases.emplace_back(new test_paged_attn(GGML_TYPE_F16, 2048, 1, 1, 0, 1, 0, true, 16, true));
+    for (int nt : {8, 9, 17}) {
+        test_cases.emplace_back(new test_paged_attn(GGML_TYPE_F16, 512, 2, nt, 0, 8, 48, true, 16, true, true));
+        test_cases.emplace_back(new test_paged_attn(GGML_TYPE_F16, 70, 4, nt, 33, 8, 48, false, 16, true, true));
+    }
+
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_Q8_KV}) {
+        for (int nt : {1, 9}) {
+            test_cases.emplace_back(new test_paged_attn(type, 256, 4, nt, 0, 4, 48, true, 16, true, true));
+        }
+        for (int nt : {7, 8, 9, 17, 33}) {
+            test_cases.emplace_back(new test_paged_attn(type, 512, 2, nt, 0, 4, 17, true, 32, true));
+            test_cases.emplace_back(new test_paged_attn(type, 256, 8, nt, 16, 4, 17, false, 32, true));
+        }
+    }
+
     for (int head_size : {64, 128}) {
         test_cases.emplace_back(new test_flash_attn_ext(head_size, head_size, 4, {8, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_KV, GGML_TYPE_Q8_KV));
     }
@@ -13675,6 +13706,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int tokens : {8, 128}) {
+        test_cases.emplace_back(new test_paged_attn(GGML_TYPE_F16, 512, 2, tokens, 0, 72, 2046, true, 32, true));
+        test_cases.emplace_back(new test_paged_attn(GGML_TYPE_F16, 256, 8, tokens, 1024, 72, 2046, true, 32, true));
+    }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_KV, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
         for (int tokens : {1, 4, 64}) {

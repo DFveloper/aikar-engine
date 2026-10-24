@@ -650,6 +650,8 @@ struct common_params {
     bool kv_turboquant_all_set = false;
     bool kv_turboquant_global_set = false;
 
+    bool cpu_les = false;
+    uint32_t cpu_les_prefetch_mib = 16;
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

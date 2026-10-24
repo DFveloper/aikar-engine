@@ -3033,6 +3033,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--cpu-les"}, "enable CPU lookahead expert preparation and scheduling (Gemma4, single sequence)",
+        [](common_params & params) { params.cpu_les = true; }
+    ).set_env("LLAMA_ARG_CPU_LES"));
+    add_opt(common_arg(
+        {"--cpu-les-prefetch-mib"}, "N", "CPU LES cache preparation budget per job in MiB (default: 16)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) { throw std::invalid_argument("CPU LES prefetch budget must be between 1 and 1024 MiB"); }
+            params.cpu_les_prefetch_mib = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
         [](common_params & params, int value) {

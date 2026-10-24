@@ -513,6 +513,19 @@ void ggml_quantize_mat_q8_K_4x8(const float * GGML_RESTRICT x, void * GGML_RESTR
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 
+template<typename block_tx8>
+static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m256i x, const __m256i y) {
+    if constexpr (std::is_same_v<block_tx8, block_q4_0x8>) {
+        // Q4_0 weights plus eight are unsigned; the activation correction is shared across columns.
+        const __m256i offset = _mm256_set1_epi8(8);
+        const __m256i dot = mul_sum_us8_pairs_acc_int32x8(acc, _mm256_add_epi8(y, offset), x);
+        const __m256i correction = mul_sum_us8_pairs_acc_int32x8(_mm256_setzero_si256(), offset, x);
+        return _mm256_sub_epi32(dot, correction);
+    } else {
+        return mul_sum_i8_pairs_acc_int32x8(acc, x, y);
+    }
+}
+
 // GEMV for 8x blocks of 32 4-bit quants with a single scale factor per block
 template<typename block_tx8>
 static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i signextendlut) {
@@ -524,6 +537,18 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
 
     const int qk = QK8_0;
     const int nb = n / qk;
+
+    const auto mul_sum = [](__m256i acc, __m256i weights, __m256i activations) {
+#if defined(__AVXVNNIINT8__)
+        return mul_sum_i8_pairs_acc_int32x8(acc, weights, activations);
+#else
+        if constexpr (std::is_same_v<block_tx8, block_q4_0x8>) {
+            return mul_sum_i8_pairs_acc_int32x8<block_tx8>(acc, activations, weights);
+        } else {
+            return mul_sum_i8_pairs_acc_int32x8(acc, weights, activations);
+        }
+#endif
+    };
 
     UNUSED(bs);
 
@@ -609,17 +634,17 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 // ...........................................................................
                 // B0(28-31) B4(28-31) B1(28-31) B5(28-31) B2(28-31) B6(28-31) B3(28-31) B7(28-31) with A0(28-31)
 
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_vec_0123_0 ,_mm256_shuffle_epi32(rhs_vec_4567_0, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 0));
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_0, 177) ,rhs_vec_4567_0, 170), _mm256_shuffle_epi32(lhs_vec_0, 85));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(rhs_vec_0123_0 ,_mm256_shuffle_epi32(rhs_vec_4567_0, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 0));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_0, 177) ,rhs_vec_4567_0, 170), _mm256_shuffle_epi32(lhs_vec_0, 85));
 
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_vec_0123_1 ,_mm256_shuffle_epi32(rhs_vec_4567_1, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 170));
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_1, 177) ,rhs_vec_4567_1, 170), _mm256_shuffle_epi32(lhs_vec_0, 255));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(rhs_vec_0123_1 ,_mm256_shuffle_epi32(rhs_vec_4567_1, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 170));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_1, 177) ,rhs_vec_4567_1, 170), _mm256_shuffle_epi32(lhs_vec_0, 255));
 
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_vec_0123_2 ,_mm256_shuffle_epi32(rhs_vec_4567_2, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 0));
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_2, 177) ,rhs_vec_4567_2, 170), _mm256_shuffle_epi32(lhs_vec_1, 85));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(rhs_vec_0123_2 ,_mm256_shuffle_epi32(rhs_vec_4567_2, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 0));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_2, 177) ,rhs_vec_4567_2, 170), _mm256_shuffle_epi32(lhs_vec_1, 85));
 
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_vec_0123_3 ,_mm256_shuffle_epi32(rhs_vec_4567_3, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 170));
-                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_3, 177) ,rhs_vec_4567_3, 170), _mm256_shuffle_epi32(lhs_vec_1, 255));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(rhs_vec_0123_3 ,_mm256_shuffle_epi32(rhs_vec_4567_3, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 170));
+                iacc = mul_sum(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_3, 177) ,rhs_vec_4567_3, 170), _mm256_shuffle_epi32(lhs_vec_1, 255));
 
                 // Accumulated values multiplied with appropriate scales
                 acc_row = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_mul_ps(col_scale_f32, row_scale_f32), acc_row);
@@ -629,19 +654,6 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
             acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
             _mm256_storeu_ps(s + (y * nr + x * 8), acc_row);
         }
-    }
-}
-
-template<typename block_tx8>
-static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m256i x, const __m256i y) {
-    if constexpr (std::is_same_v<block_tx8, block_q4_0x8>) {
-        // Q4_0 weights plus eight are unsigned; the activation correction is shared across columns.
-        const __m256i offset = _mm256_set1_epi8(8);
-        const __m256i dot = mul_sum_us8_pairs_acc_int32x8(acc, _mm256_add_epi8(y, offset), x);
-        const __m256i correction = mul_sum_us8_pairs_acc_int32x8(_mm256_setzero_si256(), offset, x);
-        return _mm256_sub_epi32(dot, correction);
-    } else {
-        return mul_sum_i8_pairs_acc_int32x8(acc, x, y);
     }
 }
 

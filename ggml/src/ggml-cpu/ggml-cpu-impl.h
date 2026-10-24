@@ -15,6 +15,11 @@
 extern "C" {
 #endif
 
+static inline int ggml_cpu_moe_expert_for_visit(const float * priority, int n_experts, int64_t visit) {
+    const int expert = (int) (visit < n_experts ? visit : visit - n_experts);
+    return priority && ((priority[expert] > 0.0f) != (visit < n_experts)) ? -1 : expert;
+}
+
 struct ggml_compute_params {
     // ith = thread index, nth = number of threads
     int ith, nth;

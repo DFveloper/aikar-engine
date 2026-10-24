@@ -406,6 +406,7 @@ extern "C" {
         enum ggml_type type_k_swa; // data type for sliding-window K cache, GGML_TYPE_COUNT = type_k [EXPERIMENTAL]
         enum ggml_type type_v_swa; // data type for sliding-window V cache, GGML_TYPE_COUNT = type_v [EXPERIMENTAL]
 
+        uint32_t cpu_les_prefetch_mib; // host expert cache preparation budget per job
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
@@ -438,6 +439,7 @@ extern "C" {
         bool kv_hadamard_k_swa;    // apply the transform to the sliding-window K cache
         bool kv_hadamard_v_swa;    // apply the transform to the sliding-window V cache
         bool kv_hadamard_separate; // use separate global and sliding-window policies
+        bool cpu_les;                // CPU lookahead expert preparation and scheduling
         bool kv_hadamard_explicit; // use the explicit per-side transform policy
 
         // [EXPERIMENTAL]
