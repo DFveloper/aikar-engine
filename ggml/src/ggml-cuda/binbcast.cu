@@ -386,6 +386,87 @@ static __global__ void k_repeat_back(
     dst[tid3*ne2*ne1*ne0 + tid2*ne1*ne0 + tid1*ne0 + tid0] = sum;
 }
 
+// Each 32-thread group reads four rows. Combine register sums in shared memory.
+template<bool mul>
+static __global__ void k_repeat_back_rows(
+        const float * a, const float * b, float * dst, int64_t cols, int64_t rows,
+        int64_t ne1, int64_t ne2, size_t a1, size_t a2, size_t a3, size_t b1, size_t b2, size_t b3) {
+    const int col_lane = threadIdx.x;
+    const int row_lane = threadIdx.y;
+    const int64_t col = int64_t(blockIdx.x)*8 + col_lane;
+    float sum = 0.0f;
+    const bool packed = a2 == size_t(ne1)*a1 && a3 == size_t(ne1*ne2)*a1 &&
+        (!mul || (b2 == size_t(ne1)*b1 && b3 == size_t(ne1*ne2)*b1));
+    ggml_cuda_pdl_sync();
+    if (col < cols) {
+        for (int64_t row = row_lane; row < rows; row += 32) {
+            size_t ai = row*a1;
+            size_t bi = row*b1;
+            if (!packed) {
+                const int64_t i1 = row % ne1;
+                const int64_t i2 = row/ne1 % ne2;
+                const int64_t i3 = row/(ne1*ne2);
+                ai = i1*a1 + i2*a2 + i3*a3;
+                bi = i1*b1 + i2*b2 + i3*b3;
+            }
+            float value = a[col + ai];
+            if constexpr (mul) {
+                value = __fmul_rn(value, b[col + bi]);
+            }
+            sum += value;
+        }
+    }
+    sum += __shfl_down_sync(0xffffffff, sum, 16);
+    sum += __shfl_down_sync(0xffffffff, sum, 8);
+    __shared__ float partial[8][8];
+    if (row_lane % 4 == 0) {
+        partial[row_lane/4][col_lane] = sum;
+    }
+    __syncthreads();
+    if (row_lane == 0 && col < cols) {
+        sum = 0.0f;
+#pragma unroll
+        for (int warp = 0; warp < 8; ++warp) {
+            sum += partial[warp][col_lane];
+        }
+        dst[col] = sum;
+    }
+}
+
+static bool use_repeat_back_rows(const ggml_tensor * src, const ggml_tensor * dst) {
+    return src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src->nb[0] == sizeof(float) && ggml_is_contiguous(dst) &&
+        dst->ne[0] == src->ne[0] && ggml_nrows(dst) == 1 && ggml_nrows(src) >= 64;
+}
+
+static void launch_repeat_back_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * a,
+        const ggml_tensor * b, ggml_tensor * dst) {
+    const dim3 threads(8, 32);
+    const int64_t blocks = (a->ne[0] + 7)/8;
+    if (b) {
+        k_repeat_back_rows<true><<<blocks, threads, 0, ctx.stream()>>>(
+            (const float *) a->data, (const float *) b->data, (float *) dst->data,
+            a->ne[0], ggml_nrows(a), a->ne[1], a->ne[2],
+            a->nb[1]/4, a->nb[2]/4, a->nb[3]/4, b->nb[1]/4, b->nb[2]/4, b->nb[3]/4);
+    } else {
+        k_repeat_back_rows<false><<<blocks, threads, 0, ctx.stream()>>>(
+            (const float *) a->data, nullptr, (float *) dst->data,
+            a->ne[0], ggml_nrows(a), a->ne[1], a->ne[2],
+            a->nb[1]/4, a->nb[2]/4, a->nb[3]/4, 0, 0, 0);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_should_fuse_mul_repeat_back(const ggml_tensor * mul, const ggml_tensor * dst) {
+    return dst->src[0] == mul && use_repeat_back_rows(mul->src[0], dst) &&
+        ggml_are_same_shape(mul->src[0], mul->src[1]) &&
+        mul->src[1]->type == GGML_TYPE_F32 && mul->src[1]->nb[0] == sizeof(float);
+}
+
+void ggml_cuda_op_mul_repeat_back(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, ggml_tensor * dst) {
+    launch_repeat_back_rows(ctx, mul->src[0], mul->src[1], dst);
+}
+
 template <float (*bin_op)(const float, const float), int n_fuse = 1>
 struct bin_bcast_cuda {
     template<typename src0_t, typename src1_t, typename dst_t>
@@ -557,6 +638,10 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
 
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+    if (use_repeat_back_rows(src0, dst)) {
+        launch_repeat_back_rows(ctx, src0, nullptr, dst);
+        return;
+    }
 
     GGML_ASSERT(src0->type == dst->type);
     GGML_ASSERT(ggml_is_contiguous(dst));

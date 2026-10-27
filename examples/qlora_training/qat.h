@@ -10,6 +10,7 @@
 enum qat_weight_format {
     QAT_WEIGHT_MXFP4,
     QAT_WEIGHT_Q4_0,
+    QAT_WEIGHT_Q2_0,
     QAT_WEIGHT_Q8_0,
 };
 

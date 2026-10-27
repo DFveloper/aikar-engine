@@ -370,13 +370,32 @@ static void test(void) {
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), turboquant_params, LLAMA_EXAMPLE_COMMON));
     }
 
-    for (const char * type : { "mxfp4", "q4_0", "q8_0", "q4_0,q8_0", "mxfp4,q8_0" }) {
+    for (const char * optimizer : { "qlion2", "QLion2", "qlion2_qat" }) {
+        common_params qat_params;
+        argv = { "binary_name", "-m", "model.gguf", "--optimizer", optimizer,
+            "--lr-scheduler", "cosine-warmup", "--warmup-steps", "4" };
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));
+        assert(qat_params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT);
+        assert(qat_params.lr_scheduler == "cosine-warmup" && qat_params.warmup_steps == 4);
+    }
+    {
+        common_params qat_params;
+        argv = { "binary_name", "-m", "model.gguf", "--parallel", "2", "--grad-accum", "3" };
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));
+        assert(qat_params.n_parallel == 2 && qat_params.grad_accum_steps == 3);
+        for (const char * value : { "0", "-1" }) {
+            argv = { "binary_name", "-m", "model.gguf", "--grad-accum", value };
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));
+        }
+    }
+
+    for (const char * type : { "mxfp4", "q2_0", "q4_0", "q8_0", "q4_0,q8_0", "mxfp4,q8_0", "q8_0,q4_0", "q4_0,mxfp4" }) {
         common_params qat_params;
         argv = { "binary_name", "-m", "model.gguf", "--quant-type", type };
         assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));
         assert(qat_params.qat_quant_type == type);
     }
-    for (const char * type : { "q4_k", "q8_0,q4_0", "q4_0,mxfp4", "q4_0,q8_0,q8_0" }) {
+    for (const char * type : { "q4_k", "mxfp4,mxfp4", "q2_0,q2_0", "q4_0,q8_0,q8_0" }) {
         common_params qat_params;
         argv = { "binary_name", "-m", "model.gguf", "--quant-type", type };
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));

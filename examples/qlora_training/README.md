@@ -28,7 +28,8 @@ One update decodes a 32-value block from each state, applies the QLion update, r
   -lr 1e-6 -lr-min 1e-7 --lr-scheduler cosine --epochs 1
 ```
 
-Use `--quant-type q4_0` for an unmixed Q4_0 input model. With a cosine schedule, `--lr-decay-steps N` makes the learning rate reach `-lr-min` at logical step N instead of stretching decay over the entire run. Periodic checkpoints contain an ordinary inference GGUF plus a sibling `.qat-state.gguf` file with Q8_0 momentum, Q4_0 residual, optimizer step, scheduler step, epoch, and dataset window. Checkpoints are saved at the first packed-context boundary after `--save-every` optimizer steps so resume does not need an in-progress gradient or activation state. `--save-first-at N` adds one earlier checkpoint for a fresh native QAT run; subsequent checkpoints retain the `--save-every` interval. Resume with `--qat-resume checkpoint.gguf`. The final `--qat-out` file contains only inference weights.
+Use `--quant-type q2_0` for a Q2_0 input model, or any comma-separated combination of `mxfp4`, `q2_0`, `q4_0`, and `q8_0` for mixed input models. Each format must be unique. Use `--qat-targets "ffn_down,attn_q"` to limit native QAT updates to matching tensor names. With a cosine schedule, `--lr-decay-steps N` makes the learning rate reach `-lr-min` at logical step N instead of stretching decay over the entire run. Periodic checkpoints contain an ordinary inference GGUF plus a sibling `.qat-state.gguf` file with Q8_0 momentum, Q4_0 residual, optimizer step, scheduler step, epoch, and dataset window. Checkpoints are saved at the first packed-context boundary after `--save-every` optimizer steps so resume does not need an in-progress gradient or activation state. `--save-first-at N` adds one earlier checkpoint for a fresh native QAT run; subsequent checkpoints retain the `--save-every` interval. Resume with `--qat-resume checkpoint.gguf`. The final `--qat-out` file contains only inference weights.
+Q2_0 native updates use the CPU QLion path; keep Q2_0 training tensors on CPU until device kernels are added.
 
 Both trainers enable `--preserve-thinking` by default. For chat templates that support preserved reasoning, prior assistant reasoning remains in the training context for every model architecture. Use `--no-preserve-thinking` to disable it.
 
@@ -41,6 +42,16 @@ QLion requires `-b == -c` and `-b` divisible by `-ub`. When `-ub < -b`, gradient
 Without microbatching, raw persistent state is 17.25 bits per weight for MXFP4 and 17.50 bits per weight for Q4_0. Q8_0 gradient accumulation raises these totals to 25.75 and 26.00 bits per weight. These figures exclude model metadata, activations, and backend workspaces. The CPU, CUDA, and Vulkan paths share the same Q8_0 accumulation contract. The V100 CUDA and Vulkan correctness tests cover MXFP4 and Q4_0 state updates, routed MoE dX, and routed MoE optimizer updates. A100 execution has not been measured in this repository environment.
 
 The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). Only freshly-allocated F32 LoRA A/B tensors are trained. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
+
+### QLion2
+
+Select `--optimizer qlion2` (case-insensitive) to enable 32-element adaptive LR scaling automatically. QLion2 always uses this unit; `--qat-lr-scale off`, `layer`, or `256` cannot change it. Existing QLion retains all its scale modes. QLion2 shares QLion's Q8_0 momentum, Q4_0 residual, quantized update and gradient accumulation paths.
+
+QLion2 computes old-momentum RMS inside the update kernel. CPU updates use local decoded blocks; CUDA assigns one 32-element group to a warp and uses register values plus shuffle reductions. Fixed-tau updates allocate no FP32 group-statistics tensor and launch no separate statistics pass. Optional `--qat-lr-warmup N` retains the layer-RMS threshold estimate using a nine-float result and two persistent floats per tensor, without a per-group FP32 array. Q2_0 CPU updates apply separate LR scales to the two 32-element groups in each 64-element weight block. CUDA supports MXFP4, Q4_0 and Q8_0 weights; Vulkan falls back to CPU for QLion2.
+
+With F32 KV caches, cached attention and sliding-window attention preserve the current microbatch's K/V gradients and keep earlier cached context when `-ub < -b`. Earlier microbatch graphs are detached (truncated backpropagation), so this does not reproduce full-context gradients exactly. This also applies to QLion. Quantized normalization parameters receive gradients through temporary F32 dequantization. The default native trainer uses F32 KV caches; quantized KV training is outside this validation.
+
+The `cosine-warmup` scheduler increases LR with a cosine ramp for `--warmup-steps`, then holds the base LR constant. It works with both trainers and advances per optimizer update, including gradient accumulation and checkpoint resume.
 
 ### Gradient-adaptive QLion learning rate
 
@@ -186,6 +197,8 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--lora-rank` | `16` | LoRA rank r |
 | `--lora-alpha` | `0` (= rank) | LoRA alpha; effective scale = alpha/rank |
 | `--lora-targets` | see below | Comma-separated internal tensor name substrings |
+| `--qat-targets` | all matching tensors | Comma-separated native QAT tensor name substrings |
+| `--quant-type` | `mxfp4` | Native QAT weight format, including `q2_0` and Q2_0 mixed forms |
 | `--lora-out` | `adapter.gguf` | Output adapter GGUF path (supports `~`) |
 | `--resume` | *(none)* | Resume weights and training position from a `--save-every` checkpoint |
 | `--save-every` | `0` | Save checkpoint every N dataset windows (0 = end only) |
@@ -211,7 +224,7 @@ Trains LoRA adapters on a quantized GGUF model.
 | `-ub` / `--ubatch-size` | `512` | GPU micro-batch tokens; controls VRAM vs. step time |
 | `-ngl` | `999` | GPU layers to offload |
 | `-lr` / `--learning-rate` | `1e-4` | AdamW learning rate |
-| `--lr-scheduler` | `constant` | Learning-rate schedule: `constant` or `cosine` |
+| `--lr-scheduler` | `constant` | Learning-rate schedule: `constant`, `cosine`, or `cosine-warmup` |
 | `--warmup-steps` | `0` | Linear warmup over N logical training steps |
 | `--warmup-init-ratio` | `0.1` | Initial warmup LR as a fraction of peak LR; must be in `(0, 1]` |
 | `--verbose-loss` | off | Print one structured loss line per SFT dataset window |
@@ -544,3 +557,18 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 ### Reward weighting implementation
 
 `llama_opt_set_reward_weights(weights, n)` sets thread-local `g_reward_weights`. In `opt_epoch`, each window reads `g_reward_weights[idata]` and passes it as `reward_scale` to `opt_epoch_iter`. Inside the iter loop, instead of writing `1.0f` for the correct token's label position in the cross-entropy label tensor, it writes `reward_scale`. Since cross-entropy loss = `-mean(label × log(softmax(logit)))`, scaling the label scales both loss and gradient identically.
+
+### Parallel native QAT and gradient accumulation
+
+Native QAT accepts `--parallel P` and `--grad-accum A`. Context (`-c`), logical batch (`-b`), and microbatch (`-ub`) are specified per sequence. Use `-b` equal to `-c`; `-ub` must divide `-c`. Parallel contexts must be divisible by 256 and use separate KV streams. For example:
+
+```sh
+llama-finetune-qlion -m model.gguf --train-file train.jsonl --optimizer qlion2 \
+    --quant-type q4_0,q8_0 -c 4096 -b 4096 -ub 4096 --parallel 2 --grad-accum 4
+```
+
+This processes two independent 4096-token windows together and updates after four parallel batches, for eight sequences per effective batch. Sequence positions and attention/KV streams stay separate. Each window's supervised mean loss contributes equally, including partial final batches. Native Q8 accumulators retain gradients between batches; no dense persistent FP32 gradient accumulator is added. Partial accumulation groups are flushed at the epoch boundary. Checkpoints contain completed optimizer updates and dataset positions in individual windows, so parallelism or accumulation can change on resume. Sequence context must stay the same when resuming a checkpoint that records it.
+
+Full microbatches preserve the complete window backward graph. Smaller microbatches retain previous KV context but detach earlier microbatch graphs, as in the existing truncated backward path. Parallel/accumulated native QAT currently rejects MTP and critical-token weighting combinations. Ordinary supervision masks and per-window reward weights remain supported.
+
+On Pascal CUDA GPUs, eligible F16/F32 attention backward uses cuBLAS with FP32 probabilities and softmax derivatives. Per-head score scratch is reused and capped at 128 MiB; unsupported bias/softcap/type/size cases keep the generic implementation. Quantized normalization tensors use the same conversion-aware backend placement as their forward graph, allowing GPU forward, backward and QLion updates.

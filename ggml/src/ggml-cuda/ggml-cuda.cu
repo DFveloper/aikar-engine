@@ -4001,6 +4001,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static bool disable_volta_fusion = getenv("GGML_CUDA_DISABLE_VOLTA_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_VOLTA_FUSION"));
 
     ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_MUL && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * reduce = cgraph->nodes[i + 1];
+        const ggml_op ops[] = { GGML_OP_MUL, GGML_OP_REPEAT_BACK };
+        const int outputs[] = { i + 1 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 1) &&
+                ggml_cuda_should_fuse_mul_repeat_back(node, reduce) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 1)) {
+            ggml_cuda_op_mul_repeat_back(*cuda_ctx, node, reduce);
+            return 1;
+        }
+    }
     if (node->op == GGML_OP_OUT_PROD && i + 1 < cgraph->n_nodes) {
         ggml_tensor * add = cgraph->nodes[i + 1];
         const ggml_op ops[] = { GGML_OP_OUT_PROD, GGML_OP_ADD };
@@ -6294,6 +6305,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_I64 && src1_type == GGML_TYPE_I32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_F32) {

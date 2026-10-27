@@ -272,8 +272,14 @@ struct qlora_lr_schedule {
         const float lr_base = lr->lr0;
         if (step < warmup_steps) {
             const float lr_start = lr_base * warmup_init_ratio;
-            const float progress = (float) step / (float) warmup_steps;
+            float progress = (float) step / (float) warmup_steps;
+            if (type == "cosine-warmup") {
+                progress = 0.5f * (1.0f - std::cos(std::acos(-1.0f) * progress));
+            }
             return lr_start + (lr_base - lr_start) * progress;
+        }
+        if (type == "cosine-warmup") {
+            return lr_base; // No epoch-based or step-based decay after warmup.
         }
         if (type != "cosine" || total_steps <= warmup_steps) {
             return lr->get_lr();
@@ -3336,7 +3342,7 @@ int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FINETUNE_QLORA)) {
         return 1;
     }
-    if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+    if (ggml_opt_optimizer_is_qlion(params.optimizer)) {
         LOG_ERR("%s: qlion is only supported by llama-finetune-qlion\n", __func__);
         return 1;
     }

@@ -6707,11 +6707,12 @@ struct ggml_tensor * ggml_qlion_qat_stats(
         struct ggml_context * ctx,
         struct ggml_tensor * momentum,
         struct ggml_tensor * state,
-        struct ggml_tensor * params) {
+        struct ggml_tensor * params,
+        bool compact) {
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(momentum));
     GGML_ASSERT(state->type == GGML_TYPE_F32 && ggml_nelements(state) == 2 && ggml_is_contiguous(state));
     GGML_ASSERT(params->type == GGML_TYPE_F32 && ggml_nelements(params) == 8 && ggml_is_contiguous(params));
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 9 + ggml_nelements(momentum) / 32);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, compact ? 9 : 9 + ggml_nelements(momentum) / 32);
     result->op = GGML_OP_QLION_QAT_STATS;
     result->src[0] = momentum;
     result->src[1] = state;
@@ -6821,7 +6822,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * params) {
     GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q2_0 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(ggml_are_same_shape(weight, grad));
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
@@ -6833,7 +6834,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat(
     GGML_ASSERT(ggml_nelements(momentum) == ggml_nelements(weight));
     GGML_ASSERT(ggml_nelements(residual) == ggml_nelements(weight));
     GGML_ASSERT(params->type == GGML_TYPE_F32);
-    GGML_ASSERT((ggml_nelements(params) == 5 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
+    GGML_ASSERT((ggml_nelements(params) == 5 || ggml_nelements(params) == 8 || ggml_nelements(params) == 9 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
     result->op     = GGML_OP_OPT_STEP_QLION_QAT;
@@ -6872,7 +6873,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_id(
     GGML_ASSERT(ids->ne[1] == n_tokens);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
-    GGML_ASSERT(params->type == GGML_TYPE_F32 && (ggml_nelements(params) == 5 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && (ggml_nelements(params) == 5 || ggml_nelements(params) == 8 || ggml_nelements(params) == 9 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, weight);
     result->op = GGML_OP_OPT_STEP_QLION_QAT_ID;
@@ -6895,14 +6896,14 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_rows(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * params) {
     GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q2_0 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(weight->ne[0] == grad->ne[0]);
     GGML_ASSERT(ggml_nelements(ids) == ggml_nrows(grad));
     GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
-    GGML_ASSERT(params->type == GGML_TYPE_F32 && (ggml_nelements(params) == 5 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && (ggml_nelements(params) == 5 || ggml_nelements(params) == 8 || ggml_nelements(params) == 9 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
 
@@ -6927,7 +6928,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_sparse_rows(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * params) {
     GGML_ASSERT(weight->flags & GGML_TENSOR_FLAG_PARAM);
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q2_0 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_Q8_0 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(count->type == GGML_TYPE_I32 && ggml_nelements(count) == 1);
     GGML_ASSERT(weight->ne[0] == grad->ne[0]);
@@ -6935,7 +6936,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_sparse_rows(
     GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(ggml_are_same_shape(weight, momentum) && ggml_are_same_shape(weight, residual));
-    GGML_ASSERT(params->type == GGML_TYPE_F32 && (ggml_nelements(params) == 5 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
+    GGML_ASSERT(params->type == GGML_TYPE_F32 && (ggml_nelements(params) == 5 || ggml_nelements(params) == 8 || ggml_nelements(params) == 9 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32));
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
     GGML_ASSERT(ggml_is_contiguous(count) && ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
 
@@ -6978,7 +6979,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat_tied(
 
     GGML_ASSERT(
         params->type == GGML_TYPE_F32 &&
-        (ggml_nelements(params) == 5 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32)
+        (ggml_nelements(params) == 5 || ggml_nelements(params) == 8 || ggml_nelements(params) == 9 || ggml_nelements(params) == 9 + ggml_nelements(weight) / 32)
     );
 
     GGML_ASSERT(
@@ -7964,6 +7965,13 @@ static void ggml_compute_backward(
         case GGML_OP_FILL: {
             // The output does not depend on the input values.
         } break;
+        case GGML_OP_SET_ROWS: {
+            if (src0_needs_grads && ggml_get_op_params_i32(tensor, 0) != 0) {
+                // KV training uses unique indices; past cache rows are detached.
+                struct ggml_tensor * ids = src1->type == GGML_TYPE_I32 ? src1 : ggml_cast(ctx, src1, GGML_TYPE_I32);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_rows(ctx, ggml_cont(ctx, grad), ids));
+            }
+        } break;
         case GGML_OP_CPY: {
             // cpy overwrites value of src1 by src0 and returns view(src1)
             // the overwriting is mathematically equivalent to:
@@ -8539,7 +8547,9 @@ void ggml_build_backward_expand_with_callback(
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
-                if (node->op == GGML_OP_CPY && (ggml_get_op_params_i32(node, 0) != 0 || ggml_is_quantized(node->src[0]->type))) {
+                if (node->op == GGML_OP_CPY && (ggml_get_op_params_i32(node, 0) != 0 ||
+                        (ggml_is_quantized(node->src[0]->type) &&
+                         !(callback && (node->src[0]->flags & GGML_TENSOR_FLAG_PARAM) && node->type == GGML_TYPE_F32)))) {
                     ignore_src[0] = true;
                 }
                 break;
@@ -8556,11 +8566,10 @@ void ggml_build_backward_expand_with_callback(
                 ignore_src[2] = true; // ids: integer tensor
                 break;
 
-            // SET_ROWS is a KV-cache scatter write.  The gradient of the written data flows
-            // through the attention read path (GET_ROWS backward), not through this node.
             case GGML_OP_SET_ROWS:
-                ignore_src[0] = true;
+                ignore_src[0] = ggml_get_op_params_i32(node, 0) == 0;
                 ignore_src[1] = true;
+                ignore_src[2] = true;
                 break;
 
             // Ops with no backward implementation — stop gradient through all sources so the

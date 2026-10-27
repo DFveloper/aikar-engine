@@ -3399,6 +3399,20 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+static ggml_tensor * build_training_cache_view(ggml_context * ctx, ggml_cgraph * graph, ggml_tensor * cached) {
+    GGML_ASSERT(cached->type == GGML_TYPE_F32);
+    for (int i = ggml_graph_n_nodes(graph) - 1; i >= 0; --i) {
+        ggml_tensor * stored = ggml_graph_node(graph, i);
+        if (stored->op == GGML_OP_SET_ROWS && stored->view_src == cached->view_src) {
+            GGML_ASSERT(stored->type == GGML_TYPE_F32 && cached->view_offs >= stored->view_offs);
+            stored->op_params[0] = 1;
+            return ggml_view_4d(ctx, stored, cached->ne[0], cached->ne[1], cached->ne[2], cached->ne[3],
+                cached->nb[1], cached->nb[2], cached->nb[3], cached->view_offs - stored->view_offs);
+        }
+    }
+    GGML_ABORT("training cache has no current K/V write");
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -3437,10 +3451,14 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v;
 
     if (cparams.training) {
-        GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
+        GGML_ASSERT(mctx_cur->get_n_kv() * ubatch.n_seqs == n_tokens);
 
         k = k_cur;
         v = v_cur;
+        if (ubatch.n_seqs > 1) {
+            k = ggml_reshape_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
+            v = ggml_reshape_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
+        }
     } else {
         {
             const auto & k_idxs = inp->get_k_idxs();
@@ -3452,6 +3470,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
         k = mctx_cur->get_k(ctx0, il);
         v = mctx_cur->get_v(ctx0, il);
+        if (training) {
+            k = build_training_cache_view(ctx0, gf, k);
+            v = build_training_cache_view(ctx0, gf, v);
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3721,7 +3743,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // whole seq fits into batch in training mode
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
     if (use_kv_cur) {
-        GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
+        GGML_ASSERT(mctx_cur->get_n_kv() * ubatch.n_seqs == n_tokens);
     }
 
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
@@ -3744,6 +3766,14 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+    if (use_kv_cur && ubatch.n_seqs > 1) {
+        k = ggml_reshape_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
+        v = ggml_reshape_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
+    }
+    if (training && !use_kv_cur) {
+        k = build_training_cache_view(ctx0, gf, k);
+        v = build_training_cache_view(ctx0, gf, v);
+    }
 
     const int64_t n_kv_max = is_swa ? std::min<int64_t>(hparams.n_swa, k->ne[2]) : 0;
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il, mctx_cur->get_turboquant_parameters(il));

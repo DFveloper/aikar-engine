@@ -522,6 +522,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (src0->type == GGML_TYPE_I64 && src1->type == GGML_TYPE_I32) {
+        ggml_cpy_scalar_cuda<int64_t, int32_t>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>

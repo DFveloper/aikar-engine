@@ -16425,7 +16425,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[4]) &&
                    ggml_nelements(op->src[4]) == 8;
         case GGML_OP_QLION_QAT_STATS:
-            return op->src[0]->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(op->src[0]) &&
+            return ggml_nelements(op) == 9 + ggml_nelements(op->src[0]) / 32 && op->src[0]->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(op->src[0]) &&
                 op->src[1]->type == GGML_TYPE_F32 && ggml_nelements(op->src[1]) == 2 &&
                 op->src[2]->type == GGML_TYPE_F32 && ggml_nelements(op->src[2]) == 8;
         case GGML_OP_ACC_QLION_QAT:
@@ -16451,7 +16451,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
                    ggml_is_contiguous(op->src[4]) && ggml_is_contiguous(op->src[5]) &&
-                   ggml_is_contiguous(op->src[6]);
+                   ggml_is_contiguous(op->src[6]) &&
+                   (ggml_nelements(op->src[6]) == 5 || ggml_nelements(op->src[6]) == 9 + ggml_nelements(op->src[0]) / 32);
         case GGML_OP_OPT_STEP_QLION_QAT_ROWS:
             return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
@@ -16459,7 +16460,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->src[5]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
                    ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op->src[4]) &&
-                   ggml_is_contiguous(op->src[5]);
+                   ggml_is_contiguous(op->src[5]) &&
+                   (ggml_nelements(op->src[5]) == 5 || ggml_nelements(op->src[5]) == 9 + ggml_nelements(op->src[0]) / 32);
         case GGML_OP_OPT_STEP_SGD:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_LOG:
@@ -17652,7 +17654,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
             src_clone[2], src_clone[3], src_clone[4]);
         } else if (tensor->op == GGML_OP_QLION_QAT_STATS) {
-            tensor_clone = ggml_qlion_qat_stats(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+            tensor_clone = ggml_qlion_qat_stats(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], ggml_nelements(tensor) == 9);
         } else if (tensor->op == GGML_OP_ACC_QLION_QAT) {
             if (src_clone[4]) {
                 tensor_clone = ggml_acc_qlion_qat_tied(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],

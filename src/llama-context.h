@@ -261,7 +261,10 @@ struct llama_context {
             const struct ggml_tensor        * source_embd = nullptr,
             size_t                           source_embd_offset = 0,
             int32_t                          position_offset = 0,
-            bool                             clear_memory = true);
+            bool                             clear_memory = true,
+            int32_t                          accumulation_steps = 1,
+            const std::vector<float>        * sequence_rewards = nullptr,
+            uint32_t                         active_sequences = 1);
 
     void opt_epoch_mtp_batch(
             const std::vector<llama_token> & tokens,

@@ -3908,22 +3908,22 @@ static void llama_set_param(
     if (!tensor) {
         return;
     }
-    const bool qat_type = tensor->type == GGML_TYPE_MXFP4 || tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q8_0;
-    if ((optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && !qat_type) ||
-        (optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && tensor->type != GGML_TYPE_F32)) {
+    const bool qat_type = tensor->type == GGML_TYPE_MXFP4 || tensor->type == GGML_TYPE_Q2_0 || tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q8_0;
+    if ((ggml_opt_optimizer_is_qlion(optimizer) && !qat_type) ||
+        (!ggml_opt_optimizer_is_qlion(optimizer) && tensor->type != GGML_TYPE_F32)) {
         return;
     }
     if (!param_filter(tensor, userdata)) {
         return;
     }
-    if (optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT && strcmp(tensor->name, "token_embd.weight") == 0) {
+    if (!ggml_opt_optimizer_is_qlion(optimizer) && strcmp(tensor->name, "token_embd.weight") == 0) {
         return; // FIXME
     }
     if (strcmp(tensor->name, "rope_freqs.weight") == 0) {
         return; // FIXME
     }
     ggml_set_param(tensor);
-    if (optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+    if (ggml_opt_optimizer_is_qlion(optimizer)) {
         ggml_opt_qat_register_param(opt_ctx, tensor);
     }
 }
@@ -4006,7 +4006,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                 gf_res_prev_active = nullptr;
                 gf_res_reserve.reset(new llm_graph_result(tmp_cap));
                 // split_only=true: only splits the graph, doesn't reallocate compute buffers
-                auto * gf_train = graph_reserve(n_ubatch, 1, n_ubatch, mctx_tmp.get(), /*split_only=*/true, /*sizes=*/nullptr, /*training=*/true);
+                auto * gf_train = graph_reserve(n_ubatch, n_seq_max(), n_ubatch, mctx_tmp.get(), /*split_only=*/true, /*sizes=*/nullptr, /*training=*/true);
                 if (gf_train) {
                     train_fwd_nodes = (uint32_t)ggml_graph_n_nodes(gf_train);
                     LLAMA_LOG_INFO("%s: measured training graph nodes = %u (n_ubatch=%u)\n",
@@ -4047,6 +4047,17 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period                = n_batch / n_ubatch;
+    const uint32_t accumulation_steps = std::max(1u, lopt_params.grad_accum_steps);
+    if (accumulation_steps > 1 && n_batch != n_ctx()) {
+        throw std::runtime_error("multi-batch accumulation requires a full-window logical batch");
+    }
+    if (accumulation_steps > 1 && !ggml_opt_optimizer_is_qlion(lopt_params.optimizer_type)) {
+        throw std::runtime_error("multi-batch accumulation requires native QLion QAT");
+    }
+    if (accumulation_steps > (uint32_t) INT32_MAX / opt_params.opt_period) {
+        throw std::runtime_error("gradient accumulation period is too large");
+    }
+    opt_params.opt_period *= accumulation_steps;
     opt_params.get_opt_pars              = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud           = lopt_params.get_opt_pars_ud;
     opt_params.optimizer                 = lopt_params.optimizer_type;
@@ -4178,7 +4189,10 @@ void llama_context::opt_epoch_iter(
         const struct ggml_tensor        * source_embd,
         size_t                           source_embd_offset,
         int32_t                          position_offset,
-        bool                             clear_memory) {
+        bool                             clear_memory,
+        int32_t                          accumulation_steps,
+        const std::vector<float>        * sequence_rewards,
+        uint32_t                         active_sequences) {
     GGML_ASSERT(opt_ctx);
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads_batch);
@@ -4197,6 +4211,16 @@ void llama_context::opt_epoch_iter(
             labels_sparse.begin(), labels_sparse.end(), [](llama_token label) { return label >= 0; });
     // Compensate for cross-entropy averaging over masked and padded rows.
     const float label_scale = n_labels > 0 ? reward_scale * (float) n_ctx / (float) n_labels : 0.0f;
+    const uint32_t n_sequences = sequence_rewards ? sequence_rewards->size() : 1;
+    const uint32_t sequence_length = n_ctx / n_sequences;
+    std::vector<float> sequence_scales(n_sequences, label_scale);
+    if (sequence_rewards) {
+        for (uint32_t s = 0; s < n_sequences; ++s) {
+            const auto begin = labels_sparse.begin() + s * sequence_length;
+            const int64_t count = std::count_if(begin, begin + sequence_length, [](llama_token label) { return label >= 0; });
+            sequence_scales[s] = count > 0 ? reward_scale * (*sequence_rewards)[s] * sequence_length / count : 0.0f;
+        }
+    }
     const bool confidence_weighting = opt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_CONFIDENCE ||
                                       opt_params.critical_token_mode == LLAMA_OPT_CRITICAL_TOKEN_MODE_HYBRID;
     const bool critical_stats_due = train && critical_metadata && opt_params.critical_stats_every > 0 &&
@@ -4224,22 +4248,23 @@ void llama_context::opt_epoch_iter(
     }
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
-        if (train && opt_params.optimizer_type == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
-            ggml_opt_set_current_period(opt_ctx, n_batch / n_ubatch);
+        if (train && ggml_opt_optimizer_is_qlion(opt_params.optimizer_type) && accumulation_steps > 0 && pos_ctx == 0) {
+            ggml_opt_set_current_period(opt_ctx, accumulation_steps * (n_batch / n_ubatch));
         }
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
             batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
-            batch.pos     [pos_batch]    = position_offset + pos_ctx + pos_batch;
+            batch.pos     [pos_batch]    = position_offset + (pos_ctx + pos_batch) % sequence_length;
             batch.n_seq_id[pos_batch]    = 1;
-            batch.seq_id  [pos_batch][0] = 0;
+            batch.seq_id  [pos_batch][0] = (pos_ctx + pos_batch) / sequence_length;
             batch.logits  [pos_batch]    = labels_sparse[pos_ctx + pos_batch] >= 0;
         }
 
         // TODO: use llama_batch_ext here
         {
             llama_batch_compat compat(this, batch);
-            if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
+            // Keep masked labels out of the output projection.
+            if (!balloc->init(*compat.batch_ext, model.vocab, false)) {
                 LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
                 return;
             }
@@ -4253,7 +4278,7 @@ void llama_context::opt_epoch_iter(
 
         uint32_t n_outputs_all = std::max<uint32_t>(1, balloc->get_n_outputs());
 
-        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, n_sequences == 1);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
             break;
@@ -4269,6 +4294,12 @@ void llama_context::opt_epoch_iter(
         static bool timings_printed = false;  // print per-ubatch timings only for the first window
         do {
             auto ubatch = mctx->get_ubatch();
+            // KV streams can reorder microbatches. Map rows back to their source windows.
+            std::vector<uint32_t> label_indices(ubatch.n_tokens);
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                label_indices[i] = ubatch.seq_id[i][0] * sequence_length + ubatch.pos[i] - position_offset;
+                GGML_ASSERT(label_indices[i] < labels_sparse.size());
+            }
             std::vector<float> source_state;
             if (source_embd) {
                 GGML_ASSERT(source_ctx);
@@ -4488,12 +4519,12 @@ void llama_context::opt_epoch_iter(
                 }
                 for (uint32_t output_row = 0; output_row < supervised_rows.size(); ++output_row) {
                     const uint32_t pos_ubatch = supervised_rows[output_row];
-                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                    const uint32_t ilabel = label_indices[pos_ubatch];
                     // -1 sentinel means "masked position" (prompt token, BOS separator, etc).
                     // Leave the dense label row or sparse weight at zero.
                     if (labels_sparse[ilabel] < 0) continue;
                     GGML_ASSERT(labels_sparse[ilabel] < res->get_logits()->ne[0]);
-                    const float active_label_scale = critical_metadata ? 1.0f : label_scale*n_outputs/ubatch.n_tokens;
+                    const float active_label_scale = critical_metadata ? 1.0f : sequence_scales[ilabel / sequence_length]*n_outputs/ubatch.n_tokens;
                     if (labels) {
                         ggml_backend_tensor_set(labels, &active_label_scale, (output_row*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                     } else {
@@ -4528,6 +4559,10 @@ void llama_context::opt_epoch_iter(
             const int64_t t3_eval = ggml_time_ms();
             copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
+            if (result && sequence_rewards) {
+                ggml_opt_result_weight_last(result, active_sequences,
+                        (float) n_sequences / (reward_scale*active_sequences));
+            }
 
             if (train_mtp && opt_mtp_context) {
                 const struct ggml_tensor * h_nextn = res->get_h_nextn();
@@ -4560,7 +4595,7 @@ void llama_context::opt_epoch_iter(
                 stats_weighted_loss += weighted_loss;
                 bool has_active = false;
                 for (uint32_t output_row = 0; output_row < supervised_rows.size(); ++output_row) {
-                    const uint32_t ilabel = pos_ctx + pos_batch + supervised_rows[output_row];
+                    const uint32_t ilabel = label_indices[supervised_rows[output_row]];
                     if (labels_sparse[ilabel] < 0) continue;
                     has_active = true;
                     const bool is_explicit = (*critical_metadata)[ilabel].span_weight > 1.0f;
@@ -4588,7 +4623,7 @@ void llama_context::opt_epoch_iter(
             }
 
             if (callback) {
-                callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
+                callback(train, opt_ctx, dataset, result, idata_in_loop + ((pos_ctx + pos_batch)/n_ubatch + 1)*active_sequences, ndata_in_loop, t_loop_start);
             }
 
             pos_batch += ubatch.n_tokens;
@@ -4644,61 +4679,78 @@ void llama_context::opt_epoch(
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval,
         bool                      shuffle) {
-    const uint32_t n_ctx    = this->n_ctx();
-    const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
+    const uint32_t n_ctx = this->n_ctx();
+    const uint32_t n_parallel = n_seq_max();
+    const uint32_t n_window = n_ctx / n_parallel;
+    const uint32_t n_batch = std::min(cparams.n_batch, n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
-    const  int64_t ndata    = ggml_opt_dataset_ndata(dataset);
+    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
+    const uint32_t accum = std::max(1u, opt_params.grad_accum_steps);
 
-    GGML_ASSERT(idata_start >= 0);
-    GGML_ASSERT(idata_start <= idata_split);
-    GGML_ASSERT(idata_split <= ndata);
-
+    GGML_ASSERT(idata_start >= 0 && idata_start <= idata_split && idata_split <= ndata);
+    GGML_ASSERT(n_ctx % n_parallel == 0);
+    if ((n_parallel > 1 && cparams.kv_unified) || ((n_parallel > 1 || accum > 1) && n_batch != n_ctx)) {
+        throw std::runtime_error("parallel training requires separate KV streams and a full logical batch");
+    }
+    const bool critical_enabled = opt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
+    if ((n_parallel > 1 || accum > 1) && (critical_enabled || opt_mtp_context)) {
+        throw std::runtime_error("parallel/accumulated training does not yet support critical weighting or MTP");
+    }
     if (shuffle && idata_split > 1) {
         ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
     }
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
-
-    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
-    std::vector<llama_token>        tokens(n_ctx);
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    std::vector<llama_token> tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
     std::vector<llama_opt_critical_token_metadata> critical_metadata;
-    const bool critical_enabled = opt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
     if (critical_enabled) {
-        GGML_ASSERT(ggml_opt_dataset_aux_size(dataset) == n_ctx * sizeof(critical_metadata[0]));
+        GGML_ASSERT(ggml_opt_dataset_aux_size(dataset) == n_window * sizeof(critical_metadata[0]));
         critical_metadata.resize(n_ctx);
     }
-
-    int64_t idata = idata_start;
+    std::vector<float> rewards(n_parallel);
+    const auto load_windows = [&](int64_t first, int64_t end, bool train) {
+        std::fill(tokens.begin(), tokens.end(), 0);
+        std::fill(labels_sparse.begin(), labels_sparse.end(), -1);
+        std::fill(rewards.begin(), rewards.end(), 0.0f);
+        const uint32_t active = std::min<int64_t>(n_parallel, end - first);
+        for (uint32_t s = 0; s < active; ++s) {
+            ggml_opt_dataset_get_batch_host(dataset, tokens.data() + s*n_window,
+                    n_window*sizeof(llama_token), labels_sparse.data() + s*n_window, first + s);
+            if (critical_enabled) {
+                ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data() + s*n_window,
+                        n_window*sizeof(critical_metadata[0]), first + s);
+            }
+            rewards[s] = train && g_reward_weights && first + s < g_reward_weights_n ? g_reward_weights[first + s] : 1.0f;
+        }
+        return active;
+    };
 
     int64_t t_loop_start = ggml_time_us();
-    int64_t ndata_in_loop = (idata_split - idata_start)*ubatch_per_ctx;
-    for (; idata < idata_split; ++idata) {
-        constexpr bool train = true;
-        const int64_t idata_in_loop = (idata - idata_start)*ubatch_per_ctx;
-        const float reward = (g_reward_weights && idata < g_reward_weights_n)
-                             ? g_reward_weights[idata] : 1.0f;
-
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        if (critical_enabled) {
-            ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data(), n_ctx*sizeof(critical_metadata[0]), idata);
+    const int64_t ndata_in_train = (idata_split - idata_start)*ubatch_per_ctx;
+    for (int64_t group = idata_start; group < idata_split;) {
+        const int64_t group_end = std::min<int64_t>(idata_split, group + (int64_t) accum*n_parallel);
+        const int32_t batches = (group_end - group + n_parallel - 1) / n_parallel;
+        // Normalize partial accumulation groups by their actual window count.
+        const float scale = (float) batches*n_parallel / (group_end - group);
+        for (int64_t idata = group; idata < group_end; idata += n_parallel) {
+            const uint32_t active = load_windows(idata, group_end, true);
+            opt_epoch_iter(dataset, result_train, tokens, labels_sparse, critical_enabled ? &critical_metadata : nullptr,
+                    batch, scale, callback_train, true, true, (idata - idata_start)*ubatch_per_ctx,
+                    ndata_in_train, t_loop_start, nullptr, nullptr, 0, 0, true,
+                    idata == group ? batches : 0, &rewards, active);
         }
-        opt_epoch_iter(dataset, result_train, tokens, labels_sparse, critical_enabled ? &critical_metadata : nullptr, batch, reward,
-            callback_train, train, train, idata_in_loop, ndata_in_loop, t_loop_start);
+        group = group_end;
     }
 
     t_loop_start = ggml_time_us();
-    ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;
-    for (; idata < ndata; ++idata) {
-        constexpr bool train = false;
-        const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
-
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        if (critical_enabled) {
-            ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data(), n_ctx*sizeof(critical_metadata[0]), idata);
-        }
-        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, critical_enabled ? &critical_metadata : nullptr, batch, 1.0f,
-            callback_eval, train, false, idata_in_loop, ndata_in_loop, t_loop_start);
+    const int64_t ndata_in_eval = (ndata - idata_split)*ubatch_per_ctx;
+    for (int64_t idata = idata_split; idata < ndata; idata += n_parallel) {
+        const uint32_t active = load_windows(idata, ndata, false);
+        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, critical_enabled ? &critical_metadata : nullptr,
+                batch, (float) n_parallel/active, callback_eval, false, false, (idata - idata_split)*ubatch_per_ctx,
+                ndata_in_eval, t_loop_start, nullptr, nullptr, 0, 0, true, 0, &rewards, active);
     }
 
     llama_batch_free(batch);
@@ -4711,6 +4763,8 @@ void llama_context::opt_eval_range(
         int64_t                   idata_end,
         ggml_opt_epoch_callback   callback_eval) {
     const uint32_t n_ctx = this->n_ctx();
+    const uint32_t n_parallel = n_seq_max();
+    const uint32_t n_window = n_ctx / n_parallel;
     const uint32_t n_batch = std::min(cparams.n_batch, n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
     const int64_t ndata = ggml_opt_dataset_ndata(dataset);
@@ -4723,21 +4777,29 @@ void llama_context::opt_eval_range(
     std::vector<llama_opt_critical_token_metadata> critical_metadata;
     const bool critical_enabled = opt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE;
     if (critical_enabled) {
-        GGML_ASSERT(ggml_opt_dataset_aux_size(dataset) == n_ctx * sizeof(critical_metadata[0]));
+        GGML_ASSERT(ggml_opt_dataset_aux_size(dataset) == n_window * sizeof(critical_metadata[0]));
         critical_metadata.resize(n_ctx);
     }
 
     const int64_t t_loop_start = ggml_time_us();
     const int64_t ndata_in_loop = (idata_end - idata_start) * ubatch_per_ctx;
-    for (int64_t idata = idata_start; idata < idata_end; ++idata) {
+    std::vector<float> rewards(n_parallel, 1.0f);
+    for (int64_t idata = idata_start; idata < idata_end; idata += n_parallel) {
         const int64_t idata_in_loop = (idata - idata_start) * ubatch_per_ctx;
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx * sizeof(llama_token), labels_sparse.data(), idata);
-        if (critical_enabled) {
-            ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data(), n_ctx * sizeof(critical_metadata[0]), idata);
+        const uint32_t active = std::min<int64_t>(n_parallel, idata_end - idata);
+        std::fill(tokens.begin(), tokens.end(), 0);
+        std::fill(labels_sparse.begin(), labels_sparse.end(), -1);
+        for (uint32_t s = 0; s < active; ++s) {
+            ggml_opt_dataset_get_batch_host(dataset, tokens.data() + s*n_window, n_window*sizeof(llama_token),
+                    labels_sparse.data() + s*n_window, idata + s);
+            if (critical_enabled) {
+                ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data() + s*n_window,
+                        n_window*sizeof(critical_metadata[0]), idata + s);
+            }
         }
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse,
-            critical_enabled ? &critical_metadata : nullptr, batch, 1.0f, callback_eval,
-            false, false, idata_in_loop, ndata_in_loop, t_loop_start);
+            critical_enabled ? &critical_metadata : nullptr, batch, (float) n_parallel/active, callback_eval,
+            false, false, idata_in_loop, ndata_in_loop, t_loop_start, nullptr, nullptr, 0, 0, true, 0, &rewards, active);
     }
     llama_batch_free(batch);
 }

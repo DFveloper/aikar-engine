@@ -1879,6 +1879,7 @@ extern "C" {
         // the target forward graph still produces hidden states for the MTP model.
         bool                                 train_mtp;
         bool                                 qat_grad_accumulator_cpu;
+        uint32_t                             grad_accum_steps; // native QAT batches per update; 0 means 1
         // When true, the MTP model is trained with a loss that encourages it to match
 
     };

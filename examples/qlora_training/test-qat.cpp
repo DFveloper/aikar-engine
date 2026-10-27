@@ -42,7 +42,12 @@ static double cosine_similarity(const std::vector<float> & a, const std::vector<
     return a2 > 0.0 && b2 > 0.0 ? dot / std::sqrt(a2 * b2) : (a2 == 0.0 && b2 == 0.0 ? 1.0 : 0.0);
 }
 
+static void test_reference_trajectory(enum qat_weight_format format);
+
 static qat_tensor_state make_state(enum qat_weight_format format, int64_t ne = 32) {
+    if (format == QAT_WEIGHT_Q2_0 && ne == 32) {
+        ne = 64;
+    }
     std::vector<float> weight(ne, 0.5f);
     weight[0] = 1.0f;
     for (int64_t i = 1; i < ne; ++i) {
@@ -161,7 +166,7 @@ static void test_zero_residual_blocks() {
 }
 
 static void test_output_formats() {
-    for (enum qat_weight_format format : { QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q4_0 }) {
+    for (enum qat_weight_format format : { QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q4_0, QAT_WEIGHT_Q2_0 }) {
         qat_tensor_state state = make_state(format);
         std::vector<float> gradient(state.ne, 0.0f);
         gradient[3] = -1.0f;
@@ -173,6 +178,10 @@ static void test_output_formats() {
         check(state.weight.size() == ggml_row_size(type, state.ne), "output format byte size changed");
         check(ggml_validate_row_data(type, state.weight.data(), state.weight.size()), "output format failed GGML validation");
     }
+}
+
+static void test_q2_0_reference_trajectory() {
+    test_reference_trajectory(QAT_WEIGHT_Q2_0);
 }
 
 static void test_nonfinite_gradient_guard() {
@@ -354,7 +363,7 @@ static void check_adaptive_residual(
 }
 
 // Statistics are checked independently before testing the quantized update.
-static void test_adaptive_statistics(ggml_backend_dev_t device) {
+static void test_adaptive_statistics(ggml_backend_dev_t device, bool compact = false) {
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
     check(backend != nullptr, "statistics backend init failed");
     ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true };
@@ -362,13 +371,13 @@ static void test_adaptive_statistics(ggml_backend_dev_t device) {
     ggml_tensor * m = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, 544);
     ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
     ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
-    ggml_tensor * stats = ggml_qlion_qat_stats(ctx, m, state, p);
+    ggml_tensor * stats = ggml_qlion_qat_stats(ctx, m, state, p, compact);
     check(ggml_backend_supports_op(backend, stats), "backend does not support QLion statistics");
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
     ggml_build_forward_expand(graph, stats);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     check(buffer != nullptr, "statistics allocation failed");
-    float pars[] = { 1, 0.9f, 0, 0, 0, 256, 1, 2 };
+    float pars[] = { 1, 0.9f, 0, 0, 0, compact ? -32.0f : 256.0f, 1, 2 };
     const float initial[] = { 0, 0 };
     ggml_backend_tensor_set(state, initial, 0, sizeof(initial));
     ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
@@ -377,7 +386,7 @@ static void test_adaptive_statistics(ggml_backend_dev_t device) {
         values[i] = i / 32 + 1;
     }
     std::vector<uint8_t> quant(ggml_nbytes(m));
-    std::vector<float> result(26);
+    std::vector<float> result(compact ? 9 : 26);
     const auto * traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
     for (int step = 0; step < 3; ++step) {
         traits->from_float_ref(values.data(), quant.data(), 544);
@@ -386,7 +395,7 @@ static void test_adaptive_statistics(ggml_backend_dev_t device) {
         ggml_backend_tensor_get(stats, result.data(), 0, result.size() * sizeof(float));
         if (step == 0) {
             check(std::abs(result[8] - std::sqrt(105.0f)) < 1e-5f, "layer RMS is incorrect");
-            for (int ib = 0; ib < 17; ++ib) {
+            for (int ib = 0; !compact && ib < 17; ++ib) {
                 check(result[9 + ib] == (ib + 1) * (ib + 1), "block mean square is incorrect");
             }
         }
@@ -402,7 +411,7 @@ static void test_adaptive_statistics(ggml_backend_dev_t device) {
     ggml_backend_tensor_set(m, quant.data(), 0, quant.size());
     check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "nonfinite statistics compute failed");
     ggml_backend_tensor_get(stats, result.data(), 0, result.size() * sizeof(float));
-    check(result[9] == 0 && std::isfinite(result[8]) && result[6] == saved[0], "nonfinite momentum contaminated statistics");
+    check((compact || result[9] == 0) && std::isfinite(result[8]) && result[6] == saved[0], "nonfinite momentum contaminated statistics");
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);
@@ -410,7 +419,7 @@ static void test_adaptive_statistics(ggml_backend_dev_t device) {
 
 static void test_adaptive_backend_step(ggml_backend_dev_t device, bool fast = false) {
     for (qat_weight_format format : { QAT_WEIGHT_Q4_0, QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q8_0 }) {
-        for (int unit : { 1, 32, 256 }) {
+        for (int unit : { 1, 32, 256, -32 }) {
             for (float tau : { 0.0f, 1.0f, 1e30f }) {
                 qat_tensor_state before = make_state(format, 544);
                 std::vector<float> momentum(544), gradient(544, 0.5f);
@@ -429,7 +438,7 @@ static void test_adaptive_backend_step(ggml_backend_dev_t device, bool fast = fa
                 const size_t mb = ggml_row_size(GGML_TYPE_Q8_0, 32);
                 const size_t rb = ggml_row_size(GGML_TYPE_Q4_0, 32);
                 for (int ib = 0; ib < 17; ++ib) {
-                    const float rms = unit == 1 ? std::sqrt(592.0f / 17) : unit == 32 ? momentum[ib * 32] :
+                    const float rms = unit == 1 ? std::sqrt(592.0f / 17) : (unit == 32 || unit == -32) ? momentum[ib * 32] :
                         ib == 16 ? 16 : ib < 8 ? std::sqrt(2.0f) : std::sqrt(40.0f);
                     qat_tensor_state block;
                     block.format = format;
@@ -463,7 +472,7 @@ static void test_adaptive_backend_step(ggml_backend_dev_t device, bool fast = fa
                 ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_Q4_0, 544);
                 ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
                 ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
-                ggml_tensor * stats = ggml_qlion_qat_stats(ctx, m, state, p);
+                ggml_tensor * stats = unit == -32 ? p : ggml_qlion_qat_stats(ctx, m, state, p, false);
                 ggml_tensor * step = ggml_opt_step_qlion_qat(ctx, w, g, m, r, stats);
                 check(ggml_backend_supports_op(backend, stats), "adaptive statistics unsupported");
                 if (!ggml_backend_supports_op(backend, step)) {
@@ -514,7 +523,7 @@ static void test_adaptive_backend_step(ggml_backend_dev_t device, bool fast = fa
     }
 }
 
-static void test_adaptive_update_variants(ggml_backend_dev_t device) {
+static void test_adaptive_update_variants(ggml_backend_dev_t device, bool fused = false) {
     for (int variant = 0; variant < 6; ++variant) {
         const int64_t ne = variant == 2 ? 512 : 256;
         qat_tensor_state initial = make_state(QAT_WEIGHT_Q4_0, ne);
@@ -563,7 +572,7 @@ static void test_adaptive_update_variants(ggml_backend_dev_t device) {
         ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 64, 4, variant == 2 ? 2 : 1);
         ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
         ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
-        ggml_tensor * stats = ggml_qlion_qat_stats(ctx, m, state, p);
+        ggml_tensor * stats = fused ? p : ggml_qlion_qat_stats(ctx, m, state, p, false);
         ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 1, variant == 2 ? 2 : 1);
         ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 1, variant == 2 ? 2 : 1);
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, variant == 2 ? 1 : 2, variant == 2 ? 2 : 1);
@@ -592,7 +601,7 @@ static void test_adaptive_update_variants(ggml_backend_dev_t device) {
         ggml_backend_tensor_set(w, initial.weight.data(), 0, initial.weight.size());
         ggml_backend_tensor_set(m, initial.momentum.data(), 0, initial.momentum.size());
         ggml_backend_tensor_set(r, initial.residual.data(), 0, initial.residual.size());
-        const float pars[] = { 0.03125f, 0, 0, 0, 0, 32, 1, 0 };
+        const float pars[] = { 0.03125f, 0, 0, 0, 0, fused ? -32.0f : 32.0f, 1, 0 };
         ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
         const int32_t routes[] = { 1, variant == 2 ? 0 : 3 };
         const int32_t nrows = 2;
@@ -624,6 +633,200 @@ static void test_adaptive_update_variants(ggml_backend_dev_t device) {
     }
 }
 
+static void test_qlion2_q2_groups(ggml_backend_dev_t device) {
+    qat_tensor_state initial = make_state(QAT_WEIGHT_Q2_0, 128);
+    std::vector<float> mv(128), gradient(128, 1), weights(128), target(128);
+    for (int i = 0; i < 128; ++i) {
+        mv[i] = i / 32 + 1;
+    }
+    const auto * wt = ggml_get_type_traits(GGML_TYPE_Q2_0);
+    const auto * mt = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    mt->from_float_ref(mv.data(), initial.momentum.data(), 128);
+    mt->to_float(initial.momentum.data(), mv.data(), 128);
+    wt->to_float(initial.weight.data(), weights.data(), 128);
+    for (int ib = 0; ib < 4; ++ib) {
+        float sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            sum += mv[ib * 32 + j] * mv[ib * 32 + j];
+        }
+        const float rms = std::sqrt(sum / 32);
+        const float alpha = 0.125f / (1 + 1 / rms);
+        for (int j = 0; j < 32; ++j) {
+            target[ib * 32 + j] = weights[ib * 32 + j] - alpha;
+        }
+    }
+    std::vector<uint8_t> expected(initial.weight.size());
+    wt->from_float_ref(target.data(), expected.data(), 128);
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_Q2_0, 128);
+    ggml_set_param(w);
+    ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    ggml_tensor * m = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, 128);
+    ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_Q4_0, 128);
+    ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+    ggml_tensor * step = ggml_opt_step_qlion_qat(ctx, w, g, m, r, p);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, step);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "QLion2 Q2 allocation failed");
+    ggml_backend_buffer_clear(buffer, 0);
+    const float pars[] = { 0.125f, 0, 0, 0, 0, -32, 1, 0 };
+    ggml_backend_tensor_set(w, initial.weight.data(), 0, initial.weight.size());
+    ggml_backend_tensor_set(m, initial.momentum.data(), 0, initial.momentum.size());
+    ggml_backend_tensor_set(g, gradient.data(), 0, gradient.size() * sizeof(float));
+    ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "QLion2 Q2 step failed");
+    std::vector<uint8_t> actual(expected.size());
+    ggml_backend_tensor_get(w, actual.data(), 0, actual.size());
+    check(actual == expected, "QLion2 Q2 did not use independent 32-element group LRs");
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+static void test_qlion2_warmup_trajectory(ggml_backend_dev_t device) {
+    for (qat_weight_format format : { QAT_WEIGHT_Q4_0, QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q8_0 }) {
+        qat_tensor_state initial = make_state(format, 544);
+        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+        ggml_init_params ip = { 32 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * w[2], * m[2], * r[2], * p[2], * state[2], * step[2];
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 544);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+        for (int fused = 0; fused < 2; ++fused) {
+            w[fused] = ggml_new_tensor_1d(ctx, qat_weight_ggml_type(format), 544);
+            ggml_set_param(w[fused]);
+            m[fused] = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, 544);
+            r[fused] = ggml_new_tensor_1d(ctx, GGML_TYPE_Q4_0, 544);
+            state[fused] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+            p[fused] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+            ggml_tensor * stats = ggml_qlion_qat_stats(ctx, m[fused], state[fused], p[fused], fused != 0);
+            step[fused] = ggml_opt_step_qlion_qat(ctx, w[fused], g, m[fused], r[fused], stats);
+            ggml_build_forward_expand(graph, step[fused]);
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        check(buffer != nullptr, "QLion2 trajectory allocation failed");
+        ggml_backend_buffer_clear(buffer, 0);
+        for (int fused = 0; fused < 2; ++fused) {
+            const float pars[] = { 0.03125f, 0.85f, 0, 0, 0, fused ? -32.0f : 32.0f, 1, 2 };
+            ggml_backend_tensor_set(w[fused], initial.weight.data(), 0, initial.weight.size());
+            ggml_backend_tensor_set(p[fused], pars, 0, sizeof(pars));
+        }
+        std::vector<float> gradient(544);
+        for (int iter = 0; iter < 8; ++iter) {
+            for (int i = 0; i < 544; ++i) {
+                gradient[i] = (i / 32 + 1) * (iter % 3 == 0 ? -0.5f : 0.25f);
+            }
+            ggml_backend_tensor_set(g, gradient.data(), 0, gradient.size() * sizeof(float));
+            check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "QLion2 warmup trajectory failed");
+            for (auto pair : { std::make_pair(w[0], w[1]), std::make_pair(m[0], m[1]), std::make_pair(r[0], r[1]) }) {
+                std::vector<uint8_t> a(ggml_nbytes(pair.first)), b(a.size());
+                ggml_backend_tensor_get(pair.first, a.data(), 0, a.size());
+                ggml_backend_tensor_get(pair.second, b.data(), 0, b.size());
+                check(a == b, "QLion2 warmup/frozen trajectory differs from QLion32");
+            }
+            float a[2], b[2];
+            ggml_backend_tensor_get(state[0], a, 0, sizeof(a));
+            ggml_backend_tensor_get(state[1], b, 0, sizeof(b));
+            check(std::abs(a[0] - b[0]) < 1e-6f && a[1] == b[1], "QLion2 warmup threshold differs from QLion32");
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+    }
+}
+
+static void test_training_cache_gradient(ggml_backend_dev_t device) {
+    for (bool transposed : { false, true }) {
+        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+        const bool cpu_only = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        ggml_backend_t cpu = cpu_only ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        ggml_backend_t backends[] = { backend, cpu };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, cpu_only ? 1 : 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        ggml_init_params ip = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 3 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * values = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, transposed ? 1 : 2, transposed ? 4 : 2);
+        ggml_set_param(values);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, transposed ? 1 : 2, transposed ? 12 : 6);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, transposed ? 4 : 2);
+        ggml_tensor * stored = ggml_set_rows(ctx, cache, values, ids);
+        ggml_set_op_params_i32(stored, 0, 1);
+        ggml_tensor * view = ggml_view_2d(ctx, stored, transposed ? 4 : 2, transposed ? 2 : 4,
+            (transposed ? 6 : 2) * sizeof(float), (transposed ? 1 : 2) * sizeof(float));
+        ggml_tensor * coefficients = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, view->ne[0], view->ne[1]);
+        ggml_tensor * output = ggml_sum(ctx, ggml_mul(ctx, view, coefficients));
+        ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
+        params.optimizer = GGML_OPT_OPTIMIZER_TYPE_SGD;
+        params.ctx_compute = ctx;
+        params.inputs = values;
+        params.outputs = output;
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_backend_buffer_clear(buffer, 0);
+        const int64_t indices[] = { 1, 4 };
+        const int64_t transposed_indices[] = { 1, 7, 4, 10 };
+        const float before[] = { 1, 2, 3, 4 };
+        const float coefficients_host[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        const float multipliers[] = { 1, 2, 7, 8 };
+        const float transposed_multipliers[] = { 1, 5, 4, 8 };
+        std::vector<float> past(12, 0.25f);
+        ggml_backend_tensor_set(cache, past.data(), 0, ggml_nbytes(cache));
+        ggml_backend_tensor_set(ids, transposed ? transposed_indices : indices, 0, ggml_nbytes(ids));
+        ggml_backend_tensor_set(values, before, 0, sizeof(before));
+        ggml_backend_tensor_set(coefficients, coefficients_host, 0, sizeof(coefficients_host));
+        ggml_opt_context_t opt = ggml_opt_init(params);
+        ggml_opt_alloc(opt, true);
+        ggml_set_zero(ggml_opt_labels(opt));
+        ggml_opt_result_t result = ggml_opt_result_init();
+        ggml_opt_eval(opt, result);
+        float after[4];
+        ggml_backend_tensor_get(values, after, 0, sizeof(after));
+        const float alpha = ggml_opt_get_default_optimizer_params(nullptr).sgd.alpha;
+        for (int i = 0; i < 4; ++i) {
+            const float gradient = (transposed ? 119 : 125) * (transposed ? transposed_multipliers[i] : multipliers[i]);
+            check(std::isfinite(after[i]) && std::abs(after[i] - (before[i] - alpha * gradient)) < 1e-5f,
+                "training cache gradient has wrong row, offset, or transposed V layout");
+        }
+        std::vector<float> cache_after(12);
+        ggml_backend_tensor_get(cache, cache_after.data(), 0, ggml_nbytes(cache));
+        for (int i = 0; i < 12; ++i) {
+            const bool current = transposed ? i == 1 || i == 7 || i == 4 || i == 10 : i / 2 == 1 || i / 2 == 4;
+            check(current || cache_after[i] == past[i], "past cache rows received gradients");
+        }
+        ggml_opt_result_free(result);
+        ggml_opt_free(opt);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_sched_free(sched);
+        if (!cpu_only) { ggml_backend_free(cpu); }
+        ggml_backend_free(backend);
+    }
+}
+
+static void test_small_q8_accumulator(ggml_backend_dev_t device) {
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * accumulator = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, 32);
+    ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, 32);
+    ggml_tensor * result = ggml_acc_qlion_qat(ctx, accumulator, grad, true);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, result);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "small Q8 accumulator allocation failed");
+    std::vector<float> values(32, 0.25f);
+    std::vector<uint8_t> expected(ggml_nbytes(grad)), actual(expected.size());
+    ggml_get_type_traits(GGML_TYPE_Q8_0)->from_float_ref(values.data(), expected.data(), 32);
+    ggml_backend_tensor_set(grad, expected.data(), 0, expected.size());
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "small Q8 accumulator reset failed");
+    ggml_backend_tensor_get(accumulator, actual.data(), 0, actual.size());
+    check(actual == expected, "small Q8 accumulator reset changed gradient bytes");
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 static void benchmark_adaptive_trajectory(ggml_backend_dev_t device) {
     if (!getenv("QAT_ADAPTIVE_BENCH")) {
         return;
@@ -644,7 +847,7 @@ static void benchmark_adaptive_trajectory(ggml_backend_dev_t device) {
             ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_Q4_0, 544);
             ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
             ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, unit ? 8 : 5);
-            ggml_tensor * stats = unit ? ggml_qlion_qat_stats(ctx, m, state, p) : p;
+            ggml_tensor * stats = unit ? ggml_qlion_qat_stats(ctx, m, state, p, false) : p;
             ggml_tensor * step = ggml_opt_step_qlion_qat(ctx, w, g, m, r, stats);
             ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
             ggml_build_forward_expand(graph, step);
@@ -798,7 +1001,7 @@ static struct ggml_opt_optimizer_params test_qlion_optimizer_params(void * userd
     return params;
 }
 
-static void test_native_optimizer_graph(enum qat_weight_format format, int unit = 0) {
+static void test_native_optimizer_graph(enum qat_weight_format format, int unit = 0, bool fused = false) {
     qat_tensor_state initial = make_state(format);
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     check(backend != nullptr, "failed to create optimizer CPU backend");
@@ -838,7 +1041,7 @@ static void test_native_optimizer_graph(enum qat_weight_format format, int unit 
     opt_params.ctx_compute = ctx_compute;
     opt_params.inputs = input;
     opt_params.outputs = output;
-    opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    opt_params.optimizer = fused ? GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT : GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
     opt_params.get_opt_pars = test_qlion_optimizer_params;
     opt_params.get_opt_pars_ud = unit ? &unit : nullptr;
     ggml_opt_context_t opt = ggml_opt_init(opt_params);
@@ -1898,10 +2101,15 @@ int main() {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t device = ggml_backend_dev_get(i);
             if (strstr(ggml_backend_dev_name(device), filter)) {
-                test_adaptive_statistics(device);
+                test_small_q8_accumulator(device);
+        test_training_cache_gradient(device);
+        test_qlion2_warmup_trajectory(device);
+        test_adaptive_statistics(device);
+        test_adaptive_statistics(device, true);
                 test_adaptive_backend_step(device);
                 test_adaptive_backend_step(device, true);
                 test_adaptive_update_variants(device);
+        test_adaptive_update_variants(device, true);
                 ++tested;
             }
         }
@@ -1922,16 +2130,23 @@ int main() {
     test_nonfinite_gradient_guard();
     test_reference_trajectory(QAT_WEIGHT_MXFP4);
     test_reference_trajectory(QAT_WEIGHT_Q4_0);
+    test_q2_0_reference_trajectory();
     test_reference_trajectory(QAT_WEIGHT_Q8_0);
     test_state_resume_trajectory(QAT_WEIGHT_MXFP4);
     test_state_resume_trajectory(QAT_WEIGHT_Q4_0);
     test_state_resume_trajectory(QAT_WEIGHT_Q8_0);
     ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     benchmark_adaptive_trajectory(cpu_device);
+    test_small_q8_accumulator(cpu_device);
+    test_training_cache_gradient(cpu_device);
+    test_qlion2_q2_groups(cpu_device);
+    test_qlion2_warmup_trajectory(cpu_device);
     test_adaptive_statistics(cpu_device);
+    test_adaptive_statistics(cpu_device, true);
     test_adaptive_backend_step(cpu_device);
     test_adaptive_backend_step(cpu_device, true);
     test_adaptive_update_variants(cpu_device);
+    test_adaptive_update_variants(cpu_device, true);
     test_batched_router_backward(cpu_device, true);
     test_batched_router_backward(cpu_device, true, true, GGML_TYPE_F16);
     test_native_backend_step(QAT_WEIGHT_MXFP4, cpu_device, true);
@@ -1972,10 +2187,15 @@ int main() {
             continue;
         }
         printf("Testing QAT backend: %s\n", ggml_backend_dev_name(device));
+        test_small_q8_accumulator(device);
+        test_training_cache_gradient(device);
+        test_qlion2_warmup_trajectory(device);
         test_adaptive_statistics(device);
+        test_adaptive_statistics(device, true);
         test_adaptive_backend_step(device);
         test_adaptive_backend_step(device, true);
         test_adaptive_update_variants(device);
+        test_adaptive_update_variants(device, true);
         test_batched_router_backward(device, false);
         test_batched_router_backward(device, false, true);
         test_native_backend_step(QAT_WEIGHT_MXFP4, device, false);
@@ -2011,6 +2231,7 @@ int main() {
     }
     for (int unit : { 1, 32, 256 }) {
         test_native_optimizer_graph(QAT_WEIGHT_Q4_0, unit);
+        test_native_optimizer_graph(QAT_WEIGHT_Q4_0, unit, true);
     }
     test_native_optimizer_graph(QAT_WEIGHT_MXFP4);
     test_native_optimizer_graph(QAT_WEIGHT_Q4_0);

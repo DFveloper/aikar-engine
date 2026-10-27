@@ -1204,11 +1204,65 @@ static std::pair<int, int> test_regression(
     return std::make_pair(npass, ntest);
 }
 
+static std::pair<int, int> test_result_sequence_weights(
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t sched, ggml_backend_t backend) {
+    int npass = 0;
+    int ntest = 0;
+    helper_ctx_data cd = helper_get_ctx_data(optim, sched, backend, true, false, 4, 2, GGML_OPT_LOSS_TYPE_MEAN);
+    double loss = -1;
+    double unc = 0;
+    ggml_opt_result_loss(cd.result, &loss, nullptr);
+    bool ok = loss == 0;
+    ggml_opt_result_loss(cd.result, &loss, &unc);
+    print_ok(__func__, ok && loss == 0 && std::isnan(unc), npass, ntest, "subtest=empty");
+
+    const auto forward = [&](float input) {
+        const float values[] = { input, input };
+        ggml_opt_alloc(cd.opt_ctx, false);
+        ggml_backend_tensor_set(cd.inputs, values, 0, sizeof(values));
+        ggml_opt_eval(cd.opt_ctx, cd.result);
+    };
+
+    // Two sequences have loss 1; the final sequence has loss 10, scaled by 2 for its gradient.
+    forward(-2);
+    ggml_opt_result_weight_last(cd.result, 2, 1);
+    forward(17);
+    ggml_opt_result_weight_last(cd.result, 1, 0.5f);
+    ggml_opt_result_loss(cd.result, &loss, &unc);
+    ok = almost_equal(loss, 4, 1e-6) && std::isfinite(unc) && unc > 0;
+    ggml_opt_result_loss(cd.result, &loss, nullptr);
+    print_ok(__func__, ok && almost_equal(loss, 4, 1e-6), npass, ntest, "subtest=odd_tail");
+
+    ggml_opt_result_weight_last(cd.result, 2, 1);
+    ggml_opt_result_loss(cd.result, &loss, &unc);
+    print_ok(__func__, almost_equal(loss, 5.5, 1e-6) && almost_equal(unc, 4.5, 1e-6),
+            npass, ntest, "subtest=equal_weight_uncertainty");
+
+    float weight;
+    ggml_backend_tensor_get(cd.weights, &weight, 0, sizeof(weight));
+    print_ok(__func__, weight == 3 && ggml_opt_step(cd.opt_ctx) == 0, npass, ntest, "subtest=forward_preserves_optimizer");
+
+    ggml_opt_result_reset(cd.result);
+    ggml_opt_result_loss(cd.result, &loss, nullptr);
+    ok = loss == 0;
+    forward(4);
+    ggml_opt_result_loss(cd.result, &loss, &unc);
+    print_ok(__func__, ok && almost_equal(loss, 7, 1e-6) && std::isnan(unc), npass, ntest, "subtest=reset");
+    helper_free_ctx_data(cd);
+    return std::make_pair(npass, ntest);
+}
+
 static std::pair<int, int> test_backend(
         const std::vector<ggml_backend_t> & backends,
         ggml_backend_sched_t backend_sched, ggml_backend_t backend, enum ggml_opt_optimizer_type optim) {
     int npass = 0;
     int ntest = 0;
+
+    {
+        std::pair<int, int> partial = test_result_sequence_weights(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
 
     if (optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW) {
         const char * backend_name = ggml_backend_name(backend);
@@ -1379,6 +1433,7 @@ int main(void) {
                     case GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q6_K:
                     case GGML_OPT_OPTIMIZER_TYPE_ADAMW_IQ4_NL:
                         GGML_ABORT("quantized optimizers do not use a backend optimizer op");
+                    case GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT:
                     case GGML_OPT_OPTIMIZER_TYPE_QLION_QAT:
                         GGML_ABORT("QLion QAT requires native quantized state tensors");
                     case GGML_OPT_OPTIMIZER_TYPE_COUNT: {

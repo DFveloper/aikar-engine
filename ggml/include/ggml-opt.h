@@ -91,9 +91,14 @@ extern "C" {
         GGML_OPT_OPTIMIZER_TYPE_ADAMW_IQ4_NL,
         GGML_OPT_OPTIMIZER_TYPE_SGD,
         GGML_OPT_OPTIMIZER_TYPE_QLION_QAT,
+        GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT,
 
         GGML_OPT_OPTIMIZER_TYPE_COUNT
     };
+
+    static inline bool ggml_opt_optimizer_is_qlion(enum ggml_opt_optimizer_type optimizer) {
+        return optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT || optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT;
+    }
 
     // parameters that control which optimizer is used and how said optimizer tries to find the minimal loss
     struct ggml_opt_optimizer_params {
@@ -115,7 +120,7 @@ extern "C" {
             float wd;    // weight decay
             float gclip; // element-wise gradient clipping threshold - 0.0f to disable
             bool  fast_state_scale;
-            int32_t lr_scale_unit; // 0 disables scaling; 1 is tensor-wise; 32 or 256 selects block size
+            int32_t lr_scale_unit; // QLion: 0 disables scaling; 1/32/256 selects the unit. QLion2 always uses 32.
             float lr_scale_tau;
             int32_t lr_scale_warmup; // collect this many layer RMS samples, then freeze tau
         } qlion_qat;
@@ -227,6 +232,8 @@ extern "C" {
     GGML_API ggml_opt_result_t ggml_opt_result_init(void);
     GGML_API void ggml_opt_result_free(ggml_opt_result_t result);
     GGML_API void ggml_opt_result_reset(ggml_opt_result_t result);
+    // Set the sample weight and undo gradient-only scaling of the last recorded loss.
+    GGML_API void ggml_opt_result_weight_last(ggml_opt_result_t result, float weight, float scale);
 
     // get data from result, uncertainties are optional and can be ignored by passing NULL
     GGML_API void ggml_opt_result_ndata(   ggml_opt_result_t result, int64_t * ndata);                  // writes 1 value, number of datapoints

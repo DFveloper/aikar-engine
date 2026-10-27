@@ -15,6 +15,7 @@ enum ggml_type qat_weight_ggml_type(enum qat_weight_format format) {
     switch (format) {
         case QAT_WEIGHT_MXFP4: return GGML_TYPE_MXFP4;
         case QAT_WEIGHT_Q4_0:  return GGML_TYPE_Q4_0;
+        case QAT_WEIGHT_Q2_0:  return GGML_TYPE_Q2_0;
         case QAT_WEIGHT_Q8_0:  return GGML_TYPE_Q8_0;
     }
     return GGML_TYPE_COUNT;
@@ -26,16 +27,17 @@ static bool qat_type_codec(enum ggml_type type, const struct ggml_type_traits * 
         error = std::string("missing GGML codec for ") + ggml_type_name(type);
         return false;
     }
-    if (traits->blck_size != QAT_BLOCK_SIZE) {
+    if (traits->blck_size != QAT_BLOCK_SIZE && traits->blck_size != 64) {
         error = std::string("unsupported GGML block size for ") + ggml_type_name(type);
         return false;
     }
     return true;
 }
 
-static bool qat_shape_valid(int64_t ne, std::string & error) {
-    if (ne <= 0 || ne % QAT_BLOCK_SIZE != 0) {
-        error = "QAT tensor element count must be a positive multiple of 32";
+static bool qat_shape_valid(enum ggml_type type, int64_t ne, std::string & error) {
+    const int64_t block_size = ggml_blck_size(type);
+    if (ne <= 0 || block_size <= 0 || ne % block_size != 0) {
+        error = "QAT tensor element count is not aligned to its quantization block";
         return false;
     }
     return true;
@@ -80,7 +82,7 @@ static bool qat_encode(
     if (!qat_type_codec(type, traits, error)) {
         return false;
     }
-    if (!qat_shape_valid(values.size(), error)) {
+    if (!qat_shape_valid(type, values.size(), error)) {
         return false;
     }
     data.resize(ggml_row_size(type, values.size()));
@@ -106,7 +108,7 @@ bool qat_tensor_state_init(
         int64_t ne,
         std::string & error) {
     error.clear();
-    if (!weights || !qat_shape_valid(ne, error)) {
+    if (!weights || !qat_shape_valid(qat_weight_ggml_type(format), ne, error)) {
         if (!weights && error.empty()) {
             error = "QAT weight input is null";
         }
@@ -139,7 +141,7 @@ bool qat_tensor_state_init_quantized(
         int64_t ne,
         std::string & error) {
     error.clear();
-    if (!weights || !qat_shape_valid(ne, error)) {
+    if (!weights || !qat_shape_valid(qat_weight_ggml_type(format), ne, error)) {
         if (!weights && error.empty()) {
             error = "QAT quantized weight input is null";
         }
@@ -162,10 +164,10 @@ bool qat_tensor_state_init_quantized(
 
 bool qat_tensor_state_validate(const struct qat_tensor_state & state, std::string & error) {
     error.clear();
-    if (!qat_shape_valid(state.ne, error)) {
+    const enum ggml_type weight_type = qat_weight_ggml_type(state.format);
+    if (!qat_shape_valid(weight_type, state.ne, error)) {
         return false;
     }
-    const enum ggml_type weight_type = qat_weight_ggml_type(state.format);
     if (weight_type == GGML_TYPE_COUNT) {
         error = "invalid QAT weight format";
         return false;
@@ -204,12 +206,16 @@ bool qat_tensor_state_decode_residual(const struct qat_tensor_state & state, std
 }
 
 static uint8_t qat_weight_code(const std::vector<uint8_t> & data, enum ggml_type type, int64_t index) {
-    const size_t block_size = ggml_type_size(type);
+    const size_t block_size = ggml_blck_size(type);
+    const size_t storage_size = ggml_type_size(type);
     const size_t scale_size = type == GGML_TYPE_MXFP4 ? 1 : sizeof(ggml_fp16_t);
-    const size_t block = index / QAT_BLOCK_SIZE;
-    const size_t in_block = index % QAT_BLOCK_SIZE;
-    const uint8_t packed = data[block * block_size + scale_size + in_block % (QAT_BLOCK_SIZE / 2)];
-    return in_block < QAT_BLOCK_SIZE / 2 ? packed & 0x0f : packed >> 4;
+    const size_t block = index / block_size;
+    const size_t in_block = index % block_size;
+    const uint8_t packed = data[block * storage_size + scale_size + in_block / (type == GGML_TYPE_Q2_0 ? 4 : 2)];
+    if (type == GGML_TYPE_Q2_0) {
+        return (packed >> ((in_block % 4) * 2)) & 0x3;
+    }
+    return in_block < block_size / 2 ? packed & 0x0f : packed >> 4;
 }
 
 static void qat_residual_stats(

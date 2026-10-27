@@ -925,7 +925,7 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
 }
 
 // checks if the weight tensor can be used with the specified buffer type and device
-static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev, bool cast_norm_weight) {
     GGML_ASSERT(w != nullptr);
 
     if (op == GGML_OP_NONE) {
@@ -944,6 +944,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     ggml_context * ctx = ctx_ptr.get();
 
     ggml_tensor * op_tensor = nullptr;
+    ggml_tensor * cast_tensor = nullptr;
+    if (cast_norm_weight && w->type != GGML_TYPE_F32 && (op == GGML_OP_MUL || op == GGML_OP_ADD)) {
+        cast_tensor = ggml_cast(ctx, w, GGML_TYPE_F32);
+    }
+    ggml_tensor * op_weight = cast_tensor ? cast_tensor : w;
 
     switch (op) {
         case GGML_OP_GET_ROWS:
@@ -975,7 +980,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         case GGML_OP_ADD:
             {
                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
-                op_tensor = ggml_add(ctx, a, w);
+                op_tensor = ggml_add(ctx, a, op_weight);
             } break;
         case GGML_OP_ADD_ID:
             {
@@ -988,7 +993,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         case GGML_OP_MUL:
             {
                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
-                op_tensor = ggml_mul(ctx, a, w);
+                op_tensor = ggml_mul(ctx, a, op_weight);
             } break;
         case GGML_OP_DIV:
             {
@@ -1064,7 +1069,8 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     // create a temporary dummy buffer for the weight so that supports_op can check the buffer type
     GGML_ASSERT(w->buffer == nullptr);
     w->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
-    bool op_supported = ggml_backend_dev_supports_op(dev, op_tensor);
+    bool op_supported = (!cast_tensor || ggml_backend_dev_supports_op(dev, cast_tensor)) &&
+        ggml_backend_dev_supports_op(dev, op_tensor);
     ggml_backend_buffer_free(w->buffer);
     w->buffer = nullptr;
 
@@ -1072,12 +1078,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list, bool cast_norm_weight) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
-        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev, cast_norm_weight)) {
             return cur_buft;
         }
     }
@@ -1205,6 +1211,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             op = info.op;
         }
 
+        // build_norm casts these weights and biases before multiplication or addition.
+        bool cast_norm_weight = false;
+        switch (tn_tensor) {
+            case LLM_TENSOR_OUTPUT_NORM:
+            case LLM_TENSOR_ATTN_NORM:
+            case LLM_TENSOR_ATTN_Q_NORM:
+            case LLM_TENSOR_ATTN_K_NORM:
+            case LLM_TENSOR_ATTN_POST_NORM:
+            case LLM_TENSOR_FFN_NORM:
+            case LLM_TENSOR_FFN_POST_NORM:
+            case LLM_TENSOR_FFN_PRE_NORM_2:
+            case LLM_TENSOR_FFN_POST_NORM_1:
+            case LLM_TENSOR_FFN_POST_NORM_2:
+            case LLM_TENSOR_PER_LAYER_PROJ_NORM:
+            case LLM_TENSOR_PER_LAYER_POST_NORM:
+                cast_norm_weight = true;
+                break;
+            default:
+                break;
+        }
+
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
             if (tn.bid != -1) {
@@ -1247,7 +1274,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu, cast_norm_weight);
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1268,7 +1295,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, t_meta, op, buft_list, cast_norm_weight);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }

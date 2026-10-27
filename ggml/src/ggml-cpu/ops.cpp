@@ -965,6 +965,16 @@ void ggml_compute_forward_dup(
                 else if (dst->type == GGML_TYPE_I32)  ggml_compute_forward_dup_flt<float, int32_t    >(params, dst);
                 else ggml_compute_forward_dup_to_q<float>(params, dst);
             } break;
+        case GGML_TYPE_I64: {
+            GGML_ASSERT(dst->type == GGML_TYPE_I32);
+            for (int64_t i = params->ith; i < ggml_nelements(src0); i += params->nth) {
+                int64_t i0, i1, i2, i3;
+                ggml_unravel_index(src0, i, &i0, &i1, &i2, &i3);
+                const int64_t value = *(const int64_t *) ((const char *) src0->data + i0*src0->nb[0] + i1*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3]);
+                GGML_ASSERT(value >= INT32_MIN && value <= INT32_MAX);
+                ggml_set_i32_1d(dst, i, (int32_t) value);
+            }
+        } break;
         case GGML_TYPE_I32:
             {
                 if (dst->type == GGML_TYPE_F32) ggml_compute_forward_dup_flt<int32_t, float>(params, dst);
@@ -10684,7 +10694,8 @@ static void ggml_compute_forward_flash_attn_back_ext(
     const int64_t q_per_kv = HQ/HK;
 
     const int64_t nr = HK*B;
-    const int64_t dr = (nr + params->nth - 1)/params->nth;
+    // Keep all batches of each sink head on the same thread.
+    const int64_t dr = sinks ? ((HK + params->nth - 1)/params->nth)*B : (nr + params->nth - 1)/params->nth;
     const int64_t ir0 = dr*params->ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
@@ -10692,8 +10703,8 @@ static void ggml_compute_forward_flash_attn_back_ext(
     float * probs  = logits + M;
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t ib = ir/HK;
-        const int64_t ikh = ir%HK;
+        const int64_t ib = sinks ? ir%B : ir/HK;
+        const int64_t ikh = sinks ? ir/B : ir%HK;
 
         for (int64_t irep = 0; irep < q_per_kv; ++irep) {
             const int64_t iqh = ikh*q_per_kv + irep;
@@ -13427,9 +13438,35 @@ void ggml_compute_forward_qlion_qat_stats(const ggml_compute_params * params, gg
     const float * p = (const float *) dst->src[2]->data;
     float * out = (float *) dst->data;
     const int64_t nb = ggml_nelements(dst->src[0]) / 32;
-    GGML_ASSERT(p[5] == 1 || p[5] == 32 || p[5] == 256);
+    GGML_ASSERT(p[5] == 1 || p[5] == 32 || p[5] == 256 || p[5] == -32);
     GGML_ASSERT(std::isfinite(p[6]) && p[6] >= 0);
     GGML_ASSERT(p[7] >= 0 && p[7] <= 16777216 && p[7] == std::floor(p[7]));
+    if (ggml_nelements(dst) == 9) {
+        if (params->ith != 0) {
+            return;
+        }
+        double sum = 0;
+        for (int64_t ib = 0; ib < nb; ++ib) {
+            const float d = GGML_FP16_TO_FP32(m[ib].d);
+            float group_sum = 0;
+            for (int j = 0; j < 32; ++j) {
+                const float v = std::isfinite(d) ? d * m[ib].qs[j] : 0.0f;
+                group_sum += v * v;
+            }
+            sum += group_sum / 32;
+        }
+        const float rms = std::sqrt(sum / nb);
+        std::copy(p, p + 8, out);
+        out[8] = rms;
+        if (state[1] < p[7]) {
+            state[1] += 1;
+            state[0] += (rms - state[0]) / state[1];
+            out[6] = -1;
+        } else if (p[7] > 0) {
+            out[6] = std::max(state[0], 1e-30f);
+        }
+        return;
+    }
     for (int64_t ib = params->ith; ib < nb; ib += params->nth) {
         const float d = GGML_FP16_TO_FP32(m[ib].d);
         float sum = 0;
@@ -13462,7 +13499,11 @@ void ggml_compute_forward_qlion_qat_stats(const ggml_compute_params * params, gg
 }
 
 static float ggml_qlion_qat_alpha(const float * p, int64_t nb, int64_t ib) {
-    if (nb == 0 || p[6] < 0) {
+    if (nb < 0) {
+        GGML_ASSERT(p[5] == -32);
+        return p[0];
+    }
+    if (nb == 0 || p[5] == -32 || p[6] < 0) {
         return p[0];
     }
     float rms = p[8];
@@ -13491,18 +13532,29 @@ static void ggml_qlion_qat_update_block(
         uint8_t * residual_block,
         const float * grad,
         const float * p,
-        float alpha) {
-    float weight_f32[32];
-    float momentum_f32[32];
-    float residual_f32[32];
-    //float momentum_new[32];
-    float target[32];
-    //float weight_new[32];
-    //float residual_new[32];
-    weight_traits->to_float(weight_block, weight_f32, 32);
-    momentum_traits->to_float(momentum_block, momentum_f32, 32);
-    residual_traits->to_float(residual_block, residual_f32, 32);
-    for (int j = 0; j < 32; ++j) {
+        float alpha,
+        bool fused_scale) {
+    const int block_size = weight_type == GGML_TYPE_Q2_0 ? 64 : 32;
+    float weight_f32[64];
+    float momentum_f32[64];
+    float residual_f32[64];
+    float target[64];
+    weight_traits->to_float(weight_block, weight_f32, block_size);
+    momentum_traits->to_float(momentum_block, momentum_f32, block_size);
+    residual_traits->to_float(residual_block, residual_f32, block_size);
+    float group_alpha[2] = { alpha, alpha };
+    if (fused_scale && p[6] >= 0) {
+        for (int group = 0; group < block_size / 32; ++group) {
+            float sum = 0;
+            for (int j = group * 32; j < (group + 1) * 32; ++j) {
+                const float v = std::isfinite(momentum_f32[j]) ? momentum_f32[j] : 0.0f;
+                sum += v * v;
+            }
+            const float rms = std::sqrt(sum / 32);
+            group_alpha[group] *= std::isfinite(rms) && rms > 0 ? 1.0f / (1.0f + p[6] / rms) : 0.0f;
+        }
+    }
+    for (int j = 0; j < block_size; ++j) {
         float g = std::isfinite(grad[j]) ? grad[j] : 0.0f;
         if (p[3] > 0.0f) {
             g = std::max(-p[3], std::min(p[3], g));
@@ -13513,18 +13565,19 @@ static void ggml_qlion_qat_update_block(
         momentum_f32[j] = m;
         //momentum_new[j] = m;
         const float direction = m > 0.0f ? 1.0f : (m < 0.0f ? -1.0f : 0.0f);
-        float value = weight_f32[j] + residual_f32[j] - alpha * (direction + p[2] * weight_f32[j]);
+        float value = weight_f32[j] + residual_f32[j] - group_alpha[j / 32] * (direction + p[2] * weight_f32[j]);
         value = std::isfinite(value) ? value : weight_f32[j];
-        if (weight_type == GGML_TYPE_Q4_0 || weight_type == GGML_TYPE_Q8_0) {
-            const float limit = weight_type == GGML_TYPE_Q4_0 ? 8.0f * 65504.0f : 128.0f * 65504.0f;
+        if (weight_type == GGML_TYPE_Q2_0 || weight_type == GGML_TYPE_Q4_0 || weight_type == GGML_TYPE_Q8_0) {
+            const float limit = weight_type == GGML_TYPE_Q2_0 ? 2.0f * 65504.0f :
+                (weight_type == GGML_TYPE_Q4_0 ? 8.0f * 65504.0f : 128.0f * 65504.0f);
             value = std::max(-limit, std::min(limit, value));
         }
         target[j] = value;
     }
-    weight_traits->from_float_ref(target, weight_block, 32);
-    weight_traits->to_float(weight_block, weight_f32, 32);
+    weight_traits->from_float_ref(target, weight_block, block_size);
+    weight_traits->to_float(weight_block, weight_f32, block_size);
     float residual_absmax = 0.0f;
-    for (int j = 0; j < 32; ++j) {
+    for (int j = 0; j < block_size; ++j) {
         float value = target[j] - weight_f32[j];
         value = std::isfinite(value) ? value : 0.0f;
         value = std::max(-8.0f * 65504.0f, std::min(8.0f * 65504.0f, value));
@@ -13532,10 +13585,10 @@ static void ggml_qlion_qat_update_block(
         residual_absmax = std::max(residual_absmax, std::abs(value));
     }
     if (residual_absmax > 0.0f && residual_absmax < 8.0f * 0x1p-24f) {
-        std::fill(residual_f32, residual_f32 + 32, 0.0f);
+        std::fill(residual_f32, residual_f32 + block_size, 0.0f);
     }
-    residual_traits->from_float_ref(residual_f32, residual_block, 32);
-    momentum_traits->from_float_ref(momentum_f32, momentum_block, 32);
+    residual_traits->from_float_ref(residual_f32, residual_block, block_size);
+    momentum_traits->from_float_ref(momentum_f32, momentum_block, block_size);
 }
 
 void ggml_compute_forward_acc_qlion_qat(const ggml_compute_params * params, ggml_tensor * dst) {
@@ -13558,6 +13611,9 @@ void ggml_compute_forward_acc_qlion_qat(const ggml_compute_params * params, ggml
     uint8_t * accumulator_data = (uint8_t *) accumulator->data;
     const float * grad_data = !tied && grad->type == GGML_TYPE_F32 ? (const float *) grad->data : nullptr;
     const uint8_t * grad_q8_data = !tied && grad->type == GGML_TYPE_Q8_0 ? (const uint8_t *) grad->data : nullptr;
+    if (block_begin >= block_end) {
+        return;
+    }
     if (reset && grad_q8_data) {
         const size_t offset = (size_t) block_begin * traits->type_size;
         const size_t size = (size_t) (block_end - block_begin) * traits->type_size;
@@ -13749,7 +13805,7 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     ggml_tensor * residual = dst->src[3];
     const ggml_tensor * opt_params = dst->src[4];
 
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q2_0 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(residual->type == GGML_TYPE_Q4_0);
@@ -13762,7 +13818,7 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     const ggml_type_traits * weight_traits = ggml_get_type_traits(weight->type);
     const ggml_type_traits * momentum_traits = ggml_get_type_traits(momentum->type);
     const ggml_type_traits * residual_traits = ggml_get_type_traits(residual->type);
-    GGML_ASSERT(weight_traits->blck_size == 32 && weight_traits->to_float && weight_traits->from_float_ref);
+    GGML_ASSERT((weight_traits->blck_size == 32 || weight_traits->blck_size == 64) && weight_traits->to_float && weight_traits->from_float_ref);
     GGML_ASSERT(momentum_traits->blck_size == 32 && momentum_traits->to_float && momentum_traits->from_float_ref);
     GGML_ASSERT(residual_traits->blck_size == 32 && residual_traits->to_float && residual_traits->from_float_ref);
 
@@ -13772,7 +13828,8 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     GGML_ASSERT(p[2] >= 0.0f && std::isfinite(p[2]));
     GGML_ASSERT(p[3] >= 0.0f && std::isfinite(p[3]));
 
-    const int64_t n_blocks = ggml_nelements(weight) / 32;
+    const int64_t weight_block_size = ggml_blck_size(weight->type);
+    const int64_t n_blocks = ggml_nelements(weight) / weight_block_size;
     const int64_t blocks_per_thread = (n_blocks + params->nth - 1) / params->nth;
     const int64_t block_begin = blocks_per_thread * params->ith;
     const int64_t block_end = std::min(n_blocks, block_begin + blocks_per_thread);
@@ -13784,15 +13841,16 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
 
     for (int64_t ib = block_begin; ib < block_end; ++ib) {
         uint8_t * weight_block = weight_data + ib * weight_traits->type_size;
-        uint8_t * momentum_block = momentum_data + ib * momentum_traits->type_size;
-        uint8_t * residual_block = residual_data + ib * residual_traits->type_size;
-        float grad_block[32];
-        const float * grad_values = grad_data ? grad_data + ib * 32 : grad_block;
+        uint8_t * momentum_block = momentum_data + ib * (weight_block_size / 32) * momentum_traits->type_size;
+        uint8_t * residual_block = residual_data + ib * (weight_block_size / 32) * residual_traits->type_size;
+        float grad_block[64];
+        const float * grad_values = grad_data ? grad_data + ib * weight_block_size : grad_block;
         if (!grad_data) {
+            GGML_ASSERT(weight_block_size == 32);
             grad_traits->to_float((const uint8_t *) grad->data + ib * grad_traits->type_size, grad_block, 32);
         }
         ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
-            weight_block, momentum_block, residual_block, grad_values, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
+            weight_block, momentum_block, residual_block, grad_values, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 9 ? ggml_nelements(weight) / 32 : ggml_nelements(opt_params) > 5 ? -1 : 0, ib), ggml_nelements(opt_params) > 5 && p[5] == -32);
     }
 }
 
@@ -13855,7 +13913,7 @@ void ggml_compute_forward_opt_step_qlion_qat_tied(const ggml_compute_params * pa
             (uint8_t *) weight->data + ib * weight_traits->type_size,
             (uint8_t *) momentum->data + ib * momentum_traits->type_size,
             (uint8_t *) residual->data + ib * residual_traits->type_size,
-            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 9 ? ggml_nelements(weight) / 32 : ggml_nelements(opt_params) > 5 ? -1 : 0, ib), ggml_nelements(opt_params) > 5 && p[5] == -32);
     }
 }
 
@@ -13902,7 +13960,7 @@ void ggml_compute_forward_opt_step_qlion_qat_id(const ggml_compute_params * para
             (uint8_t *) weight->data + ib * weight_traits->type_size,
             (uint8_t *) momentum->data + ib * momentum_traits->type_size,
             (uint8_t *) residual->data + ib * residual_traits->type_size,
-            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 9 ? ggml_nelements(weight) / 32 : ggml_nelements(opt_params) > 5 ? -1 : 0, ib), ggml_nelements(opt_params) > 5 && p[5] == -32);
     }
 }
 
@@ -13913,10 +13971,10 @@ void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * pa
     ggml_tensor * momentum = dst->src[3];
     ggml_tensor * residual = dst->src[4];
     const ggml_tensor * opt_params = dst->src[5];
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q2_0 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(opt_params->type == GGML_TYPE_F32 && (ggml_nelements(opt_params) == 5 || ggml_nelements(opt_params) == 9 + ggml_nelements(weight) / 32));
+    GGML_ASSERT(opt_params->type == GGML_TYPE_F32 && (ggml_nelements(opt_params) == 5 || ggml_nelements(opt_params) == 8 || ggml_nelements(opt_params) == 9 || ggml_nelements(opt_params) == 9 + ggml_nelements(weight) / 32));
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad) && ggml_is_contiguous(ids));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual));
 
@@ -13927,7 +13985,9 @@ void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * pa
     const int32_t * rows = (const int32_t *) ids->data;
     const float * grad_data = (const float *) grad->data;
     const int64_t n_indices = ggml_nelements(ids);
-    const int64_t n_blocks_row = weight->ne[0] / 32;
+    const int64_t weight_block_size = ggml_blck_size(weight->type);
+    const int64_t state_blocks = weight_block_size / 32;
+    const int64_t n_blocks_row = weight->ne[0] / weight_block_size;
     const int64_t n_work = n_indices * n_blocks_row;
     const int64_t work_per_thread = (n_work + params->nth - 1) / params->nth;
     const int64_t work_begin = work_per_thread * params->ith;
@@ -13948,22 +14008,22 @@ void ggml_compute_forward_opt_step_qlion_qat_rows(const ggml_compute_params * pa
         if (!first) {
             continue;
         }
-        float grad_block[32] = {};
+        float grad_block[64] = {};
         for (int64_t i = index; i < n_indices; ++i) {
             if (rows[i] != row) {
                 continue;
             }
-            const float * grad_row = grad_data + i * weight->ne[0] + block * 32;
-            for (int lane = 0; lane < 32; ++lane) {
+            const float * grad_row = grad_data + i * weight->ne[0] + block * weight_block_size;
+            for (int lane = 0; lane < weight_block_size; ++lane) {
                 grad_block[lane] += grad_row[lane];
             }
         }
         const int64_t ib = row * n_blocks_row + block;
         ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
             (uint8_t *) weight->data + ib * weight_traits->type_size,
-            (uint8_t *) momentum->data + ib * momentum_traits->type_size,
-            (uint8_t *) residual->data + ib * residual_traits->type_size,
-            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, ib));
+            (uint8_t *) momentum->data + ib * state_blocks * momentum_traits->type_size,
+            (uint8_t *) residual->data + ib * state_blocks * residual_traits->type_size,
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 9 ? ggml_nelements(weight) / 32 : ggml_nelements(opt_params) > 5 ? -1 : 0, ib), ggml_nelements(opt_params) > 5 && p[5] == -32);
     }
 }
 
@@ -13983,7 +14043,9 @@ void ggml_compute_forward_opt_step_qlion_qat_sparse_rows(const ggml_compute_para
     const int32_t * row_data = (const int32_t *) ids->data;
     const int32_t n_rows = *(const int32_t *) count->data;
     const int64_t capacity = ggml_nrows(grad);
-    const int64_t n_blocks_row = weight->ne[0] / 32;
+    const int64_t weight_block_size = ggml_blck_size(weight->type);
+    const int64_t state_blocks = weight_block_size / 32;
+    const int64_t n_blocks_row = weight->ne[0] / weight_block_size;
     GGML_ASSERT(n_rows >= 0 && n_rows <= capacity && n_rows <= weight->ne[1]);
     const int64_t n_work = n_rows * n_blocks_row;
     const int64_t work_begin = n_work * params->ith / params->nth;
@@ -13995,13 +14057,13 @@ void ggml_compute_forward_opt_step_qlion_qat_sparse_rows(const ggml_compute_para
         GGML_ASSERT(row >= 0 && row < weight->ne[1]);
         const int64_t weight_block_index = row * n_blocks_row + block;
         const int64_t grad_block_index = slot * n_blocks_row + block;
-        float grad_block[32];
-        grad_traits->to_float((const uint8_t *) grad->data + grad_block_index * grad_traits->type_size, grad_block, 32);
+        float grad_block[64];
+        grad_traits->to_float((const uint8_t *) grad->data + grad_block_index * state_blocks * grad_traits->type_size, grad_block, weight_block_size);
         ggml_qlion_qat_update_block(weight->type, weight_traits, momentum_traits, residual_traits,
             (uint8_t *) weight->data + weight_block_index * weight_traits->type_size,
-            (uint8_t *) momentum->data + weight_block_index * momentum_traits->type_size,
-            (uint8_t *) residual->data + weight_block_index * residual_traits->type_size,
-            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 5 ? ggml_nelements(weight) / 32 : 0, weight_block_index));
+            (uint8_t *) momentum->data + weight_block_index * state_blocks * momentum_traits->type_size,
+            (uint8_t *) residual->data + weight_block_index * state_blocks * residual_traits->type_size,
+            grad_block, p, ggml_qlion_qat_alpha(p, ggml_nelements(opt_params) > 9 ? ggml_nelements(weight) / 32 : ggml_nelements(opt_params) > 5 ? -1 : 0, weight_block_index), ggml_nelements(opt_params) > 5 && p[5] == -32);
     }
 }
 

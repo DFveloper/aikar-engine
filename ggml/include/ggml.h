@@ -2995,13 +2995,14 @@ extern "C" {
         struct ggml_tensor *  sgd_params); // alpha, weight decay
 
     // Temporary Q8_0 momentum mean squares and layer RMS. State is [warmup mean, sample count].
-    // Params are [alpha, beta, wd, gclip, fast_state_scale, unit (1/32/256), tau, warmup_steps].
-    // Output copies params, sets tau=-1 during warmup, then appends layer RMS and 32-element mean squares.
+    // Params are [alpha, beta, wd, gclip, fast_state_scale, unit (1/32/256, or -32 for fused 32-element scaling), tau, warmup_steps].
+    // Output copies params, sets tau=-1 during warmup, then appends layer RMS and, unless compact, 32-element mean squares.
     GGML_API struct ggml_tensor * ggml_qlion_qat_stats(
         struct ggml_context * ctx,
         struct ggml_tensor * momentum,
         struct ggml_tensor * state,
-        struct ggml_tensor * params);
+        struct ggml_tensor * params,
+        bool compact);
 
     GGML_API struct ggml_tensor * ggml_acc_qlion_qat(
         struct ggml_context * ctx,

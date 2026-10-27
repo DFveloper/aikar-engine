@@ -3346,9 +3346,21 @@ struct test_repeat_back : public test_case {
     const std::array<int64_t, 4> ne;
     const std::array<int, 4> nr;
     const bool v; // whether src is a noncontiguous view
+    const bool mul;
+    const bool other_user;
+    const bool preserve_mul;
+    std::vector<ggml_tensor *> verify_nodes;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, nr, v);
+        return VARS_TO_STR7(type, ne, nr, v, mul, other_user, preserve_mul);
+    }
+
+    bool run_whole_graph() override { return mul || other_user || preserve_mul; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify_nodes; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        return test_case::op_desc(t->op == GGML_OP_ADD1 ? t->src[0] : t);
     }
 
     size_t op_size(ggml_tensor * t) override {
@@ -3358,8 +3370,8 @@ struct test_repeat_back : public test_case {
     test_repeat_back(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {8, 6, 4, 2},
             std::array<int, 4> nr = {2, 2, 2, 2},
-            bool v = false)
-        : type(type), ne(ne), nr(nr), v(v) {}
+            bool v = false, bool mul = false, bool other_user = false, bool preserve_mul = false)
+        : type(type), ne(ne), nr(nr), v(v), mul(mul), other_user(other_user), preserve_mul(preserve_mul) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * src = ggml_new_tensor_4d(ctx, type, ne[0]*nr[0], ne[1]*nr[1], ne[2]*nr[2], ne[3]*nr[3]);
@@ -3367,9 +3379,6 @@ struct test_repeat_back : public test_case {
 
         if (v) {
             GGML_ASSERT(ne[0] % 2 == 0);
-            GGML_ASSERT(ne[1] % 2 == 0);
-            GGML_ASSERT(ne[2] % 2 == 0);
-            GGML_ASSERT(ne[3] % 2 == 0);
             GGML_ASSERT(nr[0] % 2 == 0 || nr[0] == 1);
             GGML_ASSERT(nr[1] % 2 == 0 || nr[1] == 1);
             GGML_ASSERT(nr[2] % 2 == 0 || nr[2] == 1);
@@ -3383,10 +3392,28 @@ struct test_repeat_back : public test_case {
             src = ggml_view_4d(ctx, src, ne00, ne01, ne02, ne03, src->nb[1], src->nb[2], src->nb[3], 0);
         }
 
+        if (mul) {
+            ggml_tensor * rhs = ggml_new_tensor_4d(ctx, type, src->ne[0]*(v ? 2 : 1), src->ne[1], src->ne[2], src->ne[3]);
+            if (v) {
+                rhs = ggml_view_4d(ctx, rhs, src->ne[0], src->ne[1], src->ne[2], src->ne[3], rhs->nb[1], rhs->nb[2], rhs->nb[3], 0);
+            }
+            src = ggml_mul(ctx, src, rhs);
+            if (preserve_mul) {
+                ggml_set_output(src);
+                verify_nodes.push_back(src);
+            }
+        }
+
         ggml_tensor * target = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_name(target, "target");
 
         ggml_tensor * out = ggml_repeat_back(ctx, src, target);
+        if (other_user) {
+            out = ggml_add1(ctx, out, ggml_sum(ctx, src));
+        }
+        if (preserve_mul) {
+            verify_nodes.push_back(out);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -9578,13 +9605,25 @@ struct test_flash_attn_back : public test_case {
     const bool interleaved;
     const int64_t head_dim;
     const bool bias;
+    const float gradient_scale;
+    const bool sink_gradient;
+    const int64_t key_length;
+    const bool masked_row;
 
     test_flash_attn_back(ggml_type type_kv = GGML_TYPE_F16, bool sinks = false, bool causal = true,
-            bool interleaved = false, int64_t head_dim = 64, bool bias = true)
-        : type_kv(type_kv), sinks(sinks), causal(causal), interleaved(interleaved), head_dim(head_dim), bias(bias) {}
+            bool interleaved = false, int64_t head_dim = 64, bool bias = true, float gradient_scale = 1.0f, bool sink_gradient = false, int64_t key_length = 0, bool masked_row = false)
+        : type_kv(type_kv), sinks(sinks), causal(causal), interleaved(interleaved), head_dim(head_dim), bias(bias), gradient_scale(gradient_scale), sink_gradient(sink_gradient), key_length(key_length), masked_row(masked_row) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(type_kv, sinks, causal, interleaved, head_dim, bias);
+        return VARS_TO_STR10(type_kv, sinks, causal, interleaved, head_dim, bias, gradient_scale, sink_gradient, key_length, masked_row);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        return test_case::op_desc(t->op == GGML_OP_VIEW ? t->src[0] : t);
+    }
+
+    bool run_whole_graph() override {
+        return gradient_scale != 1.0f || sink_gradient;
     }
 
     double max_nmse_err() override {
@@ -9595,11 +9634,11 @@ struct test_flash_attn_back : public test_case {
         const int64_t DK = head_dim;
         const int64_t DV = head_dim;
         const int64_t N  = 4;
-        const int64_t M  = head_dim == 512 ? 256 : 8;
+        const int64_t M  = key_length ? key_length : head_dim == 512 ? 256 : 8;
         const int64_t HQ = 4;
         const int64_t HK = 2;
 
-        const int64_t B = interleaved ? 2 : 1;
+        const int64_t B = sink_gradient ? 32 : interleaved ? 2 : 1;
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, interleaved ? HQ : N, interleaved ? N : HQ, B);
         ggml_tensor * k = ggml_new_tensor_4d(ctx, type_kv, DK, interleaved ? HK : M, interleaved ? M : HK, B);
         ggml_tensor * v = ggml_new_tensor_4d(ctx, type_kv, DV, interleaved ? HK : M, interleaved ? M : HK, B);
@@ -9627,6 +9666,17 @@ struct test_flash_attn_back : public test_case {
         ggml_flash_attn_ext_add_sinks(forward, s);
         ggml_flash_attn_ext_set_causal(forward, causal);
         ggml_tensor * out = ggml_flash_attn_ext_back(ctx, forward, d);
+        if (sink_gradient) {
+            const size_t offs_s = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN) +
+                GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN) +
+                GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+            out->op_params[5] = GGML_FLASH_ATTN_BACK_GRAD_VALID | GGML_FLASH_ATTN_BACK_GRAD_SINKS;
+            out = ggml_view_1d(ctx, out, HQ, offs_s);
+        } else if (gradient_scale != 1.0f) {
+            // Compare Q separately so V gradients cannot hide underflow in dS.
+            out->op_params[5] = GGML_FLASH_ATTN_BACK_GRAD_VALID | GGML_FLASH_ATTN_BACK_GRAD_Q;
+            out = ggml_view_1d(ctx, out, ggml_nelements(q), 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -9643,7 +9693,12 @@ struct test_flash_attn_back : public test_case {
                         }
                     }
                 }
+                if (masked_row) {
+                    std::fill(mask.begin(), mask.begin() + t->ne[0], ggml_fp32_to_fp16(-INFINITY));
+                }
                 ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(mask[0]));
+            } else if (strcmp(t->name, "d") == 0) {
+                init_tensor_uniform(t, -0.25f*gradient_scale, 0.25f*gradient_scale);
             } else {
                 init_tensor_uniform(t, -0.25f, 0.25f);
             }
@@ -9901,7 +9956,7 @@ struct test_qlion_qat_stats : public test_case {
         ggml_set_name(state, "warmup");
         ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
         ggml_set_name(p, "params");
-        return ggml_qlion_qat_stats(ctx, m, state, p);
+        return ggml_qlion_qat_stats(ctx, m, state, p, false);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -11684,6 +11739,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 1, 2}, view));
     }
 
+    for (bool mul : {false, true}) {
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {128, 1, 1, 1}, {1, 4096, 1, 1}, false, mul));
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {128, 1, 1, 1}, {1, 8192, 1, 1}, false, mul));
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {34, 2, 2, 2}, {1, 512, 1, 1}, true, mul));
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {34, 1, 1, 1}, {2, 1024, 2, 2}, true, mul));
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {34, 1, 1, 1}, {2, 128, 4, 4}, true, mul));
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {128, 1, 1, 1}, {1, 512, 1, 1}, false, mul, true));
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {128, 1, 1, 1}, {1, 512, 1, 1}, false, mul, false, true));
+    }
+
     test_cases.emplace_back(new test_dup(GGML_TYPE_F32));
     test_cases.emplace_back(new test_dup(GGML_TYPE_F16));
     test_cases.emplace_back(new test_dup(GGML_TYPE_I32));
@@ -13189,6 +13254,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_flash_attn_ext_grad());
     test_cases.emplace_back(new test_flash_attn_ext_grad(true, 2.0f, 1.5f));
+    for (int64_t keys : {4096, 8192, 8448}) {
+        test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, true, true, true, 64, false, 1.0f, false, keys, true));
+        test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, false, false, false, 64, false, 1.0f, false, keys, true));
+    }
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, false, false));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, false, true));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true));
@@ -13197,6 +13266,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true, true, 512, false));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, true, true, 256, false));
     test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, false, false, 64, false));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, true, true, true, 64, false));
+    // Bias exercises the generic tiny-gradient fallback; F32 below tests Pascal GEMM.
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F16, true, false, true, 64, true, 1e-6f));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, false, true, true, 64, false, 1e-6f));
+    test_cases.emplace_back(new test_flash_attn_back(GGML_TYPE_F32, true, true, true, 64, false, 1.0f, true));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.

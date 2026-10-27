@@ -5129,17 +5129,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"--lr-scheduler"}, "TYPE",
-        "learning-rate scheduler: constant or cosine (default: constant)",
+        "learning-rate scheduler: constant, cosine, or cosine-warmup (warmup then constant; default: constant)",
         [](common_params & params, const std::string & value) {
-            if (value != "constant" && value != "cosine") {
-                throw std::invalid_argument("--lr-scheduler must be constant or cosine");
+            if (value != "constant" && value != "cosine" && value != "cosine-warmup") {
+                throw std::invalid_argument("--lr-scheduler must be constant, cosine, or cosine-warmup");
             }
             params.lr_scheduler = value;
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--warmup-steps"}, "N",
-        "linear learning-rate warmup steps (default: 0)",
+        "learning-rate warmup steps (cosine for cosine-warmup scheduler, otherwise linear; default: 0)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--warmup-steps must be non-negative");
@@ -5267,14 +5267,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.qat_resume = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
-        {"--quant-type"}, "mxfp4|q4_0|q8_0|q4_0,q8_0|mxfp4,q8_0",
+        {"--quant-type"}, "comma-separated mxfp4|q2_0|q4_0|q8_0",
         "required native model-weight formats",
         [](common_params & params, const std::string & value) {
-            if (value != "mxfp4" && value != "q4_0" && value != "q8_0" &&
-                value != "q4_0,q8_0" && value != "mxfp4,q8_0") {
-                throw std::invalid_argument("unsupported --quant-type");
+            const auto names = string_split(value, ",");
+            std::set<std::string> unique;
+            if (names.empty() || names.size() > 4) {
+                throw std::invalid_argument("--quant-type must contain one to four formats");
+            }
+            for (const auto & name : names) {
+                if ((name != "mxfp4" && name != "q2_0" && name != "q4_0" && name != "q8_0") ||
+                    !unique.insert(name).second) {
+                    throw std::invalid_argument("unsupported --quant-type format or duplicate");
+                }
             }
             params.qat_quant_type = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-targets"}, "SUBSTRINGS",
+        "comma-separated tensor name substrings to train with native QAT (default: all matching quantized tensors)",
+        [](common_params & params, const std::string & value) { params.qat_targets = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--grad-accum"}, "N",
+        "native QAT parallel batches to accumulate per optimizer update (default: 1)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--grad-accum must be positive");
+            }
+            params.grad_accum_steps = value;
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
@@ -5327,7 +5349,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--qat-lr-scale"}, "off|layer|256|32",
-        "gradient-adaptive QLion LR scaling unit (default: off)",
+        "gradient-adaptive QLion LR scaling unit (default: off; QLion2 always uses 32)",
         [](common_params & params, const std::string & value) {
             if (value != "off" && value != "layer" && value != "256" && value != "32") {
                 throw std::invalid_argument("unsupported --qat-lr-scale");
@@ -5400,7 +5422,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"-opt", "--optimizer"}, ex == LLAMA_EXAMPLE_FINETUNE_QAT
-            ? "qlion" : "sgd|adamw|adamw_f16|adamw_q8_0|adamw_q6_k|adamw_iq4_nl",
+            ? "qlion|qlion2" : "sgd|adamw|adamw_f16|adamw_q8_0|adamw_q6_k|adamw_iq4_nl",
         ex == LLAMA_EXAMPLE_FINETUNE_QAT
             ? "native quantized QAT optimizer"
             : "optimizer (adamw_q8_0 uses device state when LoRA tensors are on CUDA or ROCm; q6_k/iq4_nl use CPU state)",

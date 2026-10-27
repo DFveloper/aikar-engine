@@ -92,6 +92,7 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> qat_residual;
     std::vector<struct ggml_tensor *> qat_lr_state;
     int32_t qat_lr_scale_unit = 0;
+    int32_t qat_lr_scale_warmup = 0;
     std::vector<struct ggml_tensor *> qat_grad_accumulator;
     bool qat_grad_accumulator_cpu = false;
     enum class qat_grad_state_kind { unclassified, dense, sparse_rows };
@@ -408,8 +409,8 @@ static ggml_opt_context::qat_grad_state & ggml_opt_qat_select_grad_state(
 }
 
 void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor * param) {
-    GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT);
-    GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q4_0 || param->type == GGML_TYPE_Q8_0));
+    GGML_ASSERT(ggml_opt_optimizer_is_qlion(opt_ctx->optimizer));
+    GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q2_0 || param->type == GGML_TYPE_Q4_0 || param->type == GGML_TYPE_Q8_0));
     GGML_ASSERT(ggml_is_contiguous(param));
     for (size_t i = 0; i < opt_ctx->qat_params.size(); ++i) {
         struct ggml_tensor * canonical = opt_ctx->qat_params[i];
@@ -757,6 +758,7 @@ struct ggml_opt_result {
     int64_t              ndata    = 0;
     int64_t              nvalid   = 0;
     std::vector<float>   loss;
+    std::vector<float>   loss_weight;
     std::vector<int32_t> pred;
     std::vector<int64_t> nvalid_batch;
     std::vector<int64_t> ncorrect_batch;
@@ -1411,8 +1413,9 @@ ggml_opt_qlion_qat_backward_callback(
         found->second;
     
     ggml_tensor * step_params = opt_ctx->opt_step_params;
-    if (opt_ctx->qat_lr_scale_unit && opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT) {
-        step_params = ggml_qlion_qat_stats(ctx, opt_ctx->qat_momentum[i], opt_ctx->qat_lr_state[i], step_params);
+    if (opt_ctx->qat_lr_scale_unit && opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT &&
+        (opt_ctx->optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT || opt_ctx->qat_lr_scale_warmup > 0)) {
+        step_params = ggml_qlion_qat_stats(ctx, opt_ctx->qat_momentum[i], opt_ctx->qat_lr_state[i], step_params, opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT);
         ggml_format_name(step_params, "QLion LR statistics for %s", opt_ctx->qat_params[i]->name);
     }
 
@@ -2069,7 +2072,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
-    const bool qlion_qat = optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
+    const bool qlion_qat = ggml_opt_optimizer_is_qlion(optimizer);
     const bool accumulate = !qlion_qat && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
         !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
 
@@ -2496,6 +2499,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             }
 
             if (node->type != GGML_TYPE_MXFP4 &&
+                node->type != GGML_TYPE_Q2_0 &&
                 node->type != GGML_TYPE_Q4_0 &&
                 node->type != GGML_TYPE_Q8_0) {
                 continue;
@@ -2917,8 +2921,10 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars              = params.get_opt_pars;
     result->get_opt_pars_ud           = params.get_opt_pars_ud;
     result->optimizer                 = params.optimizer;
-    if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
-        result->qat_lr_scale_unit = params.get_opt_pars(params.get_opt_pars_ud).qlion_qat.lr_scale_unit;
+    if (ggml_opt_optimizer_is_qlion(params.optimizer)) {
+        const auto qlion = params.get_opt_pars(params.get_opt_pars_ud).qlion_qat;
+        result->qat_lr_scale_unit = params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT ? 32 : qlion.lr_scale_unit;
+        result->qat_lr_scale_warmup = qlion.lr_scale_warmup;
         GGML_ASSERT(result->qat_lr_scale_unit == 0 || result->qat_lr_scale_unit == 1 ||
             result->qat_lr_scale_unit == 32 || result->qat_lr_scale_unit == 256);
     }
@@ -2934,7 +2940,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     GGML_ASSERT(result->opt_period >= 1);
     result->static_graphs = result->ctx_compute;
 
-    GGML_ASSERT(!result->static_graphs || result->optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT || result->opt_period == 1);
+    GGML_ASSERT(!result->static_graphs || !ggml_opt_optimizer_is_qlion(result->optimizer) || result->opt_period == 1);
 
     if (!result->static_graphs) {
         GGML_ASSERT(!result->inputs);
@@ -3119,6 +3125,7 @@ void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->ndata = 0;
     result->nvalid = 0;
     result->loss.clear();
+    result->loss_weight.clear();
     result->pred.clear();
     result->nvalid_batch.clear();
     result->ncorrect_batch.clear();
@@ -3129,26 +3136,39 @@ void ggml_opt_result_ndata(ggml_opt_result_t result, int64_t * ndata) {
     *ndata = result->ndata;
 }
 
+void ggml_opt_result_weight_last(ggml_opt_result_t result, float weight, float scale) {
+    GGML_ASSERT(result && !result->loss.empty());
+    GGML_ASSERT(std::isfinite(weight) && weight > 0 && std::isfinite(scale) && scale > 0);
+    result->loss_weight.back() = weight;
+    result->loss.back() *= scale;
+}
+
 void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc) {
     const int64_t nbatches = result->loss.size(); // Number of physical batches.
 
     if (nbatches == 0) {
         *loss = 0.0;
-        *unc  = NAN;
+        if (unc) { *unc = NAN; }
         return;
     }
 
     double sum         = 0.0;
     double sum_squared = 0.0;
+    double weight_sum = 0.0;
+    double weight_squared = 0.0;
 
-    for (const float & loss : result->loss) {
+    for (size_t i = 0; i < result->loss.size(); ++i) {
+        const float loss = result->loss[i];
+        const double weight = result->loss_weight[i];
         // If the loss is per datapoint it was scaled by 1.0f/opt_period for each physical batch.
         const float loss_scaled = result->loss_per_datapoint ? loss*result->opt_period : loss;
-        sum         += loss_scaled;
-        sum_squared += loss_scaled*loss_scaled;
+        sum         += weight*loss_scaled;
+        sum_squared += weight*loss_scaled*loss_scaled;
+        weight_sum += weight;
+        weight_squared += weight*weight;
     }
 
-    const double mean = sum/nbatches;
+    const double mean = sum/weight_sum;
     *loss = result->loss_per_datapoint ? mean : sum;
 
     if (!unc) {
@@ -3160,8 +3180,9 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
         return;
     }
 
-    const double var_sum = sum_squared/nbatches - mean*mean; // variance without Bessel's correction, i.e. nbatches/(nbatches-1)
-    *unc = result->loss_per_datapoint ? sqrt(var_sum / (nbatches - 1)) : sqrt(var_sum * nbatches/(nbatches - 1));
+    const double var_sum = std::max(0.0, sum_squared/weight_sum - mean*mean);
+    const double effective_batches = weight_sum*weight_sum/weight_squared;
+    *unc = result->loss_per_datapoint ? sqrt(var_sum / (effective_batches - 1)) : sqrt(var_sum * effective_batches/(effective_batches - 1));
 }
 
 void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
@@ -3253,7 +3274,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->allocated_graph_copy = graph;
     }
 
-    if (opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
+    if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer)) {
         ggml_backend_t gpu_backend = nullptr;
         ggml_backend_t cpu_backend = nullptr;
         for (int i = 0; i < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++i) {
@@ -3335,6 +3356,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 sgd[0] = opt_pars.sgd.alpha;
                 sgd[1] = opt_pars.sgd.wd;
             } break;
+            case GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT:
             case GGML_OPT_OPTIMIZER_TYPE_QLION_QAT: {
                 GGML_ASSERT(opt_pars.qlion_qat.alpha > 0.0f);
                 GGML_ASSERT(opt_pars.qlion_qat.beta >= 0.0f);
@@ -3348,11 +3370,12 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 qlion_qat[2] = opt_pars.qlion_qat.wd;
                 qlion_qat[3] = opt_pars.qlion_qat.gclip;
                 qlion_qat[4] = opt_pars.qlion_qat.fast_state_scale ? 1.0f : 0.0f;
-                GGML_ASSERT(opt_pars.qlion_qat.lr_scale_unit == opt_ctx->qat_lr_scale_unit);
+                GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT || opt_pars.qlion_qat.lr_scale_unit == opt_ctx->qat_lr_scale_unit);
+                GGML_ASSERT(opt_pars.qlion_qat.lr_scale_warmup == opt_ctx->qat_lr_scale_warmup);
                 if (opt_ctx->qat_lr_scale_unit) {
                     GGML_ASSERT(std::isfinite(opt_pars.qlion_qat.lr_scale_tau) && opt_pars.qlion_qat.lr_scale_tau >= 0);
                     GGML_ASSERT(opt_pars.qlion_qat.lr_scale_warmup >= 0 && opt_pars.qlion_qat.lr_scale_warmup <= 16777216);
-                    qlion_qat[5] = opt_ctx->qat_lr_scale_unit;
+                    qlion_qat[5] = opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT ? -32 : opt_ctx->qat_lr_scale_unit;
                     qlion_qat[6] = opt_pars.qlion_qat.lr_scale_tau;
                     qlion_qat[7] = opt_pars.qlion_qat.lr_scale_warmup;
                 }
@@ -3371,7 +3394,9 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         ggml_opt_step_adamw_quantized(opt_ctx, opt_pars);
     }
     opt_ctx->iter += do_optimizer_step;
-    opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+    if (opt_ctx->build_type != GGML_OPT_BUILD_TYPE_FORWARD) {
+        opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+    }
     if (do_optimizer_step) {
         opt_ctx->opt_period = opt_ctx->configured_opt_period;
     }
@@ -3409,6 +3434,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         loss *= (float) effective_period / opt_ctx->configured_opt_period;
     }
     result->loss.push_back(loss);
+    result->loss_weight.push_back(1.0f);
 
     if (opt_ctx->pred) {
         GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);
@@ -3760,7 +3786,7 @@ struct ggml_tensor * ggml_opt_qat_state_gradient_accumulator(ggml_opt_context_t 
 }
 
 void ggml_opt_set_current_period(ggml_opt_context_t opt_ctx, int32_t period) {
-    GGML_ASSERT(opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION_QAT);
+    GGML_ASSERT(ggml_opt_optimizer_is_qlion(opt_ctx->optimizer));
     GGML_ASSERT(!opt_ctx->static_graphs && !opt_ctx->eval_ready && opt_ctx->opt_i == 0);
     GGML_ASSERT(period >= 1 && period <= opt_ctx->configured_opt_period);
     opt_ctx->opt_period = period;
@@ -3789,6 +3815,8 @@ GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type o) {
             return "adamw_iq4_nl";
         case GGML_OPT_OPTIMIZER_TYPE_SGD:
             return "sgd";
+        case GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT:
+            return "qlion2";
         case GGML_OPT_OPTIMIZER_TYPE_QLION_QAT:
             return "qlion_qat";
         default:

@@ -71,19 +71,19 @@ struct qat_model_info {
 };
 
 static std::vector<enum ggml_type> qat_weight_types(const std::string & selected) {
-    if (selected == "q8_0") {
-        return { GGML_TYPE_Q8_0 };
+    std::vector<enum ggml_type> result;
+    for (const auto & name : string_split(selected, ",")) {
+        enum ggml_type type = GGML_TYPE_COUNT;
+        if (name == "mxfp4") type = GGML_TYPE_MXFP4;
+        if (name == "q2_0") type = GGML_TYPE_Q2_0;
+        if (name == "q4_0") type = GGML_TYPE_Q4_0;
+        if (name == "q8_0") type = GGML_TYPE_Q8_0;
+        if (type == GGML_TYPE_COUNT || std::find(result.begin(), result.end(), type) != result.end()) {
+            return {};
+        }
+        result.push_back(type);
     }
-    if (selected == "q4_0") {
-        return { GGML_TYPE_Q4_0 };
-    }
-    if (selected == "q4_0,q8_0") {
-        return { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 };
-    }
-    if (selected == "mxfp4,q8_0") {
-        return { GGML_TYPE_MXFP4, GGML_TYPE_Q8_0 };
-    }
-    return { GGML_TYPE_MXFP4 };
+    return result;
 }
 
 static bool qat_inspect_model(const std::string & path, const std::vector<enum ggml_type> & expected, struct qat_model_info & info) {
@@ -129,10 +129,20 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
     return true;
 }
 
+struct qat_param_filter_context {
+    const std::vector<enum ggml_type> * types;
+    std::vector<std::string> targets;
+};
+
 static bool qat_param_filter(const struct ggml_tensor * tensor, void * userdata) {
-    const auto & expected = *(const std::vector<enum ggml_type> *) userdata;
-    return tensor && std::find(expected.begin(), expected.end(), tensor->type) != expected.end() &&
-        strcmp(tensor->name, "rope_freqs.weight") != 0;
+    const auto & filter = *(const qat_param_filter_context *) userdata;
+    if (!tensor || std::find(filter.types->begin(), filter.types->end(), tensor->type) == filter.types->end() ||
+        strcmp(tensor->name, "rope_freqs.weight") == 0) {
+        return false;
+    }
+    return filter.targets.empty() || std::any_of(filter.targets.begin(), filter.targets.end(), [&](const std::string & target) {
+        return strstr(tensor->name, target.c_str()) != nullptr;
+    });
 }
 
 struct qat_opt_lr_context {
@@ -202,6 +212,10 @@ static bool qat_save_state(
     gguf_set_val_str(gctx, "general.type", "optimizer");
     gguf_set_val_u32(gctx, "training.qat.version", 1);
     gguf_set_val_str(gctx, "training.qat.quant_type", quant_type.c_str());
+    gguf_set_val_str(gctx, "training.qat.optimizer", ggml_opt_optimizer_name(config.optimizer));
+    gguf_set_val_u32(gctx, "training.qat.context_length", config.n_ctx);
+    gguf_set_val_u32(gctx, "training.qat.parallel", config.n_parallel);
+    gguf_set_val_u32(gctx, "training.qat.grad_accum_steps", config.grad_accum_steps);
     if (config.qat_lr_scale_unit) {
         gguf_set_val_u32(gctx, "training.qat.lr.unit", config.qat_lr_scale_unit);
         gguf_set_val_f32(gctx, "training.qat.lr.tau", config.qat_lr_scale_tau);
@@ -287,6 +301,14 @@ static bool qat_load_state(
         LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
         return false;
     }
+    const int context_key = gguf_find_key(gctx, "training.qat.context_length");
+    if (context_key >= 0 && (gguf_get_kv_type(gctx, context_key) != GGUF_TYPE_UINT32 ||
+        gguf_get_val_u32(gctx, context_key) != (uint32_t) config.n_ctx)) {
+        LOG_ERR("%s: checkpoint sequence context differs from --ctx-size\n", __func__);
+        gguf_free(gctx);
+        ggml_free(data_ctx);
+        return false;
+    }
     const int64_t lr_unit = gguf_find_key(gctx, "training.qat.lr.unit");
     const int64_t lr_tau = gguf_find_key(gctx, "training.qat.lr.tau");
     const int64_t lr_warmup = gguf_find_key(gctx, "training.qat.lr.warmup");
@@ -294,6 +316,14 @@ static bool qat_load_state(
         gguf_get_kv_type(gctx, lr_unit) == GGUF_TYPE_UINT32 &&
         gguf_get_kv_type(gctx, lr_tau) == GGUF_TYPE_FLOAT32 &&
         gguf_get_kv_type(gctx, lr_warmup) == GGUF_TYPE_UINT32;
+    const int optimizer_key = gguf_find_key(gctx, "training.qat.optimizer");
+    if (optimizer_key >= 0 && (gguf_get_kv_type(gctx, optimizer_key) != GGUF_TYPE_STRING ||
+        std::strcmp(gguf_get_val_str(gctx, optimizer_key), ggml_opt_optimizer_name(config.optimizer)) != 0)) {
+        LOG_ERR("%s: checkpoint optimizer does not match --optimizer\n", __func__);
+        gguf_free(gctx);
+        ggml_free(data_ctx);
+        return false;
+    }
     if ((config.qat_lr_scale_unit != 0 && !has_lr) ||
         (has_lr && (gguf_get_val_u32(gctx, lr_unit) != (uint32_t) config.qat_lr_scale_unit ||
                     gguf_get_val_f32(gctx, lr_tau) != config.qat_lr_scale_tau ||
@@ -700,13 +730,29 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: native QAT does not accept GRPO or LoRA adapters\n", __func__);
         return 1;
     }
-    if (params.optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION_QAT) {
-        LOG_ERR("%s: native QAT only supports --optimizer qlion\n", __func__);
+    if (!ggml_opt_optimizer_is_qlion(params.optimizer)) {
+        LOG_ERR("%s: native QAT only supports --optimizer qlion or qlion2\n", __func__);
         return 1;
     }
+    if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT) {
+        params.qat_lr_scale_unit = 32;
+    }
+    LOG_INF("%s: optimizer=%s lr_scale_unit=%d tau=%.9g lr_scale_warmup=%d\n", __func__,
+            ggml_opt_optimizer_name(params.optimizer), params.qat_lr_scale_unit, params.qat_lr_scale_tau, params.qat_lr_scale_warmup);
     if (params.n_ctx <= 0 || params.n_batch != params.n_ctx || params.n_ubatch <= 0 ||
         params.n_batch % params.n_ubatch != 0) {
         LOG_ERR("%s: native QLion requires explicit -c N -b N with -ub M where N is divisible by M\n", __func__);
+        return 1;
+    }
+    if (params.n_parallel < 1 || (size_t) params.n_parallel > llama_max_parallel_sequences() ||
+        params.n_ctx > INT32_MAX / params.n_parallel ||
+        (params.n_parallel > 1 && (params.n_ctx % 256 != 0 || params.kv_unified))) {
+        LOG_ERR("%s: parallel QAT requires positive parallel count, separate KV streams and context divisible by 256\n", __func__);
+        return 1;
+    }
+    if ((params.n_parallel > 1 || params.grad_accum_steps > 1) &&
+        (params.mtp_mode != "off" || params.critical_token_mode != "none")) {
+        LOG_ERR("%s: parallel/accumulated QAT does not yet support MTP or critical-token weighting\n", __func__);
         return 1;
     }
     params.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -725,6 +771,20 @@ int main(int argc, char ** argv) {
         params.model.path = params.qat_resume;
     }
     std::vector<enum ggml_type> weight_types = qat_weight_types(params.qat_quant_type);
+    if (weight_types.empty()) {
+        LOG_ERR("%s: invalid --quant-type list\n", __func__);
+        return 1;
+    }
+    if (params.qat_quant_type == "q2_0" && params.n_gpu_layers > 0) {
+        LOG_ERR("%s: q2_0 native QAT currently requires CPU weights; set -ngl 0\n", __func__);
+        return 1;
+    }
+    qat_param_filter_context qat_filter { &weight_types, {} };
+    for (const auto & target : string_split(params.qat_targets, ",")) {
+        if (!target.empty()) {
+            qat_filter.targets.push_back(target);
+        }
+    }
     struct qat_model_info model_info;
     if (!qat_inspect_model(params.model.path, weight_types, model_info)) {
         return 1;
@@ -740,7 +800,11 @@ int main(int argc, char ** argv) {
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
-    auto llama_init = common_init_from_params(params);
+    common_params init_params = params;
+    init_params.n_ctx *= params.n_parallel;
+    init_params.n_batch *= params.n_parallel;
+    init_params.n_ubatch *= params.n_parallel;
+    auto llama_init = common_init_from_params(init_params);
     struct llama_model * model = llama_init->model();
     struct llama_context * lctx = llama_init->context();
     if (!model || !lctx) {
@@ -754,7 +818,10 @@ int main(int argc, char ** argv) {
     }
     LOG_INF("%s: dataset chat template=%s\n", __func__, params.chat_template.empty() ? "model metadata" : "command-line override");
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    const int32_t n_ctx = llama_n_ctx(lctx);
+    const int32_t n_ctx = llama_n_ctx(lctx) / params.n_parallel;
+    LOG_INF("%s: sequence_context=%d parallel=%d microbatch_tokens=%u grad_accum=%d effective_sequences=%ld\n",
+            __func__, n_ctx, params.n_parallel, llama_n_ubatch(lctx), params.grad_accum_steps,
+            (long) params.n_parallel * params.grad_accum_steps);
     const size_t render_max_tokens = 0;
     std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
         params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
@@ -871,8 +938,8 @@ int main(int argc, char ** argv) {
         params.qat_fast_state_scale, params.qat_lr_scale_unit, params.qat_lr_scale_tau, params.qat_lr_scale_warmup
     };
     struct llama_opt_params opt_params {
-        0, params.mtp_mode == "only" ? lora_param_filter_none : qat_param_filter, &weight_types, qat_opt_lr_pars, &qat_lr_ctx,
-        GGML_OPT_OPTIMIZER_TYPE_QLION_QAT, LLAMA_LORA_QAT_TYPE_NONE,
+        0, params.mtp_mode == "only" ? lora_param_filter_none : qat_param_filter, &qat_filter, qat_opt_lr_pars, &qat_lr_ctx,
+        params.optimizer, LLAMA_LORA_QAT_TYPE_NONE,
         nullptr, nullptr,
         params.grad_checkpoint_interval, params.activation_recompute,
         critical_token_mode_from_string(params.critical_token_mode),
@@ -882,6 +949,7 @@ int main(int argc, char ** argv) {
         params.mtp_mode != "only",
         false,
         params.qat_grad_accumulator_cpu,
+        (uint32_t) params.grad_accum_steps,
     };
     llama_opt_init(lctx, model, opt_params);
     if (params.mtp_mode != "only" && llama_opt_qat_state_count(lctx) == 0) {
@@ -911,7 +979,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: total training step count overflows int64\n", __func__);
         return 1;
     }
-    schedule.total_steps = idata_split * params.lr.epochs;
+    const int64_t windows_per_update = (int64_t) params.n_parallel * params.grad_accum_steps;
+    schedule.total_steps = ((idata_split - 1) / windows_per_update + 1) * params.lr.epochs;
     if (schedule.total_steps <= 0 || params.warmup_steps > schedule.total_steps) {
         LOG_ERR("%s: invalid schedule: warmup_steps=%d total_steps=%ld\n",
                 __func__, params.warmup_steps, (long) schedule.total_steps);
@@ -997,7 +1066,7 @@ int main(int argc, char ** argv) {
         if (!qat_save_model(model, params.model.path, params.qat_out)) {
             final_save_ok = false;
         } else {
-            LOG_INF("%s: trained native QLion %s model saved to %s\n", __func__, params.qat_quant_type.c_str(), params.qat_out.c_str());
+            LOG_INF("%s: trained native %s %s model saved to %s\n", __func__, ggml_opt_optimizer_name(params.optimizer), params.qat_quant_type.c_str(), params.qat_out.c_str());
         }
     }
     if (mtp.ctx) {
