@@ -385,6 +385,16 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.lazy.mode = params.lazy_mode;
+        if (params.qlion_adapters && params.qlion_adapters[0]) {
+            if (fname.empty() || metadata || file || !splits.empty() || params.vocab_only) {
+                throw std::runtime_error("QLion adapters require a standalone model file and tensor loading");
+            }
+            if (!params.no_alloc) {
+                std::vector<std::string> paths;
+                for (auto p = params.qlion_adapters; *p; ++p) paths.emplace_back(*p);
+                ml.qlion.reset(new llama_qlion_overlay(fname, paths, params.qlion_allow_compatible_base));
+            }
+        }
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));

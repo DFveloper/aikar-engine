@@ -1464,7 +1464,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), qlion != nullptr);
+            if (qlion) qlion->patch_mapping(mapping->addr(), mapping->size());
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1731,6 +1732,17 @@ bool llama_model_loader::load_all_data(
         size_t n_size = ggml_nbytes(cur);
 
         const bool from_mapping = use_mmap || lazy.has(cur);
+
+        if (!from_mapping && qlion && qlion->has(cur->name)) {
+            std::vector<unsigned char> assembled(n_size);
+            qlion->read_tensor(cur->name, assembled.data(), assembled.size());
+            if (check_tensors && !ggml_validate_row_data(cur->type, assembled.data(), assembled.size())) {
+                throw std::runtime_error("QLion replacement contains invalid quantized data");
+            }
+            ggml_backend_tensor_set(cur, assembled.data(), 0, assembled.size());
+            size_done += n_size;
+            continue;
+        }
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);

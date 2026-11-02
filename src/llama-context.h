@@ -210,6 +210,9 @@ struct llama_context {
     //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    void opt_set_moe_compact(bool enabled) { opt_moe_compact = enabled; ggml_opt_set_qlion_moe_compact(opt_ctx, enabled); }
+    void opt_set_moe_fused(bool enabled) { ggml_opt_set_qlion_moe_fused(opt_ctx, enabled); }
+    void opt_set_graph_reuse(bool enabled) { opt_graph_reuse = enabled; }
     bool opt_suspend();
     bool opt_resume();
     void opt_set_weight_streaming(bool enabled);
@@ -466,6 +469,13 @@ private:
     // Saved init arguments used to recreate opt_ctx on optimizer reset.
     struct llama_model * opt_model = nullptr;
     struct llama_opt_params opt_params {};
+    bool opt_graph_reuse = false;
+    bool opt_moe_compact = false;
+    llm_graph_result * opt_graph_cached = nullptr;
+    bool opt_graph_cached_step = false;
+    uint64_t opt_graph_reused = 0;
+    uint64_t opt_supervised_tokens = 0;
+    int64_t opt_step_started_us = 0;
     llama_context * opt_mtp_context = nullptr;
 
     //

@@ -43,6 +43,42 @@ Without microbatching, raw persistent state is 17.25 bits per weight for MXFP4 a
 
 The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). Only freshly-allocated F32 LoRA A/B tensors are trained. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
 
+### QLion targets and replacement adapters
+
+`--freeze-layers N` also applies to native QLion: it excludes `blk.0` through `blk.N-1` and intersects with the existing substring filter `--qat-targets`. A negative/out-of-range count, an unsupported selected quantization type, or an empty selection is an error. Unselected weight types can remain in the base model. Tied token embeddings/output are excluded by default; explicitly selecting `token_embd` or `output.weight` enables their dense output gradient and prints a size warning. The trainer reports actual optimizer registrations, shapes, and state memory.
+
+```sh
+llama-finetune-qlion -m base.gguf --train-file train.jsonl --quant-type q4_0,q8_0 \
+    --optimizer qlion2 -c 256 -b 256 -ub 256 --freeze-layers 2 \
+    --qat-targets attn_k,attn_v,ffn --qat-out trained.gguf --qat-adapter-out adapter.gguf
+llama-export-qlion -m base.gguf --adapter adapter.gguf -o merged.gguf
+```
+
+`--qat-adapter-out` adds an atomic GGUF export containing only tensors whose final bytes differ from the captured original base. The default `--qat-adapter-units full` writes v1 full tensors in their original quantization type. `rows` and `experts` write v2 changed units; expert mode uses rows for tensors without an expert axis. Unchanged units are omitted. Full tensors can be very large for MoE models. Hashing and comparison stream through bounded host buffers. Original and payload SHA-256 hashes, architecture, targets, generator, and tied logical names are recorded. Each adapter is relative to the on-disk model loaded at the start of this run, including when training resumes from a checkpoint.
+
+Use `--qat-out '' --qat-adapter-out adapter.gguf --save-every 0 --save-first-at 0` to save only the final adapter. Regular full checkpoints and optimizer resume retain their existing format. See [export and runtime loading](../../tools/export-qlion/README.md) for compatibility and conflict handling.
+
+`--qat-static-graph on` retains compatible CPU/CUDA forward, backward, and optimizer graphs, including microbatching, gradient accumulation, and multiple sequences. Microbatch graphs reuse the existing KV capacity buckets; inputs and masks are refilled for each microstep. A capacity-bucket transition rebuilds the graph. Supervised output selection is unchanged. Shape, output-count, optimizer-phase, or train/eval changes rebuild the graph. MTP, critical weighting, activation recomputation, source embeddings, and compact routing use the dynamic path. The default is off. Use `--verbosity 5` to see actual reuse. Earlier microbatch KV rows remain detached; use a full-sequence microbatch for full-sequence K/V gradients.
+
+`--qat-moe-gradient auto|dense|fused|compact` selects routed Q8_0 gradient accumulation. The default `auto` uses CPU fusion when the routing bound permits sparse expert storage or the full F32 gradient would occupy at least 16 MiB. `dense` forces the reference, and `fused` forces supported CPU fusion using the conservative routing bound. Unsupported or multiple-contribution graphs fall back to dense accumulation.
+
+`compact` adds a forward routing pass on CPU/CUDA before each backward pass. Expert Q8_0 storage follows the actual union of expert IDs across the current accumulation group, grows while preserving previous gradients, and resets to the next group's actual size. CUDA uses one expert's F32/Q8 workspace instead of a full F32 expert gradient. All selected experts still receive zero-gradient momentum/decay updates when inactive; full momentum and residual states are retained. GPU gradients with CPU expert state use the dense reference path to preserve the GPU reduction order. This mode trades an additional forward pass and host synchronization for lower gradient memory. It disables static graph retention. It does not promise faster steps. Other backends can use scheduler fallback; native compact kernels are implemented for CPU/CUDA.
+
+Adapters are applied by the core model loader before backend repacking. Resident, mmap, and lazy loading use the same validated replacements. See [loader validation](../../docs/superpowers/reports/2026-11-03-qlion2-three-scopes.md) and [runtime API](../../tools/export-qlion/README.md).
+
+The local integration suite needs `gguf-py`, NumPy, `/usr/bin/time`, and the existing fixture artifacts. It performs no downloads:
+
+```sh
+PYTHONPATH=gguf-py python3 examples/qlora_training/test_qlion_integration.py \
+    --bin-dir build/bin --fixtures /path/to/QLion2-test/artifacts --output-dir /tmp/qlion-checks
+```
+
+Use a CUDA build and append `--gpu-layers 99 --gpu-index 0` for a single-GPU run. The physical NVML index must identify the GPU used by the trainer. GPU runs record the device identity and sample whole-device VRAM every 10 ms using the installed NVML library; this includes background allocations and can miss shorter peaks. CPU/GPU timing fields are separate, and correctness success does not imply the performance ratio goals passed.
+
+It checks dense/MoE training, merge byte equality, core-loader inference, lazy overlays, repacking, K/V momentum, frozen weights, graph reuse and fallback, and dense/fused/compact microbatch trajectories. Reports include exact commands, step statistics, effective supervised tokens/s, and peak process RSS. A CPU run does not validate GPU throughput or peak VRAM. The small MoE fixture uses four experts with two selected and a shared dense FFN; its generation recipe is in `QLion2-test/build_gemma4_moe_smoke.py`.
+
+For limited VRAM, use explicit tensor placement with `--no-op-offload` to keep other host operations on CPU. The tested ordinary `-ngl 1` configuration placed the large output layer on GPU. Frozen output weights still need activation gradients. Large contiguous non-Q4 quantized CUDA `OUT_PROD` now limits F32 conversion scratch to 64 MiB when a decoded row fits; Q4_0 keeps its existing tiled path. See the [P620 report](../../docs/superpowers/reports/2026-11-03-qlion2-p620.md) for the working hybrid 26B command, changed adapter, memory measurements, and unmet small-model time goal.
+
 ### QLion2
 
 Select `--optimizer qlion2` (case-insensitive) to enable 32-element adaptive LR scaling automatically. QLion2 always uses this unit; `--qat-lr-scale off`, `layer`, or `256` cannot change it. Existing QLion retains all its scale modes. QLion2 shares QLion's Q8_0 momentum, Q4_0 residual, quantized update and gradient accumulation paths.
@@ -518,7 +554,7 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 | ✅ Done | **`MUL_MAT_ID` backward** — LoRA on MoE dense FFN layers; `OUT_PROD_ID` for scattered outer product | Unlocks Mixtral/Nemotron-MoE | Implemented |
 | Done | **Quantized `OUT_PROD`** - dequantize on GPU + cuBLAS/hipBLAS for backward matmul | Full GPU training (no CPU fallback) | Implemented |
 | ✅ Done | **Reuse `ctx_compute_opt`** — allocate tensor metadata context once, `ggml_reset()` across ubatches | Eliminate ~0.5 s/step overhead | Implemented |
-| ❌ Skip | **Static training graphs** — KV mask shape changes per ubatch (`n_kv` grows); graph topology not static | Would need KV cache redesign | Not feasible |
+| Implemented | **Static training graphs** - reuse within KV/mask capacity buckets | Shape and phase changes rebuild | CPU/CUDA |
 | Low | **`SSM_SCAN/CONV` backward** — enable LoRA on Mamba SSM layers | Unlocks NemotronH SSM layers | Planned |
 | Low | **GELU backward** — implement `ggml_gelu_back` kernel (UNARY + GLU) | Support GPT-2/Phi-style models | Planned (needs new CUDA/CPU kernels) |
 

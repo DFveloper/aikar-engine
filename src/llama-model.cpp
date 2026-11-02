@@ -3403,6 +3403,8 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.offload_input               =*/ false,
+        /*.qlion_adapters              =*/ nullptr,
+        /*.qlion_allow_compatible_base =*/ false,
     };
 
     return result;

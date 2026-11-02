@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-model-saver.h"
+#include "qlion-adapter.h"
 
 static int64_t train_sample_split_by_conversation(
         const std::vector<training_sample> & samples,
@@ -86,12 +87,56 @@ static std::vector<enum ggml_type> qat_weight_types(const std::string & selected
     return result;
 }
 
-static bool qat_inspect_model(const std::string & path, const std::vector<enum ggml_type> & expected, struct qat_model_info & info) {
+struct qat_param_filter_context {
+    const std::vector<enum ggml_type> * types;
+    std::vector<std::string> targets;
+    int32_t freeze_layers = 0;
+    bool tied_embedding = false;
+};
+
+static bool qat_name_filter(const ggml_tensor * tensor, const qat_param_filter_context & filter) {
+    if (!tensor || strcmp(tensor->name, "rope_freqs.weight") == 0) {
+        return false;
+    }
+    if (strncmp(tensor->name, "blk.", 4) == 0) {
+        char * end = nullptr;
+        const long layer = std::strtol(tensor->name + 4, &end, 10);
+        if (end != tensor->name + 4 && *end == '.' && layer >= 0 && layer < filter.freeze_layers) return false;
+    }
+    const bool tied = filter.tied_embedding && strcmp(tensor->name, "token_embd.weight") == 0;
+    if (filter.targets.empty()) {
+        return !tied;
+    }
+    return std::any_of(filter.targets.begin(), filter.targets.end(), [&](const std::string & target) {
+        return strstr(tensor->name, target.c_str()) || (tied && strstr("output.weight", target.c_str()));
+    });
+}
+
+static bool qat_param_filter(const ggml_tensor * tensor, void * userdata) {
+    const auto & filter = *static_cast<const qat_param_filter_context *>(userdata);
+    return tensor && std::find(filter.types->begin(), filter.types->end(), tensor->type) != filter.types->end() &&
+        qat_name_filter(tensor, filter);
+}
+
+static bool qat_inspect_model(const std::string & path, const std::vector<enum ggml_type> & expected, struct qat_model_info & info, qat_param_filter_context & filter) {
     struct ggml_context * ctx_meta = nullptr;
     struct gguf_init_params params = { true, &ctx_meta };
     struct gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
     if (!gctx) {
         LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
+        return false;
+    }
+    filter.tied_embedding = gguf_find_tensor(gctx, "token_embd.weight") >= 0 && gguf_find_tensor(gctx, "output.weight") < 0;
+    const int64_t arch_key = gguf_find_key(gctx, "general.architecture");
+    const std::string layers_key = arch_key >= 0 && gguf_get_kv_type(gctx, arch_key) == GGUF_TYPE_STRING ?
+        std::string(gguf_get_val_str(gctx, arch_key)) + ".block_count" : "";
+    const int64_t layers_id = gguf_find_key(gctx, layers_key.c_str());
+    const bool valid_layers = layers_id >= 0 && gguf_get_kv_type(gctx, layers_id) == GGUF_TYPE_UINT32 &&
+        filter.freeze_layers >= 0 && uint32_t(filter.freeze_layers) <= gguf_get_val_u32(gctx, layers_id);
+    if (!valid_layers) {
+        LOG_ERR("%s: --freeze-layers is outside the model layer range\n", __func__);
+        gguf_free(gctx);
+        ggml_free(ctx_meta);
         return false;
     }
     info = {};
@@ -102,18 +147,24 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
         GGML_ASSERT(tensor);
         if (ggml_is_quantized(tensor->type)) {
             const auto found = std::find(expected.begin(), expected.end(), tensor->type);
-            if (found == expected.end()) {
+            if (found == expected.end() && qat_name_filter(tensor, filter)) {
                 LOG_ERR("%s: tensor %s has unsupported type %s\n",
                     __func__, name, ggml_type_name(tensor->type));
                 gguf_free(gctx);
                 ggml_free(ctx_meta);
                 return false;
             }
-            counts[found - expected.begin()]++;
+            if (found != expected.end()) counts[found - expected.begin()]++;
             info.quantized_bytes += ggml_nbytes(tensor);
-            info.momentum_bytes += ggml_row_size(GGML_TYPE_Q8_0, tensor->ne[0]) * ggml_nrows(tensor);
-            info.residual_bytes += ggml_row_size(GGML_TYPE_Q4_0, tensor->ne[0]) * ggml_nrows(tensor);
-            info.quantized_tensors++;
+            if (qat_param_filter(tensor, &filter)) {
+                info.momentum_bytes += ggml_row_size(GGML_TYPE_Q8_0, tensor->ne[0]) * ggml_nrows(tensor);
+                info.residual_bytes += ggml_row_size(GGML_TYPE_Q4_0, tensor->ne[0]) * ggml_nrows(tensor);
+                info.quantized_tensors++;
+                if (filter.tied_embedding && strcmp(name, "token_embd.weight") == 0) {
+                    LOG_WRN("qat_targets: tied token_embd/output selected; gradient covers the full vocabulary; dense_f32_bytes=%llu full_adapter_bytes=%llu\n",
+                        (unsigned long long) (ggml_nelements(tensor) * sizeof(float)), (unsigned long long) ggml_nbytes(tensor));
+                }
+            }
         } else {
             info.nonquantized_bytes += ggml_nbytes(tensor);
         }
@@ -126,23 +177,11 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
             return false;
         }
     }
-    return true;
-}
-
-struct qat_param_filter_context {
-    const std::vector<enum ggml_type> * types;
-    std::vector<std::string> targets;
-};
-
-static bool qat_param_filter(const struct ggml_tensor * tensor, void * userdata) {
-    const auto & filter = *(const qat_param_filter_context *) userdata;
-    if (!tensor || std::find(filter.types->begin(), filter.types->end(), tensor->type) == filter.types->end() ||
-        strcmp(tensor->name, "rope_freqs.weight") == 0) {
+    if (info.quantized_tensors == 0) {
+        LOG_ERR("%s: --qat-targets and --freeze-layers select no supported quantized tensors\n", __func__);
         return false;
     }
-    return filter.targets.empty() || std::any_of(filter.targets.begin(), filter.targets.end(), [&](const std::string & target) {
-        return strstr(tensor->name, target.c_str()) != nullptr;
-    });
+    return true;
 }
 
 struct qat_opt_lr_context {
@@ -665,10 +704,13 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
     uint64_t momentum_bytes = 0;
     uint64_t residual_bytes = 0;
     uint64_t dense_gradient_bytes = 0;
+    uint64_t lr_scale_bytes = 0;
     uint64_t sparse_gradient_bytes = 0;
     for (int64_t i = 0; i < llama_opt_qat_state_count(lctx); ++i) {
         momentum_bytes += ggml_nbytes(llama_opt_qat_state_momentum(lctx, i));
         residual_bytes += ggml_nbytes(llama_opt_qat_state_residual(lctx, i));
+        const auto * lr_scale = llama_opt_qat_state_lr_scale(lctx, i);
+        if (lr_scale) lr_scale_bytes += ggml_nbytes(lr_scale);
         struct ggml_tensor * gradient = llama_opt_qat_state_gradient_accumulator(lctx, i);
         if (gradient) {
             const struct ggml_tensor * param = llama_opt_qat_state_param(lctx, i);
@@ -697,13 +739,13 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
             device_used_bytes = total_bytes - free_bytes;
         }
     }
-    LOG_INF("qat_memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu dense_gradient_q8_0=%llu sparse_gradient_q8_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu device_used=%zu\n",
+    LOG_INF("qat_memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu lr_scale=%llu dense_gradient_q8_0=%llu sparse_gradient_q8_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu device_used=%zu\n",
         (unsigned long long) model_info.quantized_bytes, (unsigned long long) momentum_bytes,
-        (unsigned long long) residual_bytes, (unsigned long long) dense_gradient_bytes,
+        (unsigned long long) residual_bytes, (unsigned long long) lr_scale_bytes, (unsigned long long) dense_gradient_bytes,
         (unsigned long long) sparse_gradient_bytes,
         (unsigned long long) model_info.nonquantized_bytes,
         (unsigned long long) context_bytes, (unsigned long long) compute_bytes,
-        (unsigned long long) (model_info.quantized_bytes + momentum_bytes + residual_bytes + dense_gradient_bytes + sparse_gradient_bytes),
+        (unsigned long long) (model_info.quantized_bytes + momentum_bytes + residual_bytes + lr_scale_bytes + dense_gradient_bytes + sparse_gradient_bytes),
         device_used_bytes);
 }
 
@@ -724,6 +766,10 @@ int main(int argc, char ** argv) {
     }
     if (params.train_file.empty()) {
         LOG_ERR("%s: --train-file is required\n", __func__);
+        return 1;
+    }
+    if (params.qat_out.empty() && (params.qat_adapter_out.empty() || params.save_every > 0 || params.save_first_at > 0)) {
+        LOG_ERR("%s: empty --qat-out requires --qat-adapter-out and disabled full checkpoints\n", __func__);
         return 1;
     }
     if (params.grpo_mode || !params.lora_adapters.empty()) {
@@ -779,14 +825,14 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: q2_0 native QAT currently requires CPU weights; set -ngl 0\n", __func__);
         return 1;
     }
-    qat_param_filter_context qat_filter { &weight_types, {} };
+    qat_param_filter_context qat_filter { &weight_types, {}, params.lora_freeze_layers, false };
     for (const auto & target : string_split(params.qat_targets, ",")) {
         if (!target.empty()) {
             qat_filter.targets.push_back(target);
         }
     }
     struct qat_model_info model_info;
-    if (!qat_inspect_model(params.model.path, weight_types, model_info)) {
+    if (!qat_inspect_model(params.model.path, weight_types, model_info, qat_filter)) {
         return 1;
     }
     const uint64_t gradient_estimate = params.n_ubatch < params.n_batch ? model_info.momentum_bytes : 0;
@@ -819,6 +865,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: dataset chat template=%s\n", __func__, params.chat_template.empty() ? "model metadata" : "command-line override");
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_ctx = llama_n_ctx(lctx) / params.n_parallel;
+    if (params.n_ubatch < n_ctx) {
+        LOG_WRN("%s: past KV rows are detached at microbatch boundaries; use -ub equal to sequence_context for full-sequence K/V gradients\n", __func__);
+    }
     LOG_INF("%s: sequence_context=%d parallel=%d microbatch_tokens=%u grad_accum=%d effective_sequences=%ld\n",
             __func__, n_ctx, params.n_parallel, llama_n_ubatch(lctx), params.grad_accum_steps,
             (long) params.n_parallel * params.grad_accum_steps);
@@ -882,7 +931,7 @@ int main(int argc, char ** argv) {
     std::vector<llama_opt_critical_token_metadata> critical_metadata;
     const bool critical_enabled = params.critical_token_mode != "none";
     int64_t idata_split = 0;
-    
+
     ggml_opt_dataset_t dataset =
         build_dataset(
             samples,
@@ -952,9 +1001,46 @@ int main(int argc, char ** argv) {
         (uint32_t) params.grad_accum_steps,
     };
     llama_opt_init(lctx, model, opt_params);
+    llama_opt_set_graph_reuse(lctx, params.qat_static_graph);
+    if (params.qat_moe_gradient != "auto") llama_opt_set_moe_fused(lctx, params.qat_moe_gradient != "dense");
+    llama_opt_set_moe_compact(lctx, params.qat_moe_gradient == "compact");
+    if (params.qat_static_graph) {
+        LOG_INF("qat_graph: reuse requested; compatible CPU full-sequence single-stream steps are eligible; shape changes rebuild the graph\n");
+    }
     if (params.mtp_mode != "only" && llama_opt_qat_state_count(lctx) == 0) {
         LOG_ERR("%s: the training graph contains no trainable %s tensors\n", __func__, params.qat_quant_type.c_str());
         return 1;
+    }
+    std::vector<ggml_tensor *> adapter_tensors;
+    uint64_t selected_bytes = 0;
+    for (int64_t i = 0; i < llama_opt_qat_state_count(lctx); ++i) {
+        auto * tensor = llama_opt_qat_state_param(lctx, i);
+        adapter_tensors.push_back(tensor);
+        selected_bytes += ggml_nbytes(tensor);
+        LOG_INF("qat_target: %s type=%s shape=[%lld,%lld,%lld,%lld] bytes=%zu\n", tensor->name,
+            ggml_type_name(tensor->type), (long long) tensor->ne[0], (long long) tensor->ne[1],
+            (long long) tensor->ne[2], (long long) tensor->ne[3], ggml_nbytes(tensor));
+    }
+    LOG_INF("qat_targets: registered=%zu bytes=%llu\n", adapter_tensors.size(), (unsigned long long) selected_bytes);
+    common_qlion_snapshot adapter_base;
+    if (!params.qat_adapter_out.empty()) {
+        try {
+            if (params.mtp_mode == "only" || !params.qlion_adapters.empty()) {
+                throw std::runtime_error("adapter export requires training the on-disk base directly");
+            }
+            const auto aliases = [](const std::string & a, const std::string & b) {
+                return std::filesystem::weakly_canonical(a) == std::filesystem::weakly_canonical(b) ||
+                    (std::filesystem::exists(a) && std::filesystem::exists(b) && std::filesystem::equivalent(a, b));
+            };
+            if ((!params.qat_out.empty() && (aliases(params.qat_adapter_out, params.qat_out) || aliases(params.qat_out, params.model.path))) ||
+                    aliases(params.qat_adapter_out, params.model.path)) {
+                throw std::runtime_error("adapter, full model output and base must be distinct files");
+            }
+            adapter_base = common_qlion_capture(params.model.path, adapter_tensors);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: %s\n", __func__, e.what());
+            return 1;
+        }
     }
     qat_print_memory(lctx, model_info);
 
@@ -1062,11 +1148,19 @@ int main(int argc, char ** argv) {
     }
     llama_synchronize(lctx);
     bool final_save_ok = true;
-    if (params.mtp_mode != "only") {
+    if (params.mtp_mode != "only" && !params.qat_out.empty()) {
         if (!qat_save_model(model, params.model.path, params.qat_out)) {
             final_save_ok = false;
         } else {
             LOG_INF("%s: trained native %s %s model saved to %s\n", __func__, ggml_opt_optimizer_name(params.optimizer), params.qat_quant_type.c_str(), params.qat_out.c_str());
+        }
+    }
+    if (!params.qat_adapter_out.empty()) {
+        try {
+            common_qlion_save(adapter_base, adapter_tensors, params.qat_adapter_out, params.qat_adapter_units);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: %s\n", __func__, e.what());
+            final_save_ok = false;
         }
     }
     if (mtp.ctx) {

@@ -1,0 +1,5 @@
+set(TARGET llama-export-qlion)
+add_executable(${TARGET} export-qlion.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama-common)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

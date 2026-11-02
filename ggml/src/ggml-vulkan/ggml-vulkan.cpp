@@ -16429,7 +16429,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 op->src[1]->type == GGML_TYPE_F32 && ggml_nelements(op->src[1]) == 2 &&
                 op->src[2]->type == GGML_TYPE_F32 && ggml_nelements(op->src[2]) == 8;
         case GGML_OP_ACC_QLION_QAT:
-            return op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32 &&
+            return ggml_get_op_params_i32(op, 1) == 0 && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_OPT_STEP_QLION_QAT:
             return (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0) &&

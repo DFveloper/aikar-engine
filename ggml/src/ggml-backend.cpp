@@ -24,6 +24,8 @@
 #include <unordered_map>
 #include <vector>
 
+enum ggml_status ggml_backend_sched_graph_compute_prefix(ggml_backend_sched_t sched, int n_nodes);
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -1941,7 +1943,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, int n_nodes = -1) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1949,6 +1951,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
+        if (n_nodes >= 0 && split->i_start >= n_nodes) break;
+        ggml_cgraph prefix_graph;
+        ggml_cgraph * compute_graph = &split->graph;
+        if (n_nodes >= 0 && split->i_end > n_nodes) {
+            prefix_graph = ggml_graph_view(&split->graph, 0, n_nodes - split->i_start);
+            compute_graph = &prefix_graph;
+        }
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
@@ -1976,14 +1985,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, compute_graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
-            for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
-                struct ggml_tensor * t = split->graph.nodes[j0];
+            for (int j0 = 0; j0 < compute_graph->n_nodes; j0++) {
+                struct ggml_tensor * t = compute_graph->nodes[j0];
 
                 // check if the user needs data from this node
                 bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
@@ -1991,12 +2000,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
-                while (!need && j1 < split->graph.n_nodes - 1) {
-                    t = split->graph.nodes[++j1];
+                while (!need && j1 < compute_graph->n_nodes - 1) {
+                    t = compute_graph->nodes[++j1];
                     need = sched->callback_eval(t, true, sched->callback_eval_user_data);
                 }
 
-                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
+                struct ggml_cgraph gv = ggml_graph_view(compute_graph, j0, j1 + 1);
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
@@ -2023,6 +2032,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_prefix(ggml_backend_sched_t sched, int n_nodes) {
+    GGML_ASSERT(sched && sched->is_alloc && n_nodes > 0);
+    GGML_ASSERT(sched->n_splits > 0 && n_nodes <= sched->splits[sched->n_splits - 1].i_end);
+    const auto status = ggml_backend_sched_compute_splits(sched, n_nodes);
+    ggml_backend_sched_synchronize(sched);
+    return status;
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(

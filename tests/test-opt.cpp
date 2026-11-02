@@ -1334,6 +1334,55 @@ static std::pair<int, int> test_backend(
     return std::make_pair(npass, ntest);
 }
 
+static bool test_retained_dynamic_graph(const std::vector<ggml_backend_t> & backends) {
+    std::vector<ggml_backend_t> devices = backends;
+    ggml_backend_sched_t scheds[2];
+    std::vector<helper_ctx_data> cases;
+    ggml_cgraph * graphs[2];
+    ggml_context * compute[2];
+    for (int i = 0; i < 2; ++i) {
+        scheds[i] = ggml_backend_sched_new(devices.data(), nullptr, devices.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
+        cases.push_back(helper_get_ctx_data(GGML_OPT_OPTIMIZER_TYPE_SGD, scheds[i], devices.front(), false, false));
+        auto & cd = cases.back();
+        auto params = cd.opt_params;
+        params.ctx_compute = nullptr;
+        params.inputs = nullptr;
+        params.outputs = nullptr;
+        cd.opt_ctx = ggml_opt_init(params);
+        compute[i] = ggml_init({ GGML_DEFAULT_GRAPH_SIZE*ggml_tensor_overhead() + 3*ggml_graph_overhead(), nullptr, true });
+    }
+    bool ok = true;
+    for (int step = 0; step < 5; ++step) {
+        float weights[2];
+        for (int i = 0; i < 2; ++i) {
+            auto & cd = cases[i];
+            std::vector<float> inputs(ggml_nelements(cd.inputs), 0.25f*(step + 1));
+            ggml_backend_tensor_set(cd.inputs, inputs.data(), 0, inputs.size()*sizeof(float));
+            const bool retain = i == 1 && step < 4;
+            ggml_opt_retain_graph(cd.opt_ctx, retain);
+            if (!retain || step == 0 || step == 3) {
+                ggml_reset(compute[i]);
+                graphs[i] = ggml_new_graph_custom(compute[i], GGML_DEFAULT_GRAPH_SIZE, true);
+                ggml_build_forward_expand(graphs[i], cd.outputs);
+                ggml_opt_prepare_alloc(cd.opt_ctx, compute[i], graphs[i], cd.inputs, cd.outputs);
+            }
+            ggml_opt_alloc(cd.opt_ctx, true);
+            ggml_opt_eval(cd.opt_ctx, nullptr);
+            ggml_backend_tensor_get(cd.weights, &weights[i], 0, sizeof(float));
+            ok &= ggml_opt_step(cd.opt_ctx) == step + 1;
+        }
+        ok &= fabsf(weights[0] - weights[1]) < 1e-6f;
+    }
+    for (int i = 0; i < 2; ++i) {
+        ggml_opt_set_backend_sched(cases[i].opt_ctx, nullptr);
+        ggml_backend_sched_free(scheds[i]);
+        helper_free_ctx_data(cases[i]);
+        ggml_free(compute[i]);
+    }
+    printf("retained dynamic graph, rebuild and fallback: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool test_scheduler_replacement(const std::vector<ggml_backend_t> & backends) {
     ggml_backend_t backend = backends.front();
     std::vector<ggml_backend_t> sched_backends = backends;
@@ -1383,7 +1432,7 @@ int main(void) {
     size_t n_total = 0;
     if (!backends.empty()) {
         ++n_total;
-        if (test_scheduler_replacement(backends)) {
+        if (test_retained_dynamic_graph(backends) && test_scheduler_replacement(backends)) {
             ++n_ok;
         }
     }

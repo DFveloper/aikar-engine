@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-qlion-adapter.h"
 
 #include "ggml-cpp.h"
 
@@ -120,6 +121,7 @@ struct llama_model_loader {
     llama_fver  fver;
 
     llama_mmaps mappings;
+    std::unique_ptr<llama_qlion_overlay> qlion;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;

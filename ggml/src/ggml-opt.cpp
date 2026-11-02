@@ -18,6 +18,8 @@
 #include <vector>
 #include <unordered_map>
 
+enum ggml_status ggml_backend_sched_graph_compute_prefix(ggml_backend_sched_t sched, int n_nodes);
+
 struct ggml_opt_dataset {
     struct ggml_context   * ctx    = nullptr;
     ggml_backend_buffer_t   buf    = nullptr;
@@ -36,6 +38,7 @@ struct ggml_opt_dataset {
 
 struct ggml_opt_context {
     ggml_backend_sched_t       backend_sched        = nullptr;
+    bool retain_graph = false;
     ggml_cgraph              * allocated_graph      = nullptr;
     ggml_cgraph              * allocated_graph_copy = nullptr;
     struct ggml_context      * ctx_static           = nullptr;
@@ -95,7 +98,16 @@ struct ggml_opt_context {
     int32_t qat_lr_scale_warmup = 0;
     std::vector<struct ggml_tensor *> qat_grad_accumulator;
     bool qat_grad_accumulator_cpu = false;
-    enum class qat_grad_state_kind { unclassified, dense, sparse_rows };
+    bool qat_moe_fused = true;
+    bool qat_moe_auto = true;
+    bool qat_moe_actual = false;
+    bool qat_route_probe = false;
+    ggml_context * ctx_route_backward = nullptr;
+    std::vector<ggml_tensor *> qat_route_accumulators;
+    struct route_input { ggml_tensor * tensor; void * data; ggml_backend_buffer_t buffer; void * extra; };
+    std::vector<route_input> route_inputs;
+    std::map<ggml_tensor *, ggml_tensor *> route_tensor_copies;
+    enum class qat_grad_state_kind { unclassified, dense, sparse_rows, sparse_experts };
     struct qat_grad_state {
         qat_grad_state_kind kind = qat_grad_state_kind::unclassified;
         ggml_context * ctx = nullptr;
@@ -273,7 +285,10 @@ static ggml_opt_context::qat_grad_state ggml_opt_qat_make_grad_state(
     state.kind = kind;
     state.capacity = capacity;
     state.input_capacity = input_capacity;
-    if (kind == ggml_opt_context::qat_grad_state_kind::sparse_rows) {
+    if (kind == ggml_opt_context::qat_grad_state_kind::sparse_experts) {
+        GGML_ASSERT(param->ne[1] > 0 && param->ne[0] <= INT64_MAX / param->ne[1]);
+    }
+    if (kind != ggml_opt_context::qat_grad_state_kind::dense) {
         GGML_ASSERT(capacity > 0 && capacity <= INT32_MAX / 4);
         GGML_ASSERT(input_capacity >= 0 && input_capacity <= INT32_MAX - capacity);
         state.hash_capacity = 1;
@@ -281,12 +296,13 @@ static ggml_opt_context::qat_grad_state ggml_opt_qat_make_grad_state(
             state.hash_capacity *= 2;
         }
     }
-    const size_t n_tensors = kind == ggml_opt_context::qat_grad_state_kind::sparse_rows ? 6 : 1;
+    const size_t n_tensors = kind != ggml_opt_context::qat_grad_state_kind::dense ? 6 : 1;
     ggml_init_params init_params = { n_tensors * ggml_tensor_overhead(), nullptr, true };
     state.ctx = ggml_init(init_params);
     GGML_ASSERT(state.ctx);
-    if (kind == ggml_opt_context::qat_grad_state_kind::sparse_rows) {
-        state.accumulator = ggml_new_tensor_2d(state.ctx, GGML_TYPE_Q8_0, param->ne[0], capacity);
+    if (kind != ggml_opt_context::qat_grad_state_kind::dense) {
+        state.accumulator = ggml_new_tensor_2d(state.ctx, GGML_TYPE_Q8_0,
+            kind == ggml_opt_context::qat_grad_state_kind::sparse_experts ? param->ne[0]*param->ne[1] : param->ne[0], capacity);
         state.row_ids = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, capacity);
         state.row_hash = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, state.hash_capacity);
         state.row_count = ggml_new_tensor_1d(state.ctx, GGML_TYPE_I32, 1);
@@ -335,7 +351,7 @@ static void ggml_opt_qat_copy_sparse_to_dense(
         const ggml_opt_context::qat_grad_state & src,
         ggml_opt_context::qat_grad_state & dst,
         const ggml_tensor * param) {
-    GGML_ASSERT(src.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows);
+    GGML_ASSERT(src.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows || src.kind == ggml_opt_context::qat_grad_state_kind::sparse_experts);
     GGML_ASSERT(dst.kind == ggml_opt_context::qat_grad_state_kind::dense);
 
     const int32_t row_count = [&]() {
@@ -343,11 +359,12 @@ static void ggml_opt_qat_copy_sparse_to_dense(
         ggml_backend_tensor_get(src.row_count, &value, 0, sizeof(value));
         return value;
     }();
-    if (row_count <= 0) {
+    GGML_ASSERT(row_count >= 0 && row_count <= src.capacity);
+    if (row_count == 0) {
         return;
     }
 
-    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, param->ne[0]);
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, src.accumulator->ne[0]);
     std::vector<int32_t> row_ids((size_t) row_count);
     std::vector<uint8_t> rows((size_t) row_count * row_bytes);
     ggml_backend_tensor_get(src.row_ids, row_ids.data(), 0, row_ids.size() * sizeof(int32_t));
@@ -358,7 +375,8 @@ static void ggml_opt_qat_copy_sparse_to_dense(
     ggml_backend_tensor_get(&src_rows, rows.data(), 0, rows.size());
 
     for (int32_t i = 0; i < row_count; ++i) {
-        GGML_ASSERT(row_ids[(size_t) i] >= 0 && row_ids[(size_t) i] < param->ne[1]);
+        const int64_t limit = src.kind == ggml_opt_context::qat_grad_state_kind::sparse_experts ? param->ne[2] : param->ne[1];
+        GGML_ASSERT(row_ids[(size_t) i] >= 0 && row_ids[(size_t) i] < limit);
         ggml_backend_tensor_set(dst.accumulator,
             rows.data() + (size_t) i * row_bytes,
             (size_t) row_ids[(size_t) i] * row_bytes,
@@ -378,19 +396,23 @@ static ggml_opt_context::qat_grad_state & ggml_opt_qat_select_grad_state(
     }
     GGML_ASSERT(state.kind == ggml_opt_context::qat_grad_state_kind::unclassified ||
         state.kind == kind ||
-        (state.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows &&
+        ((state.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows || state.kind == ggml_opt_context::qat_grad_state_kind::sparse_experts) &&
          kind == ggml_opt_context::qat_grad_state_kind::dense));
     GGML_ASSERT(required_capacity > 0);
-    const int64_t capacity = state.buffer
-        ? std::min<int64_t>(opt_ctx->qat_params[index]->ne[1], std::max(required_capacity, 2 * state.capacity))
+    const auto * param = opt_ctx->qat_params[index];
+    const int64_t units = kind == ggml_opt_context::qat_grad_state_kind::sparse_experts ? param->ne[2] : ggml_nrows(param);
+    const int64_t limit = kind == ggml_opt_context::qat_grad_state_kind::dense ? units : std::min<int64_t>(units, INT32_MAX / 4);
+    const int64_t capacity = opt_ctx->qat_moe_actual && kind == ggml_opt_context::qat_grad_state_kind::sparse_experts ? required_capacity : state.buffer
+        ? std::min<int64_t>(limit, std::max(required_capacity, 2 * state.capacity))
         : required_capacity;
-    const int64_t input = state.buffer ? std::max(input_capacity, 2 * state.input_capacity) : input_capacity;
+    const int64_t input_limit = kind == ggml_opt_context::qat_grad_state_kind::dense ? INT64_MAX : INT32_MAX - capacity;
+    const int64_t input = state.buffer ? std::max(input_capacity, std::min(input_limit, 2 * state.input_capacity)) : input_capacity;
     if (state.buffer) {
         ggml_backend_sched_synchronize(opt_ctx->backend_sched);
     }
     auto replacement = ggml_opt_qat_make_grad_state(opt_ctx->qat_params[index], kind, capacity, input, opt_ctx->qat_grad_accumulator_cpu);
     if (state.buffer) {
-        if (state.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows &&
+        if ((state.kind == ggml_opt_context::qat_grad_state_kind::sparse_rows || state.kind == ggml_opt_context::qat_grad_state_kind::sparse_experts) &&
             kind == ggml_opt_context::qat_grad_state_kind::dense) {
             ggml_opt_qat_copy_sparse_to_dense(state, replacement, opt_ctx->qat_params[index]);
         } else {
@@ -402,7 +424,8 @@ static ggml_opt_context::qat_grad_state & ggml_opt_qat_select_grad_state(
     opt_ctx->qat_grad_accumulator[index] = state.accumulator;
     GGML_LOG_INFO("QLion QAT: gradient state %s %s capacity=%" PRId64 " input=%" PRId64 " bytes=%zu\n",
         opt_ctx->qat_params[index]->name,
-        kind == ggml_opt_context::qat_grad_state_kind::sparse_rows ? "sparse_rows" : "dense",
+        kind == ggml_opt_context::qat_grad_state_kind::sparse_rows ? "sparse_rows" :
+            kind == ggml_opt_context::qat_grad_state_kind::sparse_experts ? "sparse_experts" : "dense",
         state.capacity, state.input_capacity,
         ggml_backend_buffer_get_size(state.buffer));
     return state;
@@ -1030,7 +1053,7 @@ static ggml_tensor * map_tensor(std::map<ggml_tensor *, ggml_tensor *> & tensor_
     return new_tensor;
 }
 
-static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
+static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src, std::map<ggml_tensor *, ggml_tensor *> * copies = nullptr) {
     std::map<ggml_tensor *, ggml_tensor *> tensor_map;
 
     ggml_cgraph * dst = ggml_new_graph_custom(ctx, src->size, /*grads =*/ true);
@@ -1052,10 +1075,13 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
         GGML_ASSERT(igrad_dst != GGML_HASHSET_FULL);
         GGML_ASSERT(ggml_bitset_get(dst->visited_hash_set.used, igrad_dst));
 
-        dst->grads[igrad_dst]     = src->grads[igrad_src];
-        dst->grad_accs[igrad_dst] = src->grad_accs[igrad_src];
+        dst->grads[igrad_dst]     = src->grads ? src->grads[igrad_src] : nullptr;
+        dst->grad_accs[igrad_dst] = src->grad_accs ? src->grad_accs[igrad_src] : nullptr;
     }
 
+    dst->order = src->order;
+    for (const auto & pair : tensor_map) pair.second->flags = pair.first->flags;
+    if (copies) *copies = std::move(tensor_map);
     return dst;
 }
 
@@ -1847,6 +1873,43 @@ if (!dumped_qat_placement &&
 
     }
 
+    if (!step && opt_ctx->qat_moe_fused && opt_ctx->opt_period > 1 && pending.size() == 1 &&
+            !(opt_ctx->qat_moe_actual && opt_ctx->qat_grad_states[i].kind == ggml_opt_context::qat_grad_state_kind::dense) &&
+            pending[0]->op == GGML_OP_OUT_PROD_ID && canonical_param->buffer &&
+            (ggml_backend_buffer_get_type(canonical_param->buffer) == ggml_backend_cpu_buffer_type() || opt_ctx->qat_moe_actual) &&
+            (!opt_ctx->qat_moe_auto || ggml_nelements(canonical_param) >= 4*1024*1024 ||
+             ggml_nelements(pending[0]->src[2]) <= (canonical_param->ne[2] - 1) / opt_ctx->opt_period)) {
+        const auto * outer = pending[0];
+        const int64_t inputs = ggml_nelements(outer->src[2]);
+        const int64_t experts = canonical_param->ne[2];
+        const int64_t capacity = opt_ctx->qat_moe_actual ? std::max<int64_t>(1, opt_ctx->qat_grad_states[i].capacity) :
+            std::min<int64_t>(experts, inputs > experts / opt_ctx->opt_period ? experts : inputs*opt_ctx->opt_period);
+        ggml_tensor * accumulated;
+        if (capacity > 0 && (capacity < experts || opt_ctx->qat_moe_actual) && capacity <= INT32_MAX / 4 && inputs <= INT32_MAX - capacity &&
+                opt_ctx->qat_grad_states[i].kind != ggml_opt_context::qat_grad_state_kind::dense) {
+            auto & state = ggml_opt_qat_select_grad_state(opt_ctx, i,
+                ggml_opt_context::qat_grad_state_kind::sparse_experts, capacity, inputs);
+            accumulated = ggml_acc_qlion_qat_experts(ctx, state.accumulator, state.row_ids, state.row_hash,
+                state.row_count, state.micro_slots, state.micro_next, outer->src[0], outer->src[1], outer->src[2],
+                experts, opt_ctx->opt_i == 0, state.rehash);
+            if (opt_ctx->qat_route_probe) {
+                opt_ctx->qat_route_accumulators.resize(opt_ctx->qat_params.size(), nullptr);
+                opt_ctx->qat_route_accumulators[i] = accumulated;
+            }
+            step = opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT ? ggml_opt_step_qlion_qat_experts(ctx,
+                canonical_param, accumulated, state.row_ids, state.row_count, opt_ctx->qat_momentum[i],
+                opt_ctx->qat_residual[i], step_params) : accumulated;
+        } else {
+            auto & state = ggml_opt_qat_select_grad_state(opt_ctx, i,
+                ggml_opt_context::qat_grad_state_kind::dense, ggml_nrows(canonical_param), 0);
+            accumulated = ggml_acc_qlion_qat_id(ctx, state.accumulator,
+                outer->src[0], outer->src[1], outer->src[2], opt_ctx->opt_i == 0);
+            step = opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT ? ggml_opt_step_qlion_qat(ctx,
+                canonical_param, accumulated, opt_ctx->qat_momentum[i], opt_ctx->qat_residual[i], step_params) : accumulated;
+        }
+        ggml_format_name(accumulated, "QLion fused routed Q8_0 accumulation for %s", canonical_param->name);
+    }
+
     if (!step) {
 
         ggml_tensor * combined =
@@ -2062,6 +2125,185 @@ if (!dumped_qat_placement &&
 
     return result;
 }
+static void ggml_opt_build_backward(ggml_opt_context_t opt_ctx) {
+    ggml_set_fused_backward(opt_ctx->ctx_compute, opt_ctx->fused_backward);
+    opt_ctx->recompute_regions = 0;
+    opt_ctx->recompute_nodes = 0;
+    opt_ctx->recompute_replacements.clear();
+    const auto optimizer = opt_ctx->optimizer;
+    const bool qlion_qat = ggml_opt_optimizer_is_qlion(optimizer);
+    const bool need_momenta = optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+    const bool need_q8_device_momenta = optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0;
+    const bool need_quantized_momenta = ggml_opt_optimizer_state_type(optimizer) != GGML_TYPE_COUNT;
+    // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
+    const int recompute_forward_nodes = opt_ctx->gf->n_nodes;
+    opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
+    if (qlion_qat) {
+        opt_ctx->qat_forward_nodes.clear();
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            opt_ctx->qat_forward_nodes.insert(opt_ctx->gf->nodes[i]);
+        }
+        opt_ctx->qat_pending_grads.assign(opt_ctx->qat_params.size(), {});
+        opt_ctx->qat_expected_grads.assign(opt_ctx->qat_params.size(), 0);
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            struct ggml_tensor * node = opt_ctx->gf->nodes[i];
+            if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+            for (size_t state = 0; state < opt_ctx->qat_aliases.size(); ++state) {
+                const auto & aliases = opt_ctx->qat_aliases[state];
+                if (std::find(aliases.begin(), aliases.end(), node) != aliases.end()) {
+                    opt_ctx->qat_expected_grads[state]++;
+                    break;
+                }
+            }
+        }
+        ggml_build_backward_expand_with_callback(
+            opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(),
+            ggml_opt_qlion_qat_backward_callback, opt_ctx);
+        if (qlion_qat && !opt_ctx->qat_route_probe &&
+            !opt_ctx->
+                qat_dependency_plan_ready) {
+
+            opt_ctx->
+                qat_dependency_plan_ready =
+                    true;
+
+            size_t dependency_count =
+                0;
+
+            for (const auto & plan :
+                opt_ctx->
+                    qat_dependency_plan) {
+
+                dependency_count +=
+                    plan.size();
+            }
+
+            GGML_LOG_INFO(
+                "%s: cached QLion dependency plan: %zu dependencies across %zu states\n",
+                __func__,
+                dependency_count,
+                opt_ctx->
+                    qat_dependency_plan.size()
+            );
+        }
+    } else {
+        ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    }
+    ggml_opt_prepare_recompute(opt_ctx, recompute_forward_nodes);
+    opt_ctx->gb_grad = ggml_opt_apply_recompute(opt_ctx, recompute_forward_nodes);
+
+    if (need_quantized_momenta) {
+        const enum ggml_type state_type = ggml_opt_optimizer_state_type(opt_ctx->optimizer);
+        const ggml_type_traits * traits = ggml_get_type_traits(state_type);
+        GGML_ASSERT(traits->to_float && traits->from_float_ref);
+        ggml_quantize_init(state_type);
+
+        opt_ctx->quantized_params.clear();
+        opt_ctx->quantized_grads.clear();
+        size_t state_i = 0;
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            ggml_tensor * node = opt_ctx->gf->nodes[i];
+            ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_grad, node);
+            if (!grad || !(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+            GGML_ASSERT(node->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32);
+            if (need_q8_device_momenta && opt_ctx->grad_m[i]) {
+                continue;
+            }
+            const int64_t ne = ggml_nelements(node);
+            const enum ggml_type state_type_v = state_type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+            const int64_t block_size = std::max(ggml_blck_size(state_type), ggml_blck_size(state_type_v));
+            const int64_t ne_padded = ((ne + block_size - 1)/block_size)*block_size;
+            if (state_i == opt_ctx->quantized_states.size()) {
+                ggml_opt_context::quantized_state state;
+                state.ne = ne;
+                state.ne_padded = ne_padded;
+                const size_t nbytes = ggml_row_size(state_type, ne_padded);
+                state.m.resize(nbytes);
+                state.v.resize(ggml_row_size(state_type_v, ne_padded));
+                std::vector<float> zeros(ne_padded, 0.0f);
+                traits->from_float_ref(zeros.data(), state.m.data(), ne_padded);
+                ggml_get_type_traits(state_type_v)->from_float_ref(zeros.data(), state.v.data(), ne_padded);
+                opt_ctx->quantized_states.push_back(std::move(state));
+            } else {
+                GGML_ASSERT(opt_ctx->quantized_states[state_i].ne == ne);
+            }
+            opt_ctx->quantized_params.push_back(node);
+            opt_ctx->quantized_grads.push_back(grad);
+            state_i++;
+        }
+        GGML_ASSERT(state_i == opt_ctx->quantized_states.size());
+    }
+
+    if (opt_ctx->buf_static) {
+        if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
+            return;
+        }
+    } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
+        opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
+        ggml_graph_reset(opt_ctx->gb_grad);
+        return;
+    }
+
+    GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
+
+    // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
+    opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
+
+    ggml_tensor * adamw_params = opt_ctx->opt_step_params;
+    const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
+    for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
+        struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
+        struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
+
+        if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+            struct ggml_tensor * m = nullptr;
+            struct ggml_tensor * v = nullptr;
+            if (need_momenta) {
+                m = opt_ctx->grad_m[i];
+                v = opt_ctx->grad_v[i];
+                ggml_format_name(m, "AdamW m for %s", node->name);
+                ggml_format_name(v, "AdamW v for %s", node->name);
+            } else if (need_q8_device_momenta && opt_ctx->grad_m[i]) {
+                m = opt_ctx->grad_m[i];
+                v = opt_ctx->grad_v[i];
+                ggml_format_name(m, "AdamW Q8_0 m for %s", node->name);
+                ggml_format_name(v, "AdamW Q8_0 v for %s", node->name);
+            }
+            struct ggml_tensor * opt_step;
+            switch (optimizer) {
+                case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
+                    opt_step = ggml_opt_step_adamw(opt_ctx->ctx_compute, node, grad, m, v, adamw_params);
+                    break;
+                case GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0:
+                    if (!m || !v) {
+                        continue;
+                    }
+                    opt_step = ggml_opt_step_adamw(opt_ctx->ctx_compute, node, grad, m, v, adamw_params);
+                    break;
+                case GGML_OPT_OPTIMIZER_TYPE_SGD:
+                    opt_step = ggml_opt_step_sgd(opt_ctx->ctx_compute, node, grad, adamw_params);
+                    break;
+                default:
+                    continue;
+            }
+            ggml_format_name(opt_step, "%s step for %s", optimizer_name, node->name);
+            ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
+        }
+    }
+
+    if (!opt_ctx->buf_static) {
+        opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
+            opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
+        ggml_graph_reset(opt_ctx->gb_opt);
+    }
+
+    if (!opt_ctx->buf_cpu) opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     opt_ctx->recompute_regions = 0;
     opt_ctx->recompute_nodes = 0;
@@ -2080,8 +2322,6 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     const bool need_q8_device_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0;
-    const bool need_quantized_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
-        ggml_opt_optimizer_state_type(opt_ctx->optimizer) != GGML_TYPE_COUNT;
     const bool need_qat_state = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && qlion_qat;
 
     ggml_set_input(opt_ctx->inputs);
@@ -2414,6 +2654,22 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         return;
     }
 
+    if (qlion_qat && !opt_ctx->grad_accs.empty()) {
+        ggml_tensor * seed = nullptr;
+        for (auto * grad : opt_ctx->grad_accs) {
+            if (grad) {
+                GGML_ASSERT(!seed && ggml_is_scalar(grad));
+                seed = grad;
+            }
+        }
+        GGML_ASSERT(seed);
+        // Dynamic graphs can move the loss node when masking or views change.
+        opt_ctx->grad_accs.assign(opt_ctx->gf->n_nodes, nullptr);
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            if (opt_ctx->gf->nodes[i]->flags & GGML_TENSOR_FLAG_LOSS) opt_ctx->grad_accs[i] = seed;
+        }
+    }
+
     if (opt_ctx->grad_accs.empty()) {
         GGML_ASSERT(opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD);
 
@@ -2736,173 +2992,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
 
-    // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
-    const int recompute_forward_nodes = opt_ctx->gf->n_nodes;
-    opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
-    if (qlion_qat) {
-        opt_ctx->qat_forward_nodes.clear();
-        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
-            opt_ctx->qat_forward_nodes.insert(opt_ctx->gf->nodes[i]);
-        }
-        opt_ctx->qat_pending_grads.assign(opt_ctx->qat_params.size(), {});
-        opt_ctx->qat_expected_grads.assign(opt_ctx->qat_params.size(), 0);
-        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
-            struct ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
-                continue;
-            }
-            for (size_t state = 0; state < opt_ctx->qat_aliases.size(); ++state) {
-                const auto & aliases = opt_ctx->qat_aliases[state];
-                if (std::find(aliases.begin(), aliases.end(), node) != aliases.end()) {
-                    opt_ctx->qat_expected_grads[state]++;
-                    break;
-                }
-            }
-        }
-        ggml_build_backward_expand_with_callback(
-            opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(),
-            ggml_opt_qlion_qat_backward_callback, opt_ctx);
-        if (qlion_qat &&
-            !opt_ctx->
-                qat_dependency_plan_ready) {
-
-            opt_ctx->
-                qat_dependency_plan_ready =
-                    true;
-
-            size_t dependency_count =
-                0;
-
-            for (const auto & plan :
-                opt_ctx->
-                    qat_dependency_plan) {
-
-                dependency_count +=
-                    plan.size();
-            }
-
-            GGML_LOG_INFO(
-                "%s: cached QLion dependency plan: %zu dependencies across %zu states\n",
-                __func__,
-                dependency_count,
-                opt_ctx->
-                    qat_dependency_plan.size()
-            );
-        }
-    } else {
-        ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
-    }
-    ggml_opt_prepare_recompute(opt_ctx, recompute_forward_nodes);
-    opt_ctx->gb_grad = ggml_opt_apply_recompute(opt_ctx, recompute_forward_nodes);
-
-    if (need_quantized_momenta) {
-        const enum ggml_type state_type = ggml_opt_optimizer_state_type(opt_ctx->optimizer);
-        const ggml_type_traits * traits = ggml_get_type_traits(state_type);
-        GGML_ASSERT(traits->to_float && traits->from_float_ref);
-        ggml_quantize_init(state_type);
-
-        opt_ctx->quantized_params.clear();
-        opt_ctx->quantized_grads.clear();
-        size_t state_i = 0;
-        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
-            ggml_tensor * node = opt_ctx->gf->nodes[i];
-            ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_grad, node);
-            if (!grad || !(node->flags & GGML_TENSOR_FLAG_PARAM)) {
-                continue;
-            }
-            GGML_ASSERT(node->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32);
-            if (need_q8_device_momenta && opt_ctx->grad_m[i]) {
-                continue;
-            }
-            const int64_t ne = ggml_nelements(node);
-            const enum ggml_type state_type_v = state_type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
-            const int64_t block_size = std::max(ggml_blck_size(state_type), ggml_blck_size(state_type_v));
-            const int64_t ne_padded = ((ne + block_size - 1)/block_size)*block_size;
-            if (state_i == opt_ctx->quantized_states.size()) {
-                ggml_opt_context::quantized_state state;
-                state.ne = ne;
-                state.ne_padded = ne_padded;
-                const size_t nbytes = ggml_row_size(state_type, ne_padded);
-                state.m.resize(nbytes);
-                state.v.resize(ggml_row_size(state_type_v, ne_padded));
-                std::vector<float> zeros(ne_padded, 0.0f);
-                traits->from_float_ref(zeros.data(), state.m.data(), ne_padded);
-                ggml_get_type_traits(state_type_v)->from_float_ref(zeros.data(), state.v.data(), ne_padded);
-                opt_ctx->quantized_states.push_back(std::move(state));
-            } else {
-                GGML_ASSERT(opt_ctx->quantized_states[state_i].ne == ne);
-            }
-            opt_ctx->quantized_params.push_back(node);
-            opt_ctx->quantized_grads.push_back(grad);
-            state_i++;
-        }
-        GGML_ASSERT(state_i == opt_ctx->quantized_states.size());
-    }
-
-    if (opt_ctx->buf_static) {
-        if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
-            return;
-        }
-    } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
-        opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        ggml_graph_reset(opt_ctx->gb_grad);
-        return;
-    }
-
-    GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
-
-    // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
-    opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
-
-    ggml_tensor * adamw_params = opt_ctx->opt_step_params;
-    const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
-    for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
-        struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
-        struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
-
-        if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
-            struct ggml_tensor * m = nullptr;
-            struct ggml_tensor * v = nullptr;
-            if (need_momenta) {
-                m = opt_ctx->grad_m[i];
-                v = opt_ctx->grad_v[i];
-                ggml_format_name(m, "AdamW m for %s", node->name);
-                ggml_format_name(v, "AdamW v for %s", node->name);
-            } else if (need_q8_device_momenta && opt_ctx->grad_m[i]) {
-                m = opt_ctx->grad_m[i];
-                v = opt_ctx->grad_v[i];
-                ggml_format_name(m, "AdamW Q8_0 m for %s", node->name);
-                ggml_format_name(v, "AdamW Q8_0 v for %s", node->name);
-            }
-            struct ggml_tensor * opt_step;
-            switch (optimizer) {
-                case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
-                    opt_step = ggml_opt_step_adamw(opt_ctx->ctx_compute, node, grad, m, v, adamw_params);
-                    break;
-                case GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0:
-                    if (!m || !v) {
-                        continue;
-                    }
-                    opt_step = ggml_opt_step_adamw(opt_ctx->ctx_compute, node, grad, m, v, adamw_params);
-                    break;
-                case GGML_OPT_OPTIMIZER_TYPE_SGD:
-                    opt_step = ggml_opt_step_sgd(opt_ctx->ctx_compute, node, grad, adamw_params);
-                    break;
-                default:
-                    continue;
-            }
-            ggml_format_name(opt_step, "%s step for %s", optimizer_name, node->name);
-            ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
-        }
-    }
-
-    if (!opt_ctx->buf_static) {
-        opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
-            opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        ggml_graph_reset(opt_ctx->gb_opt);
-    }
-
-    opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
+    ggml_opt_build_backward(opt_ctx);
 }
 
 ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
@@ -2983,6 +3073,7 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     ggml_free(opt_ctx->ctx_static);
     ggml_free(opt_ctx->ctx_cpu);
     ggml_free(opt_ctx->ctx_copy);
+    ggml_free(opt_ctx->ctx_route_backward);
     delete opt_ctx;
 }
 
@@ -3211,14 +3302,43 @@ void ggml_opt_prepare_alloc(
         struct ggml_tensor  * inputs,
         struct ggml_tensor  * outputs) {
     GGML_ASSERT(!opt_ctx->static_graphs);
+    opt_ctx->allocated_graph = nullptr;
+    opt_ctx->allocated_graph_copy = nullptr;
     opt_ctx->ctx_compute = ctx_compute;
     opt_ctx->gf          = gf;
     opt_ctx->inputs      = inputs;
     opt_ctx->outputs     = outputs;
 }
 
+void ggml_opt_set_qlion_moe_compact(ggml_opt_context_t opt_ctx, bool enabled) {
+    GGML_ASSERT(!enabled || ggml_opt_optimizer_is_qlion(opt_ctx->optimizer));
+    GGML_ASSERT(!opt_ctx->static_graphs && !opt_ctx->eval_ready && opt_ctx->opt_i == 0);
+    opt_ctx->qat_moe_actual = enabled;
+    if (enabled) {
+        opt_ctx->qat_moe_fused = true;
+        opt_ctx->qat_moe_auto = false;
+    }
+}
+
+void ggml_opt_set_qlion_moe_fused(ggml_opt_context_t opt_ctx, bool enabled) {
+    GGML_ASSERT(!opt_ctx->eval_ready && opt_ctx->opt_i == 0);
+    opt_ctx->qat_moe_fused = enabled;
+    opt_ctx->qat_moe_auto = false;
+}
+
+bool ggml_opt_is_optimizer_step(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->opt_i + 1 == opt_ctx->opt_period;
+}
+
+void ggml_opt_retain_graph(ggml_opt_context_t opt_ctx, bool retain) {
+    GGML_ASSERT(!opt_ctx->static_graphs && !opt_ctx->eval_ready);
+    GGML_ASSERT(!retain || opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
+    opt_ctx->retain_graph = retain;
+}
+
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(!opt_ctx->retain_graph || backward);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
@@ -3230,7 +3350,11 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->build_type = GGML_OPT_BUILD_TYPE_FORWARD;
     }
 
-    if (!opt_ctx->static_graphs) {
+    if (!opt_ctx->static_graphs && (!opt_ctx->retain_graph || !opt_ctx->allocated_graph)) {
+        opt_ctx->qat_route_probe = opt_ctx->qat_moe_actual && opt_ctx->opt_period > 1 && backward;
+        opt_ctx->qat_route_accumulators.assign(opt_ctx->qat_params.size(), nullptr);
+        ggml_free(opt_ctx->ctx_route_backward);
+        opt_ctx->ctx_route_backward = nullptr;
         ggml_opt_build(opt_ctx);
     }
 
@@ -3254,22 +3378,53 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(graph);
 
     if (opt_ctx->allocated_graph == graph) {
+        if (opt_ctx->retain_graph) {
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                auto * node = graph->nodes[i];
+                if (node->op == GGML_OP_ACC_QLION_QAT || node->op == GGML_OP_ACC_QLION_QAT_ROWS) {
+                    ggml_set_op_params_i32(node, 0, opt_ctx->opt_i == 0);
+                    if (node->op == GGML_OP_ACC_QLION_QAT_ROWS) ggml_set_op_params_i32(node, 1, 0);
+                }
+            }
+        }
+        if (!opt_ctx->static_graphs && backward) ggml_graph_reset(opt_ctx->gb_grad);
         opt_ctx->eval_ready = true;
         return;
     }
 
+    std::map<ggml_tensor *, std::vector<uint8_t>> probe_inputs;
+    if (opt_ctx->qat_route_probe) {
+        auto preserve = [&](ggml_tensor * tensor) {
+            if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT)) return;
+            auto & bytes = probe_inputs[tensor];
+            bytes.resize(ggml_nbytes(tensor), 0);
+            if (tensor->buffer && !bytes.empty()) ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+        };
+        for (int i = 0; i < graph->n_nodes; ++i) preserve(graph->nodes[i]);
+        for (int i = 0; i < graph->n_leafs; ++i) preserve(graph->leafs[i]);
+    }
     ggml_backend_sched_reset(opt_ctx->backend_sched); // clear allocation of previous graph
 
-    if (opt_ctx->static_graphs) {
+    if (opt_ctx->static_graphs || opt_ctx->qat_route_probe) {
         ggml_init_params params = {
-            /*.mem_size   =*/ graph->size*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph->size, graph->grads),
+            /*.mem_size   =*/ 2*graph->size*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph->size, graph->grads || opt_ctx->qat_route_probe),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
         ggml_free(opt_ctx->ctx_copy);
         opt_ctx->ctx_copy = ggml_init(params);
 
-        opt_ctx->allocated_graph_copy = dup_graph(opt_ctx->ctx_copy, graph);
+        opt_ctx->allocated_graph_copy = dup_graph(opt_ctx->ctx_copy, graph, opt_ctx->qat_route_probe ? &opt_ctx->route_tensor_copies : nullptr);
+        if (opt_ctx->qat_route_probe) {
+            for (const auto & entry : opt_ctx->route_tensor_copies) {
+                auto * copy = entry.second;
+                if (copy->op != GGML_OP_NONE || (copy->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    copy->data = nullptr;
+                    copy->buffer = nullptr;
+                    copy->extra = nullptr;
+                }
+            }
+        }
     } else {
         opt_ctx->allocated_graph_copy = graph;
     }
@@ -3301,7 +3456,20 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
             }
         }
     }
-    ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy));
+    if (opt_ctx->qat_route_probe) {
+        opt_ctx->route_inputs.clear();
+        auto bind = [&](ggml_tensor * original, ggml_tensor * copy) {
+            if (!(original->flags & GGML_TENSOR_FLAG_INPUT)) return;
+            const auto & initial = probe_inputs.at(original);
+            if (!initial.empty()) ggml_backend_tensor_set(copy, initial.data(), 0, initial.size());
+            opt_ctx->route_inputs.push_back({original, original->data, original->buffer, original->extra});
+            original->data = copy->data;
+            original->buffer = copy->buffer;
+            original->extra = copy->extra;
+        };
+        for (const auto & pair : opt_ctx->route_tensor_copies) bind(pair.first, pair.second);
+    }
     opt_ctx->allocated_graph = graph;
 
     if (!opt_ctx->static_graphs && backward && opt_ctx->opt_i == 0) {
@@ -3309,6 +3477,118 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     opt_ctx->eval_ready = true;
+}
+
+static void ggml_opt_plan_actual_routes(ggml_opt_context_t opt_ctx) {
+    std::vector<std::pair<ggml_tensor *, ggml_backend_t>> forward_backends;
+    for (auto * tensor : opt_ctx->qat_forward_nodes) {
+        if (tensor->op == GGML_OP_NONE) continue;
+        auto * copy = opt_ctx->route_tensor_copies.at(tensor);
+        auto * backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, copy);
+        if (backend) forward_backends.emplace_back(tensor, backend);
+    }
+    std::vector<std::vector<uint8_t>> inputs;
+    for (const auto & binding : opt_ctx->route_inputs) {
+        inputs.emplace_back(ggml_nbytes(binding.tensor));
+        ggml_backend_tensor_get(binding.tensor, inputs.back().data(), 0, inputs.back().size());
+    }
+    GGML_ASSERT(ggml_backend_sched_graph_compute_prefix(opt_ctx->backend_sched, opt_ctx->gf->n_nodes) == GGML_STATUS_SUCCESS);
+    auto copied = [&](ggml_tensor * source) { return opt_ctx->route_tensor_copies.at(source); };
+    for (size_t index = 0; index < opt_ctx->qat_route_accumulators.size(); ++index) {
+        auto * accumulation = opt_ctx->qat_route_accumulators[index];
+        if (!accumulation) continue;
+        const auto * param = opt_ctx->qat_params[index];
+        auto & state = opt_ctx->qat_grad_states[index];
+        if (state.kind == ggml_opt_context::qat_grad_state_kind::dense) continue;
+        auto * accumulation_backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, copied(accumulation));
+        auto * gradient_backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, copied(accumulation->src[6]));
+        if (accumulation_backend && gradient_backend &&
+                ggml_backend_dev_type(ggml_backend_get_device(accumulation_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                ggml_backend_dev_type(ggml_backend_get_device(gradient_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            // Keep the dense GPU reduction when the expert state resides on CPU.
+            ggml_opt_qat_select_grad_state(opt_ctx, index, ggml_opt_context::qat_grad_state_kind::dense,
+                ggml_nrows(param), 0);
+            GGML_LOG_INFO("QLion QAT: compact fallback for %s: GPU gradient with CPU expert state\n", param->name);
+            continue;
+        }
+        // The scheduler can replace CPU routes with a retained device copy.
+        auto * source = copied(accumulation)->src[7];
+        std::set<int32_t> active;
+        if (opt_ctx->opt_i != 0 && state.buffer) {
+            int32_t count;
+            ggml_backend_tensor_get(state.row_count, &count, 0, sizeof(count));
+            GGML_ASSERT(count >= 0 && count <= state.capacity);
+            std::vector<int32_t> previous(count);
+            ggml_backend_tensor_get(state.row_ids, previous.data(), 0, count*sizeof(int32_t));
+            active.insert(previous.begin(), previous.end());
+        } else if (state.buffer) {
+            ggml_opt_qat_free_grad_state(state);
+        }
+        std::vector<uint8_t> bytes(ggml_nbytes(source));
+        ggml_backend_tensor_get(source, bytes.data(), 0, bytes.size());
+        for (int64_t token = 0; token < source->ne[1]; ++token) {
+            for (int64_t used = 0; used < source->ne[0]; ++used) {
+                int32_t expert;
+                memcpy(&expert, bytes.data() + used*source->nb[0] + token*source->nb[1], sizeof(expert));
+                GGML_ASSERT(expert >= 0 && expert < param->ne[2]);
+                active.insert(expert);
+            }
+        }
+        if (active.empty()) active.insert(0);
+        ggml_opt_qat_select_grad_state(opt_ctx, index, ggml_opt_context::qat_grad_state_kind::sparse_experts,
+            active.size(), ggml_nelements(source));
+    }
+    ggml_backend_sched_reset(opt_ctx->backend_sched);
+    for (const auto & binding : opt_ctx->route_inputs) {
+        binding.tensor->data = binding.data;
+        binding.tensor->buffer = binding.buffer;
+        binding.tensor->extra = binding.extra;
+    }
+    for (auto * tensor : opt_ctx->qat_forward_nodes) {
+        if (tensor->op != GGML_OP_NONE) {
+            tensor->data = nullptr;
+            tensor->buffer = nullptr;
+            tensor->extra = nullptr;
+        }
+    }
+    for (const auto & binding : opt_ctx->route_inputs) {
+        binding.tensor->data = nullptr;
+        binding.tensor->buffer = nullptr;
+        binding.tensor->extra = nullptr;
+    }
+    opt_ctx->qat_route_probe = false;
+    const size_t size = opt_ctx->gf->size;
+    ggml_init_params allocation = { 16*size*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size, true), nullptr, true };
+    opt_ctx->ctx_route_backward = ggml_init(allocation);
+    GGML_ASSERT(opt_ctx->ctx_route_backward);
+    auto * original = opt_ctx->ctx_compute;
+    opt_ctx->ctx_compute = opt_ctx->ctx_route_backward;
+    ggml_opt_build_backward(opt_ctx);
+    opt_ctx->ctx_compute = original;
+    opt_ctx->allocated_graph = opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT ? opt_ctx->gb_opt : opt_ctx->gb_grad;
+    opt_ctx->allocated_graph_copy = opt_ctx->allocated_graph;
+    for (const auto & binding : forward_backends) {
+        ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, binding.first, binding.second);
+    }
+    for (int backend_index = 0; backend_index < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++backend_index) {
+        auto * backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, backend_index);
+        const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+        for (int node_index = 0; node_index < opt_ctx->allocated_graph->n_nodes; ++node_index) {
+            auto * node = opt_ctx->allocated_graph->nodes[node_index];
+            if (opt_ctx->qat_forward_nodes.count(node) || node->buffer) continue;
+            const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
+                node->src[0] && node->src[0]->type == GGML_TYPE_F32;
+            if (((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) && device_type == GGML_BACKEND_DEVICE_TYPE_GPU) ||
+                (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && device_type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                if (ggml_backend_supports_op(backend, node)) ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, backend);
+            }
+        }
+    }
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph));
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        ggml_backend_tensor_set(opt_ctx->route_inputs[i].tensor, inputs[i].data(), 0, inputs[i].size());
+    }
+    if (opt_ctx->opt_i == 0) ggml_graph_reset(opt_ctx->gb_grad);
 }
 
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
@@ -3385,6 +3665,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
+    if (opt_ctx->qat_route_probe) ggml_opt_plan_actual_routes(opt_ctx);
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     for (auto & state : opt_ctx->qat_grad_states) {
         state.rehash = false;
@@ -3401,7 +3682,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         opt_ctx->opt_period = opt_ctx->configured_opt_period;
     }
 
-    if (!opt_ctx->static_graphs) {
+    if (!opt_ctx->static_graphs && !opt_ctx->retain_graph) {
         opt_ctx->gf                   = nullptr;
         opt_ctx->gb_grad              = nullptr;
         opt_ctx->gb_opt               = nullptr;

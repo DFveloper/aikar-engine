@@ -3933,6 +3933,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     if (cparams.kv_paged) { throw std::runtime_error("paged KV does not support training"); }
     GGML_ASSERT(!opt_ctx);
     opt_ctx_compute_cache.reset();
+    opt_graph_cached = nullptr;
+    opt_supervised_tokens = 0;
+    opt_step_started_us = 0;
 
     opt_ctx_compute_cache_size = 0;
     opt_model  = model;
@@ -4139,6 +4142,7 @@ bool llama_context::opt_suspend() {
 
     ggml_backend_sched_synchronize(sched.get());
     ggml_opt_set_backend_sched(opt_ctx, nullptr);
+    opt_graph_cached = nullptr;
     opt_ctx_compute_cache.reset();
     opt_ctx_compute_cache_size = 0;
     sched.reset();
@@ -4243,6 +4247,14 @@ void llama_context::opt_epoch_iter(
     std::vector<int32_t> accuracy_targets_host(n_ubatch);
     std::vector<float> sparse_weights_host(n_ubatch);
 
+    const bool retain_graph = opt_graph_reuse && !opt_moe_compact && train && opt_params.train_target && !(train_mtp && opt_mtp_context) &&
+        !critical_metadata && !source_embd && n_ctx == n_batch && !opt_params.activation_recompute &&
+        std::all_of(backend_ptrs.begin(), backend_ptrs.end(), [](ggml_backend_t backend) {
+            return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                strncmp(ggml_backend_name(backend), "CUDA", 4) == 0;
+        });
+    ggml_opt_retain_graph(opt_ctx, retain_graph);
+    if (!retain_graph) opt_graph_cached = nullptr;
     if (clear_memory) {
         memory->clear(true);
     }
@@ -4340,157 +4352,170 @@ void llama_context::opt_epoch_iter(
 
             auto * res = get_gf_res_prev();
 
+            const bool measure_step = train && opt_params.train_target && ggml_opt_optimizer_is_qlion(opt_params.optimizer_type);
+            if (measure_step && opt_step_started_us == 0) opt_step_started_us = ggml_time_us();
             const int64_t t0_build = ggml_time_ms();
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), train);
 
-            // the optimizer graph is allocated outside sched, so the next decode must rebuild
-            gf_res_prev_active = nullptr;
-            res->reset();
+            auto * gf = res->get_gf();
+            int64_t t1_alloc = t0_build;
+            const bool optimizer_step = ggml_opt_is_optimizer_step(opt_ctx);
+            const bool reuse_graph = retain_graph && opt_graph_cached == res && opt_graph_cached_step == optimizer_step && res->can_reuse(gparams);
+            if (!reuse_graph) {
+                // the optimizer graph is allocated outside sched, so the next decode must rebuild
+                gf_res_prev_active = nullptr;
+                res->reset();
 
-            auto * gf = model.build_graph(gparams);
+                gf = model.build_graph(gparams);
 
-            const bool target_backward = train && opt_params.train_target;
+                const bool target_backward = train && opt_params.train_target;
 
-            // Allocate the tensor metadata context once, then reset it each iteration.
-            // ggml_reset() is much cheaper than ggml_free()+ggml_init() — it just resets the
-            // allocation pointer without freeing/reallocating the backing memory buffer.
-            const size_t size_gf =
-                ggml_graph_size(gf);
+                // Allocate the tensor metadata context once, then reset it each iteration.
+                // ggml_reset() is much cheaper than ggml_free()+ggml_init() - it just resets the
+                // allocation pointer without freeing/reallocating the backing memory buffer.
+                const size_t size_gf =
+                    ggml_graph_size(gf);
 
-            const size_t size_meta =
-                4 *
-                    size_gf *
-                    ggml_tensor_overhead() +
-                3 *
-                    ggml_graph_overhead_custom(
-                        size_gf,
-                        /*grads=*/ true
+                const size_t size_meta =
+                    4 *
+                        size_gf *
+                        ggml_tensor_overhead() +
+                    3 *
+                        ggml_graph_overhead_custom(
+                            size_gf,
+                            /*grads=*/ true
+                        );
+
+                if (!opt_ctx_compute_cache ||
+                    opt_ctx_compute_cache_size <
+                        size_meta) {
+
+                    struct ggml_init_params params = {
+                        /*.mem_size   =*/
+                            size_meta,
+
+                        /*.mem_buffer =*/
+                            nullptr,
+
+                        /*.no_alloc   =*/
+                            true,
+                    };
+
+                    opt_ctx_compute_cache.reset(
+                        ggml_init(params)
                     );
 
-            if (!opt_ctx_compute_cache ||
-                opt_ctx_compute_cache_size <
-                    size_meta) {
+                    GGML_ASSERT(
+                        opt_ctx_compute_cache
+                    );
 
-                struct ggml_init_params params = {
-                    /*.mem_size   =*/
-                        size_meta,
+                    opt_ctx_compute_cache_size =
+                        size_meta;
 
-                    /*.mem_buffer =*/
-                        nullptr,
+                    if (!timings_printed) {
+                        LLAMA_LOG_INFO(
+                            "%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n",
+                            __func__,
+                            size_gf,
+                            ggml_graph_n_nodes(gf),
+                            (double) size_meta /
+                                (1024 * 1024)
+                        );
+                    }
 
-                    /*.no_alloc   =*/
-                        true,
-                };
+                } else {
 
-                opt_ctx_compute_cache.reset(
-                    ggml_init(params)
-                );
-
-                GGML_ASSERT(
-                    opt_ctx_compute_cache
-                );
-
-                opt_ctx_compute_cache_size =
-                    size_meta;
-
-                if (!timings_printed) {
-                    LLAMA_LOG_INFO(
-                        "%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n",
-                        __func__,
-                        size_gf,
-                        ggml_graph_n_nodes(gf),
-                        (double) size_meta /
-                            (1024 * 1024)
+                    ggml_reset(
+                        opt_ctx_compute_cache.get()
                     );
                 }
 
-            } else {
+                struct ggml_context *
+                    ctx_compute_opt =
+                        opt_ctx_compute_cache.get();
 
-                ggml_reset(
-                    opt_ctx_compute_cache.get()
-                );
-            }
+                t1_alloc = ggml_time_ms();
 
-            struct ggml_context *
-                ctx_compute_opt =
-                    opt_ctx_compute_cache.get();
+                if (confidence_weighting) {
+                    const int32_t n_active_ubatch = zero_label_sentinel ? 0 : (int32_t) supervised_rows.size();
 
-            const int64_t t1_alloc = ggml_time_ms();
+                    int32_t max_tokens = -1;
 
-            if (confidence_weighting) {
-                const int32_t n_active_ubatch = zero_label_sentinel ? 0 : (int32_t) supervised_rows.size();
+                    if (opt_params.critical_max_fraction < 1.0f &&
+                        n_active_ubatch > 0) {
 
-                int32_t max_tokens = -1;
+                        const int32_t requested_max_tokens =
+                            (int32_t) std::floor(
+                                n_active_ubatch *
+                                opt_params.critical_max_fraction);
 
-                if (opt_params.critical_max_fraction < 1.0f &&
-                    n_active_ubatch > 0) {
+                        // max_tokens == 0 currently crashes the critical-token path.
+                        // Preserve floor behavior normally, but guarantee at least one
+                        // slot when there is at least one active token.
+                        max_tokens = std::max<int32_t>(
+                            1,
+                            requested_max_tokens);
+                    }
 
-                    const int32_t requested_max_tokens =
-                        (int32_t) std::floor(
-                            n_active_ubatch *
-                            opt_params.critical_max_fraction);
-
-                    // max_tokens == 0 currently crashes the critical-token path.
-                    // Preserve floor behavior normally, but guarantee at least one
-                    // slot when there is at least one active token.
-                    max_tokens = std::max<int32_t>(
-                        1,
-                        requested_max_tokens);
+                    ggml_opt_set_critical_max_tokens(
+                        opt_ctx,
+                        max_tokens);
                 }
 
-                ggml_opt_set_critical_max_tokens(
+                ggml_opt_prepare_alloc(
                     opt_ctx,
-                    max_tokens);
-            }
+                    ctx_compute_opt,
+                    gf,
+                    res->get_inp_tokens(),
+                    res->get_logits());
 
-            ggml_opt_prepare_alloc(
-                opt_ctx,
-                ctx_compute_opt,
-                gf,
-                res->get_inp_tokens(),
-                res->get_logits());
-
-            // MTP-only training still needs this forward graph for h_nextn, but
-            // it must not try to build a target backward graph with no params.
-            ggml_opt_alloc(opt_ctx, target_backward);
-            if (target_backward && opt_params.activation_recompute && ggml_opt_recompute_regions(opt_ctx) == 0) {
-                throw std::runtime_error("activation recompute is not supported by this training graph");
-            }
-
-            static bool training_placement_printed = false;
-            if (train && !training_placement_printed) {
-                size_t n_cpu_nodes = 0;
-                size_t n_cpu_bytes = 0;
-                std::fprintf(stderr, "qlora placement: inspecting first training graph\n");
-                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                    ggml_tensor * node = ggml_graph_node(gf, i);
-                    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
-                    if (!backend || ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                        continue;
-                    }
-                    ++n_cpu_nodes;
-                    n_cpu_bytes += ggml_nbytes(node);
-                    if (n_cpu_nodes <= 8) {
-                        std::fprintf(stderr, "qlora placement: CPU node %s (%s, %.2f MiB)\n",
-                                node->name, ggml_op_name(node->op), ggml_nbytes(node)/(1024.0*1024.0));
-                    }
+                // MTP-only training still needs this forward graph for h_nextn, but
+                // it must not try to build a target backward graph with no params.
+                ggml_opt_alloc(opt_ctx, target_backward);
+                if (target_backward && opt_params.activation_recompute && ggml_opt_recompute_regions(opt_ctx) == 0) {
+                    throw std::runtime_error("activation recompute is not supported by this training graph");
                 }
-                std::fprintf(stderr, "qlora placement: graph splits=%d CPU nodes=%zu CPU node bytes=%.2f MiB\n",
-                        ggml_backend_sched_get_n_splits(sched.get()), n_cpu_nodes, n_cpu_bytes/(1024.0*1024.0));
-                if (opt_params.activation_recompute) {
-                    std::fprintf(stderr, "qlora placement: activation recompute regions=%d replay nodes=%d\n",
-                            ggml_opt_recompute_regions(opt_ctx), ggml_opt_recompute_nodes(opt_ctx));
-                }
-                for (ggml_backend_t backend : backend_ptrs) {
-                    if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                        std::fprintf(stderr, "qlora placement: %s scheduler buffer=%.2f MiB\n",
-                                ggml_backend_name(backend),
-                                ggml_backend_sched_get_buffer_size(sched.get(), backend)/(1024.0*1024.0));
-                    }
-                }
-                training_placement_printed = true;
-            }
 
+                static bool training_placement_printed = false;
+                if (train && !training_placement_printed) {
+                    size_t n_cpu_nodes = 0;
+                    size_t n_cpu_bytes = 0;
+                    std::fprintf(stderr, "qlora placement: inspecting first training graph\n");
+                    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                        ggml_tensor * node = ggml_graph_node(gf, i);
+                        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                        if (!backend || ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            continue;
+                        }
+                        ++n_cpu_nodes;
+                        n_cpu_bytes += ggml_nbytes(node);
+                        if (n_cpu_nodes <= 8) {
+                            std::fprintf(stderr, "qlora placement: CPU node %s (%s, %.2f MiB)\n",
+                                    node->name, ggml_op_name(node->op), ggml_nbytes(node)/(1024.0*1024.0));
+                        }
+                    }
+                    std::fprintf(stderr, "qlora placement: graph splits=%d CPU nodes=%zu CPU node bytes=%.2f MiB\n",
+                            ggml_backend_sched_get_n_splits(sched.get()), n_cpu_nodes, n_cpu_bytes/(1024.0*1024.0));
+                    if (opt_params.activation_recompute) {
+                        std::fprintf(stderr, "qlora placement: activation recompute regions=%d replay nodes=%d\n",
+                                ggml_opt_recompute_regions(opt_ctx), ggml_opt_recompute_nodes(opt_ctx));
+                    }
+                    for (ggml_backend_t backend : backend_ptrs) {
+                        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            std::fprintf(stderr, "qlora placement: %s scheduler buffer=%.2f MiB\n",
+                                    ggml_backend_name(backend),
+                                    ggml_backend_sched_get_buffer_size(sched.get(), backend)/(1024.0*1024.0));
+                        }
+                    }
+                    training_placement_printed = true;
+                }
+
+                opt_graph_cached = retain_graph ? res : nullptr;
+                opt_graph_cached_step = optimizer_step;
+            } else {
+                ggml_opt_alloc(opt_ctx, true);
+                if (++opt_graph_reused == 1) LLAMA_LOG_INFO("qat_graph: reusing forward/backward/optimizer graph\n");
+            }
             const int64_t t2_inputs = ggml_time_ms();
             res->set_inputs(&ubatch);
             {
@@ -4558,7 +4583,18 @@ void llama_context::opt_epoch_iter(
 
             const int64_t t3_eval = ggml_time_ms();
             copy_experts.reset();
+            const int64_t step_before = ggml_opt_step(opt_ctx);
+            if (measure_step) {
+                for (auto index : label_indices) opt_supervised_tokens += labels_sparse[index] >= 0;
+            }
             ggml_opt_eval(opt_ctx, result);
+            if (measure_step && ggml_opt_step(opt_ctx) != step_before) {
+                const int64_t duration = ggml_time_us() - opt_step_started_us;
+                LLAMA_LOG_INFO("qat_step: step=%lld supervised_tokens=%llu duration_us=%lld\n", (long long) ggml_opt_step(opt_ctx),
+                    (unsigned long long) opt_supervised_tokens, (long long) duration);
+                opt_supervised_tokens = 0;
+                opt_step_started_us = 0;
+            }
             if (result && sequence_rewards) {
                 ggml_opt_result_weight_last(result, active_sequences,
                         (float) n_sequences / (reward_scale*active_sequences));
@@ -5749,6 +5785,18 @@ bool llama_opt_suspend(struct llama_context * ctx) {
 
 bool llama_opt_resume(struct llama_context * ctx) {
     return ctx && ctx->opt_resume();
+}
+
+void llama_opt_set_moe_compact(struct llama_context * ctx, bool enabled) {
+    ctx->opt_set_moe_compact(enabled);
+}
+
+void llama_opt_set_moe_fused(struct llama_context * ctx, bool enabled) {
+    ctx->opt_set_moe_fused(enabled);
+}
+
+void llama_opt_set_graph_reuse(struct llama_context * ctx, bool enabled) {
+    ctx->opt_set_graph_reuse(enabled);
 }
 
 void llama_opt_set_weight_streaming(struct llama_context * ctx, bool enabled) {

@@ -86,66 +86,47 @@ static __global__ void ggml_cuda_moe_route_prefix(
 }
 
 
+static constexpr int ggml_cuda_moe_route_threads = 256;
+
 static __global__ void ggml_cuda_moe_route_scatter(
         const int32_t * __restrict__ ids,
         const int32_t * __restrict__ expert_offsets,
-        int32_t * __restrict__ cursor,
         int32_t * __restrict__ routes,
         int32_t * __restrict__ route_rank,
         int64_t total_routes,
-        int64_t n_expert,
         int64_t n_used,
         int64_t ids_s0,
         int64_t ids_s1) {
+    const int64_t expert = blockIdx.x;
+    const int lane = threadIdx.x;
+    __shared__ int32_t prefix[ggml_cuda_moe_route_threads];
+    __shared__ int32_t written;
+    if (lane == 0) written = expert_offsets[expert];
+    __syncthreads();
 
-    const int64_t route =
-        (int64_t) blockIdx.x *
-            blockDim.x +
-        threadIdx.x;
-
-    if (route >=
-        total_routes) {
-
-        return;
-    }
-
-    const int64_t used =
-        route %
-        n_used;
-
-    const int64_t token =
-        route /
-        n_used;
-
-    const int32_t expert =
-        ids[
-            used  * ids_s0 +
-            token * ids_s1
-        ];
-
-    if (expert < 0 ||
-        expert >= n_expert) {
-
-        return;
-    }
-
-    const int32_t pos =
-        atomicAdd(
-            &cursor[expert],
-            1
-        );
-
-    routes[pos] =
-        (int32_t) route;
-
-    if (route_rank) {
-
-        route_rank[route] =
-            pos -
-            expert_offsets[expert];
+    // A block writes each expert's routes in input order without atomic scatter.
+    for (int64_t base = 0; base < total_routes; base += blockDim.x) {
+        const int64_t route = base + lane;
+        const bool match = route < total_routes &&
+            ids[(route % n_used)*ids_s0 + (route / n_used)*ids_s1] == expert;
+        prefix[lane] = match;
+        __syncthreads();
+        for (int stride = 1; stride < ggml_cuda_moe_route_threads; stride *= 2) {
+            const int32_t add = lane >= stride ? prefix[lane - stride] : 0;
+            __syncthreads();
+            prefix[lane] += add;
+            __syncthreads();
+        }
+        if (match) {
+            const int32_t position = written + prefix[lane] - 1;
+            routes[position] = (int32_t) route;
+            if (route_rank) route_rank[route] = position - expert_offsets[expert];
+        }
+        __syncthreads();
+        if (lane == 0) written += prefix[ggml_cuda_moe_route_threads - 1];
+        __syncthreads();
     }
 }
-
 
 
 static inline void ggml_cuda_moe_build_routes(
@@ -165,7 +146,7 @@ static inline void ggml_cuda_moe_build_routes(
         n_used * n_tokens;
 
     constexpr int threads =
-        256;
+        ggml_cuda_moe_route_threads;
 
     const int64_t blocks =
         (
@@ -223,14 +204,12 @@ static inline void ggml_cuda_moe_build_routes(
     );
 
     ggml_cuda_moe_route_scatter
-        <<<blocks, threads, 0, stream>>>(
+        <<<n_expert, threads, 0, stream>>>(
             ids,
             expert_offsets,
-            cursor,
             routes,
             route_rank,
             total_routes,
-            n_expert,
             n_used,
             ids_s0,
             ids_s1

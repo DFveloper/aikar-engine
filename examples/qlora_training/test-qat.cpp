@@ -1538,7 +1538,7 @@ static bool trace_moe_ops(struct ggml_tensor * tensor, bool ask, void * userdata
     return false;
 }
 
-static void test_native_routed_update(enum qat_weight_format format, ggml_backend_dev_t device, bool required) {
+static void test_native_routed_update(enum qat_weight_format format, ggml_backend_dev_t device, bool required, bool broadcast = false) {
     constexpr int64_t cols = 32;
     constexpr int64_t rows = 5;
     constexpr int64_t experts = 3;
@@ -1550,7 +1550,7 @@ static void test_native_routed_update(enum qat_weight_format format, ggml_backen
         initial_values[i] = 0.4f + 0.1f * std::sin(0.07f * (float) i);
     }
     const std::vector<uint8_t> initial_weight = quantize_rows(weight_type, initial_values, cols);
-    std::vector<float> activations(cols * used * tokens);
+    std::vector<float> activations(cols * (broadcast ? 1 : used) * tokens);
     std::vector<float> upstream(rows * used * tokens);
     for (size_t i = 0; i < activations.size(); ++i) {
         activations[i] = 0.2f * std::cos(0.13f * (float) i);
@@ -1558,7 +1558,7 @@ static void test_native_routed_update(enum qat_weight_format format, ggml_backen
     for (size_t i = 0; i < upstream.size(); ++i) {
         upstream[i] = 0.15f * std::sin(0.19f * (float) i);
     }
-    const int32_t route_ids[used * tokens] = { 0, 2, 2, 0 };
+    const int32_t route_ids[used * tokens] = { 0, 0, 2, 0 };
     std::vector<float> full_gradient(initial_values.size(), 0.0f);
     for (int64_t token = 0; token < tokens; ++token) {
         for (int64_t route = 0; route < used; ++route) {
@@ -1566,7 +1566,7 @@ static void test_native_routed_update(enum qat_weight_format format, ggml_backen
             for (int64_t row = 0; row < rows; ++row) {
                 for (int64_t col = 0; col < cols; ++col) {
                     full_gradient[col + cols * (row + rows * expert)] +=
-                        activations[col + cols * (route + used * token)] * upstream[row + rows * (route + used * token)];
+                        activations[col + cols * ((broadcast ? 0 : route) + (broadcast ? 1 : used) * token)] * upstream[row + rows * (route + used * token)];
                 }
             }
         }
@@ -1594,7 +1594,7 @@ static void test_native_routed_update(enum qat_weight_format format, ggml_backen
     ggml_context * ctx = ggml_init(init_params);
     ggml_tensor * weight = ggml_new_tensor_3d(ctx, weight_type, cols, rows, experts);
     ggml_set_param(weight);
-    ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, used, tokens);
+    ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, broadcast ? 1 : used, tokens);
     ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, used, tokens);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
     ggml_tensor * momentum = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, cols, rows, experts);
@@ -2094,6 +2094,147 @@ static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_
     ggml_backend_free(backend);
 }
 
+static ggml_opt_optimizer_params test_moe_accumulation_params(void *) {
+    auto params = ggml_opt_get_default_optimizer_params(nullptr);
+    params.qlion_qat.alpha = 0.025f;
+    params.qlion_qat.beta = 0.85f;
+    params.qlion_qat.wd = 0.01f;
+    return params;
+}
+
+static std::vector<uint8_t> moe_accumulation_trajectory(qat_weight_format format, bool fused, bool broadcast, bool automatic = false, bool mixed = false, bool actual = false, ggml_backend_dev_t device = nullptr) {
+    const int64_t cols = 64, rows = 5, experts = 32, used = 2;
+    auto * backend = device ? ggml_backend_dev_init(device, nullptr) : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (set_threads) set_threads(backend, 4);
+    auto * cpu = device ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) : nullptr;
+    ggml_backend_t backends[] = { backend, cpu };
+    auto * sched = ggml_backend_sched_new(backends, nullptr, cpu ? 2 : 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    auto * ctx_static = ggml_init({ 3*ggml_tensor_overhead(), nullptr, true });
+    auto * weight = ggml_new_tensor_3d(ctx_static, qat_weight_ggml_type(format), cols, rows, experts);
+    ggml_set_param(weight);
+    ggml_set_name(weight, "moe.accumulation.weight");
+    auto * input = ggml_new_tensor_3d(ctx_static, GGML_TYPE_F32, cols, broadcast ? 1 : used, 8);
+    auto * ids = ggml_new_tensor_2d(ctx_static, GGML_TYPE_I32, used + 1, 8);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    std::vector<float> initial(ggml_nelements(weight));
+    for (size_t i = 0; i < initial.size(); ++i) initial[i] = 0.2f + 0.1f*std::sin(i*0.13f);
+    const auto data = quantize_rows(weight->type, initial, cols);
+    ggml_backend_tensor_set(weight, data.data(), 0, data.size());
+    auto params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT;
+    params.opt_period = 4;
+    params.get_opt_pars = test_moe_accumulation_params;
+    auto * opt = ggml_opt_init(params);
+    if (!automatic) ggml_opt_set_qlion_moe_fused(opt, fused);
+    if (actual) ggml_opt_set_qlion_moe_compact(opt, true);
+    auto * compute = ggml_init({ 4*GGML_DEFAULT_GRAPH_SIZE*ggml_tensor_overhead() + 3*ggml_graph_overhead(), nullptr, true });
+    std::vector<uint8_t> trajectory;
+    for (int step = 0; step < 12; ++step) {
+        const int64_t tokens = step >= 10 ? 8 : (step == 2 ? 3 : 1);
+        std::vector<float> values(ggml_nelements(input));
+        std::vector<int32_t> routes(ggml_nelements(ids), 0);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = 0.25f*std::cos(i*0.09f + step);
+        for (int64_t t = 0; t < tokens; ++t) {
+            routes[t*(used+1)] = step / 4 == 1 ? 27 : 1;
+            routes[t*(used+1)+1] = t % 2 ? routes[t*(used+1)] : (step / 4 == 1 ? 31 : 3);
+            if (step % 4 == 2 && t == 0) routes[t*(used+1)+1] = step / 4 == 1 ? 29 : 7;
+        }
+        ggml_backend_tensor_set(input, values.data(), 0, values.size()*sizeof(float));
+        ggml_backend_tensor_set(ids, routes.data(), 0, routes.size()*sizeof(int32_t));
+        ggml_reset(compute);
+        auto * a = ggml_view_3d(compute, input, cols, input->ne[1], tokens, input->nb[1], input->nb[2], 0);
+        auto * routing = ggml_view_2d(compute, ids, used, tokens, ids->nb[1], 0);
+        routing = ggml_view_2d(compute, ggml_cont(compute, routing), used, tokens, used*sizeof(int32_t), 0);
+        auto * output = ggml_mul_mat_id(compute, weight, a, routing);
+        if (mixed && step >= 10) output = ggml_add(compute, output, ggml_mul_mat_id(compute, weight, a, routing));
+        if (step == 3 || step == 11) output = ggml_scale(compute, output, 0.0f);
+        auto * graph = ggml_new_graph_custom(compute, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, output);
+        ggml_opt_prepare_alloc(opt, compute, graph, input, output);
+        ggml_opt_alloc(opt, true);
+        auto * accumulator = actual ? nullptr : ggml_opt_qat_state_gradient_accumulator(opt, 0);
+        if (!actual) check(accumulator != nullptr, "routed Q8 accumulator missing");
+        const size_t dense_bytes = ggml_row_size(GGML_TYPE_Q8_0, cols)*rows*experts;
+        if (!actual && fused && step < 10) check(ggml_nbytes(accumulator) < dense_bytes, "sparse expert accumulator retained dense storage");
+        if (!actual && (!fused || step >= 10)) check(ggml_nbytes(accumulator) == dense_bytes, "dense accumulator fallback has wrong size");
+        moe_op_trace trace;
+        ggml_backend_sched_set_eval_callback(sched, trace_moe_ops, &trace);
+        ggml_opt_eval(opt, nullptr);
+        if (actual && !mixed) {
+            accumulator = ggml_opt_qat_state_gradient_accumulator(opt, 0);
+            check(accumulator && accumulator->ne[1] == (step % 4 >= 2 ? 3 : 2), "actual-route storage did not track the expert union");
+            check(!trace.full_gradient, "actual-route accumulation allocated a full F32 expert gradient");
+        }
+        if (!actual) check(trace.full_gradient != (fused && ((!automatic && !mixed) || step < 10)), "unexpected full F32 expert gradient allocation");
+        check(ggml_opt_step(opt) == (step + 1)/4, "MoE accumulation changed optimizer cadence");
+        for (auto * tensor : { weight, ggml_opt_qat_state_momentum(opt, 0), ggml_opt_qat_state_residual(opt, 0) }) {
+            const size_t offset = trajectory.size();
+            trajectory.resize(offset + ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, trajectory.data() + offset, 0, ggml_nbytes(tensor));
+        }
+    }
+    ggml_opt_set_backend_sched(opt, nullptr);
+    ggml_opt_free(opt);
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx_static);
+    ggml_free(compute);
+    ggml_backend_free(cpu);
+    ggml_backend_free(backend);
+    return trajectory;
+}
+
+static void test_fused_moe_accumulation(ggml_backend_dev_t device, bool broadcast, int64_t cols, int64_t tokens = 5) {
+    const int64_t rows = 5, experts = 8, used = 3;
+    auto * backend = ggml_backend_dev_init(device, nullptr);
+    check(backend != nullptr, "fused MoE backend init failed");
+    auto * ctx = ggml_init({ 32*ggml_tensor_overhead() + 4*ggml_graph_overhead(), nullptr, true });
+    auto * activations = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, broadcast ? 1 : used, tokens);
+    auto * grad = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, used, tokens);
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
+    auto * reference = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, cols, rows, experts);
+    auto * fused = ggml_dup_tensor(ctx, reference);
+    auto * outer = ggml_out_prod_id(ctx, activations, grad, ids, experts);
+    auto * quantized = ggml_cast(ctx, outer, GGML_TYPE_Q8_0);
+    auto * ref_reset = ggml_acc_qlion_qat(ctx, reference, quantized, true);
+    auto * ref_add = ggml_acc_qlion_qat(ctx, reference, quantized, false);
+    auto * fused_reset = ggml_acc_qlion_qat_id(ctx, fused, activations, grad, ids, true);
+    auto * fused_add = ggml_acc_qlion_qat_id(ctx, fused, activations, grad, ids, false);
+    std::vector<ggml_cgraph *> graphs;
+    for (auto * output : { ref_reset, fused_reset, ref_add, fused_add }) {
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        graphs.push_back(graph);
+    }
+    check(ggml_backend_supports_op(backend, fused_reset), "CPU does not support fused MoE accumulator");
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "fused MoE allocation failed");
+    std::vector<float> a(ggml_nelements(activations)), g(ggml_nelements(grad));
+    std::vector<int32_t> routes(used*tokens);
+    std::vector<uint8_t> expected(ggml_nbytes(reference)), actual(expected.size());
+    for (int step = 0; step < 6; ++step) {
+        for (size_t i = 0; i < a.size(); ++i) a[i] = 0.5f*std::sin(0.17f*i + step);
+        for (size_t i = 0; i < g.size(); ++i) g[i] = 0.25f*std::cos(0.21f*i - step);
+        for (size_t i = 0; i < routes.size(); ++i) routes[i] = step == 4 ? 0 : (i % 3 == 0 ? 1 : (i + step) % 4);
+        // A masked microbatch must retain dense requantization semantics.
+        if (step == 3) std::fill(g.begin(), g.end(), 0.0f);
+        ggml_backend_tensor_set(activations, a.data(), 0, a.size()*sizeof(float));
+        ggml_backend_tensor_set(grad, g.data(), 0, g.size()*sizeof(float));
+        ggml_backend_tensor_set(ids, routes.data(), 0, routes.size()*sizeof(int32_t));
+        const int index = step == 0 || step == 5 ? 0 : 2;
+        check(ggml_backend_graph_compute(backend, graphs[index]) == GGML_STATUS_SUCCESS, "reference MoE accumulation failed");
+        check(ggml_backend_graph_compute(backend, graphs[index+1]) == GGML_STATUS_SUCCESS, "fused MoE accumulation failed");
+        ggml_backend_tensor_get(reference, expected.data(), 0, expected.size());
+        ggml_backend_tensor_get(fused, actual.data(), 0, actual.size());
+        check(actual == expected, "fused routed accumulator differs from dense Q8 bytes");
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
     if (const char * filter = getenv("QAT_TEST_ADAPTIVE_ONLY")) {
@@ -2101,7 +2242,16 @@ int main() {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t device = ggml_backend_dev_get(i);
             if (strstr(ggml_backend_dev_name(device), filter)) {
-                test_small_q8_accumulator(device);
+                if (strstr(ggml_backend_dev_name(device), "CUDA")) {
+            for (bool broadcast : { false, true }) {
+                for (auto format : { QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q4_0, QAT_WEIGHT_Q8_0 }) {
+                    check(moe_accumulation_trajectory(format, false, broadcast, false, false, false, device) ==
+                        moe_accumulation_trajectory(format, true, broadcast, false, false, true, device),
+                        "CUDA actual route accumulation changed the dense weight/momentum/residual trajectory");
+                }
+            }
+        }
+        test_small_q8_accumulator(device);
         test_training_cache_gradient(device);
         test_qlion2_warmup_trajectory(device);
         test_adaptive_statistics(device);
@@ -2155,6 +2305,21 @@ int main() {
     test_native_microbatch_step(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_microbatch_step(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_microbatch_step(QAT_WEIGHT_Q8_0, cpu_device, true);
+    for (bool broadcast : { false, true }) {
+        for (int64_t cols : { 32, 96, 704 }) test_fused_moe_accumulation(cpu_device, broadcast, cols);
+        for (auto format : { QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q4_0, QAT_WEIGHT_Q8_0, QAT_WEIGHT_Q2_0 }) {
+            const auto reference = moe_accumulation_trajectory(format, false, broadcast);
+            check(reference == moe_accumulation_trajectory(format, true, broadcast),
+                "fused sparse/growing/dense MoE trajectory differs from reference weight/momentum/residual bytes");
+            check(reference == moe_accumulation_trajectory(format, true, broadcast, false, false, true),
+                "actual route accumulation changed the dense weight/momentum/residual trajectory");
+            check(reference == moe_accumulation_trajectory(format, true, broadcast, true),
+                "automatic sparse/dense MoE trajectory differs from reference");
+        }
+    }
+    check(moe_accumulation_trajectory(QAT_WEIGHT_Q4_0, false, true, false, true) ==
+        moe_accumulation_trajectory(QAT_WEIGHT_Q4_0, true, true, false, true), "mixed routed gradient fallback lost accumulated experts");
+    test_fused_moe_accumulation(cpu_device, true, 64, 0);
     test_native_moe_dx(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_Q4_0, cpu_device, true);
     test_native_moe_dx(QAT_WEIGHT_Q8_0, cpu_device, true);
@@ -2167,6 +2332,9 @@ int main() {
                 test_native_moe_dx(format, cpu_device, true, 5, cols, 35, false, n_threads);
             }
         }
+    }
+    for (auto format : { QAT_WEIGHT_MXFP4, QAT_WEIGHT_Q4_0, QAT_WEIGHT_Q8_0 }) {
+        test_native_routed_update(format, cpu_device, true, true);
     }
     test_native_routed_update(QAT_WEIGHT_MXFP4, cpu_device, true);
     test_native_routed_update(QAT_WEIGHT_Q4_0, cpu_device, true);

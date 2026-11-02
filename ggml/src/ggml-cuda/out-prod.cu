@@ -1,13 +1,16 @@
 #include "out-prod.cuh"
 #include "convert.cuh"
 #include "moe-route.cuh"
+#include "cpy.cuh"
+#include "opt-step-qlion-qat.cuh"
+#include <functional>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
-static constexpr size_t Q4_0_OUT_PROD_WORKSPACE_MAX = 64ull*1024*1024;
+static constexpr size_t OUT_PROD_WORKSPACE_MAX = 64ull*1024*1024;
 
 static __global__ void out_prod_q4_0_prepare_tile(
         const char * src0, half * dst0, int64_t ne00,
@@ -53,7 +56,7 @@ static void ggml_cuda_out_prod_q4_0_tiled(ggml_backend_cuda_context & ctx, ggml_
 
     const size_t elements_per_row = ne00 + ne10;
     const int64_t rows_per_tile = std::max<int64_t>(1, std::min<int64_t>(ne01,
-        Q4_0_OUT_PROD_WORKSPACE_MAX/(sizeof(half)*elements_per_row)));
+        OUT_PROD_WORKSPACE_MAX/(sizeof(half)*elements_per_row)));
     const size_t workspace_elements = rows_per_tile*elements_per_row;
     ggml_cuda_pool_alloc<half> workspace(ctx.pool(), workspace_elements);
     half * src0_f16 = workspace.ptr;
@@ -91,6 +94,44 @@ static void ggml_cuda_out_prod_q4_0_tiled(ggml_backend_cuda_context & ctx, ggml_
                             src1_f16, CUDA_R_16F, ne10,
                     &tile_beta, dst_batch, CUDA_R_32F, ne0,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+        }
+    }
+}
+
+static void ggml_cuda_out_prod_quantized_tiled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t rows_per_tile = std::min<int64_t>(ne01, OUT_PROD_WORKSPACE_MAX/sizeof(float)/ne00);
+    GGML_ASSERT(rows_per_tile > 0 && ggml_is_contiguous(src0));
+    ggml_cuda_pool_alloc<float> workspace(ctx.pool(), rows_per_tile*ne00);
+    const auto to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+    GGML_ASSERT(to_fp32);
+    const auto stream = ctx.stream();
+    const auto handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const bool transposed = ggml_is_transposed(src1);
+    const auto operation = transposed ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const int64_t ldb = (transposed ? nb10 : nb11)/sizeof(float);
+    GGML_ASSERT((transposed ? nb11 : nb10) == sizeof(float));
+    const float alpha = 1.0f;
+    const int64_t dps2 = ne2/ne02;
+    const int64_t dps3 = ne3/ne03;
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            const char * a = (const char *) src0->data + (i2/dps2)*nb02 + (i3/dps3)*nb03;
+            const char * b = (const char *) src1->data + i2*nb12 + i3*nb13;
+            float * output = (float *) ((char *) dst->data + i2*nb2 + i3*nb3);
+            for (int64_t row = 0; row < ne01; row += rows_per_tile) {
+                const int64_t count = std::min(rows_per_tile, ne01 - row);
+                to_fp32(a + row*nb01, workspace.ptr, count*ne00, stream);
+                const float tile_beta = row == 0 ? beta : 1.0f;
+                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, operation,
+                    ne00, ne10, count, &alpha, workspace.ptr, ne00,
+                    (const float *) (b + row*nb11), ldb, &tile_beta, output, nb1/sizeof(float)));
             }
         }
     }
@@ -143,6 +184,13 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst, floa
 
     if (src0->type == GGML_TYPE_Q4_0) {
         ggml_cuda_out_prod_q4_0_tiled(ctx, dst, beta);
+        return;
+    }
+
+    const int64_t max_workspace_elements = OUT_PROD_WORKSPACE_MAX/sizeof(float);
+    if (ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && ne00 > 0 &&
+            ne00 <= max_workspace_elements && ggml_nelements(src0) > max_workspace_elements) {
+        ggml_cuda_out_prod_quantized_tiled(ctx, dst, beta);
         return;
     }
 
@@ -256,7 +304,9 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst, floa
 //   For each expert e: gather the token columns where ids[i,t]==e into contiguous
 //   GPU buffers, then use cublasSgemm (beta=1) to accumulate the outer product.
 //   ids may be CPU-resident (common in backward graphs where they are leaf tensors).
-void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void out_prod_id_each(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const std::function<float *(int64_t)> & destination,
+        const std::function<void(int64_t, float *)> & complete, bool clear) {
     const ggml_tensor * src0 = dst->src[0]; // a   [cols, n_exp_used, n_tokens]
     const ggml_tensor * src1 = dst->src[1]; // b   [rows, n_exp_used, n_tokens]
     const ggml_tensor * ids  = dst->src[2]; // ids [n_exp_used, n_tokens]  i32
@@ -267,7 +317,7 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     const int64_t cols       = src0->ne[0];
-    const int64_t n_exp_used = src0->ne[1];
+    const int64_t n_exp_used = ids->ne[0];
     const int64_t n_tokens   = src0->ne[2];
     const int64_t rows       = src1->ne[0];
     const int64_t n_expert   = dst->ne[2];
@@ -276,8 +326,6 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
 
-    // Zero destination tensor before accumulating
-    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
 
     // Read ids to host — ids may be CPU-resident (backward graph leaf) or GPU-resident
     const size_t ids_nbytes = ggml_nbytes(ids);
@@ -307,18 +355,21 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t a_stride_tok = src0->nb[2] / sizeof(float); // cols * n_exp_used
     const int64_t b_stride_exp = src1->nb[1] / sizeof(float); // rows
     const int64_t b_stride_tok = src1->nb[2] / sizeof(float); // rows * n_exp_used
-    const int64_t dst_stride_e = dst->nb[2]  / sizeof(float); // cols * rows
 
     const float alpha_one = 1.0f;
     const float beta_acc  = 1.0f; // accumulate — dst is already zeroed above
 
     const float * a_base = (const float *) src0->data;
     const float * b_base = (const float *) src1->data;
-    float       * d_base = (float       *)  dst->data;
+
 
     for (int64_t e = 0; e < n_expert; ++e) {
         const auto & toks = expert_tokens[e];
+        float * output = destination(e);
+        if (!output) continue;
+        if (clear) CUDA_CHECK(cudaMemsetAsync(output, 0, cols*rows*sizeof(float), stream));
         if (toks.empty()) {
+            complete(e, output);
             continue;
         }
 
@@ -335,7 +386,7 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             const int64_t itok = flat % n_tokens;
             CUDA_CHECK(cudaMemcpyAsync(
                 a_gathered.ptr + ti * cols,
-                a_base + iexp * a_stride_exp + itok * a_stride_tok,
+                a_base + (src0->ne[1] == 1 ? 0 : iexp * a_stride_exp) + itok * a_stride_tok,
                 cols * sizeof(float), cudaMemcpyDeviceToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(
                 b_gathered.ptr + ti * rows,
@@ -349,8 +400,83 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (int)cols, (int)rows, (int)ntoks_e,
             &alpha_one, a_gathered.ptr,         (int)cols,
                         b_gathered.ptr,         (int)rows,
-            &beta_acc,  d_base + e*dst_stride_e, (int)cols));
+            &beta_acc, output, (int)cols));
+        complete(e, output);
     }
+}
+
+void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    out_prod_id_each(ctx, dst, [dst](int64_t expert) {
+        return (float *) ((char *) dst->data + expert*dst->nb[2]);
+    }, [](int64_t, float *) {}, false);
+}
+
+void ggml_cuda_acc_qlion_qat_experts(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    auto * accumulator = dst->src[0];
+    auto * state_ids = dst->src[1];
+    auto * state_count = dst->src[3];
+    auto * activations = dst->src[8];
+    auto * gradient = dst->src[6];
+    auto * ids = dst->src[7];
+    const bool reset = ggml_get_op_params_i32(dst, 0) != 0;
+    if (reset) CUDA_CHECK(cudaMemsetAsync(accumulator->data, 0, ggml_nbytes(accumulator), ctx.stream()));
+    const int64_t experts = ggml_get_op_params_i32(dst, 3);
+    const int64_t cols = activations->ne[0];
+    const int64_t rows = gradient->ne[0];
+    const int64_t capacity = accumulator->ne[1];
+    int32_t count = 0;
+    std::vector<int32_t> active(capacity);
+    if (!reset) {
+        CUDA_CHECK(cudaMemcpyAsync(&count, state_count->data, sizeof(count), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(active.data(), state_ids->data, capacity*sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    }
+    GGML_ASSERT(count >= 0 && count <= capacity);
+    std::vector<char> route_data(ggml_nbytes(ids));
+    CUDA_CHECK(cudaMemcpyAsync(route_data.data(), ids->data, route_data.size(), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    for (int64_t used = 0; used < ids->ne[0]; ++used) {
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            int32_t expert;
+            memcpy(&expert, route_data.data() + used*ids->nb[0] + token*ids->nb[1], sizeof(expert));
+            GGML_ASSERT(expert >= 0 && expert < experts);
+            if (std::find(active.begin(), active.begin() + count, expert) == active.begin() + count) {
+                GGML_ASSERT(count < capacity);
+                active[count++] = expert;
+            }
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(state_ids->data, active.data(), count*sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(state_count->data, &count, sizeof(count), cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), cols*rows);
+    ggml_cuda_pool_alloc<block_q8_0> quantized(ctx.pool(), cols*rows/32);
+    ggml_tensor product = {};
+    product.type = GGML_TYPE_F32;
+    product.ne[0] = cols; product.ne[1] = rows; product.ne[2] = experts; product.ne[3] = 1;
+    product.nb[0] = sizeof(float); product.nb[1] = cols*sizeof(float);
+    product.nb[2] = cols*rows*sizeof(float); product.nb[3] = product.nb[2]*experts;
+    product.src[0] = activations; product.src[1] = gradient; product.src[2] = ids;
+    out_prod_id_each(ctx, &product, [&](int64_t expert) -> float * {
+        return std::find(active.begin(), active.begin() + count, expert) == active.begin() + count ? nullptr : scratch.ptr;
+    }, [&](int64_t expert, float * data) {
+        const auto slot = std::find(active.begin(), active.begin() + count, expert) - active.begin();
+        ggml_tensor f32 = product;
+        f32.ne[2] = 1; f32.nb[3] = f32.nb[2]; f32.data = data;
+        ggml_tensor q8 = f32;
+        q8.type = GGML_TYPE_Q8_0; q8.data = quantized.ptr;
+        q8.nb[0] = sizeof(block_q8_0); q8.nb[1] = ggml_row_size(GGML_TYPE_Q8_0, cols);
+        q8.nb[2] = rows*q8.nb[1]; q8.nb[3] = q8.nb[2];
+        ggml_cuda_cpy(ctx, &f32, &q8);
+        ggml_tensor target = *accumulator;
+        target.ne[1] = 1; target.nb[2] = target.nb[1]; target.nb[3] = target.nb[2];
+        target.data = (char *) accumulator->data + slot*accumulator->nb[1];
+        ggml_tensor add = target;
+        add.src[0] = &target; add.src[1] = &q8;
+        ggml_set_op_params_i32(&add, 0, reset);
+        ggml_cuda_acc_qlion_qat(ctx, &add);
+    }, true);
 }
 
 static __device__ __forceinline__ float q4_0_get(const block_q4_0 & block, int lane) {

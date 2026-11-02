@@ -1306,13 +1306,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    if (!params.qlion_adapters.empty() && params.cpu_les) {
+        COM_ERR("%s\n", "QLion adapters do not support the independent CPU LES disk cache");
+        return;
+    }
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
     }
 
     pimpl->model.reset(model);
-
     if (!params.moe_prune_profile.empty()) {
         try {
             const common_moe_prune_model_info info = common_moe_prune_inspect_model(params.model.path);
@@ -1725,6 +1728,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
+    params.qlion_adapter_paths.clear();
+    for (const auto & path : params.qlion_adapters) params.qlion_adapter_paths.push_back(path.c_str());
+    if (!params.qlion_adapter_paths.empty()) {
+        params.qlion_adapter_paths.push_back(nullptr);
+        mparams.qlion_adapters = params.qlion_adapter_paths.data();
+        mparams.qlion_allow_compatible_base = params.qlion_allow_compatible_base;
+    }
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

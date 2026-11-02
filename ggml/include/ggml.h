@@ -3010,6 +3010,15 @@ extern "C" {
         struct ggml_tensor *  grad,
         bool                  reset);
 
+    // CPU fused routed outer product and Q8_0 accumulation; preserves dense update semantics.
+    GGML_API struct ggml_tensor * ggml_acc_qlion_qat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  accumulator,
+        struct ggml_tensor *  activations,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  ids,
+        bool                  reset);
+
     GGML_API struct ggml_tensor * ggml_acc_qlion_qat_tied(
         struct ggml_context * ctx,
         struct ggml_tensor *  accumulator,
@@ -3031,6 +3040,31 @@ extern "C" {
         struct ggml_tensor *  ids,
         bool                  reset,
         bool                  rehash);
+
+    GGML_API struct ggml_tensor * ggml_acc_qlion_qat_experts(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  accumulator,
+        struct ggml_tensor *  state_ids,
+        struct ggml_tensor *  state_hash,
+        struct ggml_tensor *  state_count,
+        struct ggml_tensor *  micro_slots,
+        struct ggml_tensor *  micro_next,
+        struct ggml_tensor *  activations,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  ids,
+        int64_t               n_experts,
+        bool                  reset,
+        bool                  rehash);
+
+    GGML_API struct ggml_tensor * ggml_opt_step_qlion_qat_experts(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  weight,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  ids,
+        struct ggml_tensor *  count,
+        struct ggml_tensor *  momentum,
+        struct ggml_tensor *  residual,
+        struct ggml_tensor *  params);
 
     GGML_API struct ggml_tensor * ggml_opt_step_qlion_qat(
         struct ggml_context * ctx,

@@ -11,6 +11,7 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 set(LLAMA_CORE_SOURCES
     llama.cpp
     llama-adapter.cpp
+    llama-qlion-adapter.cpp
     llama-arch.cpp
     llama-batch.cpp
     llama-chat.cpp
@@ -79,3 +80,5 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+target_link_libraries(llama PRIVATE vendor::hash)

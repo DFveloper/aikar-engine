@@ -4,6 +4,10 @@ List of GGML operations and backend support status.
 
 CPU `PAGED_ATTN` uses cache-sized tiles and SIMD helpers, with a scalar reference selectable through `GGML_CPU_PAGED_ATTN_REFERENCE=1`. CPU `MUL_MAT_ID` accepts optional expert-priority scheduling metadata. See [CPU LES and paged attention](pulsar-cpu-les-implementation.md) for supported configurations and numerical limits.
 
+CPU routed QLion accumulation variants are listed as `ACC_QLION_QAT_ID` and `ACC_QLION_QAT_EXPERTS`. They reuse the `ACC_QLION_QAT` and `ACC_QLION_QAT_ROWS` operation codes with variant parameters; the compact expert updater reuses `OPT_STEP_QLION_QAT_SPARSE_ROWS`. CUDA supports compact expert accumulation and its updater; the direct dense fused accumulation variant remains CPU-only. Vulkan rejects these expert variants. See [native QLion training](../examples/qlora_training/README.md) for selection policy and dense fallback.
+
+CUDA `OUT_PROD` bounds conversion scratch to 64 MiB for large contiguous non-Q4 quantized inputs whose decoded row fits that workspace. Q4_0 keeps its existing tiled path. P620 Q6_K/Q8_0 boundary, transposition, broadcasting, and accumulation tests pass against CPU references. Routed CUDA dX and QLion updates emit expert routes in input order. See [P620 validation](superpowers/reports/2026-11-03-qlion2-p620.md) for measurements and limits.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)
@@ -18,6 +22,8 @@ Legend:
 |-----------|------|------|------|------|------|------|------|------|------|------|------|------|------|
 |                              ABS | ❌ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                              ACC | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|            ACC_QLION_QAT_EXPERTS | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                 ACC_QLION_QAT_ID | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 |                              ADD | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                             ADD1 | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 |                           ADD_ID | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |

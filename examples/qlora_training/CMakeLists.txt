@@ -32,4 +32,13 @@ if (BUILD_TESTING)
     target_include_directories(test-qat PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     target_link_libraries(test-qat PRIVATE ggml)
     add_test(NAME test-qat COMMAND $<TARGET_FILE:test-qat>)
+
+    add_executable(test-qlion-loader test-qlion-loader.cpp)
+    target_link_libraries(test-qlion-loader PRIVATE llama)
+    target_compile_features(test-qlion-loader PRIVATE cxx_std_17)
+
+    add_executable(test-qlion-adapter test-qlion-adapter.cpp)
+    target_link_libraries(test-qlion-adapter PRIVATE llama-common)
+    target_compile_features(test-qlion-adapter PRIVATE cxx_std_17)
+    add_test(NAME test-qlion-adapter COMMAND test-qlion-adapter ${CMAKE_CURRENT_BINARY_DIR}/adapter-test-scratch)
 endif()

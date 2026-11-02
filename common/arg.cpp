@@ -5073,9 +5073,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--freeze-layers"}, "N",
-        "freeze first N transformer layers — no LoRA adapters allocated for blk.0..blk.N-1 (default: 0 = train all layers)",
-        [](common_params & params, int value) { params.lora_freeze_layers = value; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+        "freeze first N transformer layers for LoRA or native QAT (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("--freeze-layers must be non-negative");
+            params.lora_freeze_layers = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
         {"--grad-checkpoint"}, "N",
         "deprecated alias for --activation-recompute on when N is greater than zero",
@@ -5261,6 +5264,45 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "native QAT output model GGUF path (default: qat-model.gguf)",
         [](common_params & params, const std::string & value) { params.qat_out = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-moe-gradient"}, "auto|dense|fused|compact",
+        "MoE Q8 gradients: auto/dense/fused, or compact with an extra routing pass and actual expert storage on CPU/CUDA",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && value != "dense" && value != "fused" && value != "compact") throw std::invalid_argument("invalid MoE gradient mode");
+            params.qat_moe_gradient = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-static-graph"}, "on|off",
+        "reuse compatible CPU/CUDA QLion training graphs within microbatch KV capacity buckets; shape changes rebuild (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off") throw std::invalid_argument("invalid static graph mode");
+            params.qat_static_graph = value == "on";
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-adapter-out"}, "FNAME",
+        "save changed native QAT tensors as a QLion adapter in addition to the full model",
+        [](common_params & params, const std::string & value) { params.qat_adapter_out = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qat-adapter-units"}, "full|rows|experts",
+        "QLion adapter replacement units (default: full, v1; rows/experts use v2)",
+        [](common_params & params, const std::string & value) {
+            if (value != "full" && value != "rows" && value != "experts") throw std::invalid_argument("invalid adapter units");
+            params.qat_adapter_units = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--qlion-adapter"}, "FNAME",
+        "apply a QLion tensor replacement adapter; repeat for disjoint adapters (requires --load-mode none --lazy-mode off)",
+        [](common_params & params, const std::string & value) { params.qlion_adapters.push_back(value); }
+    ));
+    add_opt(common_arg(
+        {"--qlion-allow-compatible-base"},
+        "allow a different base file hash only when every replacement unit has matching original bytes",
+        [](common_params & params) { params.qlion_allow_compatible_base = true; }
+    ));
     add_opt(common_arg(
         {"--qat-resume"}, "FNAME",
         "resume native QAT from a model checkpoint; state is read from FNAME.qat-state.gguf",

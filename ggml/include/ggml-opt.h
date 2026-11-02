@@ -255,6 +255,15 @@ extern "C" {
     // must be called exactly once prior to calling ggml_opt_eval
     GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
 
+    // Override automatic CPU MoE gradient fusion; false selects the dense reference.
+    GGML_API void ggml_opt_set_qlion_moe_fused(ggml_opt_context_t opt_ctx, bool enabled);
+
+    // Retain a dynamic graph between evaluations. Call prepare_alloc when its topology changes.
+    // Only backward optimizer graphs with a period of one are supported.
+    GGML_API void ggml_opt_set_qlion_moe_compact(ggml_opt_context_t opt_ctx, bool enabled);
+    GGML_API bool ggml_opt_is_optimizer_step(ggml_opt_context_t opt_ctx);
+    GGML_API void ggml_opt_retain_graph(ggml_opt_context_t opt_ctx, bool retain);
+
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);
 

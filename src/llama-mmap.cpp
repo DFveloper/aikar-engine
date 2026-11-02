@@ -479,10 +479,10 @@ struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, bool copy_on_write) {
         size = file->size();
         int fd = file->file_id();
-        int flags = MAP_SHARED;
+        int flags = copy_on_write ? MAP_PRIVATE : MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
@@ -492,7 +492,7 @@ struct llama_mmap::impl {
         // MAP_POPULATE would fault in the lazy ranges too
         if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
 #endif
-        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+        addr = mmap(NULL, file->size(), PROT_READ | (copy_on_write ? PROT_WRITE : 0), flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
@@ -586,21 +586,21 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, bool copy_on_write) {
         GGML_UNUSED(numa);
 
         size = file->size();
 
         HANDLE hFile = (HANDLE) _get_osfhandle(file->file_id());
 
-        hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        hMapping = CreateFileMappingA(hFile, NULL, copy_on_write ? PAGE_WRITECOPY : PAGE_READONLY, 0, 0, NULL);
 
         if (hMapping == NULL) {
             DWORD error = GetLastError();
             throw std::runtime_error(format("CreateFileMappingA failed: %s", llama_format_win_err(error).c_str()));
         }
 
-        addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        addr = MapViewOfFile(hMapping, copy_on_write ? FILE_MAP_COPY : FILE_MAP_READ, 0, 0, 0);
         DWORD error = GetLastError();
 
         if (addr == NULL) {
@@ -655,11 +655,12 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, bool copy_on_write) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
         GGML_UNUSED(lazy_ranges);
+        GGML_UNUSED(copy_on_write);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -677,7 +678,7 @@ struct llama_mmap::impl {
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges, bool copy_on_write) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges, copy_on_write)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }

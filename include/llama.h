@@ -362,6 +362,10 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool offload_input;   // offload the input embedding layer when all layers are offloaded
+
+        // NULL-terminated QLion replacement paths, consumed during file loading.
+        const char * const * qlion_adapters;
+        bool qlion_allow_compatible_base;
     };
 
     struct llama_sampler_seq_config {

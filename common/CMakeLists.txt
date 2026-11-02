@@ -95,6 +95,7 @@ add_library(${TARGET}
     log.h
     moe-prune.cpp
     moe-prune.h
+    qlion-adapter.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp

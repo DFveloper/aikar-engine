@@ -722,9 +722,16 @@ struct common_params {
     // native quantized QAT
     std::string qat_out = "qat-model.gguf";
     std::string qat_resume = "";
+    std::string qat_adapter_out;
+    std::string qat_adapter_units = "full";
+    std::vector<std::string> qlion_adapters;
+    std::vector<const char *> qlion_adapter_paths;
+    bool qlion_allow_compatible_base = false;
     std::string qat_quant_type = "mxfp4";
     std::string qat_targets = ""; // comma-separated substrings to match native QAT tensors
     bool qat_grad_accumulator_cpu = false;
+    bool qat_static_graph = false;
+    std::string qat_moe_gradient = "auto";
     int32_t grad_accum_steps = 1;
     std::string qat_momentum = "q8_0";
     std::string qat_residual = "q4_0";

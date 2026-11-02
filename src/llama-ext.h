@@ -30,6 +30,9 @@ LLAMA_API int32_t llama_decode_sparse_cross_entropy(
 
 LLAMA_API bool llama_opt_suspend(struct llama_context * ctx);
 LLAMA_API bool llama_opt_resume(struct llama_context * ctx);
+LLAMA_API void llama_opt_set_moe_compact(struct llama_context * ctx, bool enabled);
+LLAMA_API void llama_opt_set_moe_fused(struct llama_context * ctx, bool enabled);
+LLAMA_API void llama_opt_set_graph_reuse(struct llama_context * ctx, bool enabled);
 LLAMA_API void llama_opt_set_weight_streaming(struct llama_context * ctx, bool enabled);
 
 struct quantize_state_impl;

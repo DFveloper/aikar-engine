@@ -2886,6 +2886,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        if (node->op == GGML_OP_OUT_PROD_ID ||
+            (node->op == GGML_OP_ACC_QLION_QAT_ROWS && ggml_get_op_params_i32(node, 2) == 1)) {
+            // Routed gradients inspect device IDs on the host.
+            use_cuda_graph = false;
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -6544,16 +6550,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_BACK:
             return ggml_cuda_flash_attn_back_supported(op);
+        case GGML_OP_ACC_QLION_QAT:
+            return ggml_get_op_params_i32(op, 1) == 0;
+        case GGML_OP_ACC_QLION_QAT_ROWS:
+            return ggml_get_op_params_i32(op, 2) == 0 || ggml_get_op_params_i32(op, 2) == 1;
+        case GGML_OP_OPT_STEP_QLION_QAT_SPARSE_ROWS:
+            return op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_QLION_QAT_STATS:
-        case GGML_OP_ACC_QLION_QAT:
-        case GGML_OP_ACC_QLION_QAT_ROWS:
         case GGML_OP_OPT_STEP_QLION_QAT:
         case GGML_OP_OPT_STEP_QLION_QAT_ID:
         case GGML_OP_OPT_STEP_QLION_QAT_ROWS:
-        case GGML_OP_OPT_STEP_QLION_QAT_SPARSE_ROWS:
         case GGML_OP_OPT_STEP_QLION_QAT_TIED:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:

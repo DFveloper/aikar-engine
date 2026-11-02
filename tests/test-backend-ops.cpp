@@ -2847,6 +2847,19 @@ struct test_set_rows : public test_case {
     }
 };
 
+struct test_set_rows_grad : public test_set_rows {
+    using test_set_rows::test_set_rows;
+
+    std::string op_desc(ggml_tensor *) override { return "SET_ROWS_GRAD"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_set_rows::build_graph(ctx);
+        ggml_set_param(out->src[0]);
+        out->op_params[0] = 1;
+        return out;
+    }
+};
+
 // GGML_OP_TURBO_WHT
 struct test_turbo_wht : public test_case {
     const bool inverse;
@@ -6047,6 +6060,63 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
     }
 };
 
+struct test_mul_mat_id_grad : public test_mul_mat_id_dup {
+    using test_mul_mat_id_dup::test_mul_mat_id_dup;
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_GRAD"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_mul_mat_id_dup::build_graph(ctx);
+        ggml_set_param(out->src[0]);
+        ggml_set_param(out->src[1]);
+        return out;
+    }
+};
+
+struct test_moe_training_grad : public test_case {
+    std::string op_desc(ggml_tensor *) override { return "MOE_TRAINING_GRAD"; }
+    std::string vars() override { return "experts=4,used=2,fused_gate_up=1,shared=1"; }
+    float grad_eps() override { return 0.125f; }
+    bool grad_precise() override { return true; }
+    double max_maa_err() override { return 1e-3; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 2);
+        auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
+        auto * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 6, 4);
+        auto * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 4, 4);
+        auto * shared = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
+        ggml_set_name(input, "input");
+        ggml_set_name(router, "router");
+        ggml_set_name(gate_up, "gate_up");
+        ggml_set_name(down, "down");
+        ggml_set_name(shared, "shared");
+        for (auto * weight : { router, gate_up, down, shared }) ggml_set_param(weight);
+        auto * probs = ggml_soft_max(ctx, ggml_mul_mat(ctx, router, input));
+        auto * ids = ggml_argsort_top_k(ctx, probs, 2);
+        auto * weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, 4, 2), ids);
+        auto * projected = ggml_mul_mat_id(ctx, gate_up, ggml_reshape_3d(ctx, input, 4, 1, 2), ids);
+        auto * gate = ggml_cont(ctx, ggml_view_3d(ctx, projected, 3, 2, 2, projected->nb[1], projected->nb[2], 0));
+        auto * up = ggml_cont(ctx, ggml_view_3d(ctx, projected, 3, 2, 2, projected->nb[1], projected->nb[2], 3*sizeof(float)));
+        auto * expert = ggml_mul_mat_id(ctx, down, ggml_swiglu_split(ctx, gate, up), ids);
+        expert = ggml_mul(ctx, expert, weights);
+        auto * first = ggml_view_2d(ctx, expert, 4, 2, expert->nb[2], 0);
+        auto * second = ggml_view_2d(ctx, expert, 4, 2, expert->nb[2], expert->nb[1]);
+        return ggml_add(ctx, ggml_add(ctx, first, second), ggml_silu(ctx, ggml_mul_mat(ctx, shared, input)));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) continue;
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = strcmp(t->name, "router") == 0 ? 0.5f*(4 - i/4) : 0.125f + (i % 7)/32.0f;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+        }
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -6255,12 +6325,14 @@ struct test_out_prod : public test_case {
 
 struct test_out_prod_accumulate : public test_case {
     const ggml_type type_a;
+    const int64_t m;
+    const int64_t k;
 
     std::string vars() override {
-        return VARS_TO_STR1(type_a);
+        return VARS_TO_STR3(type_a, m, k);
     }
 
-    test_out_prod_accumulate(ggml_type type_a = GGML_TYPE_F32) : type_a(type_a) {}
+    test_out_prod_accumulate(ggml_type type_a = GGML_TYPE_F32, int64_t m = 32, int64_t k = 8) : type_a(type_a), m(m), k(k) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6276,9 +6348,9 @@ struct test_out_prod_accumulate : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a, 32, 8);
-        ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, 8);
-        ggml_tensor * acc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 16);
+        ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a, m, k);
+        ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, k);
+        ggml_tensor * acc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, 16);
         ggml_tensor * out = ggml_add_inplace(ctx, acc, ggml_out_prod(ctx, a, b));
         ggml_set_name(out, "out");
         return out;
@@ -9505,12 +9577,13 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
 
 
 struct test_flash_attn_ext_grad : public test_case {
+    const int grad_target;
     const bool sinks;
     const float max_bias;
     const float logit_softcap;
 
-    test_flash_attn_ext_grad(bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f)
-        : sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap) {}
+    test_flash_attn_ext_grad(bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, int grad_target = 0)
+        : grad_target(grad_target), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -9518,16 +9591,16 @@ struct test_flash_attn_ext_grad : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(sinks, max_bias, logit_softcap);
+        return VARS_TO_STR4(sinks, max_bias, logit_softcap, grad_target);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t DK = sinks ? 128 : 64;
+        const int64_t DK = grad_target ? 32 : (sinks ? 128 : 64);
         const int64_t DV = DK;
         const int64_t N  = 1;
-        const int64_t M  = 256;
-        const int64_t HQ = 4;
-        const int64_t HK = 2;
+        const int64_t M  = grad_target ? 64 : 256;
+        const int64_t HQ = grad_target ? 2 : 4;
+        const int64_t HK = grad_target ? 1 : 2;
 
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, N, HQ, 1);
         ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, M, HK, 1);
@@ -9537,7 +9610,7 @@ struct test_flash_attn_ext_grad : public test_case {
         ggml_set_name(k, "k");
         ggml_set_name(v, "v");
         ggml_set_name(m, "m");
-        ggml_set_param(q);
+        ggml_set_param(grad_target == 1 ? k : (grad_target == 2 ? v : q));
 
         ggml_tensor * s = nullptr;
         if (sinks) {
@@ -9581,7 +9654,7 @@ struct test_flash_attn_ext_grad : public test_case {
     }
 
     float grad_eps() override {
-        return 1.0f/8.0f;
+        return grad_target == 1 ? 0.5f : 1.0f/8.0f;
     }
 
     bool grad_precise() override {
@@ -9940,6 +10013,48 @@ struct test_opt_step_adamw : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+struct test_acc_qlion_qat_id : public test_case {
+    const int64_t cols;
+    const bool broadcast;
+    const bool compact;
+
+    test_acc_qlion_qat_id(int64_t cols, bool broadcast, bool compact) : cols(cols), broadcast(broadcast), compact(compact) {}
+    std::string op_desc(ggml_tensor *) override { return compact ? "ACC_QLION_QAT_EXPERTS" : "ACC_QLION_QAT_ID"; }
+    std::string vars() override { return VARS_TO_STR3(cols, broadcast, compact); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, broadcast ? 1 : 3, 4);
+        auto * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 5, 3, 4);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, 4);
+        ggml_set_name(ids, "ids");
+        if (!compact) {
+            return ggml_acc_qlion_qat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, cols, 5, 32), a, g, ids, true);
+        }
+        auto * acc = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, cols*5, 8);
+        auto * state_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8);
+        auto * hash = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 32);
+        auto * count = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        auto * slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8 + 12);
+        auto * next = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 12);
+        return ggml_acc_qlion_qat_experts(ctx, acc, state_ids, hash, count, slots, next, a, g, ids, 32, true, false);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) continue;
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> values(ggml_nelements(t), 0);
+                if (strcmp(t->name, "ids") == 0) {
+                    for (size_t i = 0; i < values.size(); ++i) values[i] = (i % 3 == 0 ? 1 : i % 4);
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
     }
 };
 
@@ -12739,10 +12854,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_out_prod_id(16, 12, 4, 2, 5));
     test_cases.emplace_back(new test_out_prod_accumulate());
     test_cases.emplace_back(new test_out_prod_accumulate(GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_out_prod_accumulate(GGML_TYPE_Q6_K, 256, 65568));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 33, 257));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 96, 17, 129));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1536, 8, 4096));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4096, 64, 4096));
+    for (const int64_t k : { 65504, 65536 }) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 2, k, {1, 1}, {1, 1}, true));
+    }
+    for (const auto type : { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+        for (bool transposed : { false, true }) {
+            test_cases.emplace_back(new test_out_prod(type, GGML_TYPE_F32, 256, 2, 65568, {1, 1}, {1, 1}, transposed));
+        }
+    }
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 2, 65568, {1, 1}, {2, 1}, true));
     test_cases.emplace_back(new test_out_prod_id(32, 24, 8, 4, 10));
     test_cases.emplace_back(new test_out_prod_id(64, 32, 16, 4, 16));
     for (const auto type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
@@ -13252,6 +13377,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int target : { 1, 2 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_grad(false, 0.0f, 0.0f, target));
+    }
+    test_cases.emplace_back(new test_moe_training_grad());
+    test_cases.emplace_back(new test_mul_mat_id_grad(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 3, 2, 4));
+    for (auto index_type : { GGML_TYPE_I32, GGML_TYPE_I64 }) {
+        test_cases.emplace_back(new test_set_rows_grad(GGML_TYPE_F32, GGML_TYPE_F32, index_type,
+            std::array<int64_t, 4>{ 8, 8, 1, 1 }, std::array<int, 2>{ 1, 1 }, 3));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_grad());
     test_cases.emplace_back(new test_flash_attn_ext_grad(true, 2.0f, 1.5f));
     for (int64_t keys : {4096, 8192, 8448}) {
@@ -13568,6 +13702,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+    for (int64_t cols : { 32, 96, 704 }) {
+        for (bool broadcast : { false, true }) {
+            for (bool compact : { false, true }) test_cases.emplace_back(new test_acc_qlion_qat_id(cols, broadcast, compact));
+        }
+    }
     for (int64_t n : { 32, 256, 544, 65536 }) {
         test_cases.emplace_back(new test_qlion_qat_stats(n));
     }

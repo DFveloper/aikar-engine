@@ -1,6 +1,6 @@
 # QLion Gemma 4 학습 및 어댑터 설계
 
-상태: 제안. 이 문서는 구현 완료를 뜻하지 않는다. 대상은 `llama-finetune-qlion`의 양자화된 기본 웨이트 학습과 Gemma 4 26B A4B 검증이다. QLion2를 QLoRA 옵티마이저로 추가하거나 FP32 LoRA 어댑터의 QAT 및 어댑터 resume을 구현하는 작업은 범위 밖이다.
+상태: CPU 및 P620 범위 부분 구현/검증. [P620 후속 검증 보고서](../reports/2026-11-03-qlion2-p620.md)에 구현 범위와 미완료 항목을 기록했다. 이 문서는 전체 계획의 구현 완료를 뜻하지 않는다. 대상은 `llama-finetune-qlion`의 양자화된 기본 웨이트 학습과 Gemma 4 26B A4B 검증이다. QLion2를 QLoRA 옵티마이저로 추가하거나 FP32 LoRA 어댑터의 QAT 및 어댑터 resume을 구현하는 작업은 범위 밖이다.
 
 ## 현재 상태
 
@@ -71,3 +71,7 @@ MoE는 router, shared/dense FFN, 선택된 전문가의 gate/up/down을 구분�
 - [계획 B: backward 및 런타임 최적화](../plans/2026-11-01-qlion-backward-runtime-plan.md)는 나머지 gradient, static graph, 26B 검증과 후속 런타임 로딩을 다룬다.
 
 각 기능은 수치 및 회귀 테스트가 통과한 뒤 활성화한다. CUDA/Vulkan과 static graph 지원 범위는 실제 테스트 결과를 기준으로 문서화한다.
+
+## 2026-11-03 나머지 세 범위 구현
+
+속도 개선을 제외한 일반 microbatch 고정 KV/mask 그래프 재사용, CPU/CUDA 실제 라우팅 기반 Q8 전문가 누적, core loader의 mmap/lazy overlay 및 repacking 통합을 구현했다. 검증과 지원 제한은 [세 범위 구현 보고서](../reports/2026-11-03-qlion2-three-scopes.md)에 기록한다. compact 모드는 추가 forward로 라우팅을 확인하며 static graph 재사용을 비활성화한다. P620 step 시간 목표는 이번 범위에 포함하지 않는다.
