@@ -391,7 +391,7 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
-void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
+static void quantize_row_nvfp4_blocks_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
     static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
@@ -423,6 +423,41 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
                 y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
             }
         }
+    }
+}
+
+void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_NVFP4 == 0);
+    if (k == 0) {
+        return;
+    }
+    float amax = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        amax = MAX(amax, fabsf(x[i]));
+    }
+    const float scale = amax > 0.0f ? MAX(amax / (448.0f * 6.0f), FLT_MIN) : 1.0f;
+    memcpy(vy, &scale, sizeof(scale));
+    block_nvfp4 * y = (block_nvfp4 *) ((char *) vy + sizeof(scale));
+    for (int64_t i = 0; i < k; i += QK_NVFP4) {
+        float normalized[QK_NVFP4];
+        for (int j = 0; j < QK_NVFP4; ++j) {
+            normalized[j] = x[i + j] / scale;
+        }
+        quantize_row_nvfp4_blocks_ref(normalized, y + i / QK_NVFP4, QK_NVFP4);
+    }
+}
+
+static void dequantize_row_nvfp4_blocks(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+void dequantize_row_nvfp4(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    if (k == 0) {
+        return;
+    }
+    float scale;
+    memcpy(&scale, vx, sizeof(scale));
+    dequantize_row_nvfp4_blocks((const block_nvfp4 *) ((const char *) vx + sizeof(scale)), y, k);
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] *= scale;
     }
 }
 
@@ -607,7 +642,7 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+static void dequantize_row_nvfp4_blocks(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
     static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
@@ -2338,7 +2373,10 @@ size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     GGML_UNUSED(quant_weights);
-    quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_nvfp4_ref(src + row*n_per_row, (char *) dst + row*row_size, n_per_row);
+    }
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
 }
 
@@ -5412,6 +5450,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     if (type < 0 || type >= GGML_TYPE_COUNT) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
         return false;
+    }
+
+    if (type == GGML_TYPE_NVFP4) {
+        if (nbytes < sizeof(float) + sizeof(block_nvfp4) || nbytes % sizeof(float) != 0) {
+            return false;
+        }
+        float scale;
+        memcpy(&scale, data, sizeof(scale));
+        return isfinite(scale) && scale > 0.0f;
     }
 
     if (nbytes % ggml_type_size(type) != 0) {

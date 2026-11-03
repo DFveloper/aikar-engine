@@ -15,14 +15,16 @@ def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantization
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
     if shape[-1] % block_size != 0:
         raise ValueError(f"Quantized tensor row size ({shape[-1]}) is not a multiple of {quant_type.name} block size ({block_size})")
-    return (*shape[:-1], shape[-1] // block_size * type_size)
+    row_meta = 4 if quant_type == GGMLQuantizationType.NVFP4 else 0
+    return (*shape[:-1], shape[-1] // block_size * type_size + row_meta)
 
 
 def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
-    if shape[-1] % type_size != 0:
+    row_meta = 4 if quant_type == GGMLQuantizationType.NVFP4 else 0
+    if shape[-1] < row_meta or (shape[-1] - row_meta) % type_size != 0:
         raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) is not a multiple of {quant_type.name} type size ({type_size})")
-    return (*shape[:-1], shape[-1] // type_size * block_size)
+    return (*shape[:-1], (shape[-1] - row_meta) // type_size * block_size)
 
 
 # This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time
@@ -762,6 +764,36 @@ class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
 class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
     # E2M1 values doubled (kvalues_mxfp4 convention)
     kvalues = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+
+    @classmethod
+    def quantize_rows(cls, rows: np.ndarray) -> np.ndarray:
+        shape = rows.shape
+        rows = rows.astype(np.float32, copy=False).reshape(-1, shape[-1])
+        amax = np.max(np.abs(rows), axis=-1, keepdims=True)
+        scale = np.where(amax > 0, np.maximum(amax / np.float32(2688), np.finfo(np.float32).tiny), np.float32(1))
+        payload = cls.quantize_blocks((rows / scale).reshape(-1, 64)).reshape(rows.shape[0], -1)
+        header = np.ascontiguousarray(scale).view(np.uint8).reshape(rows.shape[0], 4)
+        return np.concatenate((header, payload), axis=-1).reshape(quant_shape_to_byte_shape(shape, cls.qtype))
+
+    @classmethod
+    def dequantize_rows(cls, rows: np.ndarray) -> np.ndarray:
+        shape = rows.shape
+        rows = rows.view(np.uint8).reshape(-1, shape[-1])
+        scale = np.ascontiguousarray(rows[:, :4]).view(np.float32)
+        payload = np.ascontiguousarray(rows[:, 4:]).reshape(-1, cls.type_size)
+        values = cls.dequantize_blocks(payload).reshape(rows.shape[0], -1)
+        return (values * scale).reshape(quant_shape_from_byte_shape(shape, cls.qtype))
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        groups = blocks.reshape(-1, 4, 16)
+        codes = cls.fp32_to_ue4m3(np.max(np.abs(groups), axis=-1) / np.float32(6))
+        scales = cls.ue4m3_to_fp32(codes)[..., None] * np.float32(2)
+        values = np.asarray(cls.kvalues, dtype=np.float32) * np.float32(0.5)
+        error = np.abs(groups[..., None] - scales[..., None] * values)
+        indices = np.argmin(error, axis=-1).astype(np.uint8)
+        packed = indices[..., :8] | (indices[..., 8:] << np.uint8(4))
+        return np.concatenate((codes, packed.reshape(-1, 32)), axis=-1)
 
     @staticmethod
     def ue4m3_to_fp32(x: np.ndarray) -> np.ndarray:

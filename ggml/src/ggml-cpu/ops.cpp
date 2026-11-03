@@ -705,7 +705,7 @@ static void ggml_compute_forward_dup_to_q(
         float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
         size_t id = 0;
-        size_t rs = nb0 * (ne00 / ggml_blck_size(dst->type));
+        size_t rs = ggml_row_size(dst->type, ne00);
         char * dst_ptr = (char *) dst->data;
 
         for (int i03 = 0; i03 < ne03; i03++) {
@@ -740,6 +740,18 @@ static void ggml_compute_forward_dup_bytes(
     GGML_ASSERT(src0->type == dst->type);
 
     GGML_TENSOR_UNARY_OP_LOCALS;
+
+    if (ggml_get_type_traits(src0->type)->row_meta_size) {
+        GGML_ASSERT(ne00 == ne0);
+        const size_t row_bytes = ggml_row_size(src0->type, ne00);
+        const int64_t rows = ggml_nelements(src0) ? ggml_nrows(src0) : 0;
+        for (int64_t row = params->ith; row < rows; row += params->nth) {
+            const size_t source_offset = (row % ne01)*nb01 + ((row/ne01) % ne02)*nb02 + (row/(ne01*ne02))*nb03;
+            const size_t target_offset = (row % ne1)*nb1 + ((row/ne1) % ne2)*nb2 + (row/(ne1*ne2))*nb3;
+            memcpy((char *) dst->data + target_offset, (const char *) src0->data + source_offset, row_bytes);
+        }
+        return;
+    }
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
         ggml_compute_forward_dup_same_cont(params, dst);
@@ -892,7 +904,7 @@ static void ggml_compute_forward_dup_from_q(
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
-    size_t qk = ggml_blck_size(type);
+    size_t qk = ggml_get_type_traits(type)->row_meta_size ? ne00 : ggml_blck_size(type);
     const int64_t nr = ggml_nelements(src1) / qk;
 
     // destination must be contiguous in the first dimension

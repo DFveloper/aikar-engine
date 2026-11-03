@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include "nvfp4.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -472,6 +473,11 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
+    if (src0->type == GGML_TYPE_NVFP4 || src1->type == GGML_TYPE_NVFP4) {
+        ggml_cuda_cpy_nvfp4(ctx, src0, src1);
+        return;
+    }
+
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 

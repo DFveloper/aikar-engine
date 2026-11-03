@@ -3114,6 +3114,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il,
          ggml_tensor * turboquant_parameters) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+    if (k->type == GGML_TYPE_NVFP4) {
+        k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+    }
+    if (v->type == GGML_TYPE_NVFP4) {
+        v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+    }
 
     if (is_turbo_kv_type(k->type)) {
         GGML_ASSERT(q->ne[0] % 128 == 0);
@@ -3399,14 +3405,41 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
-static ggml_tensor * build_training_cache_view(ggml_context * ctx, ggml_cgraph * graph, ggml_tensor * cached) {
-    GGML_ASSERT(cached->type == GGML_TYPE_F32);
-    for (int i = ggml_graph_n_nodes(graph) - 1; i >= 0; --i) {
-        ggml_tensor * stored = ggml_graph_node(graph, i);
+ggml_tensor * llm_graph_context::build_kv_fake_quant(ggml_tensor * cur, ggml_type type) const {
+    if (type != GGML_TYPE_NVFP4) {
+        return cur;
+    }
+    auto * quantized = ggml_cast(ctx0, cur, type);
+    ggml_set_name(quantized, "kv_nvfp4_packed");
+    auto * restored = ggml_cast(ctx0, quantized, GGML_TYPE_F32);
+    auto * stop = ggml_cpy_no_grad(ctx0, restored, ggml_dup_tensor(ctx0, restored));
+    auto * master_stop = ggml_cpy_no_grad(ctx0, cur, ggml_dup_tensor(ctx0, cur));
+    auto * result = ggml_add(ctx0, cur, ggml_sub(ctx0, stop, master_stop));
+    ggml_set_name(result, "kv_nvfp4_ste");
+    return result;
+}
+
+ggml_tensor * llm_graph_context::build_training_cache_view(ggml_tensor * cached) const {
+    GGML_ASSERT(cached->type == GGML_TYPE_F32 || cached->type == GGML_TYPE_NVFP4);
+    for (int i = ggml_graph_n_nodes(gf) - 1; i >= 0; --i) {
+        ggml_tensor * stored = ggml_graph_node(gf, i);
         if (stored->op == GGML_OP_SET_ROWS && stored->view_src == cached->view_src) {
-            GGML_ASSERT(stored->type == GGML_TYPE_F32 && cached->view_offs >= stored->view_offs);
+            GGML_ASSERT(cached->view_offs >= stored->view_offs);
+            if (cached->type == GGML_TYPE_NVFP4) {
+                auto * decoded = ggml_cast(ctx0, stored, GGML_TYPE_F32);
+                auto * prefix = ggml_cpy_no_grad(ctx0, decoded, ggml_dup_tensor(ctx0, decoded));
+                auto * current = build_kv_fake_quant(stored->src[0], GGML_TYPE_NVFP4);
+                auto * updated = ggml_set_rows(ctx0, prefix, current, stored->src[1]);
+                updated->op_params[0] = 1;
+                const size_t old_row = stored->nb[1];
+                const size_t new_row = updated->nb[1];
+                return ggml_view_4d(ctx0, updated, cached->ne[0], cached->ne[1], cached->ne[2], cached->ne[3],
+                    cached->nb[1]/old_row*new_row, cached->nb[2]/old_row*new_row, cached->nb[3]/old_row*new_row,
+                    (cached->view_offs - stored->view_offs)/old_row*new_row);
+            }
+            GGML_ASSERT(stored->type == GGML_TYPE_F32);
             stored->op_params[0] = 1;
-            return ggml_view_4d(ctx, stored, cached->ne[0], cached->ne[1], cached->ne[2], cached->ne[3],
+            return ggml_view_4d(ctx0, stored, cached->ne[0], cached->ne[1], cached->ne[2], cached->ne[3],
                 cached->nb[1], cached->nb[2], cached->nb[3], cached->view_offs - stored->view_offs);
         }
     }
@@ -3453,8 +3486,8 @@ ggml_tensor * llm_graph_context::build_attn(
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() * ubatch.n_seqs == n_tokens);
 
-        k = k_cur;
-        v = v_cur;
+        k = build_kv_fake_quant(k_cur, mctx_cur->type_k());
+        v = build_kv_fake_quant(v_cur, mctx_cur->type_v());
         if (ubatch.n_seqs > 1) {
             k = ggml_reshape_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
             v = ggml_reshape_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
@@ -3471,8 +3504,8 @@ ggml_tensor * llm_graph_context::build_attn(
         k = mctx_cur->get_k(ctx0, il);
         v = mctx_cur->get_v(ctx0, il);
         if (training) {
-            k = build_training_cache_view(ctx0, gf, k);
-            v = build_training_cache_view(ctx0, gf, v);
+            k = build_training_cache_view(k);
+            v = build_training_cache_view(v);
         }
     }
 
@@ -3764,15 +3797,15 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kv_cur ? build_kv_fake_quant(k_cur, mctx_cur->type_k()) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kv_cur ? build_kv_fake_quant(v_cur, mctx_cur->type_v()) : mctx_cur->get_v(ctx0, il);
     if (use_kv_cur && ubatch.n_seqs > 1) {
         k = ggml_reshape_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
         v = ggml_reshape_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2]/ubatch.n_seqs, ubatch.n_seqs);
     }
     if (training && !use_kv_cur) {
-        k = build_training_cache_view(ctx0, gf, k);
-        v = build_training_cache_view(ctx0, gf, v);
+        k = build_training_cache_view(k);
+        v = build_training_cache_view(v);
     }
 
     const int64_t n_kv_max = is_swa ? std::min<int64_t>(hparams.n_swa, k->ne[2]) : 0;

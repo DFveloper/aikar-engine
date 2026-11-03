@@ -216,7 +216,7 @@
 #define GGML_FILE_MAGIC   0x67676d6c // "ggml"
 #define GGML_FILE_VERSION 2
 
-#define GGML_QNT_VERSION        2    // bump this on quantization format changes
+#define GGML_QNT_VERSION        3    // bump this on quantization format changes
 #define GGML_QNT_VERSION_FACTOR 1000 // do not change this
 
 #define GGML_MAX_DIMS           4
@@ -427,7 +427,7 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+        GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scales and an FP32 row scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TURBO3_0 = 43, // runtime-only TurboQuant 3-bit KV cache

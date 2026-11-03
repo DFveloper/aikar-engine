@@ -180,7 +180,7 @@ void llama_model_saver::add_kv_from_model() {
 
     // add_kv(LLM_KV_GENERAL_TYPE,                      ???);
     add_kv(LLM_KV_GENERAL_ARCHITECTURE,              model->arch_name());
-    // add_kv(LLM_KV_GENERAL_QUANTIZATION_VERSION,      ???);
+    add_kv(LLM_KV_GENERAL_QUANTIZATION_VERSION,      uint32_t(GGML_QNT_VERSION));
     // add_kv(LLM_KV_GENERAL_ALIGNMENT,                 ???);
     // add_kv(LLM_KV_GENERAL_FILE_TYPE,                 ???);
     // add_kv(LLM_KV_GENERAL_SAMPLING_SEQUENCE,         ???);
@@ -294,6 +294,10 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_GATE_LORA_RANK,          hparams.n_lora_gate);
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_ROPE_PATTERN,            hparams.rope_pattern, true);
+    if (hparams.kv_global_only) {
+        add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS, uint32_t(hparams.n_layer_all - hparams.n_layer_kv_from_start));
+        add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+    }
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         // never collapsed to a scalar: the loaders read a scalar as a period

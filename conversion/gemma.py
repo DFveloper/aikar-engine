@@ -1000,6 +1000,15 @@ class Gemma4DSparkModel(DFlashModel):
             yield self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), factors
 
 
+@ModelBase.register("Lumen4ExpForCausalLM", "Lumen4ExpForConditionalGeneration")
+class Lumen4ExpModel(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.LUMEN4EXP
+
+    def set_gguf_parameters(self):
+        self.hparams.setdefault("num_kv_shared_layers", 13)
+        super().set_gguf_parameters()
+
+
 @ModelBase.register("Gemma4UnifiedForConditionalGeneration")
 @ModelBase.example("hf-tiny-v2/tiny-random-Gemma4UnifiedForConditionalGeneration")
 class Gemma4UnifiedModel(Gemma4Model):

@@ -736,6 +736,13 @@ llama_model_loader::llama_model_loader(
             const ggml_tensor * tensor = w.tensor;
 
             enum ggml_type type = tensor->type;
+            if (type == GGML_TYPE_NVFP4) {
+                uint32_t version = 0;
+                get_key(LLM_KV_GENERAL_QUANTIZATION_VERSION, version, false);
+                if (version < 3) {
+                    throw std::runtime_error("NVFP4 without FP32 row scales is unsupported; convert the legacy GGUF first");
+                }
+            }
 
             n_type[type]++;
 

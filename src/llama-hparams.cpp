@@ -319,6 +319,9 @@ uint32_t llama_hparams::n_embd_head_v_mla() const {
 }
 
 bool llama_hparams::has_kv(uint32_t il) const {
+    if (kv_global_only && is_swa(il)) {
+        return true;
+    }
     if (n_layer_kv_from_start >= 0) {
         if (il < (uint32_t) n_layer_kv_from_start) {
             return true;

@@ -4424,6 +4424,16 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
 }
 
 static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // NVFP4 row scales require the CPU codec until the device kernels support them.
+    if (op->type == GGML_TYPE_NVFP4) {
+        return false;
+    }
+    for (const auto * src : op->src) {
+        if (src && src->type == GGML_TYPE_NVFP4) {
+            return false;
+        }
+    }
+
     ggml_backend_webgpu_device_context * ctx = static_cast<ggml_backend_webgpu_device_context *>(dev->context);
 
     ggml_tensor * src0 = op->src[0];

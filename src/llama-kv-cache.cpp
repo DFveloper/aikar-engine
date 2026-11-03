@@ -19,6 +19,10 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static bool is_rowwise_kv_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_KV || type == GGML_TYPE_NVFP4;
+}
+
 static bool is_turbo_kv_type(ggml_type type) {
     return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
 }
@@ -207,6 +211,10 @@ llama_kv_cache::llama_kv_cache(
             if ((is_turbo_kv_type(type_k) || is_turbo_kv_type(type_v)) && !turbo_backend) {
                 throw std::runtime_error(std::string("TurboQuant KV cache is unsupported on backend ") + backend_name);
             }
+            if ((type_k == GGML_TYPE_NVFP4 || type_v == GGML_TYPE_NVFP4) &&
+                dev_type != GGML_BACKEND_DEVICE_TYPE_CPU && strcmp(backend_name, "CUDA") != 0) {
+                dev = ggml_backend_buft_get_device(ggml_backend_cpu_buffer_type());
+            }
             buft = ggml_backend_dev_buffer_type(dev);
 
             if (lazy && getenv("GGML_CUDA_DISABLE_VOLTA_LAZY_KV") == nullptr) {
@@ -233,8 +241,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        const bool k_rowwise = type_k == GGML_TYPE_Q8_KV;
-        const bool v_rowwise = type_v == GGML_TYPE_Q8_KV;
+        const bool k_rowwise = is_rowwise_kv_type(type_k);
+        const bool v_rowwise = is_rowwise_kv_type(type_v);
         const int64_t k_width = turboquant_bits ? ggml_turboquant_row_size(hparams.n_embd_head_k(il), turboquant_bits, true)*hparams.n_head_kv(il) : n_embd_k_gqa;
         const int64_t v_width = turboquant_bits ? ggml_turboquant_row_size(hparams.n_embd_head_v(il), turboquant_bits, false)*hparams.n_head_kv(il) : n_embd_v_gqa;
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k,
@@ -285,8 +293,8 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_stream, v_stream, parameters });
     }
 
-    if ((type_k == GGML_TYPE_Q8_KV || type_v == GGML_TYPE_Q8_KV) && n_head_kv_all < 0) {
-        throw std::runtime_error("Q8_KV requires a constant KV head count across cache layers");
+    if ((is_rowwise_kv_type(type_k) || is_rowwise_kv_type(type_v)) && n_head_kv_all < 0) {
+        throw std::runtime_error("rowwise KV types require a constant KV head count across cache layers");
     }
 
     if (reuse) {
@@ -1310,7 +1318,7 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 uint32_t llama_kv_cache::get_n_k_rows(uint32_t n_tokens) const {
-    return !layers.empty() && type_k() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
+    return !layers.empty() && is_rowwise_kv_type(type_k()) ? n_tokens*n_head_kv_all : n_tokens;
 }
 
 bool llama_kv_cache::get_has_shift() const {
@@ -1390,7 +1398,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
                 row_bytes, row_bytes*hparams.n_head_kv(il), k->nb[2], k->nb[2]*sinfo.s0);
     }
 
-    if (k->type == GGML_TYPE_Q8_KV) {
+    if (is_rowwise_kv_type(k->type)) {
         const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
         return ggml_view_4d(ctx, k,
                 hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
@@ -1423,7 +1431,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 row_bytes, row_bytes*hparams.n_head_kv(il), v->nb[2], v->nb[2]*sinfo.s0);
     }
 
-    if (v->type == GGML_TYPE_Q8_KV) {
+    if (is_rowwise_kv_type(v->type)) {
         const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
         return ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
@@ -1476,7 +1484,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         return ggml_turboquant_pack(ctx, k_cur, k_idxs, k, layers[ikv].turboquant_parameters, n_embd_head, turboquant_bits, true);
     }
 
-    if (k->type == GGML_TYPE_Q8_KV) {
+    if (is_rowwise_kv_type(k->type)) {
         GGML_ASSERT(k->ne[0] == n_embd_head);
         k_cur = ggml_view_2d(ctx, k_cur, n_embd_head, n_head*n_tokens, k_cur->nb[1], 0);
         k = ggml_reshape_2d(ctx, k, n_embd_head, n_head*get_size()*k->ne[2]);
@@ -1527,7 +1535,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         return ggml_turboquant_pack(ctx, v_cur, v_idxs, v, layers[ikv].turboquant_parameters, n_embd_head, turboquant_bits, false);
     }
 
-    if (v->type == GGML_TYPE_Q8_KV) {
+    if (is_rowwise_kv_type(v->type)) {
         GGML_ASSERT(!v_trans);
         GGML_ASSERT(v->ne[0] == n_embd_head);
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_head, n_head*n_tokens, v_cur->nb[1], 0);
@@ -1581,7 +1589,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
-    const uint32_t n_rows = !layers.empty() && type_k() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
+    const uint32_t n_rows = !layers.empty() && is_rowwise_kv_type(type_k()) ? n_tokens*n_head_kv_all : n_tokens;
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_rows);
 
     ggml_set_input(k_idxs);
@@ -1596,7 +1604,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     ggml_tensor * v_idxs;
 
     if (!v_trans) {
-        const uint32_t n_rows = !layers.empty() && type_v() == GGML_TYPE_Q8_KV ? n_tokens*n_head_kv_all : n_tokens;
+        const uint32_t n_rows = !layers.empty() && is_rowwise_kv_type(type_v()) ? n_tokens*n_head_kv_all : n_tokens;
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_rows);
     } else {
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
@@ -1639,7 +1647,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
-    if (!layers.empty() && type_k() == GGML_TYPE_Q8_KV) {
+    if (!layers.empty() && is_rowwise_kv_type(type_k())) {
         GGML_ASSERT(n_head_kv_all > 0);
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
@@ -1669,7 +1677,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     if (!v_trans) {
-        if (!layers.empty() && type_v() == GGML_TYPE_Q8_KV) {
+        if (!layers.empty() && is_rowwise_kv_type(type_v())) {
             GGML_ASSERT(n_head_kv_all > 0);
             for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
                 const int64_t offs = sinfo.strm[s]*get_size();
@@ -2147,14 +2155,18 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
         // rotate back
-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        if (rot) {
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        }
 
         tmp = ggml_rope_ext(ctx, tmp,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
 
         // rotate fwd
-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        if (rot) {
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        }
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
@@ -2233,8 +2245,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
             ggml_view_3d(ctx, layer.k,
                 n_rot, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
-                ggml_row_size(layer.k->type, n_embd_k_gqa),
-                ggml_row_size(layer.k->type, n_embd_nope));
+                is_rowwise_kv_type(layer.k->type) ? n_head_kv*ggml_row_size(layer.k->type, n_embd_head_k) : ggml_row_size(layer.k->type, n_embd_k_gqa),
+                n_embd_nope ? ggml_row_size(layer.k->type, n_embd_nope) : 0);
 
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
 
@@ -2512,7 +2524,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         io.write(&k_type_i, sizeof(k_type_i));
 
         // Write row size of key
-        const uint64_t k_size_row = turboquant_bits ? k->nb[1] : k->type == GGML_TYPE_Q8_KV
+        const uint64_t k_size_row = turboquant_bits ? k->nb[1] : is_rowwise_kv_type(k->type)
                 ? hparams.n_head_kv(il)*ggml_row_size(k->type, hparams.n_embd_head_k(il))
                 : ggml_row_size(k->type, n_embd_k_gqa);
         io.write(&k_size_row, sizeof(k_size_row));
@@ -2541,7 +2553,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             io.write(&v_type_i, sizeof(v_type_i));
 
             // Write row size of value
-            const uint64_t v_size_row = turboquant_bits ? v->nb[1] : v->type == GGML_TYPE_Q8_KV
+            const uint64_t v_size_row = turboquant_bits ? v->nb[1] : is_rowwise_kv_type(v->type)
                     ? hparams.n_head_kv(il)*ggml_row_size(v->type, hparams.n_embd_head_v(il))
                     : ggml_row_size(v->type, n_embd_v_gqa);
             io.write(&v_size_row, sizeof(v_size_row));
@@ -2846,7 +2858,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         // Read row size of key
         uint64_t k_size_row_ref;
         io.read(&k_size_row_ref, sizeof(k_size_row_ref));
-        const size_t k_size_row = turboquant_bits ? k->nb[1] : k->type == GGML_TYPE_Q8_KV
+        const size_t k_size_row = turboquant_bits ? k->nb[1] : is_rowwise_kv_type(k->type)
                 ? hparams.n_head_kv(il)*ggml_row_size(k->type, hparams.n_embd_head_k(il))
                 : ggml_row_size(k->type, n_embd_k_gqa);
         if (k_size_row != k_size_row_ref) {
@@ -2882,7 +2894,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             // Read row size of value
             uint64_t v_size_row_ref;
             io.read(&v_size_row_ref, sizeof(v_size_row_ref));
-            const size_t v_size_row = turboquant_bits ? v->nb[1] : v->type == GGML_TYPE_Q8_KV
+            const size_t v_size_row = turboquant_bits ? v->nb[1] : is_rowwise_kv_type(v->type)
                     ? hparams.n_head_kv(il)*ggml_row_size(v->type, hparams.n_embd_head_v(il))
                     : ggml_row_size(v->type, n_embd_v_gqa);
             if (v_size_row != v_size_row_ref) {

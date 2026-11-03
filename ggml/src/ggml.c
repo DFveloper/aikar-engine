@@ -775,6 +775,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
+        .row_meta_size            = sizeof(float),
     },
     [GGML_TYPE_TURBO3_0] = {
         .type_name                = "turbo3",
@@ -7634,6 +7635,10 @@ static void ggml_acc_or_set(
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
     if (cgraph->grads[isrc]) {
+        if (!ggml_is_contiguous(cgraph->grads[isrc])) {
+            GGML_ASSERT(!cgraph->grad_accs[isrc]);
+            cgraph->grads[isrc] = ggml_cont(ctx, cgraph->grads[isrc]);
+        }
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
         struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN

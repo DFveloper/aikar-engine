@@ -132,6 +132,53 @@ static float dot_product_error(const ggml_type_traits_cpu * qfns_cpu, ggml_type 
     return std::max({err(result[0], ref00), err(result[1], ref10), err(result[bs], ref01), err(result[bs + 1], ref11)});
 }
 
+static int test_nvfp4_master_scale(bool verbose) {
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_NVFP4);
+    int failures = 0;
+    for (int n : {64, 128, 512}) {
+        const size_t row_size = ggml_row_size(GGML_TYPE_NVFP4, n);
+        assert(row_size == sizeof(float) + size_t(n / 64) * 36);
+        std::vector<float> input(2*n, 0.0f), output(n);
+        std::vector<uint8_t> packed(2*row_size + 16, 0xab);
+        for (int i = 0; i < n; ++i) {
+            input[i] = float(i % 17 - 8) * 1e-8f;
+            input[n + i] = float(i % 17 - 8) * 1e8f;
+        }
+        ggml_quantize_chunk(GGML_TYPE_NVFP4, input.data(), packed.data(), 0, 2, n, nullptr);
+        for (int row = 0; row < 2; ++row) {
+            const uint8_t * data = packed.data() + row*row_size;
+            float scale;
+            memcpy(&scale, data, sizeof(scale));
+            float amax = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                amax = std::max(amax, std::abs(input[row*n + i]));
+            }
+            assert(scale == amax / 2688.0f);
+            traits->to_float(data, output.data(), n);
+            double squared_error = 0.0, squared_input = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const double value = input[row*n + i];
+                squared_error += (output[i] - value)*(output[i] - value);
+                squared_input += value*value;
+            }
+            failures += !(squared_error / squared_input < 0.02);
+        }
+        for (size_t i = 2*row_size; i < packed.size(); ++i) {
+            assert(packed[i] == 0xab);
+        }
+        std::fill(input.begin(), input.end(), 0.0f);
+        traits->from_float_ref(input.data(), packed.data(), n);
+        traits->to_float(packed.data(), output.data(), n);
+        for (float value : output) {
+            assert(value == 0.0f);
+        }
+    }
+    if (verbose || failures) {
+        printf("nvfp4 FP32 row scales: %s\n", RESULT_STR[failures != 0]);
+    }
+    return failures;
+}
+
 static int test_vec_dot_f32(bool verbose) {
     const auto * f32 = ggml_get_type_traits_cpu(GGML_TYPE_F32);
     int num_failed = 0;
@@ -203,7 +250,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
-                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
+                type == GGML_TYPE_NVFP4 ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
             bool failed = !(total_error < max_quantization_error);
             num_failed += failed;
             if (failed || verbose) {
@@ -432,6 +479,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_q8_0_signed_extrema(verbose);
     num_failed += test_q8_kv_row(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_nvfp4_master_scale(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
 
     if (num_failed || verbose) {

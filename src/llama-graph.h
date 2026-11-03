@@ -1337,6 +1337,9 @@ struct llm_graph_context {
                     int   il,
             ggml_tensor * turboquant_parameters = nullptr) const;
 
+    ggml_tensor * build_kv_fake_quant(ggml_tensor * cur, ggml_type type) const;
+    ggml_tensor * build_training_cache_view(ggml_tensor * cached) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(

@@ -2666,7 +2666,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4 ||
-        model.arch == LLM_ARCH_GEMMA4) {
+        model.arch == LLM_ARCH_GEMMA4 || model.arch == LLM_ARCH_LUMEN4EXP) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
@@ -2864,7 +2864,7 @@ llm_graph_params llama_context::graph_params(
 ggml_cgraph * llama_context::build_training_graph(llm_graph_result & result, const llama_ubatch & ubatch,
         ggml_backend_sched_t scheduler,
         const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> & replace_weight, bool smooth_gelu) const {
-    if (model.arch != LLM_ARCH_GEMMA4 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens > cparams.n_ubatch) {
+    if ((model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_LUMEN4EXP) || ubatch.n_seqs_unq != 1 || ubatch.n_tokens > cparams.n_ubatch) {
         throw std::runtime_error("full-sequence training graph requires a single Gemma 4 window");
     }
     auto params = graph_params(&result, ubatch, nullptr, ctx_type_to_graph_type(cparams.ctx_type), true);
@@ -3929,6 +3929,9 @@ static void llama_set_param(
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    if (model->hparams.kv_global_only) {
+        LLAMA_LOG_INFO("%s: Lumen global KV training always uses NVFP4 with FP32 master scales and STE gradients\n", __func__);
+    }
     if (cpu_les) { throw std::runtime_error("CPU LES is not supported during training"); }
     if (cparams.kv_paged) { throw std::runtime_error("paged KV does not support training"); }
     GGML_ASSERT(!opt_ctx);
@@ -4012,6 +4015,13 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                 auto * gf_train = graph_reserve(n_ubatch, n_seq_max(), n_ubatch, mctx_tmp.get(), /*split_only=*/true, /*sizes=*/nullptr, /*training=*/true);
                 if (gf_train) {
                     train_fwd_nodes = (uint32_t)ggml_graph_n_nodes(gf_train);
+                    uint32_t nvfp4_kv_nodes = 0;
+                    for (uint32_t i = 0; i < train_fwd_nodes; ++i) {
+                        nvfp4_kv_nodes += strcmp(ggml_graph_node(gf_train, i)->name, "kv_nvfp4_ste") == 0;
+                    }
+                    if (nvfp4_kv_nodes) {
+                        LLAMA_LOG_INFO("%s: kv_nvfp4_ste nodes = %u\n", __func__, nvfp4_kv_nodes);
+                    }
                     LLAMA_LOG_INFO("%s: measured training graph nodes = %u (n_ubatch=%u)\n",
                                    __func__, train_fwd_nodes, n_ubatch);
                 }

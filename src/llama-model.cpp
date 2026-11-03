@@ -158,6 +158,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_GEMMA3N:
             return new llama_model_gemma3n(params);
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_LUMEN4EXP:
             return new llama_model_gemma4(params);
         case LLM_ARCH_GEMMA4_ASSISTANT:
             return new llama_model_gemma4_assistant(params);
@@ -3244,7 +3245,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
                     llama_kv_cache::layer_share_cb share = nullptr;
 
-                    if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
+                    if (hparams.kv_global_only) {
+                        reuse = [&](uint32_t il) { return hparams.has_kv(il) ? -1 : hparams.kv_global_source; };
+                    } else if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
                             GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
 
@@ -3307,11 +3310,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
-                                    params.type_k,
-                                    params.type_v,
+                                    hparams.kv_global_only ? GGML_TYPE_NVFP4 : params.type_k,
+                                    hparams.kv_global_only ? GGML_TYPE_NVFP4 : params.type_v,
                                     params.type_k_swa,
                                     params.type_v_swa,
-                                    !cparams.flash_attn,
+                                    hparams.kv_global_only ? false : !cparams.flash_attn,
                                     cparams.offload_kqv,
                                     params.swa_full,
                                     cparams.kv_unified,
@@ -3625,6 +3628,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_LUMEN4EXP:
         case LLM_ARCH_MAION_CODER:
         case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_DIFFUSION_GEMMA:

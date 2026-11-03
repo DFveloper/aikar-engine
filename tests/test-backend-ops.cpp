@@ -103,10 +103,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
-        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        std::vector<uint8_t> dataq(ggml_nbytes(tensor));
         {
             // parallel quantization by block
-            size_t blck_size = ggml_blck_size(tensor->type);
+            size_t blck_size = ggml_get_type_traits(tensor->type)->row_meta_size ? tensor->ne[0] : ggml_blck_size(tensor->type);
             size_t n_blocks = nels / blck_size;
 
             auto quantize_thread = [&](size_t start, size_t end) {
@@ -261,8 +261,8 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
 
     const auto * tt = ggml_get_type_traits(t->type);
-    size_t bs = ggml_blck_size(t->type);
-    std::vector<float> vq(ggml_blck_size(t->type));
+    size_t bs = tt->row_meta_size ? t->ne[0] : ggml_blck_size(t->type);
+    std::vector<float> vq(bs);
     bool quantized = ggml_is_quantized(t->type);
 
     // access elements by index to avoid gaps in views
@@ -2757,6 +2757,8 @@ struct test_set_rows : public test_case {
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
 
+    bool require_exact_bytes() const override { return type_dst == GGML_TYPE_NVFP4; }
+
     std::string vars() override {
         return VARS_TO_STR7(type_src, type_dst, type_idx, ne, nr23, r, v);
     }
@@ -3536,6 +3538,8 @@ struct test_cpy : public test_case {
     bool _src_transpose;
     bool _use_dst_shape;
     bool _use_dst_alloc;
+
+    bool require_exact_bytes() const override { return type_dst == GGML_TYPE_NVFP4; }
 
     std::string vars() override {
         if (_use_dst_alloc) {
@@ -8541,6 +8545,18 @@ struct test_mul_mat_vec_fusion : public test_case {
 };
 
 // GGML_OP_SUM
+struct test_shared_view_gradient : public test_case {
+    std::string vars() override { return "shared_view_gradient=1"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 4, 3);
+        ggml_set_param(input);
+        auto * view = ggml_view_3d(ctx, input, 8, 4, 2, input->nb[1], input->nb[2], 0);
+        auto * permuted = ggml_permute(ctx, input, 0, 2, 1, 3);
+        return ggml_add(ctx, ggml_sum(ctx, view), ggml_sum(ctx, permuted));
+    }
+};
+
 struct test_sum : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -11426,6 +11442,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_I32, 256, 5, 4, 1, v));
     }
 
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_NVFP4, GGML_TYPE_I64, { 512, 11, 2, 3 }, { 1, 1 }, 7));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_NVFP4, { 512, 2, 3, 1 }));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_NVFP4, GGML_TYPE_F32, { 512, 2, 3, 1 }));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
@@ -13231,6 +13250,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {4, 1, 3, 2}, {1, 1, 3, 2}, scale_mode_with_flag(mode, GGML_SCALE_FLAG_ALIGN_CORNERS)));
     }
 
+    test_cases.emplace_back(new test_shared_view_gradient());
     test_cases.emplace_back(new test_sum());
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {0, 2, 1, 3}));  // row-contiguous but non-contiguous
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {0, 3, 2, 1}));

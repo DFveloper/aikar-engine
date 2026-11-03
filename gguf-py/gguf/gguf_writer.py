@@ -364,6 +364,11 @@ class GGUFWriter:
             if tensor_dtype == np.uint8:
                 tensor_shape = quant_shape_from_byte_shape(tensor_shape, raw_dtype)
 
+        if dtype == GGMLQuantizationType.NVFP4:
+            version = self.kv_data[0].get(Keys.General.QUANTIZATION_VERSION)
+            if version is None or version.value < 3:
+                self.add_quantization_version(3)
+
         # make sure there is at least one tensor before splitting
         if len(self.tensors[-1]) > 0:
             if (  # split when over tensor limit

@@ -100,7 +100,13 @@ class GGMLQuants:
             if lw_qname[-1] == "k":
                 lw_qname = lw_qname[:-1] + "K"
             dequant_func: ctypes._NamedFuncPointer = getattr(self.libggml, "dequantize_row_" + lw_qname)
-            dequant_func(tensor.ctypes.data_as(ctypes.c_void_p), result.ctypes.data_as(c_float_p), result.size)
+            if qtype == GGMLQuantizationType.NVFP4:
+                packed = tensor.reshape(-1, tensor.shape[-1])
+                restored = result.reshape(-1, result.shape[-1])
+                for source, target in zip(packed, restored):
+                    dequant_func(source.ctypes.data_as(ctypes.c_void_p), target.ctypes.data_as(c_float_p), target.size)
+            else:
+                dequant_func(tensor.ctypes.data_as(ctypes.c_void_p), result.ctypes.data_as(c_float_p), result.size)
         return result
 
     def quantize(self, data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
@@ -162,7 +168,7 @@ def do_test(libggml_path: Path, quick: bool = False, user_type: GGMLQuantization
         has_quantize = False
 
         try:
-            gguf.dequantize(np.zeros((gguf.GGML_QUANT_SIZES[qtype][1]), dtype=np.uint8), qtype)
+            gguf.dequantize(np.zeros(gguf.quant_shape_to_byte_shape((gguf.GGML_QUANT_SIZES[qtype][0],), qtype), dtype=np.uint8), qtype)
             has_dequantize = True
         except (NotImplementedError, AssertionError) as e:
             if isinstance(e, AssertionError):
@@ -221,7 +227,11 @@ def do_test(libggml_path: Path, quick: bool = False, user_type: GGMLQuantization
                     logger.info(f"Dequantization from {qtype.name} matches exactly ✅")
 
             rq_shape = gguf.quants.quant_shape_to_byte_shape((8, 1024, 1024 // 2), qtype)
-            rq = np.random.random(rq_shape).astype(np.float16).view(np.uint8)
+            if qtype == GGMLQuantizationType.NVFP4:
+                rq = np.random.randint(0, 256, rq_shape, dtype=np.uint8)
+                rq[..., :4] = np.array([1], dtype=np.float32).view(np.uint8)
+            else:
+                rq = np.random.random(rq_shape).astype(np.float16).view(np.uint8)
 
             logger.debug(f"Dequantizing random f16 data as {qtype.name} with Python")
             pydq = gguf.quants.dequantize(rq, qtype)

@@ -746,7 +746,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             }
 
             // check that the size of the tensor in bytes is representable
-            if (ok && uint64_t(ggml_nelements(&info.t)/ggml_blck_size(info.t.type)) > SIZE_MAX/ggml_type_size(info.t.type)) {
+            const size_t row_meta = ggml_get_type_traits(info.t.type)->row_meta_size;
+            const uint64_t n_rows = info.t.ne[0] > 0 ? ggml_nelements(&info.t)/info.t.ne[0] : 0;
+            if (ok && (uint64_t(info.t.ne[0]/blck_size) > (SIZE_MAX - row_meta)/type_size ||
+                       (ggml_row_size(info.t.type, info.t.ne[0]) > 0 && n_rows > SIZE_MAX/ggml_row_size(info.t.type, info.t.ne[0])))) {
                 GGML_LOG_ERROR("%s: tensor '%s' with shape (%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") has a size in bytes > %zu\n",
                     __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], SIZE_MAX);
                 ok = false;
@@ -755,7 +758,7 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
 
             // calculate byte offsets given the tensor shape and type
             info.t.nb[0] = type_size;
-            info.t.nb[1] = info.t.nb[0]*(info.t.ne[0]/blck_size);
+            info.t.nb[1] = ggml_row_size(info.t.type, info.t.ne[0]);
             for (int j = 2; j < GGML_MAX_DIMS; ++j) {
                 info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1];
             }
@@ -1434,7 +1437,7 @@ void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggm
     GGML_ASSERT(tensor->ne[0] % blck_size == 0 && "tensor row size not divisible by block size of new type");
 
     tensor->nb[0] = type_size;
-    tensor->nb[1] = tensor->nb[0]*(tensor->ne[0]/blck_size);
+    tensor->nb[1] = ggml_row_size(type, tensor->ne[0]);
     for (int i = 2; i < GGML_MAX_DIMS; i++) {
         tensor->nb[i] = tensor->nb[i - 1]*tensor->ne[i - 1];
     }

@@ -6898,6 +6898,16 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 }
 
 static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // NVFP4 row scales require the CPU codec until the device kernels support them.
+    if (op->type == GGML_TYPE_NVFP4) {
+        return false;
+    }
+    for (const auto * src : op->src) {
+        if (src && src->type == GGML_TYPE_NVFP4) {
+            return false;
+        }
+    }
+
     ggml_backend_sycl_device_context *sycl_ctx =
         (ggml_backend_sycl_device_context *)dev->context;
     int device = sycl_ctx->device;

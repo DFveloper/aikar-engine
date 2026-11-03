@@ -350,6 +350,10 @@ class GGUFReader:
             np_dims = tuple(reversed(dims.tolist()))
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
             n_bytes = n_elems * type_size // block_size
+            version_field = self.fields.get("general.quantization_version")
+            nvfp4_scaled = ggml_type == GGMLQuantizationType.NVFP4 and version_field is not None and version_field.contents() >= 3
+            if nvfp4_scaled:
+                n_bytes += 4 * (n_elems // int(dims[0]))
             data_offs = int(start_offs + offset_tensor[0])
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:
@@ -376,7 +380,10 @@ class GGUFReader:
             else:
                 item_count = n_bytes
                 item_type = np.uint8
-                np_dims = quant_shape_to_byte_shape(np_dims, ggml_type)
+                if ggml_type == GGMLQuantizationType.NVFP4 and not nvfp4_scaled:
+                    np_dims = (*np_dims[:-1], np_dims[-1] // block_size * type_size)
+                else:
+                    np_dims = quant_shape_to_byte_shape(np_dims, ggml_type)
             tensors.append(ReaderTensor(
                 name = tensor_name,
                 tensor_type = ggml_type,
