@@ -721,6 +721,11 @@ struct common_params {
 
     // native quantized QAT
     std::string qat_out = "qat-model.gguf";
+    std::string distill_cache;
+    std::string distill_student;
+    int32_t distill_top_k = 512;
+    float distill_temperature = 1.0f;
+    int32_t distill_max_windows = 0;
     std::string qat_resume = "";
     std::string qat_adapter_out;
     std::string qat_adapter_units = "full";

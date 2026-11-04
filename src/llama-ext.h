@@ -35,6 +35,12 @@ LLAMA_API void llama_opt_set_moe_fused(struct llama_context * ctx, bool enabled)
 LLAMA_API void llama_opt_set_graph_reuse(struct llama_context * ctx, bool enabled);
 LLAMA_API void llama_opt_set_weight_streaming(struct llama_context * ctx, bool enabled);
 
+using llama_opt_distillation_callback = void (*)(void * userdata, uint64_t row, int32_t * ids, float * logp);
+// Configure before llama_opt_init. Dataset auxiliary data contains one cache row offset per token.
+LLAMA_API void llama_opt_set_distillation(
+        struct llama_context * ctx, int32_t top_k, float temperature,
+        llama_opt_distillation_callback callback, void * userdata);
+
 struct quantize_state_impl;
 
 LLAMA_API quantize_state_impl * llama_quant_init(

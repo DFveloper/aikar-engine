@@ -210,6 +210,8 @@ struct llama_context {
     //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    void opt_set_distillation(int32_t top_k, float temperature,
+            void (*callback)(void *, uint64_t, int32_t *, float *), void * userdata);
     void opt_set_moe_compact(bool enabled) { opt_moe_compact = enabled; ggml_opt_set_qlion_moe_compact(opt_ctx, enabled); }
     void opt_set_moe_fused(bool enabled) { ggml_opt_set_qlion_moe_fused(opt_ctx, enabled); }
     void opt_set_graph_reuse(bool enabled) { opt_graph_reuse = enabled; }
@@ -466,6 +468,11 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    int32_t opt_distillation_top_k = 0;
+    float opt_distillation_temperature = 1.0f;
+    void (*opt_distillation_callback)(void *, uint64_t, int32_t *, float *) = nullptr;
+    void * opt_distillation_userdata = nullptr;
+    std::vector<uint64_t> opt_distillation_rows;
     // Saved init arguments used to recreate opt_ctx on optimizer reset.
     struct llama_model * opt_model = nullptr;
     struct llama_opt_params opt_params {};

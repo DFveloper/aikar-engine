@@ -32,6 +32,7 @@ extern "C" {
         GGML_OPT_LOSS_TYPE_SUM,
         GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
         GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR,
+        GGML_OPT_LOSS_TYPE_DISTILLATION,
     };
 
     // ====== Dataset ======
@@ -167,6 +168,8 @@ extern "C" {
         bool    sparse_labels;
         bool    fused_backward;
         bool    qat_grad_accumulator_cpu;
+        int32_t distillation_top_k;
+        float   distillation_temperature;
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
@@ -197,6 +200,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_opt_sparse_targets(ggml_opt_context_t opt_ctx);
     GGML_API struct ggml_tensor * ggml_opt_sparse_weights(ggml_opt_context_t opt_ctx);
     GGML_API struct ggml_tensor * ggml_opt_accuracy_targets(ggml_opt_context_t opt_ctx);
+    GGML_API struct ggml_tensor * ggml_opt_distillation_ids(ggml_opt_context_t opt_ctx);
+    GGML_API struct ggml_tensor * ggml_opt_distillation_logp(ggml_opt_context_t opt_ctx);
+
+    // Coarse KL over teacher top-k classes and the remaining probability mass.
+    GGML_API struct ggml_tensor * ggml_opt_distillation_loss(
+            struct ggml_context * ctx, struct ggml_tensor * logits,
+            struct ggml_tensor * ids, struct ggml_tensor * logp,
+            struct ggml_tensor * weights, float temperature);
     GGML_API struct ggml_tensor * ggml_opt_loss(    ggml_opt_context_t opt_ctx); // scalar tensor that contains the loss
     GGML_API struct ggml_tensor * ggml_opt_pred(    ggml_opt_context_t opt_ctx); // predictions made by outputs
     GGML_API struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx); // number of matching predictions between outputs and labels

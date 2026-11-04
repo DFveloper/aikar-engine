@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-model-saver.h"
 #include "qlion-adapter.h"
+#include "logit-distillation.h"
 
 static int64_t train_sample_split_by_conversation(
         const std::vector<training_sample> & samples,
@@ -749,6 +750,30 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
         device_used_bytes);
 }
 
+static void distillation_limit_dataset(ggml_opt_dataset_t & dataset, int64_t & split, int32_t limit,
+        std::vector<float> & rewards) {
+    if (!limit || !dataset) return;
+    const int64_t total = ggml_opt_dataset_ndata(dataset);
+    const int64_t train = std::min<int64_t>(limit, split);
+    const int64_t val = std::min<int64_t>(limit, total - split);
+    const int64_t context = ggml_opt_dataset_data(dataset)->ne[0];
+    ggml_opt_dataset_t subset = ggml_opt_dataset_init(GGML_TYPE_I32, GGML_TYPE_I32, context, context, train + val, 1);
+    std::vector<float> selected;
+    for (int64_t i = 0; i < train + val; ++i) {
+        const int64_t src = i < train ? i : split + i - train;
+        std::memcpy(static_cast<int32_t *>(ggml_opt_dataset_data(subset)->data) + i*context,
+                static_cast<int32_t *>(ggml_opt_dataset_data(dataset)->data) + src*context, context*4);
+        std::memcpy(static_cast<int32_t *>(ggml_opt_dataset_labels(subset)->data) + i*context,
+                static_cast<int32_t *>(ggml_opt_dataset_labels(dataset)->data) + src*context, context*4);
+        selected.push_back(rewards.at(src));
+    }
+    ggml_opt_dataset_free(dataset);
+    dataset = subset;
+    split = train;
+    rewards = std::move(selected);
+}
+
+#ifndef LLAMA_LOGIT_EXTRACT_SHARED_ONLY
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     set_default_progress_ema();
@@ -762,6 +787,11 @@ int main(int argc, char ** argv) {
         }
     }
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FINETUNE_QAT)) {
+        return 1;
+    }
+    if ((!params.distill_cache.empty() || params.distill_max_windows) &&
+            (params.critical_token_mode != "none" || params.mtp_mode != "off")) {
+        LOG_ERR("distillation does not support critical-token weighting or MTP\n");
         return 1;
     }
     if (params.train_file.empty()) {
@@ -952,10 +982,25 @@ int main(int argc, char ** argv) {
             critical_enabled,
             &critical_metadata);
 
-    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
-
     if (!dataset) {
         return 1;
+    }
+    distillation_limit_dataset(dataset, idata_split, params.distill_max_windows, window_rewards);
+    const int64_t ndata = ggml_opt_dataset_ndata(dataset);
+    std::unique_ptr<logit_distillation::cache> teacher_cache;
+    if (!params.distill_cache.empty()) {
+        try {
+            teacher_cache.reset(new logit_distillation::cache(params.distill_cache));
+            teacher_cache->attach(dataset, idata_split, vocab);
+            llama_opt_set_distillation(lctx, teacher_cache->info.top_k, teacher_cache->info.temperature,
+                    logit_distillation::cache::fetch, teacher_cache.get());
+            LOG_INF("distillation: pure top-%u + tail KL, temperature=%.6g, no hard-label CE, train_windows=%ld validation_windows=%ld\n",
+                    teacher_cache->info.top_k, teacher_cache->info.temperature, (long) idata_split, (long) (ndata - idata_split));
+        } catch (const std::exception & e) {
+            LOG_ERR("%s\n", e.what());
+            ggml_opt_dataset_free(dataset);
+            return 1;
+        }
     }
     if (idata_split <= 0 ||
         idata_split > ndata) {
@@ -1176,3 +1221,4 @@ int main(int argc, char ** argv) {
     llama_backend_free();
     return final_save_ok ? 0 : 1;
 }
+#endif

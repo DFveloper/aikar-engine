@@ -58,6 +58,8 @@ struct ggml_opt_context {
     struct ggml_tensor * sparse_targets = nullptr;
     struct ggml_tensor * sparse_weights = nullptr;
     struct ggml_tensor * accuracy_targets = nullptr;
+    struct ggml_tensor * distillation_ids = nullptr;
+    struct ggml_tensor * distillation_logp = nullptr;
     struct ggml_tensor * critical_span_weights   = nullptr;
     struct ggml_tensor * critical_reward_weights = nullptr;
     struct ggml_tensor * critical_warmup_scale   = nullptr;
@@ -164,6 +166,8 @@ struct ggml_opt_context {
     bool    critical_weight_linear = false;
     bool    sparse_labels = false;
     bool    fused_backward = false;
+    int32_t distillation_top_k = 0;
+    float   distillation_temperature = 1.0f;
     int32_t critical_max_tokens = -1;
 
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
@@ -1025,6 +1029,8 @@ struct ggml_opt_params ggml_opt_default_params(
         /*sparse_labels            =*/ false,
         /*fused_backward           =*/ false,
         /*qat_grad_accumulator_cpu =*/ false,
+        /*distillation_top_k       =*/ 0,
+        /*distillation_temperature =*/ 1.0f,
         /*optimizer                =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
     };
 }
@@ -2363,7 +2369,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         //   - ncorrect (if using static graphs, 2 tensors).
         constexpr size_t n_loss = 1;
         const size_t tensors_per_param = (accumulate ? 1 : 0) + ((need_momenta || need_q8_device_momenta) ? 2 : 0);
-        const size_t tensors_const = opt_ctx->static_graphs ? (opt_ctx->critical_token_weighting ? 64 : 9) : 0;
+        const size_t tensors_const = opt_ctx->static_graphs ? (opt_ctx->critical_token_weighting || opt_ctx->distillation_top_k ? 96 : 9) : 0;
         const size_t size_meta = (n_loss + tensors_per_param*n_param + tensors_const) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
@@ -2395,6 +2401,31 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_fused_backward(ctx_results, opt_ctx->fused_backward);
 
     switch (opt_ctx->loss_type) {
+        case GGML_OPT_LOSS_TYPE_DISTILLATION: {
+            const int64_t nrows = ggml_nrows(opt_ctx->outputs);
+            const int32_t k = opt_ctx->distillation_top_k;
+            GGML_ASSERT(k > 0 && k < opt_ctx->outputs->ne[0]);
+            opt_ctx->distillation_ids = ggml_new_tensor_2d(ctx_results, GGML_TYPE_I32, k, nrows);
+            opt_ctx->distillation_logp = ggml_new_tensor_2d(ctx_results, GGML_TYPE_F32, k + 1, nrows);
+            opt_ctx->sparse_targets = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
+            opt_ctx->accuracy_targets = opt_ctx->sparse_targets;
+            opt_ctx->sparse_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+            ggml_set_input(opt_ctx->distillation_ids);
+            ggml_set_input(opt_ctx->distillation_logp);
+            ggml_set_input(opt_ctx->sparse_targets);
+            ggml_set_input(opt_ctx->sparse_weights);
+            ggml_set_name(opt_ctx->distillation_ids, "teacher_ids");
+            ggml_set_name(opt_ctx->distillation_logp, "teacher_logp");
+            opt_ctx->loss = ggml_opt_distillation_loss(ctx_results, opt_ctx->outputs,
+                    opt_ctx->distillation_ids, opt_ctx->distillation_logp,
+                    opt_ctx->sparse_weights, opt_ctx->distillation_temperature);
+            if (opt_ctx->opt_period > 1) {
+                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
+            }
+            ggml_set_name(opt_ctx->loss, "loss_distillation_kl");
+            opt_ctx->loss_per_datapoint = true;
+            break;
+        }
         case GGML_OPT_LOSS_TYPE_MEAN: {
             opt_ctx->loss = ggml_sum(ctx_results, opt_ctx->outputs);
             ggml_set_name(opt_ctx->loss, "loss_sum");
@@ -2635,7 +2666,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_loss(opt_ctx->loss);
     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_DISTILLATION) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
@@ -3043,6 +3074,8 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->sparse_labels             = params.sparse_labels;
     result->fused_backward            = params.fused_backward;
     result->qat_grad_accumulator_cpu   = params.qat_grad_accumulator_cpu;
+    result->distillation_top_k         = params.distillation_top_k;
+    result->distillation_temperature   = params.distillation_temperature;
 
     GGML_ASSERT(result->opt_period >= 1);
     result->static_graphs = result->ctx_compute;
@@ -3169,6 +3202,47 @@ struct ggml_tensor * ggml_opt_sparse_weights(ggml_opt_context_t opt_ctx) {
 
 struct ggml_tensor * ggml_opt_accuracy_targets(ggml_opt_context_t opt_ctx) {
     return opt_ctx->accuracy_targets;
+}
+
+struct ggml_tensor * ggml_opt_distillation_ids(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->distillation_ids;
+}
+
+struct ggml_tensor * ggml_opt_distillation_logp(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->distillation_logp;
+}
+
+struct ggml_tensor * ggml_opt_distillation_loss(
+        struct ggml_context * ctx, struct ggml_tensor * logits,
+        struct ggml_tensor * ids, struct ggml_tensor * logp,
+        struct ggml_tensor * weights, float temperature) {
+    const int64_t nv = logits->ne[0];
+    const int64_t nr = ggml_nrows(logits);
+    const int64_t k = ids->ne[0];
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && logp->type == GGML_TYPE_F32);
+    GGML_ASSERT(k > 0 && k < nv && ids->ne[1] == nr && logp->ne[0] == k + 1 && logp->ne[1] == nr);
+    GGML_ASSERT(std::isfinite(temperature) && temperature >= 0.01f && temperature <= 100.0f && ggml_nelements(weights) == nr);
+    auto * scaled = ggml_reshape_2d(ctx, ggml_scale(ctx, logits, 1.0f / temperature), nv, nr);
+    auto * rows = ggml_reshape_3d(ctx, scaled, 1, nv, nr);
+    auto * top = ggml_reshape_2d(ctx, ggml_get_rows(ctx, rows, ids), k, nr);
+    auto * ones = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, k, nr), 1.0f);
+    auto * mask = ggml_reshape_2d(ctx, ggml_get_rows_back(ctx, ones, ids, rows), nv, nr);
+    const auto logsumexp = [&](ggml_tensor * values) {
+        auto * maximum_ids = ggml_reshape_2d(ctx, ggml_argmax(ctx, values), 1, nr);
+        auto * maximum = ggml_reshape_2d(ctx, ggml_get_rows(ctx,
+                ggml_reshape_3d(ctx, values, 1, nv, nr), maximum_ids), 1, nr);
+        auto * shifted = ggml_sub(ctx, values, ggml_repeat(ctx, maximum, values));
+        return ggml_add(ctx, maximum, ggml_log(ctx, ggml_sum_rows(ctx, ggml_exp(ctx, shifted))));
+    };
+    auto * normalizer = logsumexp(scaled);
+    // Evaluate the tail directly in log space; 1 - sum(top) loses small tails in FP32.
+    auto * tail_logits = ggml_add(ctx, scaled, ggml_scale(ctx, mask, -1e30f));
+    auto * top_logp = ggml_sub(ctx, top, ggml_repeat(ctx, normalizer, top));
+    auto * tail_logp = ggml_sub(ctx, logsumexp(tail_logits), normalizer);
+    auto * student_logp = ggml_concat(ctx, top_logp, tail_logp, 0);
+    auto * terms = ggml_mul(ctx, ggml_exp(ctx, logp), ggml_sub(ctx, logp, student_logp));
+    auto * per_row = ggml_reshape_1d(ctx, ggml_sum_rows(ctx, terms), nr);
+    return ggml_scale(ctx, ggml_sum(ctx, ggml_mul(ctx, per_row, weights)), temperature * temperature / nr);
 }
 
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {

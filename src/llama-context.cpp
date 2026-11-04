@@ -3929,6 +3929,9 @@ static void llama_set_param(
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    if (opt_distillation_callback && lopt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE) {
+        throw std::invalid_argument("distillation and critical-token metadata cannot share dataset auxiliary storage");
+    }
     if (model->hparams.kv_global_only) {
         LLAMA_LOG_INFO("%s: Lumen global KV training always uses NVFP4 with FP32 master scales and STE gradients\n", __func__);
     }
@@ -4059,6 +4062,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    if (opt_distillation_callback) {
+        opt_params.loss_type = GGML_OPT_LOSS_TYPE_DISTILLATION;
+        opt_params.distillation_top_k = opt_distillation_top_k;
+        opt_params.distillation_temperature = opt_distillation_temperature;
+    }
     opt_params.opt_period                = n_batch / n_ubatch;
     const uint32_t accumulation_steps = std::max(1u, lopt_params.grad_accum_steps);
     if (accumulation_steps > 1 && n_batch != n_ctx()) {
@@ -4166,6 +4174,18 @@ bool llama_context::opt_resume() {
 void llama_context::opt_set_weight_streaming(bool enabled) {
     GGML_ASSERT(!opt_ctx);
     opt_weight_streaming = enabled;
+}
+
+void llama_context::opt_set_distillation(int32_t top_k, float temperature,
+        void (*callback)(void *, uint64_t, int32_t *, float *), void * userdata) {
+    if (opt_ctx || !callback || top_k <= 0 || top_k >= model.vocab.n_tokens() ||
+            !std::isfinite(temperature) || temperature < 0.01f || temperature > 100.0f) {
+        throw std::invalid_argument("invalid distillation configuration or optimizer already initialized");
+    }
+    opt_distillation_top_k = top_k;
+    opt_distillation_temperature = temperature;
+    opt_distillation_callback = callback;
+    opt_distillation_userdata = userdata;
 }
 
 void llama_context::opt_reset(bool recreate) {
@@ -4578,6 +4598,26 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(accuracy_targets, accuracy_targets_host.data(), 0, n_outputs*sizeof(int32_t));
                     ggml_backend_tensor_set(sparse_weights, sparse_weights_host.data(), 0, n_outputs*sizeof(float));
                 }
+                if (opt_distillation_callback) {
+                    std::vector<int32_t> ids(size_t(n_outputs) * opt_distillation_top_k);
+                    std::vector<float> logp(size_t(n_outputs) * (opt_distillation_top_k + 1));
+                    for (uint32_t row = 0; row < supervised_rows.size(); ++row) {
+                        const uint32_t index = label_indices[supervised_rows[row]];
+                        if (labels_sparse[index] < 0) {
+                            for (int32_t j = 0; j < opt_distillation_top_k; ++j) {
+                                ids[size_t(row)*opt_distillation_top_k + j] = j;
+                            }
+                            std::fill_n(logp.data() + size_t(row)*(opt_distillation_top_k + 1),
+                                    opt_distillation_top_k + 1, -std::log(float(opt_distillation_top_k + 1)));
+                            continue;
+                        }
+                        opt_distillation_callback(opt_distillation_userdata, opt_distillation_rows.at(index),
+                                ids.data() + size_t(row)*opt_distillation_top_k,
+                                logp.data() + size_t(row)*(opt_distillation_top_k + 1));
+                    }
+                    ggml_backend_tensor_set(ggml_opt_distillation_ids(opt_ctx), ids.data(), 0, ids.size()*sizeof(ids[0]));
+                    ggml_backend_tensor_set(ggml_opt_distillation_logp(opt_ctx), logp.data(), 0, logp.size()*sizeof(logp[0]));
+                }
                 if (critical_metadata) {
                     float warmup_scale = 1.0f;
                     if (opt_params.critical_warmup_steps > 0) {
@@ -4756,6 +4796,7 @@ void llama_context::opt_epoch(
         critical_metadata.resize(n_ctx);
     }
     std::vector<float> rewards(n_parallel);
+    if (opt_distillation_callback) opt_distillation_rows.resize(n_ctx);
     const auto load_windows = [&](int64_t first, int64_t end, bool train) {
         std::fill(tokens.begin(), tokens.end(), 0);
         std::fill(labels_sparse.begin(), labels_sparse.end(), -1);
@@ -4767,6 +4808,10 @@ void llama_context::opt_epoch(
             if (critical_enabled) {
                 ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data() + s*n_window,
                         n_window*sizeof(critical_metadata[0]), first + s);
+            }
+            if (opt_distillation_callback) {
+                ggml_opt_dataset_get_batch_host_aux(dataset, opt_distillation_rows.data() + s*n_window,
+                        n_window*sizeof(uint64_t), first + s);
             }
             rewards[s] = train && g_reward_weights && first + s < g_reward_weights_n ? g_reward_weights[first + s] : 1.0f;
         }
@@ -4830,6 +4875,7 @@ void llama_context::opt_eval_range(
     const int64_t t_loop_start = ggml_time_us();
     const int64_t ndata_in_loop = (idata_end - idata_start) * ubatch_per_ctx;
     std::vector<float> rewards(n_parallel, 1.0f);
+    if (opt_distillation_callback) opt_distillation_rows.resize(n_ctx);
     for (int64_t idata = idata_start; idata < idata_end; idata += n_parallel) {
         const int64_t idata_in_loop = (idata - idata_start) * ubatch_per_ctx;
         const uint32_t active = std::min<int64_t>(n_parallel, idata_end - idata);
@@ -4841,6 +4887,10 @@ void llama_context::opt_eval_range(
             if (critical_enabled) {
                 ggml_opt_dataset_get_batch_host_aux(dataset, critical_metadata.data() + s*n_window,
                         n_window*sizeof(critical_metadata[0]), idata + s);
+            }
+            if (opt_distillation_callback) {
+                ggml_opt_dataset_get_batch_host_aux(dataset, opt_distillation_rows.data() + s*n_window,
+                        n_window*sizeof(uint64_t), idata + s);
             }
         }
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse,
@@ -5812,6 +5862,11 @@ void llama_opt_set_graph_reuse(struct llama_context * ctx, bool enabled) {
 void llama_opt_set_weight_streaming(struct llama_context * ctx, bool enabled) {
     GGML_ASSERT(ctx);
     ctx->opt_set_weight_streaming(enabled);
+}
+
+void llama_opt_set_distillation(struct llama_context * ctx, int32_t top_k, float temperature,
+        llama_opt_distillation_callback callback, void * userdata) {
+    ctx->opt_set_distillation(top_k, temperature, callback, userdata);
 }
 
 void llama_opt_reset(struct llama_context * ctx, bool recreate) {

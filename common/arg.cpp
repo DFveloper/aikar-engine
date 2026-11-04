@@ -5261,6 +5261,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA, LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--distill-cache"}, "FNAME",
+        "top-k plus tail teacher cache; pure KL training without hard-label CE",
+        [](common_params & params, const std::string & value) { params.distill_cache = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--distill-student"}, "FNAME",
+        "student GGUF used for tokenizer and chat template during teacher extraction",
+        [](common_params & params, const std::string & value) { params.distill_student = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--distill-top-k"}, "N",
+        "number of teacher classes to cache (default: 512)",
+        [](common_params & params, int value) {
+            if (value <= 0 || value > 65536) throw std::invalid_argument("distill top-k must be in [1, 65536]");
+            params.distill_top_k = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--distill-max-windows"}, "N",
+        "limit each packed train/validation partition for distillation experiments (0 = all)",
+        [](common_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("distill max windows must be non-negative");
+            params.distill_max_windows = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--distill-temperature"}, "T",
+        "teacher extraction temperature; training uses the temperature recorded in the cache",
+        [](common_params & params, const std::string & value) {
+            params.distill_temperature = std::stof(value);
+            if (!std::isfinite(params.distill_temperature) || params.distill_temperature < 0.01f || params.distill_temperature > 100) {
+                throw std::invalid_argument("distill temperature must be in [0.01, 100]");
+            }
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--qat-out"}, "FNAME",
         "native QAT output model GGUF path (default: qat-model.gguf)",
         [](common_params & params, const std::string & value) { params.qat_out = value; }

@@ -4,6 +4,8 @@ Native QLoRA + Reward-Weighted SFT training pipeline for quantized GGUF models.
 
 ## Native full-parameter QLion (`llama-finetune-qlion`)
 
+For offline teacher extraction and pure top-k plus tail KL training with QLion2, see [logit distillation](../../scripts/logit-distillation/README.md). Pass `--distill-cache teacher.dat` to replace hard-label CE with this loss; the cache must match the packed dataset and validation partition.
+
 The QAT trainer updates MXFP4 or Q4_0 model tensors directly. It does not create LoRA adapters or a persistent floating-point master model. Each trainable tensor keeps these authoritative states:
 
 ```text
