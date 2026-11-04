@@ -304,6 +304,25 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst, floa
 //   For each expert e: gather the token columns where ids[i,t]==e into contiguous
 //   GPU buffers, then use cublasSgemm (beta=1) to accumulate the outer product.
 //   ids may be CPU-resident (common in backward graphs where they are leaf tensors).
+static __global__ void out_prod_id_gather(
+        const float * a, const float * b, float * gathered_a, float * gathered_b,
+        const int64_t * routes, int64_t count, int64_t cols, int64_t rows, int64_t tokens,
+        int64_t a_stride_exp, int64_t a_stride_tok, int64_t b_stride_exp, int64_t b_stride_tok) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count * (cols + rows)) {
+        return;
+    }
+    const int64_t slot = i / (cols + rows);
+    const int64_t col = i % (cols + rows);
+    const int64_t used = routes[slot] / tokens;
+    const int64_t token = routes[slot] % tokens;
+    if (col < cols) {
+        gathered_a[slot * cols + col] = a[used * a_stride_exp + token * a_stride_tok + col];
+    } else {
+        gathered_b[slot * rows + col - cols] = b[used * b_stride_exp + token * b_stride_tok + col - cols];
+    }
+}
+
 static void out_prod_id_each(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const std::function<float *(int64_t)> & destination,
         const std::function<void(int64_t, float *)> & complete, bool clear) {
@@ -350,6 +369,19 @@ static void out_prod_id_each(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         }
     }
 
+    std::vector<int64_t> routes;
+    std::vector<int64_t> offsets(n_expert + 1, 0);
+    for (int64_t e = 0; e < n_expert; ++e) {
+        routes.insert(routes.end(), expert_tokens[e].begin(), expert_tokens[e].end());
+        offsets[e + 1] = routes.size();
+    }
+    ggml_cuda_pool_alloc<int64_t> device_routes(ctx.pool());
+    if (!routes.empty()) {
+        device_routes.alloc(routes.size());
+        CUDA_CHECK(cudaMemcpyAsync(device_routes.ptr, routes.data(), routes.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     // Strides (in elements, not bytes)
     const int64_t a_stride_exp = src0->nb[1] / sizeof(float); // cols
     const int64_t a_stride_tok = src0->nb[2] / sizeof(float); // cols * n_exp_used
@@ -379,20 +411,15 @@ static void out_prod_id_each(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         ggml_cuda_pool_alloc<float> a_gathered(ctx.pool(), cols * ntoks_e);
         ggml_cuda_pool_alloc<float> b_gathered(ctx.pool(), rows * ntoks_e);
 
-        // Gather token vectors from GPU src0/src1 into contiguous buffers
-        for (int64_t ti = 0; ti < ntoks_e; ++ti) {
-            const int64_t flat = toks[ti];
-            const int64_t iexp = flat / n_tokens;
-            const int64_t itok = flat % n_tokens;
-            CUDA_CHECK(cudaMemcpyAsync(
-                a_gathered.ptr + ti * cols,
-                a_base + (src0->ne[1] == 1 ? 0 : iexp * a_stride_exp) + itok * a_stride_tok,
-                cols * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                b_gathered.ptr + ti * rows,
-                b_base + iexp * b_stride_exp + itok * b_stride_tok,
-                rows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-        }
+        GGML_ASSERT(cols > 0 && rows > 0 && cols <= INT64_MAX - rows);
+        GGML_ASSERT(ntoks_e <= INT64_MAX / (cols + rows));
+        const int64_t work = ntoks_e * (cols + rows);
+        GGML_ASSERT(work <= INT64_MAX - 255 && (work + 255) / 256 <= INT32_MAX);
+        out_prod_id_gather<<<(work + 255) / 256, 256, 0, stream>>>(
+            a_base, b_base, a_gathered.ptr, b_gathered.ptr, device_routes.ptr + offsets[e],
+            ntoks_e, cols, rows, n_tokens, src0->ne[1] == 1 ? 0 : a_stride_exp, a_stride_tok,
+            b_stride_exp, b_stride_tok);
+        CUDA_CHECK(cudaGetLastError());
 
         // dst[:, :, e] += a_gathered @ b_gathered^T
         // cuBLAS column-major: A=[cols, ntoks_e] lda=cols, B=[rows, ntoks_e] ldb=rows

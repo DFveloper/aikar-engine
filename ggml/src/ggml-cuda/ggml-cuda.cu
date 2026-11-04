@@ -6571,7 +6571,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_ATTN_BACK:
             return ggml_cuda_flash_attn_back_supported(op);
         case GGML_OP_ACC_QLION_QAT:
-            return ggml_get_op_params_i32(op, 1) == 0;
+            if (ggml_get_op_params_i32(op, 1) != 0) {
+                return false;
+            }
+            if (ggml_get_op_params_i32(op, 2) != 0) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+                return false;
+#else
+                return ggml_get_op_params_i32(op, 2) == 1 && !op->src[4] &&
+                    op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]);
+#endif
+            }
+            return true;
         case GGML_OP_ACC_QLION_QAT_ROWS:
             return ggml_get_op_params_i32(op, 2) == 0 || ggml_get_op_params_i32(op, 2) == 1;
         case GGML_OP_OPT_STEP_QLION_QAT_SPARSE_ROWS:

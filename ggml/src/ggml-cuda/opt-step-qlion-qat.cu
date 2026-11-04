@@ -26,7 +26,19 @@ static __global__ void qlion_qat_stats_blocks(const block_q8_0 * m, float * out,
 }
 
 template <bool compact>
-static __global__ void qlion_qat_stats_finish(const block_q8_0 * m, float * out, float * state, const float * p, int64_t nb) {
+static __global__ void qlion_qat_stats_finish(const block_q8_0 * m, float * out, float * state, const float * p, int64_t nb, bool threshold_only) {
+    if constexpr (compact) {
+        if (threshold_only && p[5] == -32 && (p[7] == 0 || state[1] >= p[7])) {
+            if (threadIdx.x == 0) {
+                for (int i = 0; i < 8; ++i) {
+                    out[i] = p[i];
+                }
+                out[6] = p[7] > 0 ? fmaxf(state[0], 1e-30f) : p[6];
+                out[8] = 0;
+            }
+            return;
+        }
+    }
     float sum = 0;
     for (int64_t ib = threadIdx.x; ib < nb; ib += blockDim.x) {
         if constexpr (compact) {
@@ -73,12 +85,12 @@ void ggml_cuda_qlion_qat_stats(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const auto * m = (const block_q8_0 *) dst->src[0]->data;
     if (ggml_nelements(dst) == 9) {
         qlion_qat_stats_finish<true><<<1, 256, 0, ctx.stream()>>>(m,
-            (float *) dst->data, (float *) dst->src[1]->data, (const float *) dst->src[2]->data, nb);
+            (float *) dst->data, (float *) dst->src[1]->data, (const float *) dst->src[2]->data, nb, ggml_get_op_params_i32(dst, 0) != 0);
     } else {
         qlion_qat_stats_blocks<<<(nb + 7) / 8, 256, 0, ctx.stream()>>>(m, (float *) dst->data, nb);
         CUDA_CHECK(cudaGetLastError());
         qlion_qat_stats_finish<false><<<1, 256, 0, ctx.stream()>>>(m,
-            (float *) dst->data, (float *) dst->src[1]->data, (const float *) dst->src[2]->data, nb);
+            (float *) dst->data, (float *) dst->src[1]->data, (const float *) dst->src[2]->data, nb, false);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -107,6 +119,7 @@ static __device__ float qlion_qat_alpha(const float * p, int64_t nb, int64_t ib)
     return p[0] * scale;
 }
 
+static constexpr int QLION_QAT_ID_DIRECT_ROUTES = 4;
 static constexpr int QLION_QAT_ID_GEMM_CAP   = 256;
 static constexpr int QLION_QAT_ID_GEMM_BATCH = 8;
 
@@ -199,6 +212,16 @@ static __device__ __forceinline__ float warp_signed_absmax(
         value,
         __ffs(mask) - 1
     );
+}
+
+static __device__ __forceinline__ void qlion_qat_store_q8(block_q8_0 * block, float value, int lane) {
+    const float signed_max = warp_signed_absmax(value);
+    const float scale = (signed_max == 0.0f ? 0.0f : signed_max) / -128.0f;
+    const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+    if (lane == 0) {
+        block->d = __float2half(scale);
+    }
+    block->qs[lane] = (int8_t) max(-128, min(127, (int) roundf(value * inverse)));
 }
 
 static __device__ __forceinline__ int mxfp4_best_index(
@@ -626,23 +649,7 @@ static __device__ void opt_step_qlion_qat_apply(
             residual_signed_max /
             -8.0f;
 
-        //
-        // reciprocal division은 lane 0 한 번만.
-        //
-        if (lane == 0 &&
-            residual_scale != 0.0f) {
-
-            residual_inverse =
-                1.0f /
-                residual_scale;
-        }
-
-        residual_inverse =
-            __shfl_sync(
-                0xffffffff,
-                residual_inverse,
-                0
-            );
+        residual_inverse = residual_scale != 0.0f ? 1.0f / residual_scale : 0.0f;
 
         //
         // 기존 Q4_0 code 계산.
@@ -815,23 +822,7 @@ static __device__ void opt_step_qlion_qat_apply(
             momentum_signed_max /
             -128.0f;
 
-        //
-        // reciprocal division도 lane0만.
-        //
-        if (lane == 0 &&
-            momentum_scale != 0.0f) {
-
-            momentum_inverse =
-                1.0f /
-                momentum_scale;
-        }
-
-        momentum_inverse =
-            __shfl_sync(
-                0xffffffff,
-                momentum_inverse,
-                0
-            );
+        momentum_inverse = momentum_scale != 0.0f ? 1.0f / momentum_scale : 0.0f;
 
         //
         // 기존 Q8_0 quantization.
@@ -1027,7 +1018,7 @@ qlion_qat_tied_add_sparse(
     }
 }
 
-template<bool grad_q8>
+template<bool grad_q8, bool quantize_grad = false>
 static __global__ void acc_qlion_qat(
         block_q8_0 * __restrict__ accumulator,
         const void * __restrict__ grad,
@@ -1041,36 +1032,36 @@ static __global__ void acc_qlion_qat(
     }
 
     if (reset && grad_q8) {
-        if (lane == 0) accumulator[ib] = ((const block_q8_0 *) grad)[ib];
+        if (lane == 0) {
+            accumulator[ib].d = ((const block_q8_0 *) grad)[ib].d;
+        }
+        accumulator[ib].qs[lane] = ((const block_q8_0 *) grad)[ib].qs[lane];
         return;
     }
 
-    __shared__ float values[QLION_QAT_WARPS_PER_BLOCK][32];
     const float old = reset ? 0.0f : __half2float(accumulator[ib].d) * (float) accumulator[ib].qs[lane];
-    const float g = grad_q8
+    float g = grad_q8
         ? __half2float(((const block_q8_0 *) grad)[ib].d) * ((const block_q8_0 *) grad)[ib].qs[lane]
         : ((const float *) grad)[ib * 32 + lane];
+    if constexpr (quantize_grad) {
+        const float vmax = warp_signed_absmax(isnan(g) ? 0.0f : g);
+        const float scale = (vmax == 0.0f ? 0.0f : vmax) / -128.0f;
+        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+        const int8_t q = (int8_t) max(-128, min(127, (int) roundf(g * inverse)));
+        const half stored_scale = __float2half(scale);
+        if (reset) {
+            if (lane == 0) {
+                accumulator[ib].d = stored_scale;
+            }
+            accumulator[ib].qs[lane] = q;
+            return;
+        }
+        // Preserve the intermediate Q8 block's FP16 scale before accumulation.
+        g = __half2float(stored_scale) * q;
+    }
     const float safe_g = isfinite(g) ? g : 0.0f;
     const float value = old + safe_g;
-    values[warp][lane] = isfinite(value) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, value)) : 0.0f;
-    __syncwarp();
-
-    if (lane == 0) {
-        float amax = 0.0f;
-        float signed_max = 0.0f;
-        for (int i = 0; i < 32; ++i) {
-            if (amax < fabsf(values[warp][i])) {
-                amax = fabsf(values[warp][i]);
-                signed_max = values[warp][i];
-            }
-        }
-        const float scale = signed_max / -128.0f;
-        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
-        accumulator[ib].d = __float2half(scale);
-        for (int i = 0; i < 32; ++i) {
-            accumulator[ib].qs[i] = (int8_t) max(-128, min(127, (int) roundf(values[warp][i] * inverse)));
-        }
-    }
+    qlion_qat_store_q8(accumulator + ib, isfinite(value) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, value)) : 0.0f, lane);
 }
 
 static __device__ uint32_t qlion_qat_row_hash(uint32_t value) {
@@ -1161,25 +1152,7 @@ static __global__ void acc_qlion_qat_rows(
         const float sum = value + g;
         value = isfinite(sum) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, sum)) : 0.0f;
     }
-    __shared__ float values[QLION_QAT_WARPS_PER_BLOCK][32];
-    values[warp][lane] = value;
-    __syncwarp();
-    if (lane == 0) {
-        float amax = 0.0f;
-        float signed_max = 0.0f;
-        for (int i = 0; i < 32; ++i) {
-            if (amax < fabsf(values[warp][i])) {
-                amax = fabsf(values[warp][i]);
-                signed_max = values[warp][i];
-            }
-        }
-        const float scale = signed_max / -128.0f;
-        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
-        accumulator[ib].d = __float2half(scale);
-        for (int i = 0; i < 32; ++i) {
-            accumulator[ib].qs[i] = (int8_t) max(-128, min(127, (int) roundf(values[warp][i] * inverse)));
-        }
-    }
+    qlion_qat_store_q8(accumulator + ib, value, lane);
 }
 
 static __global__ void acc_qlion_qat_tied(
@@ -1214,28 +1187,9 @@ static __global__ void acc_qlion_qat_tied(
         }
     }
 
-    __shared__ float values[QLION_QAT_WARPS_PER_BLOCK][32];
     const float old = reset ? 0.0f : __half2float(accumulator[ib].d) * (float) accumulator[ib].qs[lane];
     const float value = old + (isfinite(g) ? g : 0.0f);
-    values[warp][lane] = isfinite(value) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, value)) : 0.0f;
-    __syncwarp();
-
-    if (lane == 0) {
-        float amax = 0.0f;
-        float signed_max = 0.0f;
-        for (int i = 0; i < 32; ++i) {
-            if (amax < fabsf(values[warp][i])) {
-                amax = fabsf(values[warp][i]);
-                signed_max = values[warp][i];
-            }
-        }
-        const float scale = signed_max / -128.0f;
-        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
-        accumulator[ib].d = __float2half(scale);
-        for (int i = 0; i < 32; ++i) {
-            accumulator[ib].qs[i] = (int8_t) max(-128, min(127, (int) roundf(values[warp][i] * inverse)));
-        }
-    }
+    qlion_qat_store_q8(accumulator + ib, isfinite(value) ? fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, value)) : 0.0f, lane);
 }
 
 template<ggml_type weight_type, bool grad_q8>
@@ -1397,7 +1351,7 @@ static __global__ void qlion_qat_id_gather_expert_batch_padded(
     }
 }
 
-template<ggml_type weight_type>
+template<ggml_type weight_type, bool direct = false>
 static __global__ void opt_step_qlion_qat_id_apply_gemm(
         void * __restrict__ weight_data,
         const float * __restrict__ expert_grad,
@@ -1411,8 +1365,8 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
         int64_t scale_blocks,
         int64_t n_blocks_row,
         int64_t n_rows,
-        int64_t n_act_used,
-        int64_t n_used,
+        int32_t n_act_used,
+        int32_t n_used,
         int64_t expert_base,
         int64_t batch_count,
         int64_t cap) {
@@ -1423,61 +1377,21 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
     const int lane =
         threadIdx.x & 31;
 
-    const int64_t task =
-        (int64_t) blockIdx.x *
-            QLION_QAT_WARPS_PER_BLOCK +
-        warp;
-
-    const int64_t n_blocks_expert =
-        n_blocks_row * n_rows;
-
-    const int64_t total_tasks =
-        batch_count *
-        n_blocks_expert;
-
-    if (task >= total_tasks) {
+    // Each grid row owns one expert; no expert-index division is needed.
+    const int64_t local_ib = (int64_t) blockIdx.x * QLION_QAT_WARPS_PER_BLOCK + warp;
+    const int64_t n_blocks_expert = n_blocks_row * n_rows;
+    const int64_t batch_expert = blockIdx.y;
+    if (local_ib >= n_blocks_expert || batch_expert >= batch_count) {
         return;
     }
 
-    const int64_t batch_expert =
-        task / n_blocks_expert;
-
-    const int64_t local_ib =
-        task % n_blocks_expert;
-
-    if (batch_expert >= batch_count) {
-        return;
+    const int64_t task = batch_expert * n_blocks_expert + local_ib;
+    const int64_t expert = expert_base + batch_expert;
+    float g = 0.0f;
+    if constexpr (!direct) {
+        g = expert_grad[task * 32 + lane];
     }
 
-    const int64_t expert =
-        expert_base + batch_expert;
-
-    const int64_t block =
-        local_ib % n_blocks_row;
-
-    const int64_t row =
-        local_ib / n_blocks_row;
-
-    const int64_t cols =
-        n_blocks_row * 32;
-
-    //
-    // 해당 batch expert의 GEMM 결과.
-    //
-    const float * current_expert_grad =
-        expert_grad +
-        batch_expert * cols * n_rows;
-
-    float g =
-        current_expert_grad[
-            block * 32 +
-            lane +
-            cols * row
-        ];
-
-    //
-    // cap을 넘은 route는 scalar fallback으로 정확하게 추가.
-    //
     const int32_t begin =
         expert_offsets[expert];
 
@@ -1488,25 +1402,28 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
         (int64_t) begin + cap;
 
     if (overflow_begin < end) {
+        const int64_t block = local_ib % n_blocks_row;
+        const int64_t row = local_ib / n_blocks_row;
+        const int64_t cols = n_blocks_row * 32;
         for (int64_t p = overflow_begin;
              p < end;
              ++p) {
 
-            const int64_t route =
+            const int32_t route =
                 routes[p];
 
-            const int64_t used =
+            const int32_t used =
                 route % n_used;
 
-            const int64_t token =
+            const int32_t token =
                 route / n_used;
 
-            const int64_t act_used =
+            const int32_t act_used =
                 used % n_act_used;
 
             const int64_t act_route =
                 act_used +
-                n_act_used * token;
+                (int64_t) n_act_used * token;
 
             const float a =
                 activations[
@@ -1541,12 +1458,7 @@ static __global__ void opt_step_qlion_qat_id_apply_gemm(
         }
     }
 
-    //
-    // expert-local → 전체 weight block index.
-    //
-    const int64_t global_ib =
-        expert * n_blocks_expert +
-        local_ib;
+    const int64_t global_ib = expert_base * n_blocks_expert + task;
 
     opt_step_qlion_qat_apply<weight_type>(
         weight_data,
@@ -2053,7 +1965,11 @@ void ggml_cuda_acc_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             ggml_nelements(sparse_ids), reset);
     } else {
         GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
-        if (grad->type == GGML_TYPE_Q8_0) {
+        if (ggml_get_op_params_i32(dst, 2) != 0) {
+            GGML_ASSERT(grad->type == GGML_TYPE_F32);
+            acc_qlion_qat<false, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
+                (block_q8_0 *) accumulator->data, grad->data, n_blocks, reset);
+        } else if (grad->type == GGML_TYPE_Q8_0) {
             acc_qlion_qat<true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
                 (block_q8_0 *) accumulator->data, grad->data, n_blocks, reset);
         } else {
@@ -2311,16 +2227,11 @@ void ggml_cuda_opt_step_qlion_qat_id(
     const int64_t ids_s1 =
         ids->nb[1] / sizeof(int32_t);
 
+    GGML_ASSERT(n_used > 0 && n_used <= INT32_MAX);
+    GGML_ASSERT(n_tokens > 0 && n_tokens <= INT32_MAX / n_used);
+
     const int64_t total_routes =
         n_used * n_tokens;
-
-    GGML_ASSERT(
-        total_routes > 0
-    );
-
-    GGML_ASSERT(
-        total_routes <= INT32_MAX
-    );
 
     GGML_ASSERT(
         n_expert > 0
@@ -2387,6 +2298,47 @@ void ggml_cuda_opt_step_qlion_qat_id(
         ids_s1
     );
 
+    const int64_t n_blocks_row =
+        cols / 32;
+
+    const int64_t n_blocks_expert =
+        n_blocks_row * rows;
+
+    if (ggml_cuda_info().devices[ctx.device].cc == 610 && total_routes <= QLION_QAT_ID_DIRECT_ROUTES) {
+        // Short SM61 reductions avoid padded GEMM inputs and the full F32 gradient.
+        for (int64_t expert_base = 0; expert_base < n_expert; expert_base += QLION_QAT_ID_GEMM_BATCH) {
+            const int batch_count = (int) std::min<int64_t>(QLION_QAT_ID_GEMM_BATCH, n_expert - expert_base);
+            const dim3 blocks((n_blocks_expert + QLION_QAT_WARPS_PER_BLOCK - 1) / QLION_QAT_WARPS_PER_BLOCK, batch_count);
+            if (weight->type == GGML_TYPE_MXFP4) {
+                opt_step_qlion_qat_id_apply_gemm<GGML_TYPE_MXFP4, true><<<blocks, QLION_QAT_THREADS, 0, stream>>>(
+                    weight->data, nullptr,
+                    (const float *) activations->data, (const float *) grad->data,
+                    expert_offsets.ptr, routes.ptr,
+                    (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
+                    (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9,
+                    n_blocks_row, rows, (int32_t) n_act_used, (int32_t) n_used, expert_base, batch_count, 0);
+            } else if (weight->type == GGML_TYPE_Q8_0) {
+                opt_step_qlion_qat_id_apply_gemm<GGML_TYPE_Q8_0, true><<<blocks, QLION_QAT_THREADS, 0, stream>>>(
+                    weight->data, nullptr,
+                    (const float *) activations->data, (const float *) grad->data,
+                    expert_offsets.ptr, routes.ptr,
+                    (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
+                    (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9,
+                    n_blocks_row, rows, (int32_t) n_act_used, (int32_t) n_used, expert_base, batch_count, 0);
+            } else {
+                opt_step_qlion_qat_id_apply_gemm<GGML_TYPE_Q4_0, true><<<blocks, QLION_QAT_THREADS, 0, stream>>>(
+                    weight->data, nullptr,
+                    (const float *) activations->data, (const float *) grad->data,
+                    expert_offsets.ptr, routes.ptr,
+                    (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
+                    (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9,
+                    n_blocks_row, rows, (int32_t) n_act_used, (int32_t) n_used, expert_base, batch_count, 0);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
     //
     // ============================================================
     // GEMM-based expert gradient path
@@ -2424,12 +2376,6 @@ void ggml_cuda_opt_step_qlion_qat_id(
         ctx.pool(),
         expert_batch * cols * rows
     );
-
-    const int64_t n_blocks_row =
-        cols / 32;
-
-    const int64_t n_blocks_expert =
-        n_blocks_row * rows;
 
     cublasHandle_t handle =
         ctx.cublas_handle();
@@ -2555,18 +2501,9 @@ const int64_t gather_blocks =
         // --------------------------------------------------------
         //
 
-        const int64_t apply_tasks =
-            (int64_t)
-                batch_count *
-                n_blocks_expert;
-
-        const int64_t apply_blocks =
-            (
-                apply_tasks +
-                QLION_QAT_WARPS_PER_BLOCK -
-                1
-            ) /
-            QLION_QAT_WARPS_PER_BLOCK;
+        const dim3 apply_blocks(
+            (n_blocks_expert + QLION_QAT_WARPS_PER_BLOCK - 1) / QLION_QAT_WARPS_PER_BLOCK,
+            batch_count);
         if (
             weight->type ==
             GGML_TYPE_MXFP4
@@ -2588,8 +2525,8 @@ const int64_t gather_blocks =
 
                     n_blocks_row,
                     rows,
-                    n_act_used,
-                    n_used,
+                    (int32_t) n_act_used,
+                    (int32_t) n_used,
 
                     expert_base,
                     batch_count,
@@ -2603,7 +2540,7 @@ const int64_t gather_blocks =
                     expert_offsets.ptr, routes.ptr,
                     (block_q8_0 *) momentum->data, (block_q4_0 *) residual->data,
                     (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9,
-                    n_blocks_row, rows, n_act_used, n_used,
+                    n_blocks_row, rows, (int32_t) n_act_used, (int32_t) n_used,
                     expert_base, batch_count, cap);
         } else {
             opt_step_qlion_qat_id_apply_gemm<GGML_TYPE_Q4_0>
@@ -2623,8 +2560,8 @@ const int64_t gather_blocks =
 
                     n_blocks_row,
                     rows,
-                    n_act_used,
-                    n_used,
+                    (int32_t) n_act_used,
+                    (int32_t) n_used,
 
                     expert_base,
                     batch_count,

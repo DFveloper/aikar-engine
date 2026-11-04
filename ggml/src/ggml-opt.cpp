@@ -112,6 +112,7 @@ struct ggml_opt_context {
         qat_grad_state_kind kind = qat_grad_state_kind::unclassified;
         ggml_context * ctx = nullptr;
         ggml_backend_buffer_t buffer = nullptr;
+        ggml_backend_dev_t gpu_device = nullptr;
         ggml_tensor * accumulator = nullptr;
         ggml_tensor * row_ids = nullptr;
         ggml_tensor * row_hash = nullptr;
@@ -318,6 +319,12 @@ static ggml_opt_context::qat_grad_state ggml_opt_qat_make_grad_state(
         : ggml_backend_cpu_buffer_type();
     state.buffer = ggml_backend_alloc_ctx_tensors_from_buft(state.ctx, buft);
     GGML_ASSERT(state.buffer);
+    if (!use_cpu && kind == ggml_opt_context::qat_grad_state_kind::dense) {
+        const auto device = ggml_backend_buft_get_device(buft);
+        if (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            state.gpu_device = device;
+        }
+    }
     ggml_backend_buffer_clear(state.buffer, 0);
     return state;
 }
@@ -1442,6 +1449,10 @@ ggml_opt_qlion_qat_backward_callback(
     if (opt_ctx->qat_lr_scale_unit && opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT &&
         (opt_ctx->optimizer != GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT || opt_ctx->qat_lr_scale_warmup > 0)) {
         step_params = ggml_qlion_qat_stats(ctx, opt_ctx->qat_momentum[i], opt_ctx->qat_lr_state[i], step_params, opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT);
+        if (opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT) {
+            // Fused block scaling consumes the threshold, not the layer RMS.
+            ggml_set_op_params_i32(step_params, 0, 1);
+        }
         ggml_format_name(step_params, "QLion LR statistics for %s", opt_ctx->qat_params[i]->name);
     }
 
@@ -1931,15 +1942,21 @@ if (!dumped_qat_placement &&
         if (opt_ctx->opt_period > 1) {
             auto & state = ggml_opt_qat_select_grad_state(opt_ctx, i,
                 ggml_opt_context::qat_grad_state_kind::dense, ggml_nrows(canonical_param), 0);
-            if (combined->type == GGML_TYPE_F32) {
-                combined = ggml_cast(ctx, combined, GGML_TYPE_Q8_0);
-                ggml_format_name(combined, "QLion Q8_0 microgradient for %s", canonical_param->name);
+            ggml_tensor * accumulated = nullptr;
+            if (combined->type == GGML_TYPE_F32 && ggml_is_contiguous(combined) && state.gpu_device) {
+                auto * fused = ggml_acc_qlion_qat(ctx, state.accumulator, combined, opt_ctx->opt_i == 0);
+                ggml_set_op_params_i32(fused, 2, 1);
+                if (ggml_backend_dev_supports_op(state.gpu_device, fused)) {
+                    accumulated = fused;
+                }
             }
-            ggml_tensor * accumulated = ggml_acc_qlion_qat(
-                ctx,
-                state.accumulator,
-                combined,
-                opt_ctx->opt_i == 0);
+            if (!accumulated) {
+                if (combined->type == GGML_TYPE_F32) {
+                    combined = ggml_cast(ctx, combined, GGML_TYPE_Q8_0);
+                    ggml_format_name(combined, "QLion Q8_0 microgradient for %s", canonical_param->name);
+                }
+                accumulated = ggml_acc_qlion_qat(ctx, state.accumulator, combined, opt_ctx->opt_i == 0);
+            }
 
             ggml_format_name(accumulated, "QLion Q8_0 gradient accumulation for %s", canonical_param->name);
             if (opt_ctx->build_type != GGML_OPT_BUILD_TYPE_OPT) {

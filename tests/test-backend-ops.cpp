@@ -6368,9 +6368,12 @@ struct test_out_prod_id : public test_case {
     const int64_t n_experts;
     const int64_t n_experts_used;
     const int64_t n_tokens;
+    const bool broadcast;
+    const bool strided;
 
     std::string vars() override {
-        return VARS_TO_STR5(cols, rows, n_experts, n_experts_used, n_tokens);
+        return VARS_TO_STR5(cols, rows, n_experts, n_experts_used, n_tokens) +
+            (broadcast || strided ? "," + VARS_TO_STR2(broadcast, strided) : "");
     }
 
     double max_nmse_err() override {
@@ -6378,14 +6381,20 @@ struct test_out_prod_id : public test_case {
     }
 
     test_out_prod_id(int64_t cols = 32, int64_t rows = 24, int64_t n_experts = 8,
-            int64_t n_experts_used = 4, int64_t n_tokens = 10)
+            int64_t n_experts_used = 4, int64_t n_tokens = 10, bool broadcast = false, bool strided = false)
         : cols(cols), rows(rows), n_experts(n_experts),
-          n_experts_used(n_experts_used), n_tokens(n_tokens) {}
+          n_experts_used(n_experts_used), n_tokens(n_tokens), broadcast(broadcast), strided(strided) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, n_experts_used, n_tokens);
-        ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, n_experts_used, n_tokens);
-        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts_used, n_tokens);
+        const int64_t padding = strided ? 2 : 1;
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, broadcast ? 1 : n_experts_used, n_tokens * padding);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, n_experts_used, n_tokens * padding);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts_used * padding, n_tokens);
+        if (strided) {
+            a = ggml_view_3d(ctx, a, cols, a->ne[1], n_tokens, a->nb[1], a->nb[2] * padding, 0);
+            b = ggml_view_3d(ctx, b, rows, n_experts_used, n_tokens, b->nb[1], b->nb[2] * padding, 0);
+            ids = ggml_view_2d(ctx, ids, n_experts_used, n_tokens, ids->nb[1], 0);
+        }
         ggml_set_name(a, "a");
         ggml_set_name(b, "b");
         ggml_set_name(ids, "ids");
@@ -10032,6 +10041,22 @@ struct test_opt_step_adamw : public test_case {
     }
 };
 
+struct test_acc_qlion_qat_microgradient : public test_case {
+    const int64_t cols;
+    const bool reset;
+
+    test_acc_qlion_qat_microgradient(int64_t cols, bool reset) : cols(cols), reset(reset) {}
+    std::string vars() override { return VARS_TO_STR2(cols, reset); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * accumulator = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, cols, 5);
+        auto * grad = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, 5);
+        auto * result = ggml_acc_qlion_qat(ctx, accumulator, grad, reset);
+        result->op_params[2] = 1;
+        return result;
+    }
+};
+
 struct test_acc_qlion_qat_id : public test_case {
     const int64_t cols;
     const bool broadcast;
@@ -10077,8 +10102,9 @@ struct test_acc_qlion_qat_id : public test_case {
 // GGML_OP_QLION_QAT_STATS
 struct test_qlion_qat_stats : public test_case {
     const int64_t n;
-    test_qlion_qat_stats(int64_t n) : n(n) {}
-    std::string vars() override { return VAR_TO_STR(n); }
+    const bool threshold_only;
+    test_qlion_qat_stats(int64_t n, bool threshold_only = false) : n(n), threshold_only(threshold_only) {}
+    std::string vars() override { return threshold_only ? VARS_TO_STR2(n, threshold_only) : VAR_TO_STR(n); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * m = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, n);
@@ -10087,14 +10113,19 @@ struct test_qlion_qat_stats : public test_case {
         ggml_set_name(state, "warmup");
         ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
         ggml_set_name(p, "params");
-        return ggml_qlion_qat_stats(ctx, m, state, p, false);
+        ggml_tensor * result = ggml_qlion_qat_stats(ctx, m, state, p, threshold_only);
+        result->op_params[0] = threshold_only;
+        return result;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "params") == 0) {
-                const float p[] = { 1, 0.9f, 0, 0, 0, 256, 1, 2 };
+                const float p[] = { 1, 0.9f, 0, 0, 0, threshold_only ? -32.0f : 256.0f, 1, 2 };
                 ggml_backend_tensor_set(t, p, 0, sizeof(p));
+            } else if (threshold_only && strcmp(t->name, "warmup") == 0) {
+                const float frozen[] = { 0.25f, 2 };
+                ggml_backend_tensor_set(t, frozen, 0, sizeof(frozen));
             } else {
                 init_tensor_uniform(t, 0.0f, strcmp(t->name, "warmup") == 0 ? 0.0f : 1.0f);
             }
@@ -12889,6 +12920,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 2, 65568, {1, 1}, {2, 1}, true));
     test_cases.emplace_back(new test_out_prod_id(32, 24, 8, 4, 10));
     test_cases.emplace_back(new test_out_prod_id(64, 32, 16, 4, 16));
+    for (bool broadcast : { false, true }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_out_prod_id(96, 35, 11, 3, 37, broadcast, strided));
+        }
+    }
+    test_cases.emplace_back(new test_out_prod_id(32, 24, 1, 3, 41, true, true));
     for (const auto type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
         for (const int64_t cols : { 32, 96, 256, 288, 704 }) {
             test_cases.emplace_back(new test_mul_mat_id_back(type, GGML_TYPE_F32, 4, 2, false, 35, 3, cols));
@@ -13723,12 +13760,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
     for (int64_t cols : { 32, 96, 704 }) {
+        for (bool reset : { false, true }) {
+            test_cases.emplace_back(new test_acc_qlion_qat_microgradient(cols, reset));
+        }
         for (bool broadcast : { false, true }) {
             for (bool compact : { false, true }) test_cases.emplace_back(new test_acc_qlion_qat_id(cols, broadcast, compact));
         }
     }
     for (int64_t n : { 32, 256, 544, 65536 }) {
         test_cases.emplace_back(new test_qlion_qat_stats(n));
+        test_cases.emplace_back(new test_qlion_qat_stats(n, true));
     }
 
     for (ggml_type type : base_types) {

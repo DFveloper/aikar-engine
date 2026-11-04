@@ -8,6 +8,12 @@ CPU routed QLion accumulation variants are listed as `ACC_QLION_QAT_ID` and `ACC
 
 CUDA `OUT_PROD` bounds conversion scratch to 64 MiB for large contiguous non-Q4 quantized inputs whose decoded row fits that workspace. Q4_0 keeps its existing tiled path. P620 Q6_K/Q8_0 boundary, transposition, broadcasting, and accumulation tests pass against CPU references. Routed CUDA dX and QLion updates emit expert routes in input order. See [P620 validation](superpowers/reports/2026-11-03-qlion2-p620.md) for measurements and limits.
 
+For compact `QLION_QAT_STATS`, internal `op_params[0] = 1` requests only the warmup threshold. CPU and CUDA skip the momentum scan after warmup and set the unused layer RMS output to zero. The public constructor defaults to full statistics. SM61 direct routed QLion updates bypass padded GEMM buffers when the total route count is at most four. See the [P620 optimization study](superpowers/reports/2026-11-04-qlion2-craftsman.md) for matched training timings and profiles.
+
+For dense `ACC_QLION_QAT`, internal `op_params[2] = 1` quantizes the F32 microgradient before accumulation. CUDA fuses the two operations while preserving the intermediate Q8 bytes and FP16 scale rounding; CPU provides a reference implementation. The optimizer selects this mode only for supported GPU accumulators. CPU accumulator placement and unsupported backends retain the separate Q8 cast. See the [microgradient fusion study](superpowers/reports/2026-11-04-qlion2-microgradient-fusion.md).
+
+CUDA `OUT_PROD_ID` and compact expert accumulation gather each expert's activation and gradient vectors in one kernel. Route order and the existing GEMM dimensions are preserved, including broadcast activations and strided token storage. See the [MoE gather and state-kernel study](superpowers/reports/2026-11-04-qlion2-moe-gather.md).
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

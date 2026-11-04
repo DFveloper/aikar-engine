@@ -13457,6 +13457,12 @@ void ggml_compute_forward_qlion_qat_stats(const ggml_compute_params * params, gg
         if (params->ith != 0) {
             return;
         }
+        if (ggml_get_op_params_i32(dst, 0) && p[5] == -32 && (p[7] == 0 || state[1] >= p[7])) {
+            std::copy(p, p + 8, out);
+            out[6] = p[7] > 0 ? std::max(state[0], 1e-30f) : p[6];
+            out[8] = 0;
+            return;
+        }
         double sum = 0;
         for (int64_t ib = 0; ib < nb; ++ib) {
             const float d = GGML_FP16_TO_FP32(m[ib].d);
@@ -13702,6 +13708,16 @@ void ggml_compute_forward_acc_qlion_qat(const ggml_compute_params * params, ggml
     const float * grad_data = !tied && grad->type == GGML_TYPE_F32 ? (const float *) grad->data : nullptr;
     const uint8_t * grad_q8_data = !tied && grad->type == GGML_TYPE_Q8_0 ? (const uint8_t *) grad->data : nullptr;
     if (block_begin >= block_end) {
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 2) != 0) {
+        GGML_ASSERT(!tied && grad_data);
+        auto * blocks = (block_q8_0 *) accumulator_data;
+        for (int64_t ib = block_begin; ib < block_end; ++ib) {
+            block_q8_0 microgradient;
+            quantize(grad_data + ib * 32, &microgradient, 32);
+            ggml_qlion_qat_add_q8_block(blocks + ib, &microgradient, reset);
+        }
         return;
     }
     if (reset && grad_q8_data) {
