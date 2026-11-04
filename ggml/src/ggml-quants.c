@@ -391,7 +391,16 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
-static void quantize_row_nvfp4_blocks_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
+static uint8_t fp4_kv_scale_code(float scale) {
+    if (!(scale > 0.0f)) { return 0; }
+    if (scale >= 448.0f) { return 0x7e; }
+    if (scale < 0.015625f) { return (uint8_t) (scale*512.0f + 0.5f); }
+    uint32_t bits;
+    memcpy(&bits, &scale, sizeof(bits));
+    return (uint8_t) MIN(((bits + 0x80000u) >> 20) - 960u, 0x7eu);
+}
+
+static void quantize_row_nvfp4_blocks_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k, bool fp4_kv) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
     static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
@@ -412,7 +421,7 @@ static void quantize_row_nvfp4_blocks_ref(const float * GGML_RESTRICT x, block_n
             }
 
             // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax
-            const uint8_t ue = ggml_fp32_to_ue4m3(amax / 6.0f);
+            const uint8_t ue = fp4_kv ? fp4_kv_scale_code(amax / 6.0f) : ggml_fp32_to_ue4m3(amax / 6.0f);
             y[i].d[s] = ue;
             const float d = ggml_ue4m3_to_fp32(ue);
 
@@ -443,11 +452,19 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT 
         for (int j = 0; j < QK_NVFP4; ++j) {
             normalized[j] = x[i + j] / scale;
         }
-        quantize_row_nvfp4_blocks_ref(normalized, y + i / QK_NVFP4, QK_NVFP4);
+        quantize_row_nvfp4_blocks_ref(normalized, y + i / QK_NVFP4, QK_NVFP4, false);
     }
 }
 
 static void dequantize_row_nvfp4_blocks(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+void quantize_row_fp4_kv_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_nvfp4_blocks_ref(x, (block_nvfp4 *) y, k, true);
+}
+
+void dequantize_row_fp4_kv(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_nvfp4_blocks((const block_nvfp4 *) x, y, k);
+}
 
 void dequantize_row_nvfp4(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
     if (k == 0) {

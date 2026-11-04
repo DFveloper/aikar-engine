@@ -22,6 +22,7 @@
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
+#include "ggml-cuda/distillation.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
@@ -2524,6 +2525,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_DISTILLATION:
+        case GGML_OP_DISTILLATION_BACK:
+            ggml_cuda_distillation(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID_BACK:
             ggml_cuda_mul_mat_id_back(ctx, dst);
@@ -6080,6 +6085,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    bool fp4_kv = op->type == GGML_TYPE_FP4_KV;
+    for (const auto * src : op->src) {
+        fp4_kv |= src && src->type == GGML_TYPE_FP4_KV;
+    }
+    if (fp4_kv && op->op != GGML_OP_CPY && op->op != GGML_OP_NONE && op->op != GGML_OP_VIEW &&
+            op->op != GGML_OP_RESHAPE && op->op != GGML_OP_PERMUTE && op->op != GGML_OP_TRANSPOSE) { return false; }
     bool nvfp4 = op->type == GGML_TYPE_NVFP4;
     for (const auto * src : op->src) {
         nvfp4 |= src && src->type == GGML_TYPE_NVFP4;
@@ -6216,9 +6227,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32
                 && (op->src[0]->type == GGML_TYPE_F32 || ggml_is_quantized(op->src[0]->type))
                 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_DISTILLATION:
+        case GGML_OP_DISTILLATION_BACK:
+            return op->src[1]->ne[0] <= 4096;
         case GGML_OP_MUL_MAT_ID_BACK:
             return op->type == GGML_TYPE_F32
-                && (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0)
+                && (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q4_1 || op->src[0]->type == GGML_TYPE_Q8_0)
+                && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op)
                 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
         case GGML_OP_OUT_PROD_ID:
             return op->src[0] != nullptr && op->src[1] != nullptr && op->src[2] != nullptr
@@ -6292,6 +6307,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+                if (src0_type == GGML_TYPE_FP4_KV || src1_type == GGML_TYPE_FP4_KV) {
+                    return (src0_type == GGML_TYPE_FP4_KV &&
+                            (src1_type == GGML_TYPE_FP4_KV || src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16)) ||
+                           (src1_type == GGML_TYPE_FP4_KV && (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16));
+                }
                 if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_F16) &&
                     (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_BF16 || src1_type == GGML_TYPE_F16)
                 ) {

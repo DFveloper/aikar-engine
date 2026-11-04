@@ -10,37 +10,44 @@ python3 scripts/convert_gemma4_to_lumen4exp.py gemma4.gguf lumen4exp.gguf
 
 The converter preserves weight payloads and changes the architecture metadata. It does not train or distill the model. Conversion changes the model's attention behavior, so preserving weights does not preserve its logits or establish its quality.
 
+Conversion also configures YaRN for a 1,048,576-token (1M) context by default. It records `lumen4exp.context_length`, `rope.scaling.type = yarn`, the original context length, and `factor = target / original`. A 131,072-token source gets a factor of 8. An already scaled source uses its `rope.scaling.original_context_length` instead of applying scaling twice. Previous global scaling settings are replaced; SWA window and frequency metadata are preserved. Set `--context-length N` to choose another target at least as large as the original context.
+
+The model loads these YaRN settings without runtime RoPE flags. Use `-c 1048576` to allocate the full context at inference. The metadata marks the extension as not finetuned: conversion alone does not validate 1M-context quality. Distillation or long-context training and evaluation are still required.
+
 The default `lumen4exp.attention.shared_kv_layers` is 13, interpreted as the trailing 13 transformer layers. Only global attention layers in this range reuse KV. For a 30-layer model with global layers at zero-based indices 5, 11, 17, 23 and 29, the KV sources are 5, 11, 11, 11 and 11. Every SWA layer retains its own KV projections and cache. `--shared-layers 0` disables sharing.
 
 A source checkpoint must contain independent K projection and K normalization weights for all SWA layers. The converter rejects checkpoints whose original sharing removed these weights. Merge sharded GGUFs before conversion. Existing output files are never overwritten.
 
 HF checkpoints can use `Lumen4ExpForCausalLM` or `Lumen4ExpForConditionalGeneration` in their `architectures` configuration and the existing HF converter.
 
-## NVFP4 with an FP32 master scale
+## Default FP4 KV cache
 
-The existing `NVFP4` name and type number 40 are retained. Each row contains an FP32 decode scale followed by the existing E2M1 values and E4M3 scales for groups of 16 elements:
+Lumen4Exp stores global K and V in runtime-only `fp4_kv`: E2M1 values with one E4M3 scale for each group of 16 channels, after normalization and K RoPE. There is no FP32 row or tensor master scale. This uses the per-16 format described by [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash). It does not import DeepSeek's attention architecture or cache sharing rules.
 
 ```text
-master_scale = max(abs(row)) / (448 * 6)
-block_scale  = E4M3(max(abs(block / master_scale)) / 6)
-value        = E2M1_value * block_scale * master_scale
+block_scale = E4M3(max(abs(group_of_16)) / 6)
+value       = E2M1_value * block_scale
 ```
 
-Zero rows use a master scale of 1. Very small scales are clamped to a representable positive FP32 value. A row of 512 values occupies `4 + 8 * 36 = 292` bytes. The existing 64-element block payload is unchanged; the four-byte master scale belongs to the whole row.
+The number of independent global cache layers comes from model metadata and sharing rules; it is not fixed at two. A 512-channel head row occupies `8 * 36 = 288` bytes. With two KV heads, each independent global layer uses about 1.073 GiB at 1,000,000 tokens. In the earlier two-layer test configuration, two independent global layers and two KV heads require `1000000 * 2 * 2 * 2 * 288 = 2304000000` bytes (2.146 GiB). At the aligned 1,000,192 cells, the global cache uses 2,197.69 MiB. SWA keeps its configured cache types and adds 900 MiB in the four-slot test configuration. Appending rows does not change existing groups or require full-cache requantization.
 
-Lumen applies NVFP4 only to global K and V, after normalization and K RoPE. Each token's KV head vector is a row with its own scale, so appending tokens does not change previously cached rows. SWA cache types retain their existing configuration. Attention reads dequantized values.
+The default is selected automatically for `lumen4exp`; no cache-type flags or checkpoint conversion are needed. Runtime type 150 is separate from GGUF NVFP4 weight type 40. Existing NVFP4 weight codecs and conversion remain compatible. Old saved KV states are rejected by their different cache type.
 
-This follows the two-level scale formula in the [NVIDIA NVFP4 reference](https://docs.nvidia.com/deeplearning/transformer-engine/features/low_precision_training/nvfp4/nvfp4.html). [DeepSeek V4.1 Flash section 2.4.4](https://arxiv.org/html/2609.19969v1#S2.SS4.SSS4) uses the same 16-channel block format after RoPE but explicitly omits the FP32 master scale. Lumen retains it.
+CPU cache writes, dequantization and direct Flash Attention support this format. The cache stays on CPU when projection weights are offloaded. CUDA and Vulkan decline this runtime type. Direct GPU FP4 KV execution is not implemented. E4M3 scales have finite range: extremely small values can underflow, and very large values can saturate; there is no master scale to extend that range.
 
-The changed layout uses quantization version 3. The converter upgrades older NVFP4 weight rows by prepending an FP32 scale of 1, preserving their original block bytes and decoded values. Old block-only NVFP4 weights must be converted before loading with this engine.
+The existing training path uses the same per-16 FP4 quantizer in forward and STE gradients in backward. It currently restores FP32 values for the differentiable attention graph; this is not a complete FP4 backward kernel or a measured reduction in training activation memory.
 
-The scale-aware codec and global cache currently execute on CPU. CUDA, Vulkan, SYCL and WebGPU decline operations involving this NVFP4 storage layout, allowing the scheduler to use CPU. Their existing block-only kernels cannot interpret the new row header. Native GPU support and training are separate work.
+See [attention profiling](lumen4exp-nvfp4-cpu-attention.md) for the preceding optimization and its historical NVFP4 measurements.
 
 ## Validation
 
 ```sh
 PYTHONPATH=gguf-py python3 gguf-py/tests/test_lumen4exp.py -v
 build/bin/test-quantize-fns
-build/bin/test-backend-ops -b CPU -o CPY,SET_ROWS -p nvfp4
+build/bin/test-backend-ops test -b CPU -o CPY,SET_ROWS,FLASH_ATTN_EXT -p fp4_kv
 PYTHONPATH=gguf-py python3 gguf-py/tests/test_quants.py --libggml build/bin/libggml-base.so --type nvfp4 --quick
 ```
+
+The 2026-11-04 implementation passed 66 CPU backend cases for cache writes, copies and attention, the quantization suite, scalar fallback verification and six converter tests. A real server retained the 1M context and four slots, reported global `fp4_kv` K/V totaling 2,197.69 MiB plus 900 MiB SWA, and completed a 652-token prompt with eight generated tokens. Compute reservation was 1,085.79 MiB. This checks execution and storage, not trained model quality or 1M-token active-context throughput. No production server was restarted. Session validation artifacts are `build/fp4-kv-*.log` and `build/fp4-kv-smoke.json`.
+
+An additional strict sequence-state replay check returned successfully from the save/restore APIs but did not produce bitwise-identical next-token logits. Numerical error and cache-placement effects were not measured before the original checkpoint was replaced; no bitwise replay guarantee is claimed. Further model checks were stopped to avoid interfering with the user's independent KV-layer experiments. The successful server and backend results above refer to the earlier Lumen4Exp checkpoint.

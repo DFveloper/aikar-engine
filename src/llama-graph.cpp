@@ -3101,6 +3101,10 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
 
 #include "ggml-turboquant.h"
 
+static bool is_fp4_cache_type(ggml_type type) {
+    return type == GGML_TYPE_NVFP4 || type == GGML_TYPE_FP4_KV;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3114,11 +3118,28 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il,
          ggml_tensor * turboquant_parameters) const {
     const bool v_trans = v->nb[1] > v->nb[2];
-    if (k->type == GGML_TYPE_NVFP4) {
+    const auto host_cache = [](const ggml_tensor * tensor) {
+        while (tensor->view_src) {
+            tensor = tensor->view_src;
+        }
+        return tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer);
+    };
+    const bool fp4_host = cparams.flash_attn && kq_b == nullptr &&
+        is_fp4_cache_type(k->type) && k->type == v->type && host_cache(k) && host_cache(v);
+    const bool host_attention = fp4_host || (!cparams.op_offload && host_cache(k) && host_cache(v));
+    const bool fp4_cpu = fp4_host &&
+        ((k->ne[2] >= 512 && q->ne[2] == 1 && q->ne[3] == 1) || k->ne[2] >= 65536);
+    if (is_fp4_cache_type(k->type) && !fp4_cpu) {
         k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+        if (host_attention) {
+            ggml_backend_sched_set_tensor_backend(sched, k, backend_cpu);
+        }
     }
-    if (v->type == GGML_TYPE_NVFP4) {
+    if (is_fp4_cache_type(v->type) && !fp4_cpu) {
         v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+        if (host_attention) {
+            ggml_backend_sched_set_tensor_backend(sched, v, backend_cpu);
+        }
     }
 
     if (is_turbo_kv_type(k->type)) {
@@ -3164,14 +3185,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            if (host_attention) {
+                ggml_backend_sched_set_tensor_backend(sched, k, backend_cpu);
+            }
         }
 
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            if (host_attention) {
+                ggml_backend_sched_set_tensor_backend(sched, v, backend_cpu);
+            }
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (host_attention) {
+            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -3406,29 +3436,29 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 }
 
 ggml_tensor * llm_graph_context::build_kv_fake_quant(ggml_tensor * cur, ggml_type type) const {
-    if (type != GGML_TYPE_NVFP4) {
+    if (!is_fp4_cache_type(type)) {
         return cur;
     }
     auto * quantized = ggml_cast(ctx0, cur, type);
-    ggml_set_name(quantized, "kv_nvfp4_packed");
+    ggml_set_name(quantized, "kv_fp4_packed");
     auto * restored = ggml_cast(ctx0, quantized, GGML_TYPE_F32);
     auto * stop = ggml_cpy_no_grad(ctx0, restored, ggml_dup_tensor(ctx0, restored));
     auto * master_stop = ggml_cpy_no_grad(ctx0, cur, ggml_dup_tensor(ctx0, cur));
     auto * result = ggml_add(ctx0, cur, ggml_sub(ctx0, stop, master_stop));
-    ggml_set_name(result, "kv_nvfp4_ste");
+    ggml_set_name(result, "kv_fp4_ste");
     return result;
 }
 
 ggml_tensor * llm_graph_context::build_training_cache_view(ggml_tensor * cached) const {
-    GGML_ASSERT(cached->type == GGML_TYPE_F32 || cached->type == GGML_TYPE_NVFP4);
+    GGML_ASSERT(cached->type == GGML_TYPE_F32 || is_fp4_cache_type(cached->type));
     for (int i = ggml_graph_n_nodes(gf) - 1; i >= 0; --i) {
         ggml_tensor * stored = ggml_graph_node(gf, i);
         if (stored->op == GGML_OP_SET_ROWS && stored->view_src == cached->view_src) {
             GGML_ASSERT(cached->view_offs >= stored->view_offs);
-            if (cached->type == GGML_TYPE_NVFP4) {
+            if (is_fp4_cache_type(cached->type)) {
                 auto * decoded = ggml_cast(ctx0, stored, GGML_TYPE_F32);
                 auto * prefix = ggml_cpy_no_grad(ctx0, decoded, ggml_dup_tensor(ctx0, decoded));
-                auto * current = build_kv_fake_quant(stored->src[0], GGML_TYPE_NVFP4);
+                auto * current = build_kv_fake_quant(stored->src[0], cached->type);
                 auto * updated = ggml_set_rows(ctx0, prefix, current, stored->src[1]);
                 updated->op_params[0] = 1;
                 const size_t old_row = stored->nb[1];

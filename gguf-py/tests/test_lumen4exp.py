@@ -15,11 +15,21 @@ converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 
 
-def make_source(path, missing_swa=False, legacy_nvfp4=False):
+def make_source(path, missing_swa=False, legacy_nvfp4=False, context_length=131072, original_context=None):
     writer = gguf.GGUFWriter(path, "gemma4")
     writer.add_block_count(30)
     writer.add_sliding_window_pattern(([True] * 5 + [False]) * 5)
     writer.add_shared_kv_layers(0)
+    if context_length is not None:
+        writer.add_context_length(context_length)
+    if original_context is not None:
+        writer.add_rope_scaling_type(gguf.RopeScalingType.LINEAR)
+        writer.add_rope_scaling_factor(context_length / original_context if original_context else 1)
+        writer.add_rope_scaling_orig_ctx_len(original_context)
+        writer.add_rope_scaling_finetuned(True)
+        writer.add_rope_scaling_attn_factors(2.0)
+        writer.add_rope_scaling_yarn_log_mul(0.5)
+        writer.add_float32("gemma4.rope.scale_linear", 4.0)
     for layer in range(30):
         if missing_swa and layer == 28:
             continue
@@ -77,6 +87,38 @@ class TestLumen4Exp(unittest.TestCase):
         make_source(source, missing_swa=True)
         with self.assertRaisesRegex(ValueError, "independent KV weights"):
             converter.convert(source, self.root / "lumen.gguf")
+
+    def test_yarn_context_extension(self):
+        for original, target in ((None, 1048576), (32768, 1048576), (None, 262144)):
+            with self.subTest(original=original, target=target):
+                source = self.root / f"gemma-{original}-{target}.gguf"
+                output = self.root / f"lumen-{original}-{target}.gguf"
+                make_source(source, original_context=original)
+                converter.convert(source, output, context_length=target)
+                converted = gguf.GGUFReader(output)
+                values = {key: field.contents() for key, field in converted.fields.items()}
+                expected_original = 131072 if original is None else original
+                self.assertEqual(values["lumen4exp.context_length"], target)
+                self.assertEqual(values["lumen4exp.rope.scaling.type"], "yarn")
+                self.assertEqual(values["lumen4exp.rope.scaling.factor"], target / expected_original)
+                self.assertEqual(values["lumen4exp.rope.scaling.original_context_length"], expected_original)
+                self.assertFalse(values["lumen4exp.rope.scaling.finetuned"])
+                for stale in ("attn_factor", "yarn_log_multiplier"):
+                    self.assertNotIn(f"lumen4exp.rope.scaling.{stale}", values)
+                self.assertNotIn("lumen4exp.rope.scale_linear", values)
+
+    def test_invalid_context_rejected(self):
+        source = self.root / "gemma.gguf"
+        make_source(source)
+        for context in (0, -1, 65536, 0x100000000):
+            with self.subTest(context=context), self.assertRaisesRegex(ValueError, "context length"):
+                converter.convert(source, self.root / "lumen.gguf", context_length=context)
+        for context in (None, 0):
+            with self.subTest(source_context=context):
+                invalid_source = self.root / f"gemma-invalid-{context}.gguf"
+                make_source(invalid_source, context_length=context)
+                with self.assertRaisesRegex(ValueError, "context length"):
+                    converter.convert(invalid_source, self.root / "lumen.gguf")
 
     def test_invalid_sharing_rejected(self):
         source = self.root / "gemma.gguf"

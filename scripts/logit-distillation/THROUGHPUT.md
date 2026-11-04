@@ -1,5 +1,7 @@
 # Mixed-data CPU throughput
 
+These measurements used the earlier Korean multi-turn mixture. After the data audit, the default keeps only the first Korean user/assistant pair. The current 634-row mixture has 4950283 bytes, 4493 training windows and a 6609698365-byte teacher cache at context 512. Rates below are historical measurements, not a benchmark of the new corpus. See DATA_AUDIT.md and run benchmark.sh for a new measurement.
+
 Date: 2026-11-04. CPU: Xeon E5-2696 v3, eight threads, no GPU. Context=batch=microbatch=512, parallel sequences=1, gradient accumulation=1, teacher top-512 plus tail at T=1. Training uses pure KL, QLion2, learning rate 1e-5 and static graph reuse.
 
 ## Dataset and targets

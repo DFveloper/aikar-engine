@@ -1,6 +1,6 @@
 # CPU LES and paged attention
 
-This private CPU implementation targets the Gemma4 MoE router. Enable it with `--cpu-les`; `--cpu-les-prefetch-mib N` limits cache-line preparation per worker job to 1 through 1024 MiB (default 16). It requires CPU-resident decoder layers and a single sequence. It is experimental and disabled by default. Measurement on the Xeon E5-2696 v3 found a slowdown, so the temporary serving launcher leaves it disabled.
+This private CPU implementation targets the Gemma4 and Lumen4Exp MoE router. Enable it with `--cpu-les`; `--cpu-les-prefetch-mib N` limits cache-line preparation per worker job to 1 through 1024 MiB (default 16). It requires CPU-resident decoder layers and a single sequence. It is experimental and disabled by default. Measurement on the Xeon E5-2696 v3 found a slowdown, so the temporary serving launcher leaves it disabled.
 
 The context owns one asynchronous worker. During single-token decode, the graph snapshots prepared-expert priorities, then submits a prediction of the next layer's experts using its router and the current residual activation. Prediction precedes optional current-layer demand preparation. Each job has a byte budget, serial and generation. Superseded work is cancelled and cannot publish readiness into a later generation. Context destruction drains and joins the worker before releasing dependent resources. Prefill bypasses LES, LoRA graphs bypass LES, and training rejects LES.
 

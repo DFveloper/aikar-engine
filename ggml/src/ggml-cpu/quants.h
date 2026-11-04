@@ -4,6 +4,7 @@
 #include "ggml-common.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 // GGML CPU internal header
 
@@ -24,6 +25,8 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_BACKEND_API void ggml_cpu_dequantize_row_fp4_f16(const void * x, ggml_fp16_t * y, int64_t k, float * scratch, bool row_scale);
+GGML_BACKEND_API void ggml_cpu_dequantize_row_nvfp4_f16(const void * x, ggml_fp16_t * y, int64_t k, float * scratch);
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k);
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k);

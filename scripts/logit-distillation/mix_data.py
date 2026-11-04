@@ -11,7 +11,7 @@ def mix(ko, other, output, seed):
     output = Path(output).resolve()
     if output in sources:
         raise ValueError('Output must differ from inputs')
-    config = {'sources': [{'path': str(path), 'bytes': path.stat().st_size,
+    config = {'ko_first_turn_only': True, 'sources': [{'path': str(path), 'bytes': path.stat().st_size,
                            'mtime_ns': path.stat().st_mtime_ns} for path in sources], 'seed': seed}
     manifest = Path(str(output) + '.json')
     if output.is_file() and manifest.is_file():
@@ -24,6 +24,19 @@ def mix(ko, other, output, seed):
     korean = [line for line in sources[0].read_bytes().splitlines() if line.strip()]
     if not korean:
         raise ValueError('Empty Korean dataset')
+    for index, line in enumerate(korean):
+        record = json.loads(line)
+        messages = record.get('messages', [])
+        prefix = []
+        if messages and messages[0].get('role') == 'system':
+            prefix.append(messages[0])
+        first = messages[len(prefix):len(prefix) + 2]
+        if [message.get('role') for message in first] != ['user', 'assistant']:
+            raise ValueError(f'Korean row {index + 1}: missing first user/assistant pair')
+        if any(not isinstance(message.get('content'), str) or not message['content'].strip() for message in first):
+            raise ValueError(f'Korean row {index + 1}: empty first-turn content')
+        record['messages'] = prefix + first
+        korean[index] = json.dumps(record, ensure_ascii=False).encode('utf-8')
     rng = random.Random(seed)
     sample = []
     seen = 0

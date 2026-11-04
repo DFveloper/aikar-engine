@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gguf-py"))
 import gguf
 
 
-def convert(source, output, shared_layers=13):
+def convert(source, output, shared_layers=13, context_length=1048576):
     source, output = Path(source), Path(output)
     if output.exists():
         raise ValueError("output already exists")
@@ -22,6 +22,14 @@ def convert(source, output, shared_layers=13):
         raise ValueError("source architecture must be gemma4")
     if any(key.startswith("split.") for key in reader.fields):
         raise ValueError("merge split GGUF files before conversion")
+    original_context = reader.fields.get("gemma4.rope.scaling.original_context_length")
+    if original_context is None:
+        original_context = reader.fields.get("gemma4.context_length")
+    if original_context is None:
+        raise ValueError("source is missing its original context length")
+    original_context = int(original_context.contents())
+    if not 0 < original_context <= context_length <= 0xFFFFFFFF:
+        raise ValueError("context length must be at least the positive original context length and fit uint32")
     count = int(reader.fields["gemma4.block_count"].contents())
     pattern = reader.fields["gemma4.attention.sliding_window_pattern"].contents()
     if len(pattern) != count or not 0 <= shared_layers < count:
@@ -47,7 +55,8 @@ def convert(source, output, shared_layers=13):
             if key.startswith("GGUF.") or key in ("general.architecture", "general.name", "general.quantization_version"):
                 continue
             key = key.replace("gemma4.", "lumen4exp.", 1) if key.startswith("gemma4.") else key
-            if key == "lumen4exp.attention.shared_kv_layers":
+            if key in ("lumen4exp.attention.shared_kv_layers", "lumen4exp.context_length",
+                       "lumen4exp.rope.scale_linear") or key.startswith("lumen4exp.rope.scaling."):
                 continue
             writer.add_key_value(key, field.contents(), field.types[0],
                                  field.types[-1] if field.types[0] == gguf.GGUFValueType.ARRAY else None)
@@ -55,6 +64,11 @@ def convert(source, output, shared_layers=13):
         writer.add_string("general.architecture", "lumen4exp")
         writer.add_name("Lumen 3.8 Pulsar Next")
         writer.add_uint32("lumen4exp.attention.shared_kv_layers", shared_layers)
+        writer.add_uint32("lumen4exp.context_length", context_length)
+        writer.add_string("lumen4exp.rope.scaling.type", gguf.RopeScalingType.YARN.value)
+        writer.add_float32("lumen4exp.rope.scaling.factor", context_length / original_context)
+        writer.add_uint32("lumen4exp.rope.scaling.original_context_length", original_context)
+        writer.add_bool("lumen4exp.rope.scaling.finetuned", False)
         for tensor in reader.tensors:
             nbytes = tensor.n_bytes
             if legacy_nvfp4 and tensor.tensor_type == gguf.GGMLQuantizationType.NVFP4:
@@ -82,8 +96,10 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--shared-layers", type=int, default=13)
+    parser.add_argument("--context-length", type=int, default=1048576,
+                        help="YaRN target context length (default: 1048576 tokens)")
     args = parser.parse_args()
-    convert(args.source, args.output, args.shared_layers)
+    convert(args.source, args.output, args.shared_layers, args.context_length)
 
 
 if __name__ == "__main__":

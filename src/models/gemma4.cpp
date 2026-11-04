@@ -297,8 +297,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur_pos", il);
 
             if (full_sequence && hparams.kv_global_only && !hparams.is_swa(il)) {
-                Kcur = build_kv_fake_quant(Kcur, GGML_TYPE_NVFP4);
-                Vcur = build_kv_fake_quant(Vcur, GGML_TYPE_NVFP4);
+                Kcur = build_kv_fake_quant(Kcur, GGML_TYPE_FP4_KV);
+                Vcur = build_kv_fake_quant(Vcur, GGML_TYPE_FP4_KV);
             }
             if (full_sequence) {
                 sequence_k[il] = Kcur;
@@ -317,6 +317,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_attn(inp_attn,
                     model.layers[il].wo, nullptr, model.layers[il].wo_s,
                     Qcur, shared_k, shared_v, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+        }
+
+        if (hparams.kv_global_only && il >= 11 && !hparams.is_swa(il)) {
+            cb(cur, "cvec_attn", il);
+            cur = build_cvec(cur, il);
         }
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
@@ -459,7 +464,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "out_scaled", il);
         }
 
-        cur = build_cvec(cur, il);
+        if (!hparams.kv_global_only) {
+            cur = build_cvec(cur, il);
+        }
         cb(cur, "l_out", il);
 
         if (il == cparams.ream_calibration_layer) {

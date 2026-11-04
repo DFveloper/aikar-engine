@@ -59,7 +59,7 @@ static __device__ int nvfp4_nearest(float value, float scale) {
     return best;
 }
 
-template<typename src_t, typename idx_t, bool scatter>
+template<typename src_t, typename idx_t, bool scatter, bool fp4_kv = false>
 static __global__ void nvfp4_quantize_rows(
         const char * src, const char * indices, char * dst,
         nvfp4_layout source, nvfp4_layout index, nvfp4_layout target) {
@@ -90,11 +90,11 @@ static __global__ void nvfp4_quantize_rows(
         }
         __syncthreads();
     }
-    const float master = maximum[0] > 0.0f ? fmaxf(__fdiv_rn(maximum[0], 2688.0f), FLT_MIN) : 1.0f;
-    if (threadIdx.x == 0) {
+    const float master = fp4_kv ? 1.0f : (maximum[0] > 0.0f ? fmaxf(__fdiv_rn(maximum[0], 2688.0f), FLT_MIN) : 1.0f);
+    if (!fp4_kv && threadIdx.x == 0) {
         *(float *) output = master;
     }
-    auto * blocks = (block_nvfp4 *) (output + sizeof(float));
+    auto * blocks = (block_nvfp4 *) (output + (fp4_kv ? 0 : sizeof(float)));
     for (int64_t group = threadIdx.x; group < source.ne[0]/16; group += blockDim.x) {
         float values[16];
         float local_max = 0.0f;
@@ -102,7 +102,11 @@ static __global__ void nvfp4_quantize_rows(
             values[i] = __fdiv_rn(ggml_cuda_cast<float>(*(const src_t *) (input + (group*16 + i)*source.nb[0])), master);
             local_max = fmaxf(local_max, fabsf(values[i]));
         }
-        const uint8_t code = nvfp4_scale_code(__fdiv_rn(local_max, 6.0f));
+        const float requested_scale = __fdiv_rn(local_max, 6.0f);
+        const uint8_t code = fp4_kv ? (requested_scale >= 448.0f ? 0x7e :
+                (requested_scale < 0.015625f ? uint8_t(requested_scale*512.0f + 0.5f) :
+                 uint8_t(min(((__float_as_uint(requested_scale) + 0x80000u) >> 20) - 960u, 0x7eu)))) :
+                nvfp4_scale_code(requested_scale);
         const float scale = ggml_cuda_ue4m3_to_fp32(code);
         block_nvfp4 & block = blocks[group/4];
         const int sub = group % 4;
@@ -113,13 +117,13 @@ static __global__ void nvfp4_quantize_rows(
     }
 }
 
-template<typename dst_t>
+template<typename dst_t, bool fp4_kv = false>
 static __global__ void nvfp4_dequantize_rows(const char * src, char * dst, nvfp4_layout source, nvfp4_layout target) {
     const int64_t row = blockIdx.x;
     const char * input = src + nvfp4_row_offset(row, source);
     char * output = dst + nvfp4_row_offset(row, target);
-    const float master = *(const float *) input;
-    const auto * blocks = (const block_nvfp4 *) (input + sizeof(float));
+    const float master = fp4_kv ? 1.0f : *(const float *) input;
+    const auto * blocks = (const block_nvfp4 *) (input + (fp4_kv ? 0 : sizeof(float)));
     for (int64_t i = threadIdx.x; i < source.ne[0]; i += blockDim.x) {
         const block_nvfp4 & block = blocks[i/64];
         const int sub = (i % 64)/16;
@@ -150,6 +154,17 @@ void ggml_cuda_cpy_nvfp4(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     }
     if (src->type == dst->type) {
         nvfp4_copy_rows<<<nrows, 128, 0, ctx.stream()>>>((const char *) src->data, (char *) dst->data, source, target, ggml_row_size(src->type, src->ne[0]));
+    } else if (dst->type == GGML_TYPE_FP4_KV) {
+        if (src->type == GGML_TYPE_F32) {
+            nvfp4_quantize_rows<float, int64_t, false, true><<<nrows, 128, 0, ctx.stream()>>>((const char *) src->data, nullptr, (char *) dst->data, source, {}, target);
+        } else {
+            GGML_ASSERT(src->type == GGML_TYPE_F16);
+            nvfp4_quantize_rows<half, int64_t, false, true><<<nrows, 128, 0, ctx.stream()>>>((const char *) src->data, nullptr, (char *) dst->data, source, {}, target);
+        }
+    } else if (src->type == GGML_TYPE_FP4_KV && dst->type == GGML_TYPE_F32) {
+        nvfp4_dequantize_rows<float, true><<<nrows, 128, 0, ctx.stream()>>>((const char *) src->data, (char *) dst->data, source, target);
+    } else if (src->type == GGML_TYPE_FP4_KV && dst->type == GGML_TYPE_F16) {
+        nvfp4_dequantize_rows<half, true><<<nrows, 128, 0, ctx.stream()>>>((const char *) src->data, (char *) dst->data, source, target);
     } else if (dst->type == GGML_TYPE_NVFP4) {
         if (src->type == GGML_TYPE_F32) {
             nvfp4_quantize_rows<float, int64_t, false><<<nrows, 128, 0, ctx.stream()>>>((const char *) src->data, nullptr, (char *) dst->data, source, {}, target);

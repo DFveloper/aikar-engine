@@ -31,6 +31,9 @@ static inline float ggml_q8_0_scale(const float * x) {
     return vmax / -128.0f;
 }
 
+GGML_API void quantize_row_fp4_kv_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_fp4_kv(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 GGML_API void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k);

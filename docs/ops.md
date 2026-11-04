@@ -4,6 +4,8 @@ List of GGML operations and backend support status.
 
 CPU `PAGED_ATTN` uses cache-sized tiles and SIMD helpers, with a scalar reference selectable through `GGML_CPU_PAGED_ATTN_REFERENCE=1`. CPU `MUL_MAT_ID` accepts optional expert-priority scheduling metadata. See [CPU LES and paged attention](pulsar-cpu-les-implementation.md) for supported configurations and numerical limits.
 
+CPU `FLASH_ATTN_EXT` accepts paired NVFP4 K/V with FP32 row master scales. It decodes rows within the existing attention tiles and preserves the F16 rounding of the previous full-cache conversion. AVX2/F16C decodes directly to F16; other CPUs use the scalar codec with row-sized scratch. The model graph selects direct attention for CPU-resident NVFP4 caches with at least 512 cells during single-token, single-stream decode. Below 65,536 cache cells, prefill, batched decode and shorter caches retain the previous conversion path because direct attention did not consistently improve their measured throughput. Longer caches use direct attention to bound temporary storage. Mixed NVFP4 cache types are unsupported.
+
 CPU routed QLion accumulation variants are listed as `ACC_QLION_QAT_ID` and `ACC_QLION_QAT_EXPERTS`. They reuse the `ACC_QLION_QAT` and `ACC_QLION_QAT_ROWS` operation codes with variant parameters; the compact expert updater reuses `OPT_STEP_QLION_QAT_SPARSE_ROWS`. CUDA supports compact expert accumulation and its updater; the direct dense fused accumulation variant remains CPU-only. Vulkan rejects these expert variants. See [native QLion training](../examples/qlora_training/README.md) for selection policy and dense fallback.
 
 CUDA `OUT_PROD` bounds conversion scratch to 64 MiB for large contiguous non-Q4 quantized inputs whose decoded row fits that workspace. Q4_0 keeps its existing tiled path. P620 Q6_K/Q8_0 boundary, transposition, broadcasting, and accumulation tests pass against CPU references. Routed CUDA dX and QLion updates emit expert routes in input order. See [P620 validation](superpowers/reports/2026-11-03-qlion2-p620.md) for measurements and limits.
@@ -14,7 +16,7 @@ For dense `ACC_QLION_QAT`, internal `op_params[2] = 1` quantizes the F32 microgr
 
 CUDA `OUT_PROD_ID` and compact expert accumulation gather each expert's activation and gradient vectors in one kernel. Route order and the existing GEMM dimensions are preserved, including broadcast activations and strided token storage. See the [MoE gather and state-kernel study](superpowers/reports/2026-11-04-qlion2-moe-gather.md).
 
-CPU `DISTILLATION` and `DISTILLATION_BACK` fuse top-k plus tail KL and its logit gradient using row-sized scratch per thread. Teacher IDs and log-probabilities are inputs; masked rows produce zero loss and gradient. The native trainer uses these operations by default. `GGML_DISTILL_REFERENCE=1` selects the earlier graph-composed loss for numerical and performance comparisons. Other backends can fall back to CPU; native GPU kernels are not implemented. See [the CPU recovery workflow](../scripts/logit-distillation/README.md).
+CPU and CUDA `DISTILLATION` and `DISTILLATION_BACK` fuse top-k plus tail KL and its logit gradient. Teacher IDs and log-probabilities are inputs; masked rows produce zero loss and gradient. CUDA uses a shared token-ID hash table and supports k <= 4096. The native trainer uses these operations by default. `GGML_DISTILL_REFERENCE=1` selects the earlier graph-composed loss for numerical and performance comparisons. Other backends can fall back to CPU. See [the recovery workflow](../scripts/logit-distillation/README.md) and [A100 container](../scripts/logit-distillation/runpod/README.md).
 
 ## How to add a backend to this table:
 
@@ -52,8 +54,8 @@ Legend:
 |                              COS | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                      COUNT_EQUAL | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |                              CPY | ❌ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ❌ | ❌ |
-|                     DISTILLATION | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-|                DISTILLATION_BACK | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                     DISTILLATION | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                DISTILLATION_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 |               CROSS_ENTROPY_LOSS | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |          CROSS_ENTROPY_LOSS_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |                           CUMSUM | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
@@ -150,3 +152,5 @@ Legend:
 |                            TRUNC | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                          UPSCALE | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                            XIELU | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+CPU `fp4_kv` is a runtime-only E2M1 cache format with one E4M3 scale per 16 channels and no FP32 master scale. CPU CPY, SET_ROWS and paired FLASH_ATTN_EXT support it. Lumen4Exp selects it for global KV by default. CUDA supports F32/F16 conversion through CPY for training fake quantization; persistent cache writes and direct attention remain CPU operations. Vulkan declines this cache format.

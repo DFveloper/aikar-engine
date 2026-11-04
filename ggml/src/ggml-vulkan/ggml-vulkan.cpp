@@ -15967,12 +15967,12 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
 }
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    // NVFP4 row scales require the CPU codec until the device kernels support them.
-    if (op->type == GGML_TYPE_NVFP4) {
+    // These FP4 cache layouts use the CPU codec.
+    if (op->type == GGML_TYPE_NVFP4 || op->type == GGML_TYPE_FP4_KV) {
         return false;
     }
     for (const auto * src : op->src) {
-        if (src && src->type == GGML_TYPE_NVFP4) {
+        if (src && (src->type == GGML_TYPE_NVFP4 || src->type == GGML_TYPE_FP4_KV)) {
             return false;
         }
     }

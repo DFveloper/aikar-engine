@@ -473,7 +473,8 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
-    if (src0->type == GGML_TYPE_NVFP4 || src1->type == GGML_TYPE_NVFP4) {
+    if (src0->type == GGML_TYPE_NVFP4 || src1->type == GGML_TYPE_NVFP4 ||
+            src0->type == GGML_TYPE_FP4_KV || src1->type == GGML_TYPE_FP4_KV) {
         ggml_cuda_cpy_nvfp4(ctx, src0, src1);
         return;
     }

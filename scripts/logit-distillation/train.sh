@@ -22,5 +22,5 @@ exec "$BIN_DIR/llama-finetune-qlion" \
     --qat-out '' --qat-adapter-out "$OUTPUT" --save-every 0 \
     --epochs "${EPOCHS:-1}" -lr "${LR:-1e-5}" \
     --eval-initial --verbose-loss --shuffle-dataset \
-    -c "$CTX" -b "$CTX" -ub "$UBATCH" -np 1 -ngl 0 \
+    -c "$CTX" -b "$CTX" -ub "$UBATCH" -np 1 -ngl "${GPU_LAYERS:-0}" \
     -t "$THREADS" -tb "$THREADS" -dthr "$THREADS" "$@"

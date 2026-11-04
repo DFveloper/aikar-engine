@@ -20,7 +20,7 @@ static bool ggml_is_power_of_2(int n) {
 }
 
 static bool is_rowwise_kv_type(ggml_type type) {
-    return type == GGML_TYPE_Q8_KV || type == GGML_TYPE_NVFP4;
+    return type == GGML_TYPE_Q8_KV || type == GGML_TYPE_NVFP4 || type == GGML_TYPE_FP4_KV;
 }
 
 static bool is_turbo_kv_type(ggml_type type) {
@@ -199,7 +199,7 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        if (offload && type_k != GGML_TYPE_FP4_KV && type_v != GGML_TYPE_FP4_KV) {
             auto * dev = model.dev_layer(il);
             const auto dev_type = ggml_backend_dev_type(dev);
             const char * backend_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));

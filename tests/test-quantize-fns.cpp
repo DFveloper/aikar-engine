@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu/quants.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -138,14 +139,15 @@ static int test_nvfp4_master_scale(bool verbose) {
     for (int n : {64, 128, 512}) {
         const size_t row_size = ggml_row_size(GGML_TYPE_NVFP4, n);
         assert(row_size == sizeof(float) + size_t(n / 64) * 36);
-        std::vector<float> input(2*n, 0.0f), output(n);
-        std::vector<uint8_t> packed(2*row_size + 16, 0xab);
+        std::vector<float> input(3*n, 0.0f), output(n);
+        std::vector<uint8_t> packed(3*row_size + 16, 0xab);
         for (int i = 0; i < n; ++i) {
             input[i] = float(i % 17 - 8) * 1e-8f;
             input[n + i] = float(i % 17 - 8) * 1e8f;
+            input[2*n + i] = std::sin(float(i)) * 0.75f;
         }
-        ggml_quantize_chunk(GGML_TYPE_NVFP4, input.data(), packed.data(), 0, 2, n, nullptr);
-        for (int row = 0; row < 2; ++row) {
+        ggml_quantize_chunk(GGML_TYPE_NVFP4, input.data(), packed.data(), 0, 3, n, nullptr);
+        for (int row = 0; row < 3; ++row) {
             const uint8_t * data = packed.data() + row*row_size;
             float scale;
             memcpy(&scale, data, sizeof(scale));
@@ -155,6 +157,11 @@ static int test_nvfp4_master_scale(bool verbose) {
             }
             assert(scale == amax / 2688.0f);
             traits->to_float(data, output.data(), n);
+            std::vector<ggml_fp16_t> expected(n), actual(n);
+            std::vector<float> scratch(n);
+            ggml_fp32_to_fp16_row(output.data(), expected.data(), n);
+            ggml_cpu_dequantize_row_nvfp4_f16(data, actual.data(), n, scratch.data());
+            failures += expected != actual;
             double squared_error = 0.0, squared_input = 0.0;
             for (int i = 0; i < n; ++i) {
                 const double value = input[row*n + i];
@@ -163,7 +170,7 @@ static int test_nvfp4_master_scale(bool verbose) {
             }
             failures += !(squared_error / squared_input < 0.02);
         }
-        for (size_t i = 2*row_size; i < packed.size(); ++i) {
+        for (size_t i = 3*row_size; i < packed.size(); ++i) {
             assert(packed[i] == 0xab);
         }
         std::fill(input.begin(), input.end(), 0.0f);
@@ -176,6 +183,57 @@ static int test_nvfp4_master_scale(bool verbose) {
     if (verbose || failures) {
         printf("nvfp4 FP32 row scales: %s\n", RESULT_STR[failures != 0]);
     }
+    return failures;
+}
+
+static int test_fp4_kv(bool verbose) {
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_FP4_KV);
+    int failures = 0;
+    for (int n : {64, 128, 512}) {
+        const size_t bytes = ggml_row_size(GGML_TYPE_FP4_KV, n);
+        assert(bytes == size_t(n/16)*9);
+        std::vector<float> input(n), output(n), scratch(n);
+        for (int i = 0; i < n; ++i) {
+            input[i] = std::sin(float(i)) * (i/16 % 2 ? 16.0f : 0.125f);
+        }
+        std::vector<uint8_t> packed(bytes + 16, 0xab), changed(bytes);
+        traits->from_float_ref(input.data(), packed.data(), n);
+        traits->to_float(packed.data(), output.data(), n);
+        std::vector<ggml_fp16_t> actual(n), expected(n);
+        ggml_fp32_to_fp16_row(output.data(), expected.data(), n);
+        ggml_cpu_dequantize_row_fp4_f16(packed.data(), actual.data(), n, scratch.data(), false);
+        failures += actual != expected;
+        double error = 0, norm = 0;
+        for (int i = 0; i < n; ++i) {
+            error += (output[i] - input[i])*(output[i] - input[i]);
+            norm += input[i]*input[i];
+        }
+        failures += !(error/norm < 0.02);
+        input[0] = 100.0f;
+        traits->from_float_ref(input.data(), changed.data(), n);
+        failures += memcmp(packed.data() + 1, changed.data() + 1, 3) != 0;
+        failures += memcmp(packed.data() + 12, changed.data() + 12, 24) != 0;
+        failures += memcmp(packed.data() + 36, changed.data() + 36, bytes - 36) != 0;
+        for (size_t i = bytes; i < packed.size(); ++i) { failures += packed[i] != 0xab; }
+        std::fill(input.begin(), input.end(), 0.0f);
+        traits->from_float_ref(input.data(), packed.data(), n);
+        traits->to_float(packed.data(), output.data(), n);
+        for (float value : output) { failures += value != 0.0f; }
+    }
+    const float scales[] = {0, 1.0f/512, 1.0f/64, 240, 256, 288, 416, 448};
+    const uint8_t codes[] = {0, 1, 8, 0x77, 0x78, 0x79, 0x7d, 0x7e};
+    float values[128], restored[128];
+    uint8_t packed[72];
+    for (int group = 0; group < 8; ++group) {
+        for (int i = 0; i < 16; ++i) { values[group*16 + i] = 6*scales[group]; }
+    }
+    traits->from_float_ref(values, packed, 128);
+    traits->to_float(packed, restored, 128);
+    for (int group = 0; group < 8; ++group) {
+        failures += packed[group/4*36 + group%4] != codes[group];
+        for (int i = 0; i < 16; ++i) { failures += restored[group*16 + i] != values[group*16 + i]; }
+    }
+    if (verbose || failures) { printf("FP4 KV per-16 scales: %s\n", RESULT_STR[failures != 0]); }
     return failures;
 }
 
@@ -250,7 +308,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
-                type == GGML_TYPE_NVFP4 ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
+                (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_FP4_KV) ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
             bool failed = !(total_error < max_quantization_error);
             num_failed += failed;
             if (failed || verbose) {
@@ -480,6 +538,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_q8_kv_row(verbose);
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_nvfp4_master_scale(verbose);
+    num_failed += test_fp4_kv(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
 
     if (num_failed || verbose) {

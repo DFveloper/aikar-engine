@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan and run CPU teacher extraction or QLion2 attention recovery."""
+"""Plan and run teacher extraction or QLion2 attention recovery."""
 import argparse
 import datetime
 import fcntl
@@ -67,6 +67,9 @@ def main():
     extract_batch = int(env['EXTRACT_UBATCH'])
     train_batch = int(env['TRAIN_UBATCH'])
     threads = int(env['THREADS'])
+    gpu_layers = int(env.get('GPU_LAYERS', '0'))
+    static_graph = env.get('STATIC_GRAPH', 'on')
+    require(gpu_layers >= 0 and static_graph in ('on', 'off', 'auto'), 'Invalid GPU or graph configuration.')
     require(context >= 256 and context % 256 == 0, 'CTX must be a positive multiple of 256.')
     require(0 < extract_batch <= context and 0 < train_batch <= context and context % train_batch == 0, 'Invalid microbatch size.')
     require(threads > 0 and int(env['EPOCHS']) > 0 and int(env['GRAD_ACCUM']) > 0, 'Threads, epochs and accumulation must be positive.')
@@ -82,7 +85,7 @@ def main():
     cache = root / f'teacher-top{inputs["top_k"]}-c{context}.dat'
     common = ['--train-file', str(data), '--distill-cache', str(cache), '--distill-max-windows', '0',
               '--distill-validation-windows', str(inputs['validation_windows']), '--val-split', str(inputs['val_split']),
-              '-c', str(context), '-b', str(context), '-np', '1', '-ngl', '0',
+              '-c', str(context), '-b', str(context), '-np', '1', '-ngl', str(gpu_layers),
               '-t', str(threads), '-tb', str(threads), '-dthr', str(threads)]
     extract = [str(binary_dir / 'llama-extract-logits'), '-m', str(teacher), '--distill-student', str(student),
                '--distill-top-k', str(inputs['top_k']), '--distill-temperature', str(inputs['temperature']),
@@ -154,9 +157,10 @@ def main():
     settings = {key: env[key] for key in ('TRAIN_UBATCH', 'EPOCHS', 'LR', 'LR_MIN', 'WARMUP_STEPS', 'SAVE_EVERY',
                                          'EVAL_EVERY', 'GRAD_ACCUM', 'TARGETS')}
     settings.update({'inputs': inputs, 'cache_sha256': cache_manifest['sha256'], 'binary': identity(binary_dir / 'llama-finetune-qlion')})
+    settings.update({'gpu_layers': gpu_layers, 'static_graph': static_graph})
     command = [str(binary_dir / 'llama-finetune-qlion'), '-m', str(student), *common,
                '-ub', str(train_batch), '--optimizer', 'qlion2', '--quant-type', 'q4_0,q8_0',
-               '--qat-targets', env['TARGETS'], '--freeze-layers', '0', '--qat-static-graph', 'on',
+               '--qat-targets', env['TARGETS'], '--freeze-layers', '0', '--qat-static-graph', static_graph,
                '--grad-accum', str(accumulation), '--epochs', str(epochs), '-lr', env['LR'],
                '-lr-min', env['LR_MIN'], '--lr-scheduler', 'cosine', '--warmup-steps', str(warmup),
                '--save-every', str(save_every), '--eval-every', str(eval_every), '--eval-initial',

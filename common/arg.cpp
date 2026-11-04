@@ -3034,7 +3034,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--cpu-les"}, "enable CPU lookahead expert preparation and scheduling (Gemma4, single sequence)",
+        {"--cpu-les"}, "enable CPU lookahead expert preparation and scheduling (Gemma4 or Lumen4Exp, single sequence)",
         [](common_params & params) { params.cpu_les = true; }
     ).set_env("LLAMA_ARG_CPU_LES"));
     add_opt(common_arg(

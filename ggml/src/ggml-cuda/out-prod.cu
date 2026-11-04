@@ -595,6 +595,11 @@ static __global__ void mul_mat_id_back_dequant_batch(
     float value;
     if constexpr (weight_type == GGML_TYPE_MXFP4) {
         value = mxfp4_get(((const block_mxfp4 *) weight_data)[global_ib], lane);
+    } else if constexpr (weight_type == GGML_TYPE_Q4_1) {
+        const block_q4_1 & block = ((const block_q4_1 *) weight_data)[global_ib];
+        const int quant = lane < 16 ? block.qs[lane] & 15 : block.qs[lane - 16] >> 4;
+        const float2 scale = __half22float2(block.dm);
+        value = scale.x*quant + scale.y;
     } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
         const block_q8_0 & block = ((const block_q8_0 *) weight_data)[global_ib];
         value = __half2float(block.d) * block.qs[lane];
@@ -914,6 +919,11 @@ static __global__ void mul_mat_id_back_overflow(
         float value;
         if constexpr (weight_type == GGML_TYPE_MXFP4) {
             value = mxfp4_get(((const block_mxfp4 *) weight_data)[ib], lane);
+        } else if constexpr (weight_type == GGML_TYPE_Q4_1) {
+            const block_q4_1 & block = ((const block_q4_1 *) weight_data)[ib];
+            const int quant = lane < 16 ? block.qs[lane] & 15 : block.qs[lane - 16] >> 4;
+            const float2 scale = __half22float2(block.dm);
+            value = scale.x*quant + scale.y;
         } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
             const block_q8_0 & block = ((const block_q8_0 *) weight_data)[ib];
             value = __half2float(block.d) * block.qs[lane];
@@ -1020,6 +1030,7 @@ void ggml_cuda_mul_mat_id_back(
             GGML_TYPE_MXFP4 ||
         weight->type ==
             GGML_TYPE_Q4_0 ||
+        weight->type == GGML_TYPE_Q4_1 ||
         weight->type == GGML_TYPE_Q8_0
     );
 
@@ -1264,6 +1275,10 @@ void ggml_cuda_mul_mat_id_back(
                     batch_count
                 );
 
+        } else if (weight->type == GGML_TYPE_Q4_1) {
+            mul_mat_id_back_dequant_batch<GGML_TYPE_Q4_1>
+                <<<dequant_blocks, dequant_threads, 0, stream>>>(
+                    weight->data, weight_f32.ptr, cols, rows, n_blocks_row, expert_base, batch_count);
         } else if (weight->type == GGML_TYPE_Q8_0) {
             mul_mat_id_back_dequant_batch<GGML_TYPE_Q8_0>
                 <<<dequant_blocks, dequant_threads, 0, stream>>>(
@@ -1418,6 +1433,13 @@ void ggml_cuda_mul_mat_id_back(
                 cap
             );
 
+    } else if (weight->type == GGML_TYPE_Q4_1) {
+        mul_mat_id_back_overflow<GGML_TYPE_Q4_1>
+            <<<overflow_blocks, MUL_MAT_ID_BACK_WARPS * 32, 0, stream>>>(
+                weight->data, (const float *) grad->data, (const int32_t *) ids->data,
+                route_rank.ptr, (float *) dst->data,
+                n_blocks_row, rows, n_expert, n_used, n_tokens,
+                grad_s0, grad_s1, grad_s2, ids_s0, ids_s1, cap);
     } else if (weight->type == GGML_TYPE_Q8_0) {
         mul_mat_id_back_overflow<GGML_TYPE_Q8_0>
             <<<overflow_blocks, MUL_MAT_ID_BACK_WARPS * 32, 0, stream>>>(

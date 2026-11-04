@@ -17,5 +17,5 @@ exec "$BIN_DIR/llama-extract-logits" \
     --train-file "$DATA" --distill-cache "$CACHE" \
     --distill-top-k 512 --distill-temperature 1 \
     --distill-max-windows "$MAX_WINDOWS" --val-split "$VAL_SPLIT" \
-    -c "$CTX" -b "$CTX" -ub "$UBATCH" -np 1 -ngl 0 \
+    -c "$CTX" -b "$CTX" -ub "$UBATCH" -np 1 -ngl "${GPU_LAYERS:-0}" \
     -t "$THREADS" -tb "$THREADS" -dthr "$THREADS" "$@"

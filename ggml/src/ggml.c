@@ -793,6 +793,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
     },
+    [GGML_TYPE_FP4_KV] = {
+        .type_name                = "fp4_kv",
+        .blck_size                = QK_NVFP4,
+        .type_size                = sizeof(block_nvfp4),
+        .is_quantized             = true,
+        .to_float                 = dequantize_row_fp4_kv,
+        .from_float_ref           = quantize_row_fp4_kv_ref,
+    },
     [GGML_TYPE_Q8_KV] = {
         .type_name                = "q8_kv",
         .blck_size                = QK8_KV,
@@ -1285,9 +1293,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "glu_back(dy,x,y)",
     "paged_attn(q,k,v,cache,table,slots,queries)",
+    "distillation(logits,ids,logp,weights)",
+    "distillation_back(logits,ids,logp,weights,grad)",
 };
 
-static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
+static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -9473,6 +9483,10 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_KV:   result = quantize_q8_kv  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_FP4_KV:
+            quantize_row_fp4_kv_ref(src + start, (char *) dst + start_row * row_size, nrows*n_per_row);
+            result = nrows*row_size;
+            break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

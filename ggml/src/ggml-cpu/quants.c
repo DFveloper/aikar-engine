@@ -85,6 +85,40 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void ggml_cpu_dequantize_row_fp4_f16(const void * vx, ggml_fp16_t * y, int64_t k, float * scratch, bool row_scale) {
+#if defined(__AVX2__) && defined(__F16C__)
+    GGML_UNUSED(scratch);
+    assert(k % QK_NVFP4 == 0);
+    float master = 1.0f;
+    if (row_scale) { memcpy(&master, vx, sizeof(master)); }
+    const block_nvfp4 * x = (const block_nvfp4 *) ((const char *) vx + (row_scale ? sizeof(master) : 0));
+    const __m128i values = _mm_loadu_si128((const __m128i *) kvalues_mxfp4);
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    const __m256 scale = _mm256_set1_ps(master);
+    for (int64_t block = 0; block < k/QK_NVFP4; ++block) {
+        for (int sub = 0; sub < QK_NVFP4/QK_NVFP4_SUB; ++sub) {
+            const __m256 d = _mm256_set1_ps(ggml_ue4m3_to_fp32(x[block].d[sub]));
+            const __m128i packed = _mm_loadl_epi64((const __m128i *) (x[block].qs + sub*QK_NVFP4_SUB/2));
+            const __m128i low = _mm_shuffle_epi8(values, _mm_and_si128(packed, mask));
+            const __m128i high = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(packed, 4), mask));
+            const __m256 a = _mm256_mul_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low)), d), scale);
+            const __m256 b = _mm256_mul_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high)), d), scale);
+            ggml_fp16_t * out = y + block*QK_NVFP4 + sub*QK_NVFP4_SUB;
+            _mm_storeu_si128((__m128i *) out, _mm256_cvtps_ph(a, _MM_FROUND_TO_NEAREST_INT));
+            _mm_storeu_si128((__m128i *) (out + QK_NVFP4_SUB/2), _mm256_cvtps_ph(b, _MM_FROUND_TO_NEAREST_INT));
+        }
+    }
+#else
+    if (row_scale) { dequantize_row_nvfp4(vx, scratch, k); }
+    else { dequantize_row_fp4_kv(vx, scratch, k); }
+    ggml_fp32_to_fp16_row(scratch, y, k);
+#endif
+}
+
+void ggml_cpu_dequantize_row_nvfp4_f16(const void * vx, ggml_fp16_t * y, int64_t k, float * scratch) {
+    ggml_cpu_dequantize_row_fp4_f16(vx, y, k, scratch, true);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

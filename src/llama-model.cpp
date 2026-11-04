@@ -3310,8 +3310,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
-                                    hparams.kv_global_only ? GGML_TYPE_NVFP4 : params.type_k,
-                                    hparams.kv_global_only ? GGML_TYPE_NVFP4 : params.type_v,
+                                    hparams.kv_global_only ? GGML_TYPE_FP4_KV : params.type_k,
+                                    hparams.kv_global_only ? GGML_TYPE_FP4_KV : params.type_v,
                                     params.type_k_swa,
                                     params.type_v_swa,
                                     hparams.kv_global_only ? false : !cparams.flash_attn,

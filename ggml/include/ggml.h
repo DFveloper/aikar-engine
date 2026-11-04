@@ -432,6 +432,7 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TURBO3_0 = 43, // runtime-only TurboQuant 3-bit KV cache
         GGML_TYPE_TURBO4_0 = 44, // runtime-only TurboQuant 4-bit KV cache
+        GGML_TYPE_FP4_KV  = 150, // runtime-only E2M1 KV, one E4M3 scale per 16 values
         GGML_TYPE_Q8_KV   = 151, // runtime-only Q8 KV cache with 64-element blocks
         GGML_TYPE_COUNT   = 152,
     };

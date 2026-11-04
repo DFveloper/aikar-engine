@@ -590,9 +590,9 @@ llama_context::llama_context(
         }
 
         if (params.cpu_les) {
-            if (model.arch != LLM_ARCH_GEMMA4 || cparams.n_seq_max != 1 ||
+            if ((model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_LUMEN4EXP) || cparams.n_seq_max != 1 ||
                     params.cpu_les_prefetch_mib < 1 || params.cpu_les_prefetch_mib > 1024) {
-                throw std::runtime_error("CPU LES requires Gemma4, one sequence, and a 1 to 1024 MiB prefetch budget");
+                throw std::runtime_error("CPU LES requires Gemma4 or Lumen4Exp, one sequence, and a 1 to 1024 MiB prefetch budget");
             }
             std::vector<llama_cpu_les_layer> layers;
             for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
@@ -3933,7 +3933,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         throw std::invalid_argument("distillation and critical-token metadata cannot share dataset auxiliary storage");
     }
     if (model->hparams.kv_global_only) {
-        LLAMA_LOG_INFO("%s: Lumen global KV training always uses NVFP4 with FP32 master scales and STE gradients\n", __func__);
+        LLAMA_LOG_INFO("%s: Lumen global KV training uses FP4 E2M1, per-16 E4M3 scales and STE gradients\n", __func__);
     }
     if (cpu_les) { throw std::runtime_error("CPU LES is not supported during training"); }
     if (cparams.kv_paged) { throw std::runtime_error("paged KV does not support training"); }

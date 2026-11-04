@@ -9584,6 +9584,47 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_nvfp4_broadcast : public test_flash_attn_ext {
+    test_flash_attn_nvfp4_broadcast(int nb, ggml_type type = GGML_TYPE_NVFP4) : test_flash_attn_ext(512, 512, 2, {8, 2}, 513, nb,
+            true, true, 8.0f, 30.0f, GGML_PREC_F32, type, type) {}
+
+    std::string vars() override { return test_flash_attn_ext::vars() + ",kv_broadcast=1"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_flash_attn_ext::build_graph(ctx);
+        for (int i : {1, 2}) {
+            auto * cache = out->src[i];
+            out->src[i] = ggml_view_4d(ctx, cache, cache->ne[0], cache->ne[1], cache->ne[2], 1,
+                cache->nb[1], cache->nb[2], cache->nb[3], 0);
+        }
+        return out;
+    }
+};
+
+struct test_flash_attn_nvfp4_masked : public test_flash_attn_ext {
+    test_flash_attn_nvfp4_masked(int nb, ggml_type type = GGML_TYPE_NVFP4) : test_flash_attn_ext(512, 512, 2, {8, 1}, 513, nb,
+            true, false, 0, 0, GGML_PREC_F32, type, type) {}
+
+    std::string vars() override { return test_flash_attn_ext::vars() + ",all_masked=1"; }
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        auto * mask = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> values(ggml_nelements(mask), ggml_fp32_to_fp16(-INFINITY));
+        ggml_backend_tensor_set(mask, values.data(), 0, ggml_nbytes(mask));
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double error = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) { return INFINITY; }
+            error = std::max({error, double(std::abs(a[i])), double(std::abs(b[i]))});
+        }
+        return error;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -11515,6 +11556,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_I32, 256, 5, 4, 1, v));
     }
 
+    for (ggml_type source : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (ggml_type index : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+            test_cases.emplace_back(new test_set_rows(source, GGML_TYPE_FP4_KV, index, {512, 11, 2, 3}, {1, 1}, 7));
+        }
+    }
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_FP4_KV, {512, 11, 2, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_FP4_KV, GGML_TYPE_F32, {512, 11, 2, 1}));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_NVFP4, GGML_TYPE_I64, { 512, 11, 2, 3 }, { 1, 1 }, 7));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_NVFP4, { 512, 2, 3, 1 }));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_NVFP4, GGML_TYPE_F32, { 512, 2, 3, 1 }));
@@ -13578,6 +13626,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    for (ggml_type type : {GGML_TYPE_NVFP4, GGML_TYPE_FP4_KV}) {
+        for (int hs : {64, 512}) {
+            for (int kv : {17, 512}) {
+                for (int nb : {1, 8, 64}) {
+                    for (bool mask : {false, true}) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, mask ? 2 : 1}, kv, nb,
+                            mask, true, mask ? 8.0f : 0.0f, 30.0f, GGML_PREC_F32, type, type,
+                            {0, 2, 1, 3}));
+                    }
+                }
+            }
+        }
+
+        for (int nb : {1, 8, 64}) {
+            test_cases.emplace_back(new test_flash_attn_nvfp4_broadcast(nb, type));
+            test_cases.emplace_back(new test_flash_attn_nvfp4_masked(nb, type));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 512, 1,
+            true, false, 0, 0, GGML_PREC_F32, type, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 512, 1,
+            true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, type));
+
+    }
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));

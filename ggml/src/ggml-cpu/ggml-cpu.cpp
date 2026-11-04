@@ -440,6 +440,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[1]->type == GGML_TYPE_NVFP4 || op->src[2]->type == GGML_TYPE_NVFP4 ||
+                    op->src[1]->type == GGML_TYPE_FP4_KV || op->src[2]->type == GGML_TYPE_FP4_KV) {
+                return src0->type == GGML_TYPE_F32 &&
+                    (op->src[1]->type == GGML_TYPE_NVFP4 || op->src[1]->type == GGML_TYPE_FP4_KV) &&
+                    op->src[1]->type == op->src[2]->type;
+            }
+            return true;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
