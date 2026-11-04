@@ -726,6 +726,9 @@ struct common_params {
     int32_t distill_top_k = 512;
     float distill_temperature = 1.0f;
     int32_t distill_max_windows = 0;
+    int32_t distill_validation_windows = 0;
+    bool distill_resume_extraction = false;
+    bool distill_plan = false;
     std::string qat_resume = "";
     std::string qat_adapter_out;
     std::string qat_adapter_units = "full";

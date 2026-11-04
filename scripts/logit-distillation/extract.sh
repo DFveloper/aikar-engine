@@ -4,7 +4,7 @@ RUN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO=${REPO:-/home/user/aikar-engine}
 BIN_DIR=${BIN_DIR:-$REPO/build-distill-cpu/bin}
 MODEL_DIR=${MODEL_DIR:-/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar}
-DATA=${DATA:-/mnt/openwebui/AIKAR/train_ko.jsonl}
+source "$RUN_DIR/data.sh"
 CTX=${CTX:-512}
 UBATCH=${UBATCH:-128}
 THREADS=${THREADS:-8}

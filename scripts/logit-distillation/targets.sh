@@ -1,0 +1,1 @@
+TARGETS=${TARGETS:-blk.11.attn_q.weight,blk.11.attn_k.weight,blk.11.attn_v.weight,blk.11.attn_output.weight,blk.17.attn_q.weight,blk.17.attn_k.weight,blk.17.attn_v.weight,blk.17.attn_output.weight,blk.23.attn_q.weight,blk.23.attn_k.weight,blk.23.attn_v.weight,blk.23.attn_output.weight,blk.29.attn_q.weight,blk.29.attn_k.weight,blk.29.attn_v.weight,blk.29.attn_output.weight}

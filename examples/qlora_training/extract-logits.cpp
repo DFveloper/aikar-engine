@@ -12,8 +12,9 @@ int main(int argc, char ** argv) {
         logit_distillation::require(params.n_ctx > 0 && params.n_batch == params.n_ctx && params.n_ubatch > 0 &&
                 params.n_parallel == 1 && params.critical_token_mode == "none" && params.mtp_mode == "off",
                 "extraction requires -c N -b N, -np 1, no critical weighting or MTP");
-        logit_distillation::require(!std::filesystem::exists(params.distill_cache) &&
-                !std::filesystem::exists(params.distill_cache + ".partial"), "output cache already exists");
+        logit_distillation::require(params.distill_plan || !std::filesystem::exists(params.distill_cache), "output cache already exists");
+        const bool resume = std::filesystem::exists(params.distill_cache + ".partial");
+        logit_distillation::require(params.distill_plan || !resume || params.distill_resume_extraction, "partial cache exists; use --distill-resume-extraction");
         common_init();
         llama_backend_init();
         llama_numa_init(params.numa);
@@ -33,7 +34,7 @@ int main(int argc, char ** argv) {
         ggml_opt_dataset_t dataset = build_dataset(samples, params.n_ctx, rewards, sample_split, split,
                 params.train_on_prompt, llama_vocab_bos(vocab));
         logit_distillation::require(dataset != nullptr, "cannot pack training data");
-        distillation_limit_dataset(dataset, split, params.distill_max_windows, rewards);
+        distillation_limit_dataset(dataset, split, params.distill_max_windows, rewards, params.distill_validation_windows);
         logit_distillation::header info;
         info.context = params.n_ctx;
         info.vocab = llama_vocab_n_tokens(vocab);
@@ -46,22 +47,40 @@ int main(int argc, char ** argv) {
                 {"data", params.train_file}, {"train_on_prompt", params.train_on_prompt},
                 {"preserve_thinking", params.preserve_thinking}, {"val_split", params.val_split}}).dump();
         logit_distillation::require(info.top_k < info.vocab, "top-k must be smaller than vocabulary");
+        if (params.distill_plan) {
+            const auto * targets = static_cast<int32_t *>(ggml_opt_dataset_labels(dataset)->data);
+            const uint64_t train_rows = std::count_if(targets, targets + split*info.context, [](int32_t t) { return t >= 0; });
+            const uint64_t rows = std::count_if(targets, targets + info.windows*info.context, [](int32_t t) { return t >= 0; });
+            std::ostringstream encoded(std::ios::binary);
+            info.save(encoded);
+            const uint64_t bytes = encoded.str().size() + info.windows*info.context*8 + rows*info.row_bytes();
+            const auto plan = nlohmann::json({{"context", info.context}, {"train_windows", split},
+                    {"validation_windows", info.windows - split}, {"train_rows", train_rows},
+                    {"validation_rows", rows - train_rows}, {"cache_bytes", bytes}});
+            std::printf("%s\n", plan.dump().c_str());
+            ggml_opt_dataset_free(dataset);
+            return 0;
+        }
         auto teacher = common_init_from_params(params);
         logit_distillation::require(teacher->model() && teacher->context(), "cannot load teacher");
         logit_distillation::require(llama_n_ctx(teacher->context()) == info.context,
                 "runtime rounded the context; choose an aligned context such as 256 or 512");
         logit_distillation::require(info.tokenizer == logit_distillation::vocab_hash(llama_model_get_vocab(teacher->model())),
                 "teacher and student token IDs differ");
-        std::ofstream out(params.distill_cache + ".partial", std::ios::binary);
-        info.save(out);
         auto * tokens = static_cast<int32_t *>(ggml_opt_dataset_data(dataset)->data);
         auto * labels = static_cast<int32_t *>(ggml_opt_dataset_labels(dataset)->data);
-        common_batch batch(teacher->context());
         uint64_t rows = 0;
+        const uint64_t first_window = resume ? logit_distillation::resume_cache(
+                params.distill_cache + ".partial", info, tokens, labels, rows) : 0;
+        std::ofstream out(params.distill_cache + ".partial", std::ios::binary | (resume ? std::ios::app : std::ios::trunc));
+        if (!resume) info.save(out);
+        common_batch batch(teacher->context());
+        const uint64_t resumed_rows = rows;
+        LOG_INF("distill_extract: resumed_windows=%llu resumed_rows=%llu\n", (unsigned long long) first_window, (unsigned long long) rows);
         double tail_sum = 0;
         double tail_max = 0;
         const int64_t start_ms = ggml_time_ms();
-        for (uint64_t w = 0; w < info.windows; ++w) {
+        for (uint64_t w = first_window; w < info.windows; ++w) {
             const size_t base = size_t(w)*info.context;
             logit_distillation::write(out, tokens + base, size_t(info.context)*4);
             logit_distillation::write(out, labels + base, size_t(info.context)*4);
@@ -73,11 +92,14 @@ int main(int argc, char ** argv) {
                     batch.add(tokens[base + pos], pos, 0, labels[base + pos] >= 0);
                 }
                 logit_distillation::require(llama_process(teacher->context(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "teacher decode failed");
+                std::vector<const float *> output_rows;
                 for (uint32_t pos = begin; pos < end; ++pos) {
                     if (labels[base + pos] < 0) continue;
                     const float * logits = llama_get_logits_ith(teacher->context(), pos - begin);
                     logit_distillation::require(logits != nullptr, "missing teacher logits");
-                    const double tail = logit_distillation::encode_row(out, logits, info);
+                    output_rows.push_back(logits);
+                }
+                for (const double tail : logit_distillation::encode_rows(out, output_rows, info, params.cpuparams_batch.n_threads)) {
                     tail_sum += tail;
                     tail_max = std::max(tail_max, tail);
                     ++rows;
@@ -85,10 +107,15 @@ int main(int argc, char ** argv) {
             }
             LOG_INF("distill_extract: window=%llu/%llu rows=%llu mean_tail=%.8g max_tail=%.8g elapsed_s=%.3f\n",
                     (unsigned long long) (w + 1), (unsigned long long) info.windows, (unsigned long long) rows,
-                    rows ? tail_sum / rows : 0, tail_max, (ggml_time_ms() - start_ms)*0.001);
+                    rows > resumed_rows ? tail_sum / (rows - resumed_rows) : 0, tail_max, (ggml_time_ms() - start_ms)*0.001);
         }
         out.close();
         logit_distillation::require(bool(out), "cache close failed");
+        const double elapsed = (ggml_time_ms() - start_ms)*0.001;
+        const uint64_t input_tokens = (info.windows - first_window)*info.context;
+        LOG_INF("distill_throughput: input_tokens=%llu supervised_tokens=%llu elapsed_s=%.3f input_tok_s=%.3f supervised_tok_s=%.3f\n",
+                (unsigned long long) input_tokens, (unsigned long long) (rows - resumed_rows), elapsed,
+                elapsed > 0 ? input_tokens/elapsed : 0, elapsed > 0 ? (rows - resumed_rows)/elapsed : 0);
         std::filesystem::rename(params.distill_cache + ".partial", params.distill_cache);
         LOG_INF("distill_extract: saved=%s rows=%llu bytes_per_row=%zu\n", params.distill_cache.c_str(),
                 (unsigned long long) rows, info.row_bytes());

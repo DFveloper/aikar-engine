@@ -9994,6 +9994,48 @@ struct test_cross_entropy_loss_sparse : public test_case {
     }
 };
 
+struct test_distillation : public test_case {
+    const int64_t nv, nr, k;
+    const float temperature;
+    test_distillation(int64_t nv, int64_t nr, int64_t k, float temperature)
+        : nv(nv), nr(nr), k(k), temperature(temperature) {}
+    std::string vars() override { return VARS_TO_STR4(nv, nr, k, temperature); }
+    double max_nmse_err() override { return 1e-6; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, nr);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, nr);
+        auto * logp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k+1, nr);
+        auto * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nr);
+        ggml_set_name(logits, "kd_logits");
+        ggml_set_name(ids, "kd_ids");
+        ggml_set_name(logp, "kd_logp");
+        ggml_set_name(weights, "kd_weights");
+        ggml_set_param(logits);
+        return ggml_distillation(ctx, logits, ids, logp, weights, temperature);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::strcmp(t->name, "kd_ids") == 0) {
+                std::vector<int32_t> values(k*nr);
+                for (int64_t r = 0; r < nr; ++r) for (int64_t i = 0; i < k; ++i) values[r*k+i] = (i+r)%nv;
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            } else if (std::strcmp(t->name, "kd_logp") == 0) {
+                std::vector<float> values((k+1)*nr, std::log(.5f/k));
+                for (int64_t r = 0; r < nr; ++r) values[r*(k+1)+k] = std::log(.5f);
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            } else if (std::strcmp(t->name, "kd_weights") == 0) {
+                std::vector<float> values(nr, 1.0f);
+                values[0] = 0;
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            }
+        }
+    }
+    float grad_eps() override { return 0.1f; }
+    bool grad_precise() override { return true; }
+};
+
 // GGML_OP_OPT_STEP_ADAMW
 struct test_opt_step_adamw : public test_case {
     const ggml_type type;
@@ -12926,7 +12968,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_out_prod_id(32, 24, 1, 3, 41, true, true));
-    for (const auto type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
+    for (const auto type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
         for (const int64_t cols : { 32, 96, 256, 288, 704 }) {
             test_cases.emplace_back(new test_mul_mat_id_back(type, GGML_TYPE_F32, 4, 2, false, 35, 3, cols));
             test_cases.emplace_back(new test_mul_mat_id_back(type, GGML_TYPE_F32, 4, 2, false, 35, 5, cols, 1.0f, 40, true));
@@ -13756,6 +13798,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 2, 1, 1}, true));
     test_cases.emplace_back(new test_cross_entropy_loss_sparse({10, 5, 4, 3}, false));
     test_cases.emplace_back(new test_cross_entropy_loss_sparse({10, 5, 4, 3}, true));
+    test_cases.emplace_back(new test_distillation(8, 3, 3, 1.0f));
+    test_cases.emplace_back(new test_distillation(64, 5, 7, 2.0f));
+    test_cases.emplace_back(new test_distillation(262144, 8, 512, 1.0f));
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));

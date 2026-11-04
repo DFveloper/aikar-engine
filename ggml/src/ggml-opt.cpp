@@ -3216,6 +3216,18 @@ struct ggml_tensor * ggml_opt_distillation_loss(
         struct ggml_context * ctx, struct ggml_tensor * logits,
         struct ggml_tensor * ids, struct ggml_tensor * logp,
         struct ggml_tensor * weights, float temperature) {
+    const char * reference = std::getenv("GGML_DISTILL_REFERENCE");
+    if (reference && std::strcmp(reference, "1") == 0) {
+        return ggml_opt_distillation_loss_reference(ctx, logits, ids, logp, weights, temperature);
+    }
+    auto * rows = ggml_distillation(ctx, logits, ids, logp, weights, temperature);
+    return ggml_scale(ctx, ggml_sum(ctx, rows), temperature*temperature/ggml_nrows(logits));
+}
+
+struct ggml_tensor * ggml_opt_distillation_loss_reference(
+        struct ggml_context * ctx, struct ggml_tensor * logits,
+        struct ggml_tensor * ids, struct ggml_tensor * logp,
+        struct ggml_tensor * weights, float temperature) {
     const int64_t nv = logits->ne[0];
     const int64_t nr = ggml_nrows(logits);
     const int64_t k = ids->ne[0];

@@ -14,9 +14,9 @@ The copies of extract.sh and train.sh beside the models use these defaults:
 
 - Teacher: /mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/Test.gguf
 - Student: /mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/Lumen-3.8-Pulsar-base.gguf
-- JSONL: /mnt/openwebui/AIKAR/train_ko.jsonl
+- JSONL: mixed-train-1to1.jsonl, prepared from all 317 conversations in /mnt/openwebui/AIKAR/train_ko.jsonl and 317 reservoir-sampled conversations from /mnt/openwebui/AIKAR/train.jsonl (seed 42).
 - Context 512, microbatch 128, 8 CPU threads, T=1, top-k=512, conversation validation fraction 0.05.
-- QLion2 updates attention Q/K/V/output tensors, while other parameters stay frozen. Set TARGETS or pass --freeze-layers to change the selected parameters.
+- QLion2 updates attention Q/K/V/output tensors only in blocks 11, 17, 23 and 29 (zero-based), while other parameters stay frozen. targets.sh contains the shared target list. Set TARGETS or pass --freeze-layers to change the selected parameters.
 - Training writes a separate QLion adapter. Original model files are not output destinations.
 
 Run extraction first, then training. Use the same CTX, MAX_WINDOWS, VAL_SPLIT, DATA and prompt/thinking settings in both stages. MAX_WINDOWS limits each partition separately; zero selects all packed windows. Context must match the runtime allocation, normally a multiple of 256. The training cache records its temperature, so training does not reinterpret it with a different temperature.
@@ -33,8 +33,46 @@ Extraction uses the student's vocabulary, chat template, conversation split, pac
 
 QLKD0001 is a versioned little-endian DAT format. Its header records context, vocabulary size, k, temperature, token-ID fingerprint, window counts, train/validation boundary and JSON provenance. Each window stores context-sized input and label I32 arrays, followed by one teacher record per non-masked position. Each teacher record has k I32 IDs, k FP16 log-probabilities and one FP32 tail log-mass: 6*k+4 bytes, or 3,076 bytes for k=512. A reader renormalizes the k+1 probabilities after FP16 decoding. It checks inputs, masks, partitions, dimensions, file length, duplicate IDs and probability values. Cache row offsets are shuffled with dataset windows.
 
-The loss uses the same teacher-selected IDs on the student and computes logsumexp over the full vocabulary and over the remaining vocabulary. Its scale is T*T. Tail logits use an additive -1e30 mask on selected IDs. This preserves the individual top-k probabilities and total tail mass; it does not supervise relative probabilities inside the tail. It uses existing GGML graph operations and materializes vocabulary-sized intermediates. This is not a fused or vocabulary-memory-free loss implementation.
+The loss uses the same teacher-selected IDs on the student and computes logsumexp over the full vocabulary and over the remaining vocabulary. Its scale is T*T. This preserves the individual top-k probabilities and total tail mass; it does not supervise relative probabilities inside the tail. A fused CPU forward/backward operation avoids the reference graph's vocabulary-sized intermediates. Full student logits and their gradient are still needed. Set GGML_DISTILL_REFERENCE=1 to compare against the original graph implementation.
 
 Critical-token weighting and MTP are rejected with distillation. Native QLion training already rejects GRPO. The staging callback API must be configured before optimizer initialization. GPU execution is unverified; the supplied scripts explicitly use CPU. With multiple microbatches, the existing trainer detaches past KV gradients. Use UBATCH=CTX when full-sequence KV gradients are needed.
 
 Keep validation conversations separate before packing. The small example selects only two packed windows per partition and cannot establish general model quality or long-context recovery. Evaluate held-out task metrics and PPL separately before increasing training scale.
+
+## Production recovery
+
+The separate production wrappers use production.env. All four extraction/training wrappers automatically prepare the same deterministic 1:1 conversation mixture before packing. The full Korean file is retained, while the second file is sampled without replacement. The 1:1 ratio counts conversations, not tokens; token counts and validation proportions can differ. DATA overrides the mixture with an explicit input file. DATA_KO, DATA_OTHER, MIXED_DATA and MIX_SEED override mixture inputs, output and seed. Keep these fixed across extraction and training. Source files are not modified. The generated JSON sidecar records source identities and row counts.
+
+Production selects all training windows, 32 evenly sampled held-out validation windows, context and microbatch 512, eight CPU threads, top-512 plus tail at T=1, and pure KL. It updates available quantized attention Q/K/V/output tensors only in blocks 11, 17, 23 and 29, with three epochs and a cosine learning rate from 1e-5 to 1e-6 after 50 warmup steps. The GGUF sliding-window pattern identifies these as the second through fifth global layers (the first is block 5). Missing shared-KV tensors are not created. These are starting settings, not a demonstrated recovery recipe.
+
+For this shared-KV model, all four selected blocks reuse KV from block 5. Their stored K projections do not participate in the forward graph, and no separate V projection exists. Thus eight Q/output tensors receive effective updates; four selected but unused K tensors remain unchanged. The shared KV source in block 5 stays frozen.
+
+```bash
+cd /mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/logit-distillation
+./production-extract.sh --dry-run
+./production-train.sh --dry-run
+PROD_DIR=/path/with/enough/space ./production-extract.sh
+PROD_DIR=/path/with/enough/space RUN_ID=recovery-01 ./production-train.sh
+```
+
+Use the same PROD_DIR and packing settings in both stages. The mixed dataset plan contains 5,562 training windows with 2,513,367 supervised token presentations, plus 14,705 validation positions. Repeated assistant targets can repeat text, so this is not a unique-token count. The cache is exactly 7,799,262,856 bytes (7.26 GiB). Three epochs mean 16,686 optimizer updates at accumulation one. The earlier Korean-only plan and smoke caches do not apply to this mixed input; use a fresh PROD_DIR if a Korean-only production cache already exists.
+
+Training retains full GGUF model and optimizer-state checkpoint pairs every 1,000 steps and at completion. The current mixed-data plan with blocks 11/17/23/29 attention budgets 17 checkpoint sets and requires about 234.69 GiB free after extraction, including reserve space. production-train.sh --dry-run reports the current requirement. The model volume currently has about 21 GiB free; choose a larger PROD_DIR before a default production run. SAVE_EVERY=0 disables intermediate checkpoints and reduces space use but removes intermediate recovery points. No old checkpoint is automatically deleted.
+
+Interrupted extraction resumes complete windows from its .partial file and recomputes a torn final window. Completed caches are verified by SHA-256. Training resume requires an explicit checkpoint, its sibling .qat-state.gguf, the original RUN_ID, and unchanged numerical/data settings:
+
+```bash
+PROD_DIR=/path/with/enough/space RUN_ID=recovery-01 \
+  RESUME=/path/with/enough/space/runs/recovery-01/final.gguf.step1000.gguf \
+  ./production-train.sh
+```
+
+Run manifests, commands, logs and status files live under PROD_DIR. Checkpoints include optimizer, scheduler, shuffle and distillation configuration. Keep both files in a checkpoint pair together. Outputs are separate from the source models. This workflow has been exercised on small real CPU runs; full production recovery quality has not been measured.
+
+## Throughput measurement
+
+See THROUGHPUT.md for actual mixed-data CPU rates with attention targets in blocks 11, 17, 23 and 29.
+
+Run bash benchmark.sh for a sequential CPU extraction/training benchmark with production context, threads and attention targets, using two training and two validation windows by default. Override BENCH_WINDOWS for a longer run. It retains the small cache and logs beside the models and removes its own temporary full-model checkpoint after completion. It needs about 15 GiB temporary space for that checkpoint and optimizer state.
+
+Extraction logs input_tok_s for all processed input tokens and supervised_tok_s for teacher rows written. Training logs both rates for the training loop, including forward/backward, optimizer updates, cache staging and graph setup. Epoch-end validation and final checkpoint writes are excluded; any periodic evaluation/checkpoints within a longer epoch are included. These are packed-token presentations, including padding and overlap, rather than unique corpus tokens. Separate .time files record whole-process wall time including loading, validation and serialization. The benchmark uses one epoch and no periodic evaluation or intermediate checkpoints.

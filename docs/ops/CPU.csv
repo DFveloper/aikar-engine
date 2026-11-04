@@ -20451,3 +20451,6 @@
 "CPU","OUT_PROD_ID","cols=96,rows=35,n_experts=11,n_experts_used=3,n_tokens=37,broadcast=1,strided=0","support","1","yes","CPU"
 "CPU","OUT_PROD_ID","cols=96,rows=35,n_experts=11,n_experts_used=3,n_tokens=37,broadcast=1,strided=1","support","1","yes","CPU"
 "CPU","OUT_PROD_ID","cols=32,rows=24,n_experts=1,n_experts_used=3,n_tokens=41,broadcast=1,strided=1","support","1","yes","CPU"
+"CPU","DISTILLATION","nv=8,nr=3,k=3,temperature=1.000000","support","1","yes","CPU"
+"CPU","DISTILLATION","nv=64,nr=5,k=7,temperature=2.000000","support","1","yes","CPU"
+"CPU","DISTILLATION","nv=262144,nr=8,k=512,temperature=1.000000","support","1","yes","CPU"

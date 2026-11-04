@@ -5546,7 +5546,7 @@ void ggml_compute_forward_mul_mat_id_back(
     const ggml_tensor * weight = dst->src[0];
     const ggml_tensor * grad   = dst->src[1];
     const ggml_tensor * ids    = dst->src[2];
-    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q4_1 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(weight->ne[0] % 32 == 0);
 
@@ -14383,5 +14383,64 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+void ggml_compute_forward_distillation(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * logits = dst->src[0];
+    const auto * ids = dst->src[1];
+    const auto * logp = dst->src[2];
+    const auto * weights = static_cast<const float *>(dst->src[3]->data);
+    const bool backward = dst->op == GGML_OP_DISTILLATION_BACK;
+    const float temperature = ggml_get_op_params_f32(dst, 0);
+    const int nv = logits->ne[0];
+    const int k = ids->ne[0];
+    const int64_t nr = logits->ne[1];
+    if (params->ith >= nr) return;
+    std::vector<float> scaled(nv), work(nv);
+    std::vector<uint8_t> selected(nv, 0);
+    for (int64_t row = params->ith; row < nr; row += params->nth) {
+        float * output = static_cast<float *>(dst->data) + (backward ? row*nv : row);
+        if (weights[row] == 0) {
+            std::fill_n(output, backward ? nv : 1, 0.0f);
+            continue;
+        }
+        const auto * z = reinterpret_cast<const float *>(static_cast<const char *>(logits->data) + row*logits->nb[1]);
+        const auto * indices = reinterpret_cast<const int32_t *>(static_cast<const char *>(ids->data) + row*ids->nb[1]);
+        const auto * teacher = reinterpret_cast<const float *>(static_cast<const char *>(logp->data) + row*logp->nb[1]);
+        double teacher_mass = 0;
+        for (int i = 0; i < k; ++i) {
+            GGML_ASSERT(indices[i] >= 0 && indices[i] < nv && !selected[indices[i]]);
+            selected[indices[i]] = 1;
+            teacher_mass += std::exp(double(teacher[i]));
+        }
+        const double teacher_tail = std::exp(double(teacher[k]));
+        teacher_mass += teacher_tail;
+        for (int j = 0; j < nv; ++j) scaled[j] = z[j]/temperature;
+        float maximum;
+        ggml_vec_max_f32(nv, &maximum, scaled.data());
+        const double sum = ggml_vec_soft_max_f32(nv, work.data(), scaled.data(), maximum);
+        const double normalizer = double(maximum) + std::log(sum);
+        const double factor = backward ? double(weights[row])*static_cast<const float *>(dst->src[4]->data)[row]/temperature : 0;
+        if (backward) {
+            for (int j = 0; j < nv; ++j) output[j] = factor*teacher_mass*work[j]/sum;
+        }
+        for (int i = 0; i < k; ++i) scaled[indices[i]] = -INFINITY;
+        float tail_maximum;
+        ggml_vec_max_f32(nv, &tail_maximum, scaled.data());
+        const double tail_sum = ggml_vec_soft_max_f32(nv, work.data(), scaled.data(), tail_maximum);
+        if (backward) {
+            for (int j = 0; j < nv; ++j) output[j] -= factor*teacher_tail*work[j]/tail_sum;
+            for (int i = 0; i < k; ++i) output[indices[i]] -= factor*std::exp(double(teacher[i]));
+        } else {
+            const double student_tail_logp = double(tail_maximum) + std::log(tail_sum) - normalizer;
+            double loss = teacher_tail*(teacher[k] - student_tail_logp);
+            for (int i = 0; i < k; ++i) {
+                const double student_logp = double(z[indices[i]])/temperature - normalizer;
+                loss += std::exp(double(teacher[i]))*(teacher[i] - student_logp);
+            }
+            *output = weights[row]*loss;
+        }
+        for (int i = 0; i < k; ++i) selected[indices[i]] = 0;
     }
 }

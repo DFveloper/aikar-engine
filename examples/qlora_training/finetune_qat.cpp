@@ -256,6 +256,12 @@ static bool qat_save_state(
     gguf_set_val_u32(gctx, "training.qat.context_length", config.n_ctx);
     gguf_set_val_u32(gctx, "training.qat.parallel", config.n_parallel);
     gguf_set_val_u32(gctx, "training.qat.grad_accum_steps", config.grad_accum_steps);
+    gguf_set_val_str(gctx, "training.qat.loss", config.distill_cache.empty() ? "ce" : "top_k_tail_kl");
+    if (!config.distill_cache.empty()) {
+        gguf_set_val_str(gctx, "training.qat.distill_cache", std::filesystem::weakly_canonical(config.distill_cache).string().c_str());
+        gguf_set_val_u32(gctx, "training.qat.distill_top_k", config.distill_top_k);
+        gguf_set_val_f32(gctx, "training.qat.distill_temperature", config.distill_temperature);
+    }
     if (config.qat_lr_scale_unit) {
         gguf_set_val_u32(gctx, "training.qat.lr.unit", config.qat_lr_scale_unit);
         gguf_set_val_f32(gctx, "training.qat.lr.tau", config.qat_lr_scale_tau);
@@ -342,6 +348,23 @@ static bool qat_load_state(
         return false;
     }
     const int context_key = gguf_find_key(gctx, "training.qat.context_length");
+    const int loss_key = gguf_find_key(gctx, "training.qat.loss");
+    const int cache_key = gguf_find_key(gctx, "training.qat.distill_cache");
+    const int k_key = gguf_find_key(gctx, "training.qat.distill_top_k");
+    const int t_key = gguf_find_key(gctx, "training.qat.distill_temperature");
+    const bool kd = !config.distill_cache.empty();
+    const bool loss_valid = loss_key < 0 ? !kd : gguf_get_kv_type(gctx, loss_key) == GGUF_TYPE_STRING &&
+            std::strcmp(gguf_get_val_str(gctx, loss_key), kd ? "top_k_tail_kl" : "ce") == 0;
+    const bool cache_valid = !kd || (cache_key >= 0 && gguf_get_kv_type(gctx, cache_key) == GGUF_TYPE_STRING &&
+            std::filesystem::weakly_canonical(config.distill_cache).string() == gguf_get_val_str(gctx, cache_key) &&
+            k_key >= 0 && gguf_get_kv_type(gctx, k_key) == GGUF_TYPE_UINT32 && gguf_get_val_u32(gctx, k_key) == uint32_t(config.distill_top_k) &&
+            t_key >= 0 && gguf_get_kv_type(gctx, t_key) == GGUF_TYPE_FLOAT32 && gguf_get_val_f32(gctx, t_key) == config.distill_temperature);
+    if (!loss_valid || !cache_valid) {
+        LOG_ERR("%s: checkpoint loss or teacher cache configuration differs\n", __func__);
+        gguf_free(gctx);
+        ggml_free(data_ctx);
+        return false;
+    }
     if (context_key >= 0 && (gguf_get_kv_type(gctx, context_key) != GGUF_TYPE_UINT32 ||
         gguf_get_val_u32(gctx, context_key) != (uint32_t) config.n_ctx)) {
         LOG_ERR("%s: checkpoint sequence context differs from --ctx-size\n", __func__);
@@ -639,6 +662,17 @@ static void qat_epoch_callback(
     if (!train || !g_qat_callback) {
         return;
     }
+    if (ibatch == ibatch_max && !g_qat_callback->params->distill_cache.empty()) {
+        const double elapsed = (ggml_time_us() - t_start_us)*1e-6;
+        const int64_t input_tokens = ibatch*g_qat_callback->params->n_ubatch;
+        const auto * labels = static_cast<int32_t *>(ggml_opt_dataset_labels(dataset)->data);
+        const int64_t context = ggml_opt_dataset_labels(dataset)->ne[0];
+        const int64_t supervised = std::count_if(labels + g_qat_callback->window_start*context,
+                labels + g_qat_callback->validation_start*context, [](int32_t token) { return token >= 0; });
+        LOG_INF("qat_throughput: input_tokens=%ld supervised_tokens=%ld elapsed_s=%.3f input_tok_s=%.3f supervised_tok_s=%.3f\n",
+                (long) input_tokens, (long) supervised, elapsed, elapsed > 0 ? input_tokens/elapsed : 0,
+                elapsed > 0 ? supervised/elapsed : 0);
+    }
     struct llama_context * step_lctx =
         g_qat_callback->params->mtp_mode == "only" ? g_qat_callback->mtp_lctx : g_qat_callback->lctx;
     const int64_t step = llama_opt_step(step_lctx);
@@ -751,16 +785,17 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
 }
 
 static void distillation_limit_dataset(ggml_opt_dataset_t & dataset, int64_t & split, int32_t limit,
-        std::vector<float> & rewards) {
-    if (!limit || !dataset) return;
+        std::vector<float> & rewards, int32_t validation_limit = 0) {
+    if ((!limit && !validation_limit) || !dataset) return;
     const int64_t total = ggml_opt_dataset_ndata(dataset);
-    const int64_t train = std::min<int64_t>(limit, split);
-    const int64_t val = std::min<int64_t>(limit, total - split);
+    const int64_t train = limit ? std::min<int64_t>(limit, split) : split;
+    const int64_t available_val = limit ? std::min<int64_t>(limit, total - split) : total - split;
+    const int64_t val = validation_limit ? std::min<int64_t>(validation_limit, available_val) : available_val;
     const int64_t context = ggml_opt_dataset_data(dataset)->ne[0];
     ggml_opt_dataset_t subset = ggml_opt_dataset_init(GGML_TYPE_I32, GGML_TYPE_I32, context, context, train + val, 1);
     std::vector<float> selected;
     for (int64_t i = 0; i < train + val; ++i) {
-        const int64_t src = i < train ? i : split + i - train;
+        const int64_t src = i < train ? i : split + (i - train)*available_val/val;
         std::memcpy(static_cast<int32_t *>(ggml_opt_dataset_data(subset)->data) + i*context,
                 static_cast<int32_t *>(ggml_opt_dataset_data(dataset)->data) + src*context, context*4);
         std::memcpy(static_cast<int32_t *>(ggml_opt_dataset_labels(subset)->data) + i*context,
@@ -985,13 +1020,15 @@ int main(int argc, char ** argv) {
     if (!dataset) {
         return 1;
     }
-    distillation_limit_dataset(dataset, idata_split, params.distill_max_windows, window_rewards);
+    distillation_limit_dataset(dataset, idata_split, params.distill_max_windows, window_rewards, params.distill_validation_windows);
     const int64_t ndata = ggml_opt_dataset_ndata(dataset);
     std::unique_ptr<logit_distillation::cache> teacher_cache;
     if (!params.distill_cache.empty()) {
         try {
             teacher_cache.reset(new logit_distillation::cache(params.distill_cache));
             teacher_cache->attach(dataset, idata_split, vocab);
+            params.distill_top_k = teacher_cache->info.top_k;
+            params.distill_temperature = teacher_cache->info.temperature;
             llama_opt_set_distillation(lctx, teacher_cache->info.top_k, teacher_cache->info.temperature,
                     logit_distillation::cache::fetch, teacher_cache.get());
             LOG_INF("distillation: pure top-%u + tail KL, temperature=%.6g, no hard-label CE, train_windows=%ld validation_windows=%ld\n",
@@ -1198,6 +1235,10 @@ int main(int argc, char ** argv) {
             final_save_ok = false;
         } else {
             LOG_INF("%s: trained native %s %s model saved to %s\n", __func__, ggml_opt_optimizer_name(params.optimizer), params.qat_quant_type.c_str(), params.qat_out.c_str());
+            if (!params.distill_cache.empty()) {
+                final_save_ok = qat_save_state(lctx, params.qat_out, params.lr.epochs, 0,
+                        schedule.step, params.qat_quant_type, params) && final_save_ok;
+            }
         }
     }
     if (!params.qat_adapter_out.empty()) {

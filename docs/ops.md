@@ -14,6 +14,8 @@ For dense `ACC_QLION_QAT`, internal `op_params[2] = 1` quantizes the F32 microgr
 
 CUDA `OUT_PROD_ID` and compact expert accumulation gather each expert's activation and gradient vectors in one kernel. Route order and the existing GEMM dimensions are preserved, including broadcast activations and strided token storage. See the [MoE gather and state-kernel study](superpowers/reports/2026-11-04-qlion2-moe-gather.md).
 
+CPU `DISTILLATION` and `DISTILLATION_BACK` fuse top-k plus tail KL and its logit gradient using row-sized scratch per thread. Teacher IDs and log-probabilities are inputs; masked rows produce zero loss and gradient. The native trainer uses these operations by default. `GGML_DISTILL_REFERENCE=1` selects the earlier graph-composed loss for numerical and performance comparisons. Other backends can fall back to CPU; native GPU kernels are not implemented. See [the CPU recovery workflow](../scripts/logit-distillation/README.md).
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)
@@ -50,6 +52,8 @@ Legend:
 |                              COS | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                      COUNT_EQUAL | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |                              CPY | ❌ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ❌ | ❌ |
+|                     DISTILLATION | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                DISTILLATION_BACK | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 |               CROSS_ENTROPY_LOSS | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |          CROSS_ENTROPY_LOSS_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |                           CUMSUM | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |

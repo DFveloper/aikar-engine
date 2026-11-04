@@ -1,6 +1,6 @@
 # QLion2 offline logit distillation CPU validation
 
-Date: 2026-11-04. This is a local working-tree implementation on the AIKAR fork. Existing unrelated edits were retained. No commit or push was performed.
+Date: 2026-11-04. This report records the original implementation and smoke test on the AIKAR fork, subsequently committed as dea3f28b8. Existing unrelated edits were retained. See OPTIMIZATION.md for the later CPU kernel, extraction optimizations and production workflow. No push was performed.
 
 ## Implementation
 

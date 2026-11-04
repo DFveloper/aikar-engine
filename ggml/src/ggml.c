@@ -1152,9 +1152,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "GLU_BACK",
     "PAGED_ATTN",
+    "DISTILLATION",
+    "DISTILLATION_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
+static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -6516,6 +6518,38 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+struct ggml_tensor * ggml_distillation(
+        struct ggml_context * ctx, struct ggml_tensor * logits,
+        struct ggml_tensor * ids, struct ggml_tensor * logp,
+        struct ggml_tensor * weights, float temperature) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(logp->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(logits) && ggml_is_matrix(ids) && ggml_is_matrix(logp));
+    GGML_ASSERT(logits->ne[0] <= INT32_MAX && ids->ne[0] > 0 && ids->ne[0] < logits->ne[0]);
+    GGML_ASSERT(ids->ne[1] == logits->ne[1] && logp->ne[0] == ids->ne[0] + 1 && logp->ne[1] == ids->ne[1]);
+    GGML_ASSERT(ggml_nelements(weights) == logits->ne[1]);
+    GGML_ASSERT(ggml_is_contiguous(logits) && ggml_is_contiguous(ids) && ggml_is_contiguous(logp) && ggml_is_contiguous(weights));
+    GGML_ASSERT(isfinite(temperature) && temperature >= 0.01f && temperature <= 100.0f);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, logits->ne[1]);
+    result->op = GGML_OP_DISTILLATION;
+    result->src[0] = logits;
+    result->src[1] = ids;
+    result->src[2] = logp;
+    result->src[3] = weights;
+    ggml_set_op_params(result, &temperature, sizeof(temperature));
+    return result;
+}
+
+static struct ggml_tensor * ggml_distillation_back(
+        struct ggml_context * ctx, struct ggml_tensor * loss, struct ggml_tensor * grad) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, loss->src[0]);
+    result->op = GGML_OP_DISTILLATION_BACK;
+    for (int i = 0; i < 4; ++i) result->src[i] = loss->src[i];
+    result->src[4] = grad;
+    memcpy(result->op_params, loss->op_params, sizeof(result->op_params));
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(
@@ -8365,6 +8399,12 @@ static void ggml_compute_backward(
                 } //break;
             }
         } break;
+        case GGML_OP_DISTILLATION: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_distillation_back(ctx, tensor, grad));
+            }
+            GGML_ASSERT(!src1_needs_grads && !src2_needs_grads);
+        } break;
         case GGML_OP_CROSS_ENTROPY_LOSS: {
             if (src0_needs_grads) {
                 struct ggml_tensor * loss_back = src1->type == GGML_TYPE_I32
@@ -8672,6 +8712,11 @@ void ggml_build_backward_expand_with_callback(
                          !(callback && (node->src[0]->flags & GGML_TENSOR_FLAG_PARAM) && node->type == GGML_TYPE_F32)))) {
                     ignore_src[0] = true;
                 }
+                break;
+            case GGML_OP_DISTILLATION:
+                ignore_src[1] = true;
+                ignore_src[2] = true;
+                ignore_src[3] = true;
                 break;
             case GGML_OP_ADD_ID:
                 ignore_src[2] = true;

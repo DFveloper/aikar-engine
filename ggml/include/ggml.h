@@ -621,6 +621,9 @@ extern "C" {
 
         GGML_OP_PAGED_ATTN,
 
+        GGML_OP_DISTILLATION,
+        GGML_OP_DISTILLATION_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2936,6 +2939,12 @@ extern "C" {
             void                * userdata);
 
     // loss function
+
+    // One weighted top-k plus tail KL value per logits row, before T*T scaling.
+    GGML_API struct ggml_tensor * ggml_distillation(
+            struct ggml_context * ctx, struct ggml_tensor * logits,
+            struct ggml_tensor * ids, struct ggml_tensor * logp,
+            struct ggml_tensor * weights, float temperature);
 
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss(
             struct ggml_context * ctx,

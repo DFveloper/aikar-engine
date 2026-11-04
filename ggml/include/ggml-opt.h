@@ -208,6 +208,10 @@ extern "C" {
             struct ggml_context * ctx, struct ggml_tensor * logits,
             struct ggml_tensor * ids, struct ggml_tensor * logp,
             struct ggml_tensor * weights, float temperature);
+    GGML_API struct ggml_tensor * ggml_opt_distillation_loss_reference(
+            struct ggml_context * ctx, struct ggml_tensor * logits,
+            struct ggml_tensor * ids, struct ggml_tensor * logp,
+            struct ggml_tensor * weights, float temperature);
     GGML_API struct ggml_tensor * ggml_opt_loss(    ggml_opt_context_t opt_ctx); // scalar tensor that contains the loss
     GGML_API struct ggml_tensor * ggml_opt_pred(    ggml_opt_context_t opt_ctx); // predictions made by outputs
     GGML_API struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx); // number of matching predictions between outputs and labels

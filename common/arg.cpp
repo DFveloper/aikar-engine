@@ -5287,6 +5287,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--distill-validation-windows"}, "N",
+        "cap validation windows with deterministic sampling (0 = all)",
+        [](common_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("distill validation windows must be non-negative");
+            params.distill_validation_windows = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--distill-plan"},
+        "print packed window counts and exact teacher-cache size without loading teacher weights",
+        [](common_params & params) { params.distill_plan = true; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
+        {"--distill-resume-extraction"},
+        "resume a matching partial teacher cache at the last complete window",
+        [](common_params & params) { params.distill_resume_extraction = true; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--distill-temperature"}, "T",
         "teacher extraction temperature; training uses the temperature recorded in the cache",
         [](common_params & params, const std::string & value) {
