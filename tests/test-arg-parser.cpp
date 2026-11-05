@@ -258,6 +258,16 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     {
+        common_params qat_params;
+        argv = {"binary_name", "-m", "model.gguf", "--qat-adapter-only", "--qat-adapter-out", "adapter.gguf",
+                "--save-every", "2", "--save-first-at", "1"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), qat_params, LLAMA_EXAMPLE_FINETUNE_QAT));
+        assert(qat_params.qat_out.empty());
+        assert(qat_params.qat_adapter_out == "adapter.gguf");
+        assert(qat_params.save_every == 2 && qat_params.save_first_at == 1);
+    }
+
+    {
         const std::filesystem::path recipe =
             std::filesystem::temp_directory_path() / "llama-test-lora-qat-tensor-types.txt";
         {

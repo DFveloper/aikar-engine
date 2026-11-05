@@ -5336,8 +5336,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(
+        {"--qat-adapter-only"},
+        "save QAT adapters and optimizer state without full models (shorthand for --qat-out ''); requires --qat-adapter-out",
+        [](common_params & params) { params.qat_out.clear(); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
+    add_opt(common_arg(
         {"--qat-adapter-out"}, "FNAME",
-        "save changed native QAT tensors as a QLion adapter in addition to the full model",
+        "save changed native QAT tensors as a QLion adapter (use --qat-adapter-only to omit the full model)",
         [](common_params & params, const std::string & value) { params.qat_adapter_out = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QAT }));
     add_opt(common_arg(

@@ -326,8 +326,8 @@ static bool qat_save_state(
     gguf_get_meta_data(gctx, metadata.data());
     out.seekp(0);
     out.write((const char *) metadata.data(), metadata.size());
-    const bool ok = out.good();
     out.close();
+    const bool ok = !out.fail();
     gguf_free(gctx);
     ggml_free(tensor_ctx);
     return ok;
@@ -702,7 +702,7 @@ static void qat_epoch_callback(
     if (window_complete && (first_save_due || periodic_save_due)) {
         const int64_t window = g_qat_callback->window_start + ibatch / g_qat_callback->ubatches_per_window;
         bool saved = true;
-        if (g_qat_callback->params->mtp_mode != "only") {
+        if (g_qat_callback->params->mtp_mode != "only" && !g_qat_callback->params->qat_out.empty()) {
             const std::string path = g_qat_callback->params->qat_out + ".step" + std::to_string(step) + ".gguf";
             saved = qat_save_checkpoint(g_qat_callback->lctx, g_qat_callback->model,
                 g_qat_callback->params->model.path, path, g_qat_callback->epoch, window,
@@ -728,9 +728,14 @@ static void qat_epoch_callback(
         if (saved && !g_qat_callback->params->qat_adapter_out.empty()) {
             try {
                 const auto path = g_qat_callback->params->qat_adapter_out + ".step" + std::to_string(step) + ".gguf";
+                llama_synchronize(g_qat_callback->lctx);
                 common_qlion_save(*g_qat_callback->adapter_base, *g_qat_callback->adapter_tensors,
                     path, g_qat_callback->params->qat_adapter_units);
-                LOG_INF("qat_adapter_checkpoint: saved step=%ld path=%s\n", (long) step, path.c_str());
+                if (g_qat_callback->params->qat_out.empty()) {
+                    saved = qat_save_state(g_qat_callback->lctx, path, g_qat_callback->epoch, window,
+                        g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type, *g_qat_callback->params);
+                }
+                if (saved) LOG_INF("qat_adapter_checkpoint: saved step=%ld path=%s\n", (long) step, path.c_str());
             } catch (const std::exception & e) {
                 LOG_ERR("qat_adapter_checkpoint: %s\n", e.what());
                 saved = false;
@@ -846,8 +851,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: --train-file is required\n", __func__);
         return 1;
     }
-    if (params.qat_out.empty() && (params.qat_adapter_out.empty() || params.save_every > 0 || params.save_first_at > 0)) {
-        LOG_ERR("%s: empty --qat-out requires --qat-adapter-out and disabled full checkpoints\n", __func__);
+    if (params.qat_out.empty() && params.qat_adapter_out.empty()) {
+        LOG_ERR("%s: adapter-only saving requires --qat-adapter-out\n", __func__);
         return 1;
     }
     if (params.grpo_mode || !params.lora_adapters.empty()) {
@@ -1257,6 +1262,10 @@ int main(int argc, char ** argv) {
     if (!params.qat_adapter_out.empty()) {
         try {
             common_qlion_save(adapter_base, adapter_tensors, params.qat_adapter_out, params.qat_adapter_units);
+            if (params.qat_out.empty()) {
+                final_save_ok = qat_save_state(lctx, params.qat_adapter_out, params.lr.epochs, 0,
+                    schedule.step, params.qat_quant_type, params) && final_save_ok;
+            }
             if (final_save_ok) {
                 LOG_INF("qat_adapter_checkpoint: saved final path=%s\n", params.qat_adapter_out.c_str());
             }

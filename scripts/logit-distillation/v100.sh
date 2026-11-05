@@ -19,6 +19,8 @@ VAL_WINDOWS=${VAL_WINDOWS:-32}
 VAL_SPLIT=${VAL_SPLIT:-0.05}
 THREADS=${THREADS:-8}
 RECOMPUTE=${RECOMPUTE:-off}
+SAVE_EVERY=${SAVE_EVERY:-0}
+SAVE_FIRST_AT=${SAVE_FIRST_AT:-0}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export GGML_CUDA_P2P=${GGML_CUDA_P2P:-1}
 if [[ $GGML_CUDA_P2P == 0 ]]; then unset GGML_CUDA_P2P; fi
@@ -50,7 +52,8 @@ case "$mode" in
             --optimizer qlion2 --quant-type q4_0,q8_0 --qat-targets "$TARGETS"
             --override-tensor '^output\.weight$=CUDA0' --kv-cache-training -ctk f32 -ctv f32
             --qat-static-graph off --activation-recompute "$RECOMPUTE" --epochs "${EPOCHS:-3}" -lr "${LR:-1e-5}"
-            --qat-out '' --qat-adapter-out "$OUTPUT" --save-every 0 --verbose-loss)
+            --qat-adapter-only --qat-adapter-out "$OUTPUT"
+            --save-every "$SAVE_EVERY" --save-first-at "$SAVE_FIRST_AT" --verbose-loss)
         ;;
     *) echo 'Usage: bash scripts/logit-distillation/v100.sh {download,build,infer,teacher,extract,train} [--dry-run | extra arguments]'; exit 0 ;;
 esac

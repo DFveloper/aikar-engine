@@ -178,7 +178,8 @@ def main():
                               "experts": 4 if model_name == "moe" else 0,
                               "experts_used": 2 if model_name == "moe" else 0,
                               "sha256": file_hash(model)}
-        dynamic, adapter, dynamic_text = train(model_name + "-dynamic", model, data=args.fixtures / "synthetic_chat.jsonl", epochs=2)
+        dynamic, adapter, dynamic_text = train(model_name + "-dynamic", model, ["--save-every", "1"],
+            data=args.fixtures / "synthetic_chat.jsonl", epochs=2)
         static, _, static_text = train(model_name + "-static", model, ["--qat-static-graph", "on"],
                                        data=args.fixtures / "synthetic_chat.jsonl", epochs=2)
         reused = "reusing forward/backward/optimizer graph" in static_text
@@ -190,6 +191,36 @@ def main():
         merged = args.output_dir / (model_name + "-merged.gguf")
         run(model_name + "-merge", [exporter, "-m", model, "--adapter", adapter, "-o", merged])
         compare_models(dynamic, merged)
+        only_name = model_name + "-adapter-only"
+        only_full, only_adapter, _ = train(only_name, model,
+            ["--qat-adapter-only", "--save-first-at", "1", "--save-every", "1"],
+            data=args.fixtures / "synthetic_chat.jsonl", epochs=2)
+        assert not only_full.exists(), "adapter-only saving wrote a full model"
+        assert not list(args.output_dir.glob(only_name + ".gguf*")), "adapter-only saving wrote full checkpoints"
+        checkpoints = sorted((path for path in args.output_dir.glob(only_adapter.name + ".step*.gguf")
+            if not path.name.endswith(".qat-state.gguf")),
+            key=lambda path: int(re.search(r"\.step(\d+)\.gguf$", path.name)[1]))
+        assert checkpoints and checkpoints[0].name.endswith(".step1.gguf"), "missing first adapter checkpoint"
+        assert len(checkpoints) >= 2, "missing periodic adapter checkpoints"
+        assert file_hash(checkpoints[-1]) == file_hash(only_adapter), "final adapter differs from last checkpoint"
+        for checkpoint in [*checkpoints, only_adapter]:
+            state = Path(str(checkpoint) + ".qat-state.gguf")
+            state_reader, states = tensor_map(state)
+            assert state_reader.fields["general.type"].contents() == "optimizer"
+            assert states, "missing adapter optimizer state"
+        last_step = re.search(r"\.step(\d+)\.gguf$", checkpoints[-1].name)[1]
+        compare_models(Path(str(dynamic) + f".step{last_step}.gguf.qat-state.gguf"),
+            Path(str(only_adapter) + ".qat-state.gguf"))
+        run(only_name + "-merge", [exporter, "-m", model, "--adapter", only_adapter, "-o", merged])
+        compare_models(dynamic, merged)
+        resume_model = args.output_dir / (only_name + "-resume-base.gguf")
+        run(only_name + "-resume-merge", [exporter, "-m", model, "--adapter", checkpoints[0], "-o", resume_model])
+        Path(str(resume_model) + ".qat-state.gguf").write_bytes(Path(str(checkpoints[0]) + ".qat-state.gguf").read_bytes())
+        resumed_only, _, _ = train(only_name + "-resume", resume_model, ["--qat-resume", resume_model],
+            data=args.fixtures / "synthetic_chat.jsonl", epochs=3)
+        continued, _, _ = train(only_name + "-reference", model,
+            data=args.fixtures / "synthetic_chat.jsonl", epochs=3)
+        compare_models(continued, resumed_only)
         infer = ["-p", "hi", "-n", "2", "-c", "256", "-b", "256", "-ub", "256", "-ngl", args.gpu_layers,
                  "-t", "4", "--load-mode", "none", "--lazy-mode", "off", "-no-cnv", "--seed", "42", "--verbosity", "0"]
         run(model_name + "-infer-merged", [completion, "-m", merged, *infer])
