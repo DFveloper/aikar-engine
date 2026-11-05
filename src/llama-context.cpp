@@ -457,6 +457,24 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        for (const auto & entry : model.tensors_by_name) {
+            if (!entry.second->buffer) {
+                continue;
+            }
+            auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(entry.second->buffer));
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                    std::any_of(backends.begin(), backends.end(), [dev](const auto & backend) {
+                        return ggml_backend_get_device(backend.get()) == dev;
+                    })) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (!backend) {
+                throw std::runtime_error(format("failed to initialize tensor override backend %s", ggml_backend_dev_name(dev)));
+            }
+            backends.emplace_back(backend);
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -4092,12 +4110,21 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.critical_confidence_threshold = lopt_params.critical_confidence_threshold;
     opt_params.critical_weight_linear    = lopt_params.critical_weight_shape == LLAMA_OPT_CRITICAL_WEIGHT_SHAPE_LINEAR;
     bool native_training_kernels_supported = true;
+    std::vector<ggml_backend_dev_t> training_devices;
     for (ggml_backend_t backend : backend_ptrs) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR && !ggml_backend_dev_backend_reg(dev)) {
+            training_devices.insert(training_devices.end(), model->get_split_state_ud.devices.begin(), model->get_split_state_ud.devices.end());
+        } else {
+            training_devices.push_back(dev);
+        }
+    }
+    for (ggml_backend_dev_t dev : training_devices) {
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             continue;
         }
-        const char * reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
         if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
             native_training_kernels_supported = false;
             break;

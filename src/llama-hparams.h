@@ -86,7 +86,6 @@ struct llama_hparams {
 
     // TODO: this needs to be reworked
     bool kv_global_only = false;
-    int32_t kv_global_source = -1;
     int32_t  n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
 
     // different head size for full_attention and SWA layers
@@ -497,6 +496,7 @@ struct llama_hparams {
     uint32_t n_embd_head_v_mla() const;
 
     bool has_kv(uint32_t il) const;
+    int32_t kv_source(uint32_t il) const;
 
     bool has_rope(uint32_t il) const;
 

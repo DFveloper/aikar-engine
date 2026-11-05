@@ -402,6 +402,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    if (tensor_name.rfind("QLion ", 0) == 0) {
+        const size_t offset = tensor_name.find(" for ");
+        if (offset != std::string::npos) {
+            const auto * param = ud->model->get_tensor(tensor_name.substr(offset + 5).c_str());
+            if (param && ggml_are_same_shape(param, tensor)) {
+                return llama_meta_device_get_split_state(param, userdata);
+            }
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -492,6 +501,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
+        }
+        if (hparams.kv_global_only && !hparams.is_swa(il) && !hparams.has_kv(il)) {
+            rotation = get_il_eff(hparams.kv_source(il)) % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
@@ -3246,7 +3258,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_kv_cache::layer_share_cb share = nullptr;
 
                     if (hparams.kv_global_only) {
-                        reuse = [&](uint32_t il) { return hparams.has_kv(il) ? -1 : hparams.kv_global_source; };
+                        reuse = [&](uint32_t il) { return hparams.has_kv(il) ? -1 : hparams.kv_source(il); };
                     } else if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
                             GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);

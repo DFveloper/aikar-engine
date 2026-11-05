@@ -3,7 +3,11 @@
 #include "ggml-cpu.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
+extern "C" {
+#include "hash/sha256/sha256.h"
+}
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -11,10 +15,45 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 static void check(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+static void test_sha256() {
+    const std::pair<size_t, const char *> vectors[] = {
+        {0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {1, "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"},
+        {55, "3b453d648ef01a1ddbc30ef4cee00724bb53fe40b38a08c04cfd6009235c09bf"},
+        {56, "a5f1426b20451b15d1c92aef1b27b36b038d13a77874409d73889c02fa1ca778"},
+        {63, "b728e1a944ecf6d47629afefa1656cbe11fd7bf23145fcba144af99ea5ec14f5"},
+        {64, "17ff3615c8f2285b470ee569e15b37503eae49e36882b63ccc1aceb055d7f082"},
+        {65, "f747a3be9b4a85941804d77e333783b22f194e6252b37570fd51bc2bc7886a57"},
+        {127, "1b6e94ae18eff1dbc2ee77615845eaf55a88b19cb3a867179a0cfe90789943cf"},
+        {128, "44d942056dd7041cfe6a1bbcb1a1f3afc385bb951b5efd787e71f514f29e1ddc"},
+        {129, "a14a45b30d8e4eca06366744bea6597da4da3404e76a29019874cfec816bc586"},
+        {4096, "a6b060d732a944b4f177ef54ea891486888d047f26f9caf1a32786d8d7adf040"},
+    };
+    for (size_t alignment = 0; alignment < 8; ++alignment) {
+        std::vector<unsigned char> input(alignment + 4096);
+        for (size_t i = 0; i < 4096; ++i) input[alignment + i] = (unsigned char) (i*37 + i/251);
+        for (const auto & vector : vectors) for (size_t chunk : {1, 7, 55, 64, 65, 127, 4096}) {
+            sha256_t hash;
+            sha256_init(&hash);
+            sha256_update(&hash, nullptr, 0);
+            for (size_t pos = 0; pos < vector.first; pos += chunk) {
+                sha256_update(&hash, input.data() + alignment + pos, std::min(chunk, vector.first - pos));
+                sha256_update(&hash, nullptr, 0);
+            }
+            unsigned char digest[32];
+            sha256_final(&hash, digest);
+            char actual[65];
+            for (size_t i = 0; i < 32; ++i) snprintf(actual + 2*i, 3, "%02x", digest[i]);
+            check(std::strcmp(actual, vector.second) == 0, "SHA-256 differs from reference");
+        }
+    }
 }
 
 static void rejected(const std::function<void()> & action) {
@@ -242,6 +281,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     try {
+        test_sha256();
         check(std::filesystem::create_directory(argv[1]), "scratch directory already exists");
         fixture f(argv[1]);
         test_adapter(f);

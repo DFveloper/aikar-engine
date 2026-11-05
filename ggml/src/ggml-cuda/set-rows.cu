@@ -691,7 +691,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (dst->type == GGML_TYPE_NVFP4) {
+    if (dst->type == GGML_TYPE_NVFP4 || dst->type == GGML_TYPE_FP4_KV) {
         ggml_cuda_set_rows_nvfp4(ctx, src0, src1, dst);
         return;
     }

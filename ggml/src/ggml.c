@@ -7678,6 +7678,9 @@ static void ggml_acc_or_set(
         const  size_t         offset) {
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
+    if (!ggml_is_contiguous(tensor)) {
+        tensor = ggml_cont(ctx, tensor);
+    }
     if (cgraph->grads[isrc]) {
         if (!ggml_is_contiguous(cgraph->grads[isrc])) {
             GGML_ASSERT(!cgraph->grad_accs[isrc]);

@@ -68,7 +68,8 @@ class TestLumen4Exp(unittest.TestCase):
                 original, converted = gguf.GGUFReader(source), gguf.GGUFReader(output)
                 self.assertEqual(converted.fields["general.architecture"].contents(), "lumen4exp")
                 self.assertEqual(converted.fields["general.name"].contents(), "Lumen 3.8 Pulsar Next")
-                self.assertEqual(converted.fields["lumen4exp.attention.shared_kv_layers"].contents(), 13)
+                self.assertEqual(converted.fields["lumen4exp.attention.shared_kv_layers"].contents(), 19)
+                self.assertNotIn("lumen4exp.attention.independent_kv_layers", converted.fields)
                 self.assertEqual(converted.fields["general.quantization_version"].contents(), 3)
                 self.assertFalse(any(key.startswith("gemma4.") for key in converted.fields))
                 for a, b in zip(original.tensors, converted.tensors):
@@ -87,6 +88,24 @@ class TestLumen4Exp(unittest.TestCase):
         make_source(source, missing_swa=True)
         with self.assertRaisesRegex(ValueError, "independent KV weights"):
             converter.convert(source, self.root / "lumen.gguf")
+
+    def test_shared_global_weights_optional(self):
+        source = self.root / "gemma.gguf"
+        make_source(source)
+        reader = gguf.GGUFReader(source)
+        writer = gguf.GGUFWriter(self.root / "missing.gguf", "gemma4")
+        for key, field in reader.fields.items():
+            if not key.startswith("GGUF."):
+                writer.add_key_value(key, field.contents(), field.types[0],
+                                     field.types[-1] if field.types[0] == gguf.GGUFValueType.ARRAY else None)
+        for tensor in reader.tensors:
+            if tensor.name != "blk.17.attn_k.weight":
+                writer.add_tensor(tensor.name, tensor.data, raw_dtype=tensor.tensor_type)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        converter.convert(self.root / "missing.gguf", self.root / "lumen.gguf")
 
     def test_yarn_context_extension(self):
         for original, target in ((None, 1048576), (32768, 1048576), (None, 262144)):

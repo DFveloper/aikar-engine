@@ -6,7 +6,7 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
 
     hparams.kv_global_only = arch == LLM_ARCH_LUMEN4EXP;
-    uint32_t n_kv_shared_layers = hparams.kv_global_only ? 13 : 0;
+    uint32_t n_kv_shared_layers = hparams.kv_global_only ? 19 : 0;
     ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
 
     if (hparams.kv_global_only && n_kv_shared_layers >= hparams.n_layer_all) {
@@ -15,12 +15,13 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_layer_kv_from_start = hparams.n_layer_all - (int32_t)n_kv_shared_layers;
     if (hparams.kv_global_only) {
         for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-            if (!hparams.is_swa(il) && il < (uint32_t) hparams.n_layer_kv_from_start) {
-                hparams.kv_global_source = il;
+            if (!hparams.is_swa(il)) {
+                const int32_t source = hparams.kv_source(il);
+                if (source < 0) {
+                    throw std::runtime_error("Lumen KV sharing requires an earlier independent global layer");
+                }
+                LLAMA_LOG_INFO("%s: global layer %u KV source %d\n", __func__, il, source);
             }
-        }
-        if (hparams.kv_global_source < 0) {
-            throw std::runtime_error("Lumen KV sharing requires an independent global layer");
         }
     }
     hparams.f_attention_scale     = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
@@ -310,7 +311,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
-            const int source_layer = hparams.kv_global_only ? hparams.kv_global_source :
+            const int source_layer = hparams.kv_global_only ? hparams.kv_source(il) :
                 hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
             ggml_tensor * shared_k = full_sequence ? sequence_k.at(source_layer) : nullptr;
             ggml_tensor * shared_v = full_sequence ? sequence_v.at(source_layer) : nullptr;

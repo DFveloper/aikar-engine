@@ -4,6 +4,7 @@ This code is based on public domain code from Wei Dai's Crypto++ library. */
 
 #include "rotate-bits/rotate-bits.h"
 #include "sha256.h"
+#include <string.h>
 
 /* define it for speed optimization */
 #define _SHA256_UNROLL
@@ -147,16 +148,16 @@ sha256_transform(uint32_t *state, const uint32_t *data)
 #undef s1
 
 static void
-sha256_write_byte_block(sha256_t *p)
+sha256_write_byte_block(sha256_t *p, const unsigned char *data)
 {
   uint32_t data32[16];
   unsigned i;
   for (i = 0; i < 16; i++)
     data32[i] =
-      ((uint32_t)(p->buffer[i * 4    ]) << 24) +
-      ((uint32_t)(p->buffer[i * 4 + 1]) << 16) +
-      ((uint32_t)(p->buffer[i * 4 + 2]) <<  8) +
-      ((uint32_t)(p->buffer[i * 4 + 3]));
+      ((uint32_t)(data[i * 4    ]) << 24) +
+      ((uint32_t)(data[i * 4 + 1]) << 16) +
+      ((uint32_t)(data[i * 4 + 2]) <<  8) +
+      ((uint32_t)(data[i * 4 + 3]));
   sha256_transform(p->state, data32);
 }
 
@@ -175,17 +176,24 @@ void
 sha256_update(sha256_t *p, const unsigned char *data, size_t size)
 {
   uint32_t curBufferPos = (uint32_t)p->count & 0x3F;
-  while (size > 0)
+  p->count += size;
+  if (curBufferPos != 0 && size != 0)
   {
-    p->buffer[curBufferPos++] = *data++;
-    p->count++;
-    size--;
-    if (curBufferPos == 64)
-    {
-      curBufferPos = 0;
-      sha256_write_byte_block(p);
-    }
+    size_t n = 64 - curBufferPos;
+    if (n > size) n = size;
+    memcpy(p->buffer + curBufferPos, data, n);
+    data += n;
+    size -= n;
+    if (curBufferPos + n != 64) return;
+    sha256_write_byte_block(p, p->buffer);
   }
+  while (size >= 64)
+  {
+    sha256_write_byte_block(p, data);
+    data += 64;
+    size -= 64;
+  }
+  if (size != 0) memcpy(p->buffer, data, size);
 }
 
 
@@ -200,7 +208,7 @@ sha256_final(sha256_t *p, unsigned char *digest)
   {
     curBufferPos &= 0x3F;
     if (curBufferPos == 0)
-      sha256_write_byte_block(p);
+      sha256_write_byte_block(p, p->buffer);
     p->buffer[curBufferPos++] = 0;
   }
   for (i = 0; i < 8; i++)
@@ -208,7 +216,7 @@ sha256_final(sha256_t *p, unsigned char *digest)
     p->buffer[curBufferPos++] = (unsigned char)(lenInBits >> 56);
     lenInBits <<= 8;
   }
-  sha256_write_byte_block(p);
+  sha256_write_byte_block(p, p->buffer);
 
   for (i = 0; i < 8; i++)
   {

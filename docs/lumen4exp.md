@@ -14,7 +14,7 @@ Conversion also configures YaRN for a 1,048,576-token (1M) context by default. I
 
 The model loads these YaRN settings without runtime RoPE flags. Use `-c 1048576` to allocate the full context at inference. The metadata marks the extension as not finetuned: conversion alone does not validate 1M-context quality. Distillation or long-context training and evaluation are still required.
 
-The default `lumen4exp.attention.shared_kv_layers` is 13, interpreted as the trailing 13 transformer layers. Only global attention layers in this range reuse KV. For a 30-layer model with global layers at zero-based indices 5, 11, 17, 23 and 29, the KV sources are 5, 11, 11, 11 and 11. Every SWA layer retains its own KV projections and cache. `--shared-layers 0` disables sharing.
+The default `lumen4exp.attention.shared_kv_layers` is 19, interpreted as the trailing 19 transformer layers. Only global attention layers in this range reuse KV. For the 30-layer model, layer 5 is the only global KV owner; global layers 11, 17, 23 and 29 all reuse layer 5. All indices are zero-based. Every SWA layer retains its own KV projections and cache. `--shared-layers 0` disables sharing. The temporary independent-layer-17 override has been removed.
 
 A source checkpoint must contain independent K projection and K normalization weights for all SWA layers. The converter rejects checkpoints whose original sharing removed these weights. Merge sharded GGUFs before conversion. Existing output files are never overwritten.
 
@@ -33,7 +33,7 @@ The number of independent global cache layers comes from model metadata and shar
 
 The default is selected automatically for `lumen4exp`; no cache-type flags or checkpoint conversion are needed. Runtime type 150 is separate from GGUF NVFP4 weight type 40. Existing NVFP4 weight codecs and conversion remain compatible. Old saved KV states are rejected by their different cache type.
 
-CPU cache writes, dequantization and direct Flash Attention support this format. The cache stays on CPU when projection weights are offloaded. CUDA and Vulkan decline this runtime type. Direct GPU FP4 KV execution is not implemented. E4M3 scales have finite range: extremely small values can underflow, and very large values can saturate; there is no master scale to extend that range.
+CPU cache writes, dequantization and direct Flash Attention support this format. CUDA supports packed cache writes and GPU dequantization before F16 Flash Attention, including on V100; no native FP4 tensor-core instructions are required. FP4 cache rows span the KV heads so tensor parallelism can split the head channels while sharing token indices. Unsupported backends keep the packed cache on CPU. Small-model FP4 KV inference passed on two V100s. Real-model validation is pending after a repeated PCIe/NVLink device failure; see the V100 guide for kernel logs. E4M3 scales have finite range: extremely small values can underflow, and very large values can saturate; there is no master scale to extend that range.
 
 The existing training path uses the same per-16 FP4 quantizer in forward and STE gradients in backward. It currently restores FP32 values for the differentiable attention graph; this is not a complete FP4 backward kernel or a measured reduction in training activation memory.
 
@@ -51,3 +51,7 @@ PYTHONPATH=gguf-py python3 gguf-py/tests/test_quants.py --libggml build/bin/libg
 The 2026-11-04 implementation passed 66 CPU backend cases for cache writes, copies and attention, the quantization suite, scalar fallback verification and six converter tests. A real server retained the 1M context and four slots, reported global `fp4_kv` K/V totaling 2,197.69 MiB plus 900 MiB SWA, and completed a 652-token prompt with eight generated tokens. Compute reservation was 1,085.79 MiB. This checks execution and storage, not trained model quality or 1M-token active-context throughput. No production server was restarted. Session validation artifacts are `build/fp4-kv-*.log` and `build/fp4-kv-smoke.json`.
 
 An additional strict sequence-state replay check returned successfully from the save/restore APIs but did not produce bitwise-identical next-token logits. Numerical error and cache-placement effects were not measured before the original checkpoint was replaced; no bitwise replay guarantee is claimed. Further model checks were stopped to avoid interfering with the user's independent KV-layer experiments. The successful server and backend results above refer to the earlier Lumen4Exp checkpoint.
+
+## Two V100 recovery workflow
+
+See [the V100 launcher](../scripts/logit-distillation/V100.md) for tensor-parallel inference, downloaded teacher logits and attention-only recovery. Global KV remains FP4; the training launcher selects F32 for SWA caches to support differentiable cache writes.

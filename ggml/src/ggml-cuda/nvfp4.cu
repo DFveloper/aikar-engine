@@ -183,16 +183,16 @@ void ggml_cuda_cpy_nvfp4(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename src_t>
+template<typename src_t, bool fp4_kv = false>
 static void nvfp4_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * rows, ggml_tensor * dst) {
     const auto source = nvfp4_tensor_layout(src);
     const auto index = nvfp4_tensor_layout(rows);
     const auto target = nvfp4_tensor_layout(dst);
     if (rows->type == GGML_TYPE_I64) {
-        nvfp4_quantize_rows<src_t, int64_t, true><<<ggml_nrows(src), 128, 0, ctx.stream()>>>((const char *) src->data, (const char *) rows->data, (char *) dst->data, source, index, target);
+        nvfp4_quantize_rows<src_t, int64_t, true, fp4_kv><<<ggml_nrows(src), 128, 0, ctx.stream()>>>((const char *) src->data, (const char *) rows->data, (char *) dst->data, source, index, target);
     } else {
         GGML_ASSERT(rows->type == GGML_TYPE_I32);
-        nvfp4_quantize_rows<src_t, int32_t, true><<<ggml_nrows(src), 128, 0, ctx.stream()>>>((const char *) src->data, (const char *) rows->data, (char *) dst->data, source, index, target);
+        nvfp4_quantize_rows<src_t, int32_t, true, fp4_kv><<<ggml_nrows(src), 128, 0, ctx.stream()>>>((const char *) src->data, (const char *) rows->data, (char *) dst->data, source, index, target);
     }
 }
 
@@ -202,9 +202,17 @@ void ggml_cuda_set_rows_nvfp4(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (src->type == GGML_TYPE_F32) {
-        nvfp4_set_rows<float>(ctx, src, rows, dst);
+        if (dst->type == GGML_TYPE_FP4_KV) {
+            nvfp4_set_rows<float, true>(ctx, src, rows, dst);
+        } else {
+            nvfp4_set_rows<float>(ctx, src, rows, dst);
+        }
     } else if (src->type == GGML_TYPE_F16) {
-        nvfp4_set_rows<half>(ctx, src, rows, dst);
+        if (dst->type == GGML_TYPE_FP4_KV) {
+            nvfp4_set_rows<half, true>(ctx, src, rows, dst);
+        } else {
+            nvfp4_set_rows<half>(ctx, src, rows, dst);
+        }
     } else {
         GGML_ABORT("unsupported NVFP4 SET_ROWS source type");
     }

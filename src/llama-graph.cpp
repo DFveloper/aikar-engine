@@ -3122,7 +3122,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         while (tensor->view_src) {
             tensor = tensor->view_src;
         }
-        return tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer);
+        if (!tensor->buffer) {
+            return false;
+        }
+        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+        return (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META) &&
+            ggml_backend_buffer_is_host(tensor->buffer);
     };
     const bool fp4_host = cparams.flash_attn && kq_b == nullptr &&
         is_fp4_cache_type(k->type) && k->type == v->type && host_cache(k) && host_cache(v);
@@ -3461,11 +3466,13 @@ ggml_tensor * llm_graph_context::build_training_cache_view(ggml_tensor * cached)
                 auto * current = build_kv_fake_quant(stored->src[0], cached->type);
                 auto * updated = ggml_set_rows(ctx0, prefix, current, stored->src[1]);
                 updated->op_params[0] = 1;
-                const size_t old_row = stored->nb[1];
-                const size_t new_row = updated->nb[1];
+                const auto decoded_offset = [cached](size_t bytes) {
+                    GGML_ASSERT(bytes % ggml_type_size(cached->type) == 0);
+                    return bytes/ggml_type_size(cached->type)*ggml_blck_size(cached->type)*sizeof(float);
+                };
                 return ggml_view_4d(ctx0, updated, cached->ne[0], cached->ne[1], cached->ne[2], cached->ne[3],
-                    cached->nb[1]/old_row*new_row, cached->nb[2]/old_row*new_row, cached->nb[3]/old_row*new_row,
-                    (cached->view_offs - stored->view_offs)/old_row*new_row);
+                    decoded_offset(cached->nb[1]), decoded_offset(cached->nb[2]), decoded_offset(cached->nb[3]),
+                    decoded_offset(cached->view_offs - stored->view_offs));
             }
             GGML_ASSERT(stored->type == GGML_TYPE_F32);
             stored->op_params[0] = 1;

@@ -3538,7 +3538,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         for (int i = 0; i < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++i) {
             ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
             const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
-            if (device_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            if ((device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_META) && !gpu_backend) {
                 gpu_backend = backend;
             } else if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 cpu_backend = backend;
@@ -3681,9 +3681,12 @@ static void ggml_opt_plan_actual_routes(ggml_opt_context_t opt_ctx) {
             if (opt_ctx->qat_forward_nodes.count(node) || node->buffer) continue;
             const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
                 node->src[0] && node->src[0]->type == GGML_TYPE_F32;
-            if (((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) && device_type == GGML_BACKEND_DEVICE_TYPE_GPU) ||
+            if (((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) &&
+                    (device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_META)) ||
                 (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && device_type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
-                if (ggml_backend_supports_op(backend, node)) ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, backend);
+                if (!ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, node) && ggml_backend_supports_op(backend, node)) {
+                    ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, backend);
+                }
             }
         }
     }

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gguf-py"))
 import gguf
 
 
-def convert(source, output, shared_layers=13, context_length=1048576):
+def convert(source, output, shared_layers=19, context_length=1048576):
     source, output = Path(source), Path(output)
     if output.exists():
         raise ValueError("output already exists")
@@ -95,7 +95,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--shared-layers", type=int, default=13)
+    parser.add_argument("--shared-layers", type=int, default=19)
     parser.add_argument("--context-length", type=int, default=1048576,
                         help="YaRN target context length (default: 1048576 tokens)")
     args = parser.parse_args()

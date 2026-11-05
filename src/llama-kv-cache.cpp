@@ -20,7 +20,7 @@ static bool ggml_is_power_of_2(int n) {
 }
 
 static bool is_rowwise_kv_type(ggml_type type) {
-    return type == GGML_TYPE_Q8_KV || type == GGML_TYPE_NVFP4 || type == GGML_TYPE_FP4_KV;
+    return type == GGML_TYPE_Q8_KV || type == GGML_TYPE_NVFP4;
 }
 
 static bool is_turbo_kv_type(ggml_type type) {
@@ -199,10 +199,11 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload && type_k != GGML_TYPE_FP4_KV && type_v != GGML_TYPE_FP4_KV) {
+        if (offload) {
             auto * dev = model.dev_layer(il);
             const auto dev_type = ggml_backend_dev_type(dev);
-            const char * backend_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            const char * backend_name = reg ? ggml_backend_reg_name(reg) : "Meta";
             const bool turbo_backend = dev_type == GGML_BACKEND_DEVICE_TYPE_CPU ||
                     strcmp(backend_name, "CUDA") == 0 || strcmp(backend_name, "Vulkan") == 0;
             if (turboquant_bits && dev_type != GGML_BACKEND_DEVICE_TYPE_CPU && strcmp(backend_name, "CUDA") != 0) {
@@ -211,8 +212,23 @@ llama_kv_cache::llama_kv_cache(
             if ((is_turbo_kv_type(type_k) || is_turbo_kv_type(type_v)) && !turbo_backend) {
                 throw std::runtime_error(std::string("TurboQuant KV cache is unsupported on backend ") + backend_name);
             }
-            if ((type_k == GGML_TYPE_NVFP4 || type_v == GGML_TYPE_NVFP4) &&
-                dev_type != GGML_BACKEND_DEVICE_TYPE_CPU && strcmp(backend_name, "CUDA") != 0) {
+            const auto supports_packed_cache = [&](ggml_type type) {
+                if (type != GGML_TYPE_NVFP4 && type != GGML_TYPE_FP4_KV) {
+                    return true;
+                }
+                ggml_tensor source = {};
+                ggml_tensor target = {};
+                source.type = GGML_TYPE_F32;
+                target.type = type;
+                target.op = GGML_OP_CPY;
+                target.src[0] = &source;
+                target.src[1] = &target;
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    source.ne[i] = target.ne[i] = i == 0 ? 64 : 1;
+                }
+                return ggml_backend_dev_supports_op(dev, &target);
+            };
+            if (!supports_packed_cache(type_k) || !supports_packed_cache(type_v)) {
                 dev = ggml_backend_buft_get_device(ggml_backend_cpu_buffer_type());
             }
             buft = ggml_backend_dev_buffer_type(dev);

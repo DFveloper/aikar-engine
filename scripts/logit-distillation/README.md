@@ -16,7 +16,7 @@ The copies of extract.sh and train.sh beside the models use these defaults:
 - Student: /mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/Lumen-3.8-Pulsar-base.gguf
 - JSONL: Korean knowledge/reasoning prepared by prepare_ko.py from pinned public train splits. DATA selects an existing file. DATA_MODE=mixed restores the historical Korean-first-turn/English 1:1 mixture.
 - Context 512, microbatch 128, 8 CPU threads, T=1, top-k=512, conversation validation fraction 0.05.
-- QLion2 updates attention Q/K/V/output tensors only in blocks 11, 17, 23 and 29 (zero-based), while other parameters stay frozen. targets.sh contains the shared target list. Set TARGETS or pass --freeze-layers to change the selected parameters.
+- QLion2 updates attention Q/output tensors only in shared blocks 11, 17, 23 and 29 (zero-based), while global KV source block 5 and other parameters stay frozen. targets.sh contains the shared target list. Set TARGETS or pass --freeze-layers to change the selected parameters.
 - Training writes a separate QLion adapter. Original model files are not output destinations.
 
 Run extraction first, then training. Use the same CTX, MAX_WINDOWS, VAL_SPLIT, DATA and prompt/thinking settings in both stages. MAX_WINDOWS limits each partition separately; zero selects all packed windows. Context must match the runtime allocation, normally a multiple of 256. The training cache records its temperature, so training does not reinterpret it with a different temperature.
@@ -78,3 +78,7 @@ See THROUGHPUT.md for actual mixed-data CPU rates with attention targets in bloc
 Run bash benchmark.sh for a sequential CPU extraction/training benchmark with production context, threads and attention targets, using two training and two validation windows by default. Override BENCH_WINDOWS for a longer run. It retains the small cache and logs beside the models and removes its own temporary full-model checkpoint after completion. It needs about 15 GiB temporary space for that checkpoint and optimizer state.
 
 Extraction logs input_tok_s for all processed input tokens and supervised_tok_s for teacher rows written. Training logs both rates for the training loop, including forward/backward, optimizer updates, cache staging and graph setup. Epoch-end validation and final checkpoint writes are excluded; any periodic evaluation/checkpoints within a longer epoch are included. These are packed-token presentations, including padding and overlap, rather than unique corpus tokens. Separate .time files record whole-process wall time including loading, validation and serialization. The benchmark uses one epoch and no periodic evaluation or intermediate checkpoints.
+
+## Two V100 GPUs
+
+See [V100.md](V100.md) for the tensor-parallel launcher and downloaded context-1024 teacher cache. With the user's reduced clocks and 150 W power limits, the current single-owner architecture completed two real-model optimizer updates, validation, adapter export and inference. Layer 5 is the only global KV owner; shared layers 11, 17, 23 and 29 train Q/output weights. Gemma 4 inference also completed. Full recovery quality remains unmeasured; see the validation status and logs there.

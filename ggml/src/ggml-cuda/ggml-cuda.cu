@@ -6089,22 +6089,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     for (const auto * src : op->src) {
         fp4_kv |= src && src->type == GGML_TYPE_FP4_KV;
     }
-    if (fp4_kv && op->op != GGML_OP_CPY && op->op != GGML_OP_NONE && op->op != GGML_OP_VIEW &&
-            op->op != GGML_OP_RESHAPE && op->op != GGML_OP_PERMUTE && op->op != GGML_OP_TRANSPOSE) { return false; }
     bool nvfp4 = op->type == GGML_TYPE_NVFP4;
     for (const auto * src : op->src) {
         nvfp4 |= src && src->type == GGML_TYPE_NVFP4;
     }
-    if (nvfp4) {
+    if (nvfp4 || fp4_kv) {
         if (op->op == GGML_OP_CPY || op->op == GGML_OP_CONT || op->op == GGML_OP_DUP) {
             const auto source_type = op->src[0]->type;
             const auto target_type = op->type;
+            const auto packed_type = fp4_kv ? GGML_TYPE_FP4_KV : GGML_TYPE_NVFP4;
             return op->src[0]->ne[0] == op->ne[0] && op->ne[0] % QK_NVFP4 == 0 &&
-                (source_type == GGML_TYPE_NVFP4 || source_type == GGML_TYPE_F32 || source_type == GGML_TYPE_F16) &&
-                (target_type == GGML_TYPE_NVFP4 || target_type == GGML_TYPE_F32 || target_type == GGML_TYPE_F16);
+                (source_type == packed_type || source_type == GGML_TYPE_F32 || source_type == GGML_TYPE_F16) &&
+                (target_type == packed_type || target_type == GGML_TYPE_F32 || target_type == GGML_TYPE_F16);
         }
         if (op->op == GGML_OP_SET_ROWS) {
-            return op->type == GGML_TYPE_NVFP4 && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+            return (op->type == GGML_TYPE_NVFP4 || op->type == GGML_TYPE_FP4_KV) &&
+                op->src[0]->ne[0] == op->ne[0] && op->ne[0] % QK_NVFP4 == 0 &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
         }
         return op->op == GGML_OP_NONE || op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE ||

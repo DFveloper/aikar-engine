@@ -334,6 +334,18 @@ bool llama_hparams::has_kv(uint32_t il) const {
     return true;
 }
 
+int32_t llama_hparams::kv_source(uint32_t il) const {
+    if (has_kv(il)) {
+        return il;
+    }
+    for (int32_t source = int32_t(il) - 1; source >= 0; --source) {
+        if (!is_swa(source) && has_kv(source)) {
+            return source;
+        }
+    }
+    return -1;
+}
+
 bool llama_hparams::has_rope(uint32_t il) const {
     // the router layer stores adapter routing signal, not positional info,
     // so it must not be RoPE-shifted
