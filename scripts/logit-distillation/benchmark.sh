@@ -3,11 +3,31 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 set -a
 source "$SCRIPT_DIR/production.env"
+for model in Lumen-3.8-Pulsar-base.gguf Test.gguf; do
+    if [[ ! -r "$MODEL_DIR/$model" ]]; then
+        echo "Missing model: $MODEL_DIR/$model. Download both GGUF inputs before benchmarking (distill fetch-models --help)." >&2
+        exit 1
+    fi
+done
 source "$SCRIPT_DIR/data.sh"
 set +a
 BENCH_DIR=${BENCH_DIR:-$MODEL_DIR/logit-distillation/benchmark-$(date -u +%Y%m%dT%H%M%SZ)}
 mkdir "$BENCH_DIR"
-BENCH_TEMP=$(mktemp -d "${TMPDIR:-/tmp}/qlion-throughput.XXXXXXXX")
+python3 - "$BENCH_DIR/settings.json" <<'PY'
+import json
+import os
+import subprocess
+import sys
+keys = ('DATA', 'MODEL_DIR', 'CTX', 'EXTRACT_UBATCH', 'TRAIN_UBATCH', 'THREADS', 'GPU_LAYERS', 'STATIC_GRAPH', 'TARGETS', 'TOP_K', 'TEMPERATURE', 'VAL_SPLIT', 'VAL_WINDOWS', 'GRAD_ACCUM')
+settings = {key: os.environ[key] for key in keys}
+if int(settings['GPU_LAYERS']) > 0:
+    settings['GPU'] = subprocess.check_output(['nvidia-smi', '--query-gpu=name,memory.total,driver_version', '--format=csv,noheader'], text=True).strip()
+with open(sys.argv[1], 'w') as stream:
+    json.dump(settings, stream, indent=2)
+PY
+BENCH_TEMP_ROOT=${TMPDIR:-$MODEL_DIR/logit-distillation/tmp}
+mkdir -p "$BENCH_TEMP_ROOT"
+BENCH_TEMP=$(mktemp -d "$BENCH_TEMP_ROOT/qlion-throughput.XXXXXXXX")
 trap 'rm -f "$BENCH_TEMP/final.gguf" "$BENCH_TEMP/final.gguf.qat-state.gguf"; rmdir "$BENCH_TEMP"' EXIT
 common=(--train-file "$DATA" --distill-cache "$BENCH_DIR/teacher.dat"
     --distill-max-windows "${BENCH_WINDOWS:-2}" --val-split "$VAL_SPLIT"
@@ -21,6 +41,7 @@ common=(--train-file "$DATA" --distill-cache "$BENCH_DIR/teacher.dat"
     "$BIN_DIR/llama-finetune-qlion" -m "$MODEL_DIR/Lumen-3.8-Pulsar-base.gguf" \
     "${common[@]}" -ub "$TRAIN_UBATCH" --optimizer qlion2 --quant-type q4_0,q8_0 \
     --qat-targets "$TARGETS" --freeze-layers 0 --qat-static-graph "$STATIC_GRAPH" \
+    --grad-accum "$GRAD_ACCUM" \
     --epochs 1 -lr "$LR" --save-every 0 --eval-every 0 --shuffle-dataset \
     --verbose-loss --qat-out "$BENCH_TEMP/final.gguf" > "$BENCH_DIR/train.log" 2>&1
 rg 'distill_throughput' "$BENCH_DIR/extract.log"

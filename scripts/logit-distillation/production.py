@@ -13,6 +13,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from hf_upload import Publisher, completed_checkpoints, upload_error
 
 
 def require(ok, message):
@@ -51,6 +55,55 @@ def space_check(path, needed, dry):
     require(dry or free >= needed, 'Insufficient disk space. Free space or set PROD_DIR to another volume; no training was started.')
 
 
+def publish_checkpoints(publisher, run, log_path=None):
+    failed = []
+    for model in completed_checkpoints(run, log_path):
+        try:
+            publisher.checkpoint(run, model)
+        except Exception as error:
+            failed.append(model.name)
+            print(f'HF upload pending: {model.name} ({upload_error(error)}); local files are retained.', flush=True)
+    return failed
+
+
+def run_training(command, log_path, run, publisher):
+    with log_path.open('ab') as log:
+        if publisher is None:
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+            return
+        with subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT) as process, ThreadPoolExecutor(max_workers=1) as uploads:
+            pending, observed, failed, retry_at = None, set(), [], 0
+            try:
+                while True:
+                    if pending is not None and pending.done():
+                        failed = pending.result()
+                        pending = None
+                        retry_at = time.monotonic() + 10
+                    ready = {model.name for model in completed_checkpoints(run, log_path)}
+                    if pending is None and (ready != observed or (failed and time.monotonic() >= retry_at)):
+                        observed = ready
+                        pending = uploads.submit(publish_checkpoints, publisher, run, log_path)
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if process.poll() is not None:
+                        if pending is not None:
+                            pending.result()
+                        publish_checkpoints(publisher, run, log_path)
+                        require(process.returncode == 0, f'Training exited with status {process.returncode}.')
+                        break
+            except BaseException:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stage', choices=['extract', 'train'])
@@ -73,6 +126,8 @@ def main():
     require(context >= 256 and context % 256 == 0, 'CTX must be a positive multiple of 256.')
     require(0 < extract_batch <= context and 0 < train_batch <= context and context % train_batch == 0, 'Invalid microbatch size.')
     require(threads > 0 and int(env['EPOCHS']) > 0 and int(env['GRAD_ACCUM']) > 0, 'Threads, epochs and accumulation must be positive.')
+    require(env.get('HF_UPLOAD', '1') in ('0', '1'), 'HF_UPLOAD must be 0 or 1.')
+    publisher = Publisher() if not args.dry_run and env.get('HF_UPLOAD', '1') == '1' else None
     for path in (student, teacher, data):
         require(path.is_file(), f'Missing input: {path}')
     for name in ('llama-extract-logits', 'llama-finetune-qlion'):
@@ -80,10 +135,11 @@ def main():
     inputs = {'student': identity(student), 'teacher': identity(teacher), 'data': identity(data), 'data_sha256': digest(data),
               'context': context, 'top_k': int(env['TOP_K']), 'temperature': float(env['TEMPERATURE']),
               'val_split': float(env['VAL_SPLIT']), 'validation_windows': int(env['VAL_WINDOWS']),
-              'max_windows': 0, 'preserve_thinking': True, 'train_on_prompt': False}
+              'max_windows': int(env.get('PROD_MAX_WINDOWS', '0')), 'preserve_thinking': True, 'train_on_prompt': False}
+    require(inputs['max_windows'] >= 0, 'PROD_MAX_WINDOWS must be nonnegative.')
     require(0 < inputs['val_split'] < 1 and inputs['validation_windows'] > 0, 'Production requires held-out validation.')
     cache = root / f'teacher-top{inputs["top_k"]}-c{context}.dat'
-    common = ['--train-file', str(data), '--distill-cache', str(cache), '--distill-max-windows', '0',
+    common = ['--train-file', str(data), '--distill-cache', str(cache), '--distill-max-windows', str(inputs['max_windows']),
               '--distill-validation-windows', str(inputs['validation_windows']), '--val-split', str(inputs['val_split']),
               '-c', str(context), '-b', str(context), '-np', '1', '-ngl', str(gpu_layers),
               '-t', str(threads), '-tb', str(threads), '-dthr', str(threads)]
@@ -125,6 +181,8 @@ def main():
                     require(json.loads(manifest.read_text())['sha256'] == checksum, 'Cache checksum differs.')
                 save_json(manifest, {'inputs': inputs, 'plan': plan, 'sha256': checksum})
                 print('Verified complete teacher cache; extraction skipped.')
+                if publisher:
+                    publisher.dataset(root)
                 return
             partial = Path(str(cache) + '.partial')
             needed = max(0, plan['cache_bytes'] - (partial.stat().st_size if partial.exists() else 0)) + 2**30
@@ -137,6 +195,8 @@ def main():
             require(cache.stat().st_size == plan['cache_bytes'], 'Cache size differs from plan.')
             save_json(manifest, {'inputs': inputs, 'plan': plan, 'sha256': digest(cache)})
             print('Teacher cache complete.')
+            if publisher:
+                publisher.dataset(root)
         return
     if cache.is_file() and (root / 'cache.json').is_file():
         cache_manifest = json.loads((root / 'cache.json').read_text())
@@ -164,7 +224,8 @@ def main():
                '--grad-accum', str(accumulation), '--epochs', str(epochs), '-lr', env['LR'],
                '-lr-min', env['LR_MIN'], '--lr-scheduler', 'cosine', '--warmup-steps', str(warmup),
                '--save-every', str(save_every), '--eval-every', str(eval_every), '--eval-initial',
-               '--shuffle-dataset', '--verbose-loss', '--qat-out', str(run / 'final.gguf')]
+               '--shuffle-dataset', '--verbose-loss', '--qat-out', str(run / 'final.gguf'),
+               '--qat-adapter-out', str(run / 'final.adapter.gguf')]
     resume = env.get('RESUME')
     if resume:
         checkpoint = Path(resume).resolve()
@@ -182,7 +243,9 @@ def main():
     elements = sum(math.prod(int(x) for x in t.shape) for t in reader.tensors
                    if any(s in t.name for s in targets) and int(t.tensor_type) in (2, 8))
     require(elements > 0, 'No supported attention parameters selected.')
-    checkpoint_bytes = student.stat().st_size + math.ceil(elements * 52 / 32)
+    adapter_bytes = sum(t.n_bytes for t in reader.tensors
+                        if any(s in t.name for s in targets) and int(t.tensor_type) in (2, 8)) + 2**20
+    checkpoint_bytes = student.stat().st_size + math.ceil(elements * 52 / 32) + adapter_bytes
     copies = (steps // save_every if save_every else 0) + 1
     space_check(root, checkpoint_bytes * copies + 2 * 2**30, args.dry_run)
     print(f'Optimizer steps={steps}, checkpoint sets <= {copies}; older checkpoints are retained.', flush=True)
@@ -196,14 +259,16 @@ def main():
             save_json(run / 'run.json', settings)
         save_json(run / ('command-' + stamp + '.json'), command)
         save_json(run / 'status.json', {'phase': 'running', 'command': command})
-        with (run / ('train-' + stamp + '.log')).open('ab') as log:
-            try:
-                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
-            except BaseException:
-                save_json(run / 'status.json', {'phase': 'interrupted', 'resume_requires': 'explicit checkpoint model plus .qat-state.gguf'})
-                raise
+        try:
+            run_training(command, run / ('train-' + stamp + '.log'), run, publisher)
+        except BaseException:
+            save_json(run / 'status.json', {'phase': 'interrupted', 'resume_requires': 'explicit checkpoint model plus .qat-state.gguf'})
+            raise
         require((run / 'final.gguf').is_file() and (run / 'final.gguf.qat-state.gguf').is_file(), 'Final model/state pair is missing.')
         save_json(run / 'status.json', {'phase': 'complete', 'model': str(run / 'final.gguf'), 'optimizer_steps': steps})
+        if publisher:
+            failed = publish_checkpoints(publisher, run)
+            require(not failed, 'Some HF uploads are pending. Retry with distill upload-checkpoints --run-dir ' + str(run))
     print('Recovery training complete.')
 
 

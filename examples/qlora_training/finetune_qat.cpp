@@ -631,6 +631,8 @@ struct qat_callback_context {
     int64_t validation_start;
     int64_t validation_end;
     bool    first_save_pending;
+    const common_qlion_snapshot * adapter_base;
+    const std::vector<ggml_tensor *> * adapter_tensors;
 };
 
 static thread_local struct qat_callback_context * g_qat_callback = nullptr;
@@ -722,6 +724,17 @@ static void qat_epoch_callback(
             llama_synchronize(g_qat_callback->mtp_lctx);
             saved = save_adapter(g_qat_callback->mtp->tensors, path, g_qat_callback->mtp->arch,
                 g_qat_callback->mtp->alpha, g_qat_callback->params->mtp_model, &state) && saved;
+        }
+        if (saved && !g_qat_callback->params->qat_adapter_out.empty()) {
+            try {
+                const auto path = g_qat_callback->params->qat_adapter_out + ".step" + std::to_string(step) + ".gguf";
+                common_qlion_save(*g_qat_callback->adapter_base, *g_qat_callback->adapter_tensors,
+                    path, g_qat_callback->params->qat_adapter_units);
+                LOG_INF("qat_adapter_checkpoint: saved step=%ld path=%s\n", (long) step, path.c_str());
+            } catch (const std::exception & e) {
+                LOG_ERR("qat_adapter_checkpoint: %s\n", e.what());
+                saved = false;
+            }
         }
         if (saved) {
             g_qat_callback->last_saved_step = step;
@@ -1183,7 +1196,7 @@ int main(int argc, char ** argv) {
         llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx),
         llama_opt_step(params.mtp_mode == "only" ? mtp.ctx.get() : lctx),
         result_eval, idata_split, ndata,
-        params.save_first_at > schedule.step
+        params.save_first_at > schedule.step, &adapter_base, &adapter_tensors
     };
     g_qat_callback = &callback_ctx;
     if (params.shuffle_dataset) {
@@ -1244,6 +1257,9 @@ int main(int argc, char ** argv) {
     if (!params.qat_adapter_out.empty()) {
         try {
             common_qlion_save(adapter_base, adapter_tensors, params.qat_adapter_out, params.qat_adapter_units);
+            if (final_save_ok) {
+                LOG_INF("qat_adapter_checkpoint: saved final path=%s\n", params.qat_adapter_out.c_str());
+            }
         } catch (const std::exception & e) {
             LOG_ERR("%s: %s\n", __func__, e.what());
             final_save_ok = false;
