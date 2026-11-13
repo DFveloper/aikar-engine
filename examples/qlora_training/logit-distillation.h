@@ -255,6 +255,48 @@ inline std::vector<double> encode_rows(std::ostream & out, const std::vector<con
     return tails;
 }
 
+inline std::vector<double> encode_compact_rows(std::ostream & out, const int32_t * ids, const double * stats,
+        size_t rows, const header & h) {
+    require(rows <= SIZE_MAX/h.row_bytes(), "encoded batch is too large");
+    std::vector<uint8_t> data(rows*h.row_bytes());
+    std::vector<double> tails(rows);
+    std::vector<uint32_t> order(h.top_k);
+    std::vector<int32_t> sorted_ids(h.top_k);
+    std::vector<ggml_fp16_t> logp(h.top_k);
+    for (size_t r = 0; r < rows; ++r) {
+        const auto * row_ids = ids + r*h.top_k;
+        const auto * row_stats = stats + r*(h.top_k + 3);
+        for (uint32_t j = 0; j < h.top_k; ++j) {
+            require(row_ids[j] >= 0 && uint32_t(row_ids[j]) < h.vocab && std::isfinite(row_stats[j]), "invalid compact teacher row");
+            order[j] = j;
+            sorted_ids[j] = row_ids[j];
+        }
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        require(std::adjacent_find(sorted_ids.begin(), sorted_ids.end()) == sorted_ids.end(), "duplicate compact teacher IDs");
+        const double maximum = row_stats[h.top_k], log_total = row_stats[h.top_k + 1];
+        const double tail = row_stats[h.top_k + 2];
+        require(std::isfinite(maximum) && std::isfinite(log_total) && std::isfinite(tail) && tail <= 1e-12,
+                "non-finite compact teacher normalization");
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            return row_stats[a] != row_stats[b] ? row_stats[a] > row_stats[b] : row_ids[a] < row_ids[b];
+        });
+        for (uint32_t j = 0; j < h.top_k; ++j) {
+            sorted_ids[j] = row_ids[order[j]];
+            const float value = (row_stats[order[j]] - maximum)/h.temperature - log_total;
+            logp[j] = ggml_fp32_to_fp16(value);
+            require(std::isfinite(ggml_fp16_to_fp32(logp[j])), "top-k logp exceeds FP16 range");
+        }
+        const float tail_logp = tail;
+        auto * output = data.data() + r*h.row_bytes();
+        std::memcpy(output, sorted_ids.data(), size_t(h.top_k)*4);
+        std::memcpy(output + size_t(h.top_k)*4, logp.data(), size_t(h.top_k)*2);
+        std::memcpy(output + size_t(h.top_k)*6, &tail_logp, 4);
+        tails[r] = std::exp(tail);
+    }
+    write(out, data.data(), data.size());
+    return tails;
+}
+
 class cache {
 public:
     header info;

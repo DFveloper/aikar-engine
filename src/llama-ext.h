@@ -28,6 +28,12 @@ LLAMA_API int32_t llama_decode_sparse_cross_entropy(
         size_t n_targets,
         float * loss);
 
+// Decode without full host logits. Outputs follow batch output-token order.
+// Each stats row has k selected logits, maximum, log-normalizer relative to maximum, and tail log-probability.
+LLAMA_API int32_t llama_decode_top_k(
+        struct llama_context * ctx, const struct llama_batch_ext * batch, int32_t top_k, float temperature,
+        int32_t * ids, double * stats, size_t n_rows);
+
 LLAMA_API bool llama_opt_suspend(struct llama_context * ctx);
 LLAMA_API bool llama_opt_resume(struct llama_context * ctx);
 LLAMA_API void llama_opt_set_moe_compact(struct llama_context * ctx, bool enabled);

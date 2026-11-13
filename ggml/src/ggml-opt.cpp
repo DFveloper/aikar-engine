@@ -96,6 +96,7 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> qat_momentum;
     std::vector<struct ggml_tensor *> qat_residual;
     std::vector<struct ggml_tensor *> qat_lr_state;
+    bool qat_fp32_residual = false;
     int32_t qat_lr_scale_unit = 0;
     int32_t qat_lr_scale_warmup = 0;
     std::vector<struct ggml_tensor *> qat_grad_accumulator;
@@ -446,6 +447,8 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
     GGML_ASSERT(ggml_opt_optimizer_is_qlion(opt_ctx->optimizer));
     GGML_ASSERT(param && (param->type == GGML_TYPE_MXFP4 || param->type == GGML_TYPE_Q2_0 || param->type == GGML_TYPE_Q4_0 || param->type == GGML_TYPE_Q8_0));
     GGML_ASSERT(ggml_is_contiguous(param));
+    const bool fp32_residual = opt_ctx->qat_fp32_residual && ggml_is_matrix(param) &&
+        strcmp(param->name, "token_embd.weight") != 0 && strcmp(param->name, "output.weight") != 0;
     for (size_t i = 0; i < opt_ctx->qat_params.size(); ++i) {
         struct ggml_tensor * canonical = opt_ctx->qat_params[i];
         if (canonical == param) {
@@ -538,7 +541,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
                 struct ggml_tensor * new_residual =
                     ggml_new_tensor(
                         new_state_ctx,
-                        GGML_TYPE_Q4_0,
+                        fp32_residual ? GGML_TYPE_F32 : GGML_TYPE_Q4_0,
                         GGML_MAX_DIMS,
                         param->ne
                     );
@@ -551,7 +554,7 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
 
                 ggml_format_name(
                     new_residual,
-                    "QLion Q4_0 residual for %s",
+                    fp32_residual ? "QLion F32 residual for %s" : "QLion Q4_0 residual for %s",
                     param->name
                 );
 
@@ -693,10 +696,10 @@ void ggml_opt_qat_register_param(ggml_opt_context_t opt_ctx, struct ggml_tensor 
     };
     struct ggml_context * state_ctx = ggml_init(state_params);
     struct ggml_tensor * momentum = ggml_new_tensor(state_ctx, GGML_TYPE_Q8_0, GGML_MAX_DIMS, param->ne);
-    struct ggml_tensor * residual = ggml_new_tensor(state_ctx, GGML_TYPE_Q4_0, GGML_MAX_DIMS, param->ne);
+    struct ggml_tensor * residual = ggml_new_tensor(state_ctx, fp32_residual ? GGML_TYPE_F32 : GGML_TYPE_Q4_0, GGML_MAX_DIMS, param->ne);
     struct ggml_tensor * lr_state = opt_ctx->qat_lr_scale_unit ? ggml_new_tensor_1d(state_ctx, GGML_TYPE_F32, 2) : nullptr;
     ggml_format_name(momentum, "QLion Q8_0 momentum for %s", param->name);
-    ggml_format_name(residual, "QLion Q4_0 residual for %s", param->name);
+    ggml_format_name(residual, fp32_residual ? "QLion F32 residual for %s" : "QLion Q4_0 residual for %s", param->name);
     ggml_backend_buffer_t state_buffer = ggml_backend_alloc_ctx_tensors_from_buft(state_ctx, param_buft);
     GGML_ASSERT(state_buffer);
     ggml_backend_buffer_clear(state_buffer, 0);
@@ -994,6 +997,7 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     result.qlion_qat.wd    = 0.0f;
     result.qlion_qat.gclip = 0.0f;
     result.qlion_qat.fast_state_scale = false;
+    result.qlion_qat.fp32_residual = false;
     result.qlion_qat.lr_scale_unit = 0;
     result.qlion_qat.lr_scale_tau = 1e-3f;
     result.qlion_qat.lr_scale_warmup = 0;
@@ -3063,6 +3067,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
         const auto qlion = params.get_opt_pars(params.get_opt_pars_ud).qlion_qat;
         result->qat_lr_scale_unit = params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT ? 32 : qlion.lr_scale_unit;
         result->qat_lr_scale_warmup = qlion.lr_scale_warmup;
+        result->qat_fp32_residual = qlion.fp32_residual;
         GGML_ASSERT(result->qat_lr_scale_unit == 0 || result->qat_lr_scale_unit == 1 ||
             result->qat_lr_scale_unit == 32 || result->qat_lr_scale_unit == 256);
     }

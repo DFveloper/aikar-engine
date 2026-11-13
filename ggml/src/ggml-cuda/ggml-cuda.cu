@@ -2526,6 +2526,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_TOP_K_STATS:
+            ggml_cuda_top_k_stats(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_TOP_K:
+            ggml_cuda_mul_mat_top_k(ctx, dst);
+            break;
         case GGML_OP_DISTILLATION:
         case GGML_OP_DISTILLATION_BACK:
             ggml_cuda_distillation(ctx, dst);
@@ -6228,6 +6234,31 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32
                 && (op->src[0]->type == GGML_TYPE_F32 || ggml_is_quantized(op->src[0]->type))
                 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_TOP_K:
+            return op->type == GGML_TYPE_F64 &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
+                 op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_matrix(op->src[0]) && ggml_is_matrix(op->src[1]) &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) && ggml_is_matrix(op) &&
+                op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= 16384 &&
+                op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0 &&
+                op->src[0]->ne[1] > 1 && op->src[0]->ne[1] <= 262144 &&
+                op->src[1]->ne[1] > 0 && op->src[1]->ne[1] <= 65535 &&
+                op->src[1]->ne[0] == op->src[0]->ne[0] &&
+                ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 0) <= 512 &&
+                ggml_get_op_params_i32(op, 0) < op->src[0]->ne[1] &&
+                std::isfinite(ggml_get_op_params_f32(op, 1)) && ggml_get_op_params_f32(op, 1) >= 0.01f &&
+                ggml_get_op_params_f32(op, 1) <= 100.f &&
+                std::isfinite(ggml_get_op_params_f32(op, 2)) && ggml_get_op_params_f32(op, 2) >= 0 &&
+                op->ne[0] == 2*ggml_get_op_params_i32(op, 0) + 3 && op->ne[1] == op->src[1]->ne[1];
+        case GGML_OP_TOP_K_STATS:
+            return op->type == GGML_TYPE_F64 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
+                ggml_is_matrix(op->src[0]) && ggml_is_matrix(op->src[1]) &&
+                op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= 262144 &&
+                op->src[1]->ne[0] > 0 && op->src[1]->ne[0] < op->src[0]->ne[0] &&
+                op->src[1]->ne[1] == op->src[0]->ne[1] &&
+                op->ne[0] == op->src[1]->ne[0] + 3 && op->ne[1] == op->src[0]->ne[1];
         case GGML_OP_DISTILLATION:
         case GGML_OP_DISTILLATION_BACK:
             return op->src[1]->ne[0] <= 4096;

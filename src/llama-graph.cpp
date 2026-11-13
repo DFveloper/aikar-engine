@@ -1422,6 +1422,9 @@ void llm_graph_result::reset() {
     t_sparse_targets = nullptr;
     t_sparse_weights = nullptr;
     t_sparse_loss    = nullptr;
+    t_top_k_ids      = nullptr;
+    t_top_k_stats    = nullptr;
+    t_top_k_packed   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1498,6 +1501,18 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(tensor);
         }
     }
+}
+
+void llm_graph_result::add_top_k(int32_t top_k, float temperature) {
+    if (t_top_k_packed) return;
+    GGML_ASSERT(t_logits != nullptr);
+    t_top_k_ids = ggml_top_k(ctx_compute.get(), t_logits, top_k);
+    t_top_k_stats = ggml_top_k_stats(ctx_compute.get(), t_logits, t_top_k_ids, temperature);
+    ggml_set_name(t_top_k_ids, "distill_top_k_ids");
+    ggml_set_name(t_top_k_stats, "distill_top_k_stats");
+    ggml_set_output(t_top_k_ids);
+    ggml_set_output(t_top_k_stats);
+    ggml_build_forward_expand(gf, t_top_k_stats);
 }
 
 void llm_graph_result::add_sparse_loss() {
@@ -4481,6 +4496,11 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_logits() const {
+    if (res->t_top_k_packed) {
+        ggml_set_output(res->t_top_k_packed);
+        ggml_build_forward_expand(gf, res->t_top_k_packed);
+        return;
+    }
     // a pooled embeddings context outputs one vector per sequence, so its graph skips the LM head
     if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE) {
         res->t_logits = nullptr;

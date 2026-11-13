@@ -14,7 +14,15 @@ For compact `QLION_QAT_STATS`, internal `op_params[0] = 1` requests only the war
 
 For dense `ACC_QLION_QAT`, internal `op_params[2] = 1` quantizes the F32 microgradient before accumulation. CUDA fuses the two operations while preserving the intermediate Q8 bytes and FP16 scale rounding; CPU provides a reference implementation. The optimizer selects this mode only for supported GPU accumulators. CPU accumulator placement and unsupported backends retain the separate Q8 cast. See the [microgradient fusion study](superpowers/reports/2026-11-04-qlion2-microgradient-fusion.md).
 
+Dense `OPT_STEP_QLION_QAT` accepts an optional F32 error-feedback residual on CPU and CUDA. `ggml_opt_optimizer_params.qlion_qat.fp32_residual` selects it; the default remains Q4_0, and routed/sparse/tied variants retain Q4_0. F32 mode accumulates the update separately from the quantized weight, preserves sub-quantum residuals, and tests an additional least-squares scale using the existing codes. Weights and Q8_0 momentum remain quantized. Small-update tests independently verify the cumulative weight-plus-residual sum for Q4_0/Q8_0 weights and F32/Q8_0 gradients on CPU and both V100 devices.
+
+CUDA `MUL_MAT_ID_BACK` fuses Q4_0 decoding, gradient gather, Tensor Core multiplication and scatter on Volta for at least 16 experts and 128 tokens. Per-route power-of-two normalization is combined with route counting; prefix offsets and route tiles are constructed together. The kernel reads quantized weights directly, uses normalized F16 tiles with F32 accumulation, and writes zero-gradient tiles without a matrix multiplication. It avoids decoded-weight and gathered-gradient matrices. `GGML_CUDA_DISABLE_FUSION=1` selects the existing F32 GEMM path. CPU comparisons cover duplicate routes, partial tiles, zero gradients and gradient magnitudes from 1e-20 to 1e20; normalized F16 arithmetic is not bit-identical to F32 GEMM.
+
 CUDA `OUT_PROD_ID` and compact expert accumulation gather each expert's activation and gradient vectors in one kernel. Route order and the existing GEMM dimensions are preserved, including broadcast activations and strided token storage. See the [MoE gather and state-kernel study](superpowers/reports/2026-11-04-qlion2-moe-gather.md).
+
+`TOP_K_STATS` returns selected raw logits and F64 full/tail normalization statistics for offline extraction. CUDA supports contiguous F32 matrices with vocabulary size up to 262144; CPU provides a fallback.
+
+`MUL_MAT_TOP_K` is an inference-only fused projection and top-k operation for contiguous F32/F16/Q4_0/Q8_0 weights and F32 hidden states, k <= 512, hidden width <= 16384 and vocabulary <= 262144. Each F64 output row contains k token IDs, k raw (optionally softcapped) logits, the maximum logit, log total mass relative to that maximum, and log tail probability. CUDA dequantizes weights in registers, sorts 4096-token tiles in shared memory and merges only the retained candidates and normalization statistics; it never materializes the full logits matrix or a decoded weight matrix. Discarded mass is summed directly rather than subtracted from total mass. CPU provides a dense reference. Gemma4/Lumen4Exp offline top-k extraction uses this path for unsplit weights without output scales or LoRA; `GGML_DISTILL_FUSED_HEAD=0` restores the separate projection/top-k path. Training and ordinary decoding are unchanged.
 
 CPU and CUDA `DISTILLATION` and `DISTILLATION_BACK` fuse top-k plus tail KL and its logit gradient. Teacher IDs and log-probabilities are inputs; masked rows produce zero loss and gradient. CUDA supports k <= 4096, uses block reductions for large vocabularies, and tests membership with a shared bitmap for vocabularies up to 262144 tokens or a shared token-ID hash table for larger vocabularies. Full-vocabulary and tail normalizers remain separate to retain small tail masses. The native trainer uses these operations by default. `GGML_DISTILL_REFERENCE=1` selects the earlier graph-composed loss for numerical and performance comparisons. Other backends can fall back to CPU. See [the recovery workflow](../scripts/logit-distillation/README.md) and [A100 container](../scripts/logit-distillation/runpod/README.md).
 
@@ -56,6 +64,8 @@ Legend:
 |                              CPY | ❌ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ❌ | ❌ |
 |                     DISTILLATION | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 |                DISTILLATION_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                     TOP_K_STATS | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                   MUL_MAT_TOP_K | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 |               CROSS_ENTROPY_LOSS | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |          CROSS_ENTROPY_LOSS_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 |                           CUMSUM | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |

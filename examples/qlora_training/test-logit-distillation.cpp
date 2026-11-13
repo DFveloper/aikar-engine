@@ -472,6 +472,52 @@ static void tensor_parallel_copy(ggml_backend_dev_t first, ggml_backend_dev_t se
     }
 }
 
+static void tensor_parallel_partial_write(ggml_backend_dev_t first, ggml_backend_dev_t second) {
+    ggml_backend_dev_t devices[] = {first, second};
+    for (int axis : {0, 1, 2}) for (int mode : {0, 1, 2}) for (auto type : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        if (axis == 2 && mode != 0) continue;
+        int config[] = {axis, mode};
+        auto split = [](const ggml_tensor * tensor, void * userdata) {
+            const auto * config = static_cast<const int *>(userdata);
+            const int axis = config[0];
+            ggml_backend_meta_split_state state = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
+            state.ne[0] = state.ne[1] = tensor->ne[axis]/2;
+            if (config[1] == 1) {
+                state.nr[0] = 2;
+                state.ne[0] /= 2;
+                state.ne[1] /= 2;
+            } else if (config[1] == 2) {
+                state.n_segments = 2;
+                state.nr[1] = 1;
+                state.ne[0] = state.ne[1] = tensor->ne[axis]/8;
+                state.ne[2] = state.ne[3] = 3*tensor->ne[axis]/8;
+            }
+            return state;
+        };
+        auto * dev = ggml_backend_meta_device(devices, 2, split, config);
+        auto * backend = ggml_backend_dev_init(dev, nullptr);
+        auto * ctx = ggml_init({1024*1024, nullptr, true});
+        auto * tensor = ggml_new_tensor_3d(ctx, type, 256, 8, axis == 2 ? 8 : 1);
+        auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+        check(buffer != nullptr, "meta partial write allocation failed");
+        std::vector<uint8_t> expected(ggml_nbytes(tensor)), actual(expected.size());
+        for (size_t i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i*37 + 11);
+        ggml_backend_tensor_set(tensor, expected.data(), 0, expected.size());
+        ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+        check(actual == expected, "meta initial write differs from reference");
+        for (size_t offset : {size_t(3), tensor->nb[1]/2 - 13, tensor->nb[1] - 7, expected.size()/2 - 13, expected.size() - 1, expected.size()}) {
+            const size_t count = std::min(size_t(67), expected.size() - offset);
+            std::vector<uint8_t> patch(count);
+            for (size_t i = 0; i < count; ++i) patch[i] = uint8_t(offset + i*19);
+            std::copy(patch.begin(), patch.end(), expected.begin() + offset);
+            ggml_backend_tensor_set(tensor, patch.data(), offset, count);
+            ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+            check(actual == expected, "meta partial write changes unexpected bytes");
+        }
+        ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_backend_free(backend);
+    }
+}
+
 static void tensor_parallel_backward(ggml_backend_dev_t first, ggml_backend_dev_t second) {
     ggml_backend_dev_t devices[] = {first, second};
     const int mirrored = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
@@ -587,6 +633,67 @@ static std::vector<float> attention_backward(bool parallel) {
     return result;
 }
 
+static void compact_encoding_checks(ggml_backend_t backend = nullptr) {
+    for (int nv : {13, 257, 4097, 262144}) for (int nr : {1, 3}) for (int k : {1, std::min(nv - 1, 512)})
+            for (int mode : {0, 1, 2, 3, 4}) for (float t : {.5f, 1.f, 2.f}) {
+        ggml_init_params params = {32*1024*1024, nullptr, backend != nullptr};
+        auto * ctx = ggml_init(params);
+        auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, nr);
+        auto * ids = ggml_top_k(ctx, logits, k);
+        auto * stats = ggml_top_k_stats(ctx, logits, ids, t);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, stats);
+        auto * buffer = backend ? ggml_backend_alloc_ctx_tensors(ctx, backend) : nullptr;
+        check(!backend || buffer, "cannot allocate compact tensors");
+        std::vector<float> values(size_t(nv)*nr);
+        std::mt19937 generator(42);
+        std::uniform_real_distribution<float> random(-20.f, 20.f);
+        for (auto & value : values) value = mode == 0 ? random(generator) : mode == 1 ? std::round(random(generator)) :
+                mode == 2 ? (generator()%2 ? 0.f : -0.f) : -1000.f;
+        if (mode == 3) for (int r = 0; r < nr; ++r) values[size_t(r)*nv] = 1000.f;
+        if (mode == 4) for (int r = 0; r < nr; ++r) values[size_t(r)*nv + 7] = NAN;
+        if (backend) ggml_backend_tensor_set(logits, values.data(), 0, values.size()*sizeof(float));
+        else std::memcpy(logits->data, values.data(), values.size()*sizeof(float));
+        check((backend ? ggml_backend_graph_compute(backend, graph) : ggml_graph_compute_with_ctx(ctx, graph, 3)) ==
+                GGML_STATUS_SUCCESS, "compact graph failed");
+        std::vector<int32_t> actual_ids(size_t(k)*nr);
+        std::vector<double> actual_stats(size_t(k + 3)*nr);
+        if (backend) {
+            ggml_backend_tensor_get(ids, actual_ids.data(), 0, actual_ids.size()*sizeof(int32_t));
+            ggml_backend_tensor_get(stats, actual_stats.data(), 0, actual_stats.size()*sizeof(double));
+        } else {
+            std::memcpy(actual_ids.data(), ids->data, actual_ids.size()*sizeof(int32_t));
+            std::memcpy(actual_stats.data(), stats->data, actual_stats.size()*sizeof(double));
+        }
+        logit_distillation::header h;
+        h.vocab = nv; h.top_k = k; h.temperature = t;
+        std::ostringstream compact(std::ios::binary), reference(std::ios::binary);
+        bool rejected = false;
+        try {
+            logit_distillation::encode_compact_rows(compact, actual_ids.data(), actual_stats.data(), nr, h);
+        } catch (const std::runtime_error &) { rejected = true; }
+        check(rejected == (mode == 4), "compact non-finite validation failed");
+        if (mode != 4) {
+            for (int r = 0; r < nr; ++r) logit_distillation::encode_row(reference, values.data() + size_t(r)*nv, h);
+            const auto a = compact.str(), b = reference.str();
+            for (int r = 0; r < nr; ++r) {
+                const size_t offset = size_t(r)*h.row_bytes();
+                if (std::memcmp(a.data() + offset, b.data() + offset, size_t(k)*6) != 0) {
+                    std::fprintf(stderr, "compact mismatch: nv=%d mode=%d temperature=%g row=%d backend=%s\n", nv, mode, t, r,
+                            backend ? ggml_backend_name(backend) : "CPU");
+                    check(false, "compact IDs or FP16 logp differ");
+                }
+                float ta, tb;
+                std::memcpy(&ta, a.data() + offset + size_t(k)*6, 4);
+                std::memcpy(&tb, b.data() + offset + size_t(k)*6, 4);
+                check(std::abs(ta - tb) <= 1e-6f, "compact tail differs");
+            }
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+}
+
 int main(int argc, char ** argv) {
     try {
         llama_hparams hparams;
@@ -609,6 +716,8 @@ int main(int argc, char ** argv) {
             loss_and_gradient(t, true, false, reference_mode);
             loss_and_gradient(t, false, true, reference_mode);
         }
+        compact_encoding_checks();
+        std::puts("compact encoding: CPU IDs, FP16 logp, tails, ties and non-finite checks passed");
         encoder_checks();
         cache_checks();
         frozen_q41_moe_gradient();
@@ -616,6 +725,7 @@ int main(int argc, char ** argv) {
         tensor_parallel_backward(cpu, cpu);
         tensor_parallel_accumulate(cpu, cpu);
         tensor_parallel_copy(cpu, cpu);
+        tensor_parallel_partial_write(cpu, cpu);
         if (argc == 2 && std::strcmp(argv[1], "--cuda") == 0) {
             ggml_backend_load_all();
             auto * first = ggml_backend_dev_by_name("CUDA0");
@@ -624,6 +734,7 @@ int main(int argc, char ** argv) {
             for (auto * device : {first, second}) {
                 auto * backend = ggml_backend_dev_init(device, nullptr);
                 check(backend != nullptr, "cannot initialize CUDA KL backend");
+                compact_encoding_checks(backend);
                 for (int nv : {8, 4097, 262144, 262145}) for (float t : {1.f, 2.f}) {
                     loss_and_gradient(t, false, false, false, backend, nv);
                     loss_and_gradient(t, true, true, false, backend, nv);
@@ -635,6 +746,7 @@ int main(int argc, char ** argv) {
             if (allreduce && std::strcmp(allreduce, "none") == 0) tensor_parallel_backward(first, second);
             tensor_parallel_accumulate(first, second);
             tensor_parallel_copy(first, second);
+            tensor_parallel_partial_write(first, second);
         }
         const auto serial = attention_backward(false);
         const auto parallel = attention_backward(true);

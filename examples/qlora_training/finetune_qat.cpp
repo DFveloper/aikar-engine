@@ -615,6 +615,31 @@ static bool qat_save_checkpoint(
     return true;
 }
 
+static void qat_prune_checkpoints(const std::string & prefix, const std::string & keep) {
+    if (prefix.empty()) return;
+    std::error_code ec;
+    const auto prefix_path = std::filesystem::absolute(prefix, ec);
+    if (ec) return;
+    const auto keep_path = std::filesystem::absolute(keep, ec);
+    if (ec) return;
+    const std::string stem = prefix_path.filename().string() + ".step";
+    const auto keep_state = std::filesystem::path(keep_path.string() + ".qat-state.gguf");
+    for (const auto & entry : std::filesystem::directory_iterator(prefix_path.parent_path(), ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(stem, 0) != 0) continue;
+        if (entry.path() == keep_path || entry.path() == keep_state) continue;
+        std::error_code remove_ec;
+        std::filesystem::remove(entry.path(), remove_ec);
+        if (remove_ec) {
+            LOG_ERR("%s: cannot remove %s: %s\n", __func__, entry.path().c_str(), remove_ec.message().c_str());
+        } else {
+            LOG_INF("%s: removed %s\n", __func__, entry.path().c_str());
+        }
+    }
+}
+
 struct qat_callback_context {
     struct llama_context * lctx;
     struct llama_context * mtp_lctx;
@@ -707,6 +732,7 @@ static void qat_epoch_callback(
             saved = qat_save_checkpoint(g_qat_callback->lctx, g_qat_callback->model,
                 g_qat_callback->params->model.path, path, g_qat_callback->epoch, window,
                 g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type, *g_qat_callback->params);
+            if (saved) qat_prune_checkpoints(g_qat_callback->params->qat_out, path);
         }
         if (g_qat_callback->mtp_lctx) {
             checkpoint_state state;
@@ -724,6 +750,7 @@ static void qat_epoch_callback(
             llama_synchronize(g_qat_callback->mtp_lctx);
             saved = save_adapter(g_qat_callback->mtp->tensors, path, g_qat_callback->mtp->arch,
                 g_qat_callback->mtp->alpha, g_qat_callback->params->mtp_model, &state) && saved;
+            if (saved) qat_prune_checkpoints(g_qat_callback->params->mtp_lora_out, path);
         }
         if (saved && !g_qat_callback->params->qat_adapter_out.empty()) {
             try {
@@ -735,7 +762,10 @@ static void qat_epoch_callback(
                     saved = qat_save_state(g_qat_callback->lctx, path, g_qat_callback->epoch, window,
                         g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type, *g_qat_callback->params);
                 }
-                if (saved) LOG_INF("qat_adapter_checkpoint: saved step=%ld path=%s\n", (long) step, path.c_str());
+                if (saved) {
+                    LOG_INF("qat_adapter_checkpoint: saved step=%ld path=%s\n", (long) step, path.c_str());
+                    qat_prune_checkpoints(g_qat_callback->params->qat_adapter_out, path);
+                }
             } catch (const std::exception & e) {
                 LOG_ERR("qat_adapter_checkpoint: %s\n", e.what());
                 saved = false;
@@ -1257,6 +1287,7 @@ int main(int argc, char ** argv) {
                 final_save_ok = qat_save_state(lctx, params.qat_out, params.lr.epochs, 0,
                         schedule.step, params.qat_quant_type, params) && final_save_ok;
             }
+            if (final_save_ok) qat_prune_checkpoints(params.qat_out, params.qat_out);
         }
     }
     if (!params.qat_adapter_out.empty()) {
@@ -1268,6 +1299,7 @@ int main(int argc, char ** argv) {
             }
             if (final_save_ok) {
                 LOG_INF("qat_adapter_checkpoint: saved final path=%s\n", params.qat_adapter_out.c_str());
+                qat_prune_checkpoints(params.qat_adapter_out, params.qat_adapter_out);
             }
         } catch (const std::exception & e) {
             LOG_ERR("%s: %s\n", __func__, e.what());
@@ -1278,6 +1310,7 @@ int main(int argc, char ** argv) {
         llama_synchronize(mtp.ctx.get());
         final_save_ok = save_adapter(mtp.tensors, params.mtp_lora_out, mtp.arch, mtp.alpha,
             params.mtp_model) && final_save_ok;
+        if (final_save_ok) qat_prune_checkpoints(params.mtp_lora_out, params.mtp_lora_out);
         if (mtp.tensors.buf) ggml_backend_buffer_free(mtp.tensors.buf);
         if (mtp.tensors.ctx) ggml_free(mtp.tensors.ctx);
     }

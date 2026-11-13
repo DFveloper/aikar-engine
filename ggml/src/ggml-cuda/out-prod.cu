@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -517,6 +518,190 @@ static __device__ __forceinline__ float mxfp4_get(const block_mxfp4 & block, int
     const int q = lane < 16 ? packed & 0x0f : packed >> 4;
     return ggml_cuda_e8m0_to_fp32(block.e) * 0.5f * kvalues_mxfp4[q];
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <mma.h>
+
+static constexpr int MUL_MAT_ID_BACK_FUSED_M = 128;
+static constexpr int MUL_MAT_ID_BACK_FUSED_N = 64;
+static constexpr int MUL_MAT_ID_BACK_FUSED_K = 64;
+static constexpr int MUL_MAT_ID_BACK_FUSED_WARPS = 8;
+static constexpr int MUL_MAT_ID_BACK_SCALE_WARPS = 4;
+
+// Normalize each operand by a power of two before the FP16 tile conversion.
+static __device__ __forceinline__ int mul_mat_id_back_scale_exp(float maximum) {
+    return maximum > 0.0f && isfinite(maximum) ? max(-126, min(126, 10 - ilogbf(maximum))) : 0;
+}
+
+static __global__ void mul_mat_id_back_q4_0_fused(
+        const block_q4_0 * weight, const float * grad, const int32_t * routes,
+        const int32_t * expert_offsets, const int32_t * experts, const int32_t * offsets, const int32_t * exponents,
+        float * dst, int64_t cols, int64_t rows, int64_t n_used,
+        int64_t grad_s0, int64_t grad_s1, int64_t grad_s2) {
+#ifdef VOLTA_MMA_AVAILABLE
+    namespace wmma = nvcuda::wmma;
+    const int expert = experts[blockIdx.y];
+    if (expert < 0) return;
+    constexpr int tile_m = MUL_MAT_ID_BACK_FUSED_M;
+    constexpr int tile_n = MUL_MAT_ID_BACK_FUSED_N;
+    constexpr int tile_k = MUL_MAT_ID_BACK_FUSED_K;
+    constexpr int warps = MUL_MAT_ID_BACK_FUSED_WARPS;
+    const int tid = threadIdx.x;
+    const int warp = tid/WARP_SIZE;
+    const int lane = tid%WARP_SIZE;
+    const int64_t col_begin = int64_t(blockIdx.x)*tile_m;
+    const int64_t blocks_row = cols/QK4_0;
+    const int begin = offsets[blockIdx.y];
+    const int end = expert_offsets[expert + 1];
+    __shared__ int selected[tile_n];
+    __shared__ int grad_exp[tile_n];
+    __shared__ float grad_scale[tile_n];
+    __shared__ int weight_exp;
+    __shared__ float weight_scale;
+    // The MMA input tiles and output fragments use this storage at different times.
+    __shared__ __align__(32) unsigned char workspace[tile_m*tile_n*sizeof(float)];
+    half * a = reinterpret_cast<half *>(workspace);
+    half * b = a + tile_m*tile_k;
+    float * c = reinterpret_cast<float *>(workspace);
+    if (tid < tile_n) {
+        selected[tid] = begin + tid < end ? routes[begin + tid] : -1;
+        grad_exp[tid] = selected[tid] >= 0 ? exponents[selected[tid]] : INT_MIN;
+        grad_scale[tid] = grad_exp[tid] == INT_MIN ? 0.0f : ldexpf(1.0f, grad_exp[tid]);
+    }
+    const bool nonzero = tid < tile_n && grad_exp[tid] != INT_MIN;
+    if (!__syncthreads_or(nonzero)) {
+        for (int i = tid; i < tile_m*tile_n; i += warps*WARP_SIZE) {
+            const int route = selected[i/tile_m];
+            if (route >= 0 && col_begin + i%tile_m < cols) dst[col_begin + i%tile_m + cols*int64_t(route)] = 0.0f;
+        }
+        return;
+    }
+
+    if (warp == 0) {
+        float maximum = 0.0f;
+        for (int64_t row = lane; row < rows; row += WARP_SIZE) {
+            for (int block_m = 0; block_m < tile_m/QK4_0 && col_begin + block_m*QK4_0 < cols; ++block_m) {
+                const auto & block = weight[(int64_t(expert)*rows + row)*blocks_row + col_begin/QK4_0 + block_m];
+                maximum = fmaxf(maximum, 8.0f*fabsf(__half2float(block.d)));
+            }
+        }
+        maximum = warp_reduce_max(maximum);
+        if (lane == 0) {
+            weight_exp = mul_mat_id_back_scale_exp(maximum);
+            weight_scale = ldexpf(1.0f, weight_exp);
+        }
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1, acc2, acc3;
+    wmma::fill_fragment(acc0, 0.0f);
+    wmma::fill_fragment(acc1, 0.0f);
+    wmma::fill_fragment(acc2, 0.0f);
+    wmma::fill_fragment(acc3, 0.0f);
+    const int m = warp*16;
+    const int n = 0;
+    for (int64_t row_begin = 0; row_begin < rows; row_begin += tile_k) {
+        for (int i = tid; i < tile_m*tile_k; i += warps*WARP_SIZE) {
+            const int col = i%tile_m;
+            const int64_t row = row_begin + i/tile_m;
+            float value = 0.0f;
+            if (row < rows && col_begin + col < cols) {
+                const auto & block = weight[(int64_t(expert)*rows + row)*blocks_row + (col_begin + col)/QK4_0];
+                const int quant_col = col%QK4_0;
+                const int packed = block.qs[quant_col%16];
+                const int quant = (quant_col < 16 ? packed & 15 : packed >> 4) - 8;
+                value = __half2float(block.d)*quant*weight_scale;
+            }
+            a[i] = __float2half(value);
+        }
+        for (int i = tid; i < tile_k*tile_n; i += warps*WARP_SIZE) {
+            const int slot = i/tile_k;
+            const int64_t row = row_begin + i%tile_k;
+            const int route = selected[slot];
+            float value = 0.0f;
+            if (route >= 0 && row < rows) {
+                value = grad[row*grad_s0 + (route%n_used)*grad_s1 + (route/n_used)*grad_s2]*grad_scale[slot];
+            }
+            b[i] = __float2half(value);
+        }
+        __syncthreads();
+        for (int k = 0; k < tile_k; k += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf0, bf1, bf2, bf3;
+            wmma::load_matrix_sync(af, a + m + k*tile_m, tile_m);
+            wmma::load_matrix_sync(bf0, b + k + n*tile_k, tile_k);
+            wmma::load_matrix_sync(bf1, b + k + (n + 16)*tile_k, tile_k);
+            wmma::load_matrix_sync(bf2, b + k + (n + 32)*tile_k, tile_k);
+            wmma::load_matrix_sync(bf3, b + k + (n + 48)*tile_k, tile_k);
+            wmma::mma_sync(acc0, af, bf0, acc0);
+            wmma::mma_sync(acc1, af, bf1, acc1);
+            wmma::mma_sync(acc2, af, bf2, acc2);
+            wmma::mma_sync(acc3, af, bf3, acc3);
+        }
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(c + m + n*tile_m, acc0, tile_m, wmma::mem_col_major);
+    wmma::store_matrix_sync(c + m + (n + 16)*tile_m, acc1, tile_m, wmma::mem_col_major);
+    wmma::store_matrix_sync(c + m + (n + 32)*tile_m, acc2, tile_m, wmma::mem_col_major);
+    wmma::store_matrix_sync(c + m + (n + 48)*tile_m, acc3, tile_m, wmma::mem_col_major);
+    __syncthreads();
+    for (int i = tid; i < tile_m*tile_n; i += warps*WARP_SIZE) {
+        const int slot = i/tile_m;
+        const int route = selected[slot];
+        if (route >= 0 && col_begin + i%tile_m < cols) {
+            dst[col_begin + i%tile_m + cols*int64_t(route)] = grad_exp[slot] == INT_MIN ? 0.0f : ldexpf(c[i], -weight_exp - grad_exp[slot]);
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+#endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void mul_mat_id_back_count_scale(
+        const float * grad, const int32_t * ids, int32_t * counts, int32_t * exponents,
+        int64_t rows, int64_t n_expert, int64_t n_used, int64_t total_routes,
+        int64_t grad_s0, int64_t grad_s1, int64_t grad_s2, int64_t ids_s0, int64_t ids_s1) {
+    const int warp = threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x%WARP_SIZE;
+    const int64_t route = int64_t(blockIdx.x)*MUL_MAT_ID_BACK_SCALE_WARPS + warp;
+    if (route >= total_routes) return;
+    const int used = route%n_used;
+    const int token = route/n_used;
+    const int expert = ids[used*ids_s0 + token*ids_s1];
+    if (lane == 0 && expert >= 0 && expert < n_expert) atomicAdd(counts + expert, 1);
+    float maximum = 0.0f;
+    for (int64_t row = lane; row < rows; row += WARP_SIZE) {
+        const float value = grad[row*grad_s0 + used*grad_s1 + token*grad_s2];
+        maximum = fmaxf(maximum, isnan(value) ? INFINITY : fabsf(value));
+    }
+    maximum = warp_reduce_max(maximum);
+    if (lane == 0) exponents[route] = maximum == 0.0f ? INT_MIN : mul_mat_id_back_scale_exp(maximum);
+}
+
+static __global__ void mul_mat_id_back_prefix_tiles(
+        const int32_t * counts, int32_t * expert_offsets, int32_t * experts, int32_t * offsets,
+        int64_t n_expert, int64_t n_tiles, int64_t cap) {
+    // sum(ceil(routes_per_expert/cap)) <= n_expert + ceil(total_routes/cap).
+    int32_t sum = 0;
+    int64_t tile = 0;
+    expert_offsets[0] = 0;
+    for (int64_t expert = 0; expert < n_expert; ++expert) {
+        const int32_t end = sum + counts[expert];
+        expert_offsets[expert + 1] = end;
+        for (int64_t begin = sum; begin < end; begin += cap) {
+            experts[tile] = expert;
+            offsets[tile++] = begin;
+        }
+        sum = end;
+    }
+    for (; tile < n_tiles; ++tile) {
+        experts[tile] = -1;
+        offsets[tile] = 0;
+    }
+}
+#endif
 
 static constexpr int MUL_MAT_ID_BACK_CAP =
     256;
@@ -1167,6 +1352,38 @@ void ggml_cuda_mul_mat_id_back(
             ctx.pool(),
             total_routes
         );
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool disable_fusion = std::getenv("GGML_CUDA_DISABLE_FUSION") &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_FUSION"));
+    constexpr int64_t tile_n = MUL_MAT_ID_BACK_FUSED_N;
+    const int64_t n_tiles = n_expert + (total_routes + tile_n - 1)/tile_n;
+    if (!disable_fusion && weight->type == GGML_TYPE_Q4_0 && n_tokens >= 128 && n_expert >= 16 &&
+            ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA && n_tiles <= 65535) {
+        ggml_cuda_pool_alloc<int32_t> experts(ctx.pool(), n_tiles);
+        ggml_cuda_pool_alloc<int32_t> offsets(ctx.pool(), n_tiles);
+        ggml_cuda_pool_alloc<int32_t> exponents(ctx.pool(), total_routes);
+        CUDA_CHECK(cudaMemsetAsync(cursor.ptr, 0, n_expert*sizeof(int32_t), stream));
+        mul_mat_id_back_count_scale<<<(total_routes + MUL_MAT_ID_BACK_SCALE_WARPS - 1)/MUL_MAT_ID_BACK_SCALE_WARPS, MUL_MAT_ID_BACK_SCALE_WARPS*WARP_SIZE, 0, stream>>>(
+                static_cast<const float *>(grad->data), static_cast<const int32_t *>(ids->data),
+                cursor.ptr, exponents.ptr, rows, n_expert, n_used, total_routes,
+                grad_s0, grad_s1, grad_s2, ids_s0, ids_s1);
+        CUDA_CHECK(cudaGetLastError());
+        mul_mat_id_back_prefix_tiles<<<1, 1, 0, stream>>>(
+                cursor.ptr, expert_offsets.ptr, experts.ptr, offsets.ptr, n_expert, n_tiles, tile_n);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_moe_route_scatter<<<n_expert, ggml_cuda_moe_route_threads, 0, stream>>>(
+                static_cast<const int32_t *>(ids->data), expert_offsets.ptr, routes.ptr, nullptr,
+                total_routes, n_used, ids_s0, ids_s1);
+        CUDA_CHECK(cudaGetLastError());
+        mul_mat_id_back_q4_0_fused<<<dim3((cols + MUL_MAT_ID_BACK_FUSED_M - 1)/MUL_MAT_ID_BACK_FUSED_M, n_tiles), MUL_MAT_ID_BACK_FUSED_WARPS*WARP_SIZE, 0, stream>>>(
+                static_cast<const block_q4_0 *>(weight->data), static_cast<const float *>(grad->data),
+                routes.ptr, expert_offsets.ptr, experts.ptr, offsets.ptr, exponents.ptr,
+                static_cast<float *>(dst->data), cols, rows, n_used, grad_s0, grad_s1, grad_s2);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
 
     ggml_cuda_pool_alloc<int32_t>
         route_rank(

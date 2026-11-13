@@ -1235,6 +1235,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DISTILLATION_BACK: {
                 split_state = handle_generic(src_ss, true);
             } break;
+            case GGML_OP_TOP_K_STATS: {
+                split_state = handle_per_row(src_ss);
+            } break;
             case GGML_OP_OPT_STEP_QLION_QAT: {
                 GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]) && split_states_equal(src_ss[0], src_ss[2]) &&
                         split_states_equal(src_ss[0], src_ss[3]) && src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1648,11 +1651,39 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
+
+        const size_t stride = tensor->nb[split_state.axis + 1];
+        if (offset % stride != 0 || size % stride != 0) {
+            const size_t end = offset + size;
+            for (size_t chunk = offset/stride; chunk*stride < end; ++chunk) {
+                size_t start = chunk*stride;
+                std::vector<size_t> local_offsets(n_bufs, 0);
+                for (size_t s = 0; s < split_state.n_segments; ++s) {
+                    for (size_t r = 0; r < split_state.nr[s]; ++r) {
+                        for (size_t j = 0; j < n_bufs; ++j) {
+                            auto * local = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            const size_t bytes = split_state.ne[s*n_bufs + j]*tensor->nb[split_state.axis]/
+                                (split_state.axis == 0 ? ggml_blck_size(tensor->type) : 1);
+                            const size_t first = std::max(offset, start);
+                            const size_t last = std::min(end, start + bytes);
+                            if (first < last) {
+                                ggml_backend_tensor_set(local, (const char *) data + first - offset,
+                                    chunk*local->nb[split_state.axis + 1] + local_offsets[j] + first - start, last - first);
+                            }
+                            start += bytes;
+                            local_offsets[j] += bytes;
+                        }
+                    }
+                }
+            }
+            return;
+        }
 
         size_t offset_data = 0;
         std::vector<size_t> simple_offsets(n_bufs, 0);
@@ -1716,8 +1747,24 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         case GGML_BACKEND_SPLIT_AXIS_2: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
-            GGML_ASSERT(offset % chunk_size_full == 0);
-            GGML_ASSERT(size   % chunk_size_full == 0);
+            if (offset % chunk_size_full != 0 || size % chunk_size_full != 0) {
+                const size_t end = offset + size;
+                for (size_t chunk = offset/chunk_size_full; chunk*chunk_size_full < end; ++chunk) {
+                    size_t start = chunk*chunk_size_full;
+                    for (size_t j = 0; j < n_bufs; ++j) {
+                        auto * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                        const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                        const size_t first = std::max(offset, start);
+                        const size_t last = std::min(end, start + chunk_size_j);
+                        if (first < last) {
+                            ggml_backend_tensor_set(simple_tensor, (const char *) data + first - offset,
+                                chunk*chunk_size_j + first - start, last - first);
+                        }
+                        start += chunk_size_j;
+                    }
+                }
+                return;
+            }
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             size_t offset_j = 0;

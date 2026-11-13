@@ -499,6 +499,27 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     res->t_embd = cur;
 
     // lm_head
+    const char * fused_head = std::getenv("GGML_DISTILL_FUSED_HEAD");
+    if (params.top_k > 0 && params.top_k <= 512 && params.top_k < model.output->ne[1] &&
+            !training && n_outputs > 0 && n_outputs <= 65535 && !replace_weight && loras->empty() &&
+            !model.output_s && model.split_mode() == LLAMA_SPLIT_MODE_NONE &&
+            (!fused_head || std::strcmp(fused_head, "0") != 0) &&
+            (model.output->type == GGML_TYPE_F32 || model.output->type == GGML_TYPE_F16 ||
+             model.output->type == GGML_TYPE_Q4_0 || model.output->type == GGML_TYPE_Q8_0) &&
+            ggml_is_contiguous(model.output) && model.output->ne[0] <= 16384 && model.output->ne[1] <= 262144) {
+        auto * hidden = build_hadamard_input(model.output, cur);
+        hidden = ggml_is_contiguous(hidden) ? hidden : ggml_cont(ctx0, hidden);
+        auto * packed = ggml_mul_mat_top_k(ctx0, model.output, hidden, params.top_k,
+                params.top_k_temperature, hparams.f_final_logit_softcapping);
+        if (model.dev_output() && ggml_backend_dev_supports_op(model.dev_output(), packed)) {
+            LLAMA_LOG_DEBUG("distill_fused_head: vocab=%lld hidden=%lld rows=%lld k=%d\n",
+                    (long long) model.output->ne[1], (long long) model.output->ne[0],
+                    (long long) hidden->ne[1], params.top_k);
+            cb(packed, "distill_fused_head", -1);
+            res->t_top_k_packed = packed;
+            return;
+        }
+    }
     cur = build_lora_mm(model.output, cur, model.output_s);
 
     if (hparams.f_final_logit_softcapping) {

@@ -1162,9 +1162,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAGED_ATTN",
     "DISTILLATION",
     "DISTILLATION_BACK",
+    "TOP_K_STATS",
+    "MUL_MAT_TOP_K",
 };
 
-static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
+static_assert(GGML_OP_COUNT == 121, "GGML_OP_COUNT != 121");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1295,9 +1297,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "paged_attn(q,k,v,cache,table,slots,queries)",
     "distillation(logits,ids,logp,weights)",
     "distillation_back(logits,ids,logp,weights,grad)",
+    "top_k_stats(logits,ids)",
+    "mul_mat_top_k(weights,hidden)",
 };
 
-static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
+static_assert(GGML_OP_COUNT == 121, "GGML_OP_COUNT != 121");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6528,6 +6532,47 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+struct ggml_tensor * ggml_mul_mat_top_k(
+        struct ggml_context * ctx, struct ggml_tensor * weights,
+        struct ggml_tensor * hidden, int32_t k, float temperature, float softcap) {
+    GGML_ASSERT(ggml_is_matrix(weights) && ggml_is_matrix(hidden));
+    GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(hidden));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || weights->type == GGML_TYPE_F16 ||
+                weights->type == GGML_TYPE_Q4_0 || weights->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(hidden->type == GGML_TYPE_F32 && hidden->ne[0] == weights->ne[0]);
+    GGML_ASSERT(weights->ne[0] > 0 && weights->ne[0] <= 16384);
+    GGML_ASSERT(weights->ne[1] > 1 && weights->ne[1] <= 262144);
+    GGML_ASSERT(k > 0 && k <= 512 && k < weights->ne[1]);
+    GGML_ASSERT(isfinite(temperature) && temperature >= 0.01f && temperature <= 100.0f);
+    GGML_ASSERT(isfinite(softcap) && softcap >= 0);
+    GGML_ASSERT(hidden->ne[1] > 0 && (uint64_t) hidden->ne[1] <= SIZE_MAX / ((2*(size_t) k + 3)*sizeof(double)));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F64, 2*k + 3, hidden->ne[1]);
+    result->op = GGML_OP_MUL_MAT_TOP_K;
+    result->src[0] = weights;
+    result->src[1] = hidden;
+    ggml_set_op_params_i32(result, 0, k);
+    ggml_set_op_params_f32(result, 1, temperature);
+    ggml_set_op_params_f32(result, 2, softcap);
+    return result;
+}
+
+struct ggml_tensor * ggml_top_k_stats(
+        struct ggml_context * ctx, struct ggml_tensor * logits,
+        struct ggml_tensor * ids, float temperature) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_matrix(logits) && ggml_is_matrix(ids));
+    GGML_ASSERT(ggml_is_contiguous(logits) && ggml_is_contiguous(ids));
+    GGML_ASSERT(logits->ne[0] <= INT32_MAX - 3 && ids->ne[0] > 0 && ids->ne[0] < logits->ne[0]);
+    GGML_ASSERT(ids->ne[1] == logits->ne[1]);
+    GGML_ASSERT(isfinite(temperature) && temperature >= 0.01f && temperature <= 100.0f);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F64, ids->ne[0] + 3, ids->ne[1]);
+    result->op = GGML_OP_TOP_K_STATS;
+    result->src[0] = logits;
+    result->src[1] = ids;
+    ggml_set_op_params(result, &temperature, sizeof(temperature));
+    return result;
+}
+
 struct ggml_tensor * ggml_distillation(
         struct ggml_context * ctx, struct ggml_tensor * logits,
         struct ggml_tensor * ids, struct ggml_tensor * logp,
@@ -6952,7 +6997,7 @@ struct ggml_tensor * ggml_opt_step_qlion_qat(
     GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(ggml_are_same_shape(weight, grad));
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(residual->type == GGML_TYPE_Q4_0 || residual->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(weight));
     GGML_ASSERT(ggml_is_contiguous(grad));
     GGML_ASSERT(ggml_is_contiguous(momentum));

@@ -275,7 +275,8 @@ static __device__ void opt_step_qlion_qat_apply(
         int64_t scale_blocks,
         int64_t ib,
         int lane,
-        float g) {
+        float g,
+        bool fp32_residual = false) {
 
     float alpha = qlion_qat_alpha(pars, scale_blocks, ib);
     const float beta  = pars[1];
@@ -305,28 +306,8 @@ static __device__ void opt_step_qlion_qat_apply(
         alpha *= isfinite(rms) && rms > 0 ? 1.0f / (1.0f + pars[6] / rms) : 0.0f;
     }
 
-    const float residual_old_scale =
-        __half2float(
-            residual[ib].d
-        );
-
-    const uint8_t residual_old_packed =
-        residual[ib].
-            qs[lane & 15];
-
-    const int residual_old_q =
-        lane < 16
-            ? residual_old_packed &
-                0x0f
-            : residual_old_packed >>
-                4;
-
-    const float residual_value =
-        residual_old_scale *
-        (
-            residual_old_q -
-            8
-        );
+    const float residual_old_scale = fp32_residual ? 0.0f : __half2float(residual[ib].d);
+    const float residual_value = fp32_residual ? ((float *) residual)[ib*32 + lane] : q4_0_value(residual[ib], lane);
 
     float weight_old;
     if constexpr (weight_type == GGML_TYPE_MXFP4) {
@@ -345,12 +326,16 @@ static __device__ void opt_step_qlion_qat_apply(
     momentum_new = isfinite(momentum_new) ? momentum_new : 0.0f;
     momentum_new = fmaxf(-128.0f * 65504.0f, fminf(128.0f * 65504.0f, momentum_new));
     const float direction = momentum_new > 0.0f ? 1.0f : (momentum_new < 0.0f ? -1.0f : 0.0f);
-    float target = weight_old + residual_value - alpha * (direction + wd * weight_old);
+    float next_residual = fmaf(-alpha, direction + wd * weight_old, residual_value);
+    float target = fp32_residual ? weight_old + next_residual : weight_old + residual_value - alpha * (direction + wd * weight_old);
+    const float unclipped = target;
     target = isfinite(target) ? target : weight_old;
     if constexpr (weight_type != GGML_TYPE_MXFP4) {
         const float limit = weight_type == GGML_TYPE_Q8_0 ? 128.0f * 65504.0f : 8.0f * 65504.0f;
         target = fmaxf(-limit, fminf(limit, target));
     }
+
+    if (fp32_residual && target != unclipped) next_residual = target - weight_old;
 
     float weight_new;
     if constexpr (weight_type == GGML_TYPE_MXFP4) {
@@ -436,28 +421,55 @@ static __device__ void opt_step_qlion_qat_apply(
             ((block_mxfp4 *) weight_data)[ib].qs[lane] = q | (q_hi << 4);
         }
         weight_new = scale * kvalues_mxfp4[q];
-    } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
-        const float scale = warp_signed_absmax(target) / -128.0f;
-        const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
-        const int q = max(-128, min(127, (int) roundf(target * inverse)));
-        if (lane == 0) {
-            ((block_q8_0 *) weight_data)[ib].d = __float2half(scale);
-        }
-        ((block_q8_0 *) weight_data)[ib].qs[lane] = (int8_t) q;
-        weight_new = __half2float(__float2half(scale)) * q;
     } else {
-        const float signed_max = warp_signed_absmax(target);
-        const float scale = signed_max / -8.0f;
+        constexpr bool q8 = weight_type == GGML_TYPE_Q8_0;
+        const float old_scale = q8 ? __half2float(((const block_q8_0 *) weight_data)[ib].d) :
+                                    __half2float(((const block_q4_0 *) weight_data)[ib].d);
+        const float scale = warp_signed_absmax(target) / (q8 ? -128.0f : -8.0f);
         const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
-        const int q = min(15, (int) (target * inverse + 8.5f));
-        const int q_hi = __shfl_sync(0xffffffff, q, (lane + 16) & 31);
-        if (lane == 0) {
-            ((block_q4_0 *) weight_data)[ib].d = __float2half(scale);
+        int q = q8 ? max(-128, min(127, (int) roundf(target * inverse))) :
+                     max(0, min(15, (int) (target * inverse + 8.5f)));
+        const float old_inverse = old_scale != 0.0f ? 1.0f / old_scale : 0.0f;
+        const int old_q = q8 ? (int) fmaxf(-128.0f, fminf(127.0f, roundf(target * old_inverse))) :
+                              (int) fmaxf(0.0f, fminf(15.0f, target * old_inverse + 8.5f));
+        const float candidate = __half2float(__float2half(scale)) * (q8 ? q : q - 8);
+        const float old_candidate = old_scale * (q8 ? old_q : old_q - 8);
+        const float error = target - candidate;
+        const float old_error = target - old_candidate;
+        // Keep the existing scale when it gives a closer projection of the update.
+        const bool reuse = warp_reduce_sum<32>(old_error * old_error) <= warp_reduce_sum<32>(error * error);
+        float stored_scale = reuse ? old_scale : scale;
+        q = reuse ? old_q : q;
+        weight_new = reuse ? old_candidate : candidate;
+        if (fp32_residual) {
+            const int original_q = q8 ? ((const block_q8_0 *) weight_data)[ib].qs[lane] :
+                (lane < 16 ? ((const block_q4_0 *) weight_data)[ib].qs[lane] & 15 :
+                              ((const block_q4_0 *) weight_data)[ib].qs[lane & 15] >> 4);
+            const float code = q8 ? original_q : original_q - 8;
+            const float norm = warp_reduce_sum<32>(code * code);
+            const float fitted = norm > 0 ? warp_reduce_sum<32>(target * code) / norm : old_scale;
+            const float fitted_scale = __half2float(__float2half(fmaxf(-65504.0f, fminf(65504.0f, fitted))));
+            const float fitted_value = fitted_scale * code;
+            const float fitted_error = target - fitted_value;
+            const float selected_error = target - weight_new;
+            if (warp_reduce_sum<32>(fitted_error * fitted_error) < warp_reduce_sum<32>(selected_error * selected_error)) {
+                stored_scale = fitted_scale;
+                q = original_q;
+                weight_new = fitted_value;
+            }
         }
-        if (lane < 16) {
-            ((block_q4_0 *) weight_data)[ib].qs[lane] = q | (q_hi << 4);
+        if (!__all_sync(0xffffffff, target == weight_old)) {
+            if constexpr (q8) {
+                if (lane == 0) ((block_q8_0 *) weight_data)[ib].d = __float2half(stored_scale);
+                ((block_q8_0 *) weight_data)[ib].qs[lane] = (int8_t) q;
+            } else {
+                const int q_hi = __shfl_sync(0xffffffff, q, (lane + 16) & 31);
+                if (lane == 0) ((block_q4_0 *) weight_data)[ib].d = __float2half(stored_scale);
+                if (lane < 16) ((block_q4_0 *) weight_data)[ib].qs[lane] = q | (q_hi << 4);
+            }
+        } else {
+            weight_new = weight_old;
         }
-        weight_new = __half2float(__float2half(scale)) * (q - 8);
     }
 
     //
@@ -466,6 +478,10 @@ static __device__ void opt_step_qlion_qat_apply(
     // ============================================================
     //
 
+    if (fp32_residual) {
+        const float value = next_residual + (weight_old - weight_new);
+        ((float *) residual)[ib*32 + lane] = isfinite(value) ? value : 0.0f;
+    } else {
     float residual_new =
         target - weight_new;
 
@@ -707,6 +723,8 @@ static __device__ void opt_step_qlion_qat_apply(
     // Momentum Q8_0 update
     // ============================================================
     //
+
+    }
 
     float momentum_scale   = 0.0f;
     float momentum_inverse = 0.0f;
@@ -1200,7 +1218,8 @@ static __global__ void opt_step_qlion_qat(
         block_q4_0 * __restrict__ residual,
         const float * __restrict__ pars,
         int64_t scale_blocks,
-        int64_t n_blocks) {
+        int64_t n_blocks,
+        bool fp32_residual) {
 
     const int warp =
         threadIdx.x >> 5;
@@ -1229,7 +1248,8 @@ static __global__ void opt_step_qlion_qat(
         scale_blocks,
         ib,
         lane,
-        g
+        g,
+        fp32_residual
     );
 }
 
@@ -2030,7 +2050,7 @@ void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor *
     const ggml_tensor * pars = dst->src[4];
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT((grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0) &&
-        momentum->type == GGML_TYPE_Q8_0 && residual->type == GGML_TYPE_Q4_0);
+        momentum->type == GGML_TYPE_Q8_0 && (residual->type == GGML_TYPE_Q4_0 || residual->type == GGML_TYPE_F32));
     GGML_ASSERT(pars->type == GGML_TYPE_F32 && (ggml_nelements(pars) == 5 || ggml_nelements(pars) == 8 || ggml_nelements(pars) == 9 || ggml_nelements(pars) == 9 + ggml_nelements(weight) / 32));
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(grad));
     GGML_ASSERT(ggml_is_contiguous(momentum) && ggml_is_contiguous(residual) && ggml_is_contiguous(pars));
@@ -2045,27 +2065,27 @@ void ggml_cuda_opt_step_qlion_qat(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (weight->type == GGML_TYPE_MXFP4 && grad->type == GGML_TYPE_Q8_0) {
         opt_step_qlion_qat<GGML_TYPE_MXFP4, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
-            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks);
+            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks, residual->type == GGML_TYPE_F32);
     } else if (weight->type == GGML_TYPE_MXFP4) {
         opt_step_qlion_qat<GGML_TYPE_MXFP4, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
-            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks);
+            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks, residual->type == GGML_TYPE_F32);
     } else if (weight->type == GGML_TYPE_Q8_0 && grad->type == GGML_TYPE_Q8_0) {
         opt_step_qlion_qat<GGML_TYPE_Q8_0, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
-            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks);
+            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks, residual->type == GGML_TYPE_F32);
     } else if (weight->type == GGML_TYPE_Q8_0) {
         opt_step_qlion_qat<GGML_TYPE_Q8_0, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
-            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks);
+            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks, residual->type == GGML_TYPE_F32);
     } else if (grad->type == GGML_TYPE_Q8_0) {
         opt_step_qlion_qat<GGML_TYPE_Q4_0, true><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
-            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks);
+            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks, residual->type == GGML_TYPE_F32);
     } else {
         opt_step_qlion_qat<GGML_TYPE_Q4_0, false><<<grid_blocks, QLION_QAT_THREADS, 0, ctx.stream()>>>(
             weight->data, grad->data, (block_q8_0 *) momentum->data,
-            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks);
+            (block_q4_0 *) residual->data, (const float *) pars->data, ggml_nelements(pars) == 5 ? 0 : ggml_nelements(pars) <= 9 ? -1 : ggml_nelements(pars) - 9, n_blocks, residual->type == GGML_TYPE_F32);
     }
 }
 

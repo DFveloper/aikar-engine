@@ -624,6 +624,8 @@ extern "C" {
 
         GGML_OP_DISTILLATION,
         GGML_OP_DISTILLATION_BACK,
+        GGML_OP_TOP_K_STATS,
+        GGML_OP_MUL_MAT_TOP_K,
 
         GGML_OP_COUNT,
     };
@@ -2940,6 +2942,17 @@ extern "C" {
             void                * userdata);
 
     // loss function
+
+    // Offline inference only. F64 rows: k token IDs, k raw logits, max logit,
+    // log(sum(exp((z-max)/temperature))), and log tail probability.
+    GGML_API struct ggml_tensor * ggml_mul_mat_top_k(
+            struct ggml_context * ctx, struct ggml_tensor * weights,
+            struct ggml_tensor * hidden, int32_t k, float temperature, float softcap);
+
+    // F64 rows: k selected logits, maximum, log(sum(exp((logit - maximum)/T))), and normalized tail log-mass.
+    GGML_API struct ggml_tensor * ggml_top_k_stats(
+            struct ggml_context * ctx, struct ggml_tensor * logits,
+            struct ggml_tensor * ids, float temperature);
 
     // One weighted top-k plus tail KL value per logits row, before T*T scaling.
     GGML_API struct ggml_tensor * ggml_distillation(

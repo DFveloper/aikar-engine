@@ -121,6 +121,7 @@ extern "C" {
             float wd;    // weight decay
             float gclip; // element-wise gradient clipping threshold - 0.0f to disable
             bool  fast_state_scale;
+            bool  fp32_residual; // dense QLion error feedback; routed updates retain Q4_0
             int32_t lr_scale_unit; // QLion: 0 disables scaling; 1/32/256 selects the unit. QLion2 always uses 32.
             float lr_scale_tau;
             int32_t lr_scale_warmup; // collect this many layer RMS samples, then freeze tau

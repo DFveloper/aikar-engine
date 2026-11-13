@@ -864,6 +864,8 @@ struct llm_graph_params {
     uint32_t n_outputs;
 
     bool sparse_loss;
+    int32_t top_k;
+    float top_k_temperature;
     bool training;
     bool activation_recompute;
 
@@ -953,6 +955,8 @@ struct llm_graph_params {
             training == other.training &&
             activation_recompute == other.activation_recompute &&
             sparse_loss == other.sparse_loss &&
+            top_k == other.top_k &&
+            top_k_temperature == other.top_k_temperature &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -978,6 +982,9 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
     ggml_tensor * get_sparse_loss() const { return t_sparse_loss; }
+    ggml_tensor * get_top_k_ids() const { return t_top_k_ids; }
+    ggml_tensor * get_top_k_stats() const { return t_top_k_stats; }
+    ggml_tensor * get_top_k_packed() const { return t_top_k_packed; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -991,6 +998,7 @@ public:
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
     void add_sparse_loss();
+    void add_top_k(int32_t top_k, float temperature);
     void set_sparse_loss_inputs(const llama_token * targets, size_t n_targets);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -1022,6 +1030,9 @@ public:
     ggml_tensor * t_sparse_targets = nullptr;
     ggml_tensor * t_sparse_weights = nullptr;
     ggml_tensor * t_sparse_loss    = nullptr;
+    ggml_tensor * t_top_k_ids      = nullptr;
+    ggml_tensor * t_top_k_stats    = nullptr;
+    ggml_tensor * t_top_k_packed   = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
     std::vector<float> sparse_weights_data;

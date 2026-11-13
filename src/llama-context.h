@@ -158,6 +158,8 @@ struct llama_context {
             const llama_token * targets,
             size_t n_targets,
             float * loss);
+    int decode_top_k(const llama_batch_ext & batch, int32_t top_k, float temperature,
+            int32_t * ids, double * stats, size_t n_rows);
 
     //
     // state save/load
@@ -425,6 +427,15 @@ private:
         size_t n_consumed = 0;
         double sum = 0.0;
     } sparse_loss;
+
+    struct top_k_state {
+        int32_t k = 0;
+        float temperature = 1.0f;
+        int32_t * ids = nullptr;
+        double * stats = nullptr;
+        size_t n_rows = 0;
+        size_t n_consumed = 0;
+    } top_k_output;
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 

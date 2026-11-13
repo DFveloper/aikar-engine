@@ -17,6 +17,7 @@
 #include <cfloat>
 #include <climits>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 void ggml_compute_forward_turboquant_pack(const ggml_compute_params * params, ggml_tensor * dst) {
@@ -9502,7 +9503,7 @@ void ggml_compute_forward_argsort(
 struct cmp_top_k {
     const float * data;
     bool operator()(int32_t a, int32_t b) const {
-        return data[a] > data[b];
+        return data[a] != data[b] ? data[a] > data[b] : a < b;
     }
 };
 
@@ -13699,9 +13700,14 @@ static void ggml_qlion_qat_update_block(
     float momentum_f32[64];
     float residual_f32[64];
     float target[64];
+    float old_weight[64];
+    float next_residual[64];
+    const bool fp32_residual = residual_traits->blck_size == 1;
     weight_traits->to_float(weight_block, weight_f32, block_size);
     momentum_traits->to_float(momentum_block, momentum_f32, block_size);
-    residual_traits->to_float(residual_block, residual_f32, block_size);
+    std::copy(weight_f32, weight_f32 + block_size, old_weight);
+    if (fp32_residual) std::memcpy(residual_f32, residual_block, block_size*sizeof(float));
+    else residual_traits->to_float(residual_block, residual_f32, block_size);
     float group_alpha[2] = { alpha, alpha };
     if (fused_scale && p[6] >= 0) {
         for (int group = 0; group < block_size / 32; ++group) {
@@ -13725,29 +13731,92 @@ static void ggml_qlion_qat_update_block(
         momentum_f32[j] = m;
         //momentum_new[j] = m;
         const float direction = m > 0.0f ? 1.0f : (m < 0.0f ? -1.0f : 0.0f);
-        float value = weight_f32[j] + residual_f32[j] - group_alpha[j / 32] * (direction + p[2] * weight_f32[j]);
+        next_residual[j] = std::fma(-group_alpha[j / 32], direction + p[2] * weight_f32[j], residual_f32[j]);
+        float value = fp32_residual ? weight_f32[j] + next_residual[j] :
+            weight_f32[j] + residual_f32[j] - group_alpha[j / 32] * (direction + p[2] * weight_f32[j]);
+        const float unclipped = value;
         value = std::isfinite(value) ? value : weight_f32[j];
         if (weight_type == GGML_TYPE_Q2_0 || weight_type == GGML_TYPE_Q4_0 || weight_type == GGML_TYPE_Q8_0) {
             const float limit = weight_type == GGML_TYPE_Q2_0 ? 2.0f * 65504.0f :
                 (weight_type == GGML_TYPE_Q4_0 ? 8.0f * 65504.0f : 128.0f * 65504.0f);
             value = std::max(-limit, std::min(limit, value));
         }
+        if (fp32_residual && value != unclipped) next_residual[j] = value - weight_f32[j];
         target[j] = value;
     }
-    weight_traits->from_float_ref(target, weight_block, block_size);
-    weight_traits->to_float(weight_block, weight_f32, block_size);
+    if ((weight_type != GGML_TYPE_Q4_0 && weight_type != GGML_TYPE_Q8_0) ||
+            !std::equal(target, target + block_size, weight_f32)) {
+        uint8_t previous[sizeof(block_q8_0)];
+        if (weight_type == GGML_TYPE_Q4_0 || weight_type == GGML_TYPE_Q8_0) {
+            std::memcpy(previous, weight_block, weight_traits->type_size);
+        }
+        weight_traits->from_float_ref(target, weight_block, block_size);
+        weight_traits->to_float(weight_block, weight_f32, block_size);
+        if (weight_type == GGML_TYPE_Q4_0 || weight_type == GGML_TYPE_Q8_0) {
+            const bool q8 = weight_type == GGML_TYPE_Q8_0;
+            ggml_fp16_t half_scale;
+            std::memcpy(&half_scale, previous, sizeof(half_scale));
+            const float scale = GGML_FP16_TO_FP32(half_scale);
+            const float inverse = scale != 0 ? 1.0f / scale : 0.0f;
+            uint8_t candidate[sizeof(block_q8_0)] = {};
+            std::memcpy(candidate, previous, sizeof(half_scale));
+            for (int j = 0; j < 32; ++j) {
+                if (q8) {
+                    ((int8_t *) (candidate + 2))[j] = (int8_t) std::max(-128.0f, std::min(127.0f, std::round(target[j] * inverse)));
+                } else {
+                    const int q = (int) std::max(0.0f, std::min(15.0f, target[j] * inverse + 8.5f));
+                    candidate[2 + j%16] |= q << (j/16 * 4);
+                }
+            }
+            float decoded[32];
+            weight_traits->to_float(candidate, decoded, 32);
+            float old_error = 0, new_error = 0;
+            for (int j = 0; j < 32; ++j) {
+                old_error += (target[j] - decoded[j]) * (target[j] - decoded[j]);
+                new_error += (target[j] - weight_f32[j]) * (target[j] - weight_f32[j]);
+            }
+            if (old_error <= new_error) {
+                std::memcpy(weight_block, candidate, weight_traits->type_size);
+                std::copy(decoded, decoded + 32, weight_f32);
+            }
+            if (fp32_residual) {
+                float numerator = 0, denominator = 0;
+                for (int j = 0; j < 32; ++j) {
+                    const int code = q8 ? ((const int8_t *) (previous + 2))[j] :
+                        ((previous[2 + j%16] >> (j/16*4)) & 15) - 8;
+                    numerator += target[j] * code;
+                    denominator += code * code;
+                }
+                const float fitted = denominator > 0 ? numerator / denominator : scale;
+                const ggml_fp16_t fitted_scale = GGML_FP32_TO_FP16(std::max(-65504.0f, std::min(65504.0f, fitted)));
+                std::memcpy(candidate, previous, weight_traits->type_size);
+                std::memcpy(candidate, &fitted_scale, sizeof(fitted_scale));
+                weight_traits->to_float(candidate, decoded, 32);
+                float fitted_error = 0, selected_error = 0;
+                for (int j = 0; j < 32; ++j) {
+                    fitted_error += (target[j] - decoded[j]) * (target[j] - decoded[j]);
+                    selected_error += (target[j] - weight_f32[j]) * (target[j] - weight_f32[j]);
+                }
+                if (fitted_error < selected_error) {
+                    std::memcpy(weight_block, candidate, weight_traits->type_size);
+                    std::copy(decoded, decoded + 32, weight_f32);
+                }
+            }
+        }
+    }
     float residual_absmax = 0.0f;
     for (int j = 0; j < block_size; ++j) {
-        float value = target[j] - weight_f32[j];
+        float value = fp32_residual ? next_residual[j] + (old_weight[j] - weight_f32[j]) : target[j] - weight_f32[j];
         value = std::isfinite(value) ? value : 0.0f;
         value = std::max(-8.0f * 65504.0f, std::min(8.0f * 65504.0f, value));
         residual_f32[j] = value;
         residual_absmax = std::max(residual_absmax, std::abs(value));
     }
-    if (residual_absmax > 0.0f && residual_absmax < 8.0f * 0x1p-24f) {
+    if (!fp32_residual && residual_absmax > 0.0f && residual_absmax < 8.0f * 0x1p-24f) {
         std::fill(residual_f32, residual_f32 + block_size, 0.0f);
     }
-    residual_traits->from_float_ref(residual_f32, residual_block, block_size);
+    if (fp32_residual) std::memcpy(residual_block, residual_f32, block_size*sizeof(float));
+    else residual_traits->from_float_ref(residual_f32, residual_block, block_size);
     momentum_traits->from_float_ref(momentum_f32, momentum_block, block_size);
 }
 
@@ -14073,7 +14142,7 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_Q2_0 || weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(momentum->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(residual->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(residual->type == GGML_TYPE_Q4_0 || residual->type == GGML_TYPE_F32);
     GGML_ASSERT(opt_params->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(weight));
     GGML_ASSERT(ggml_is_contiguous(grad));
@@ -14085,7 +14154,8 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     const ggml_type_traits * residual_traits = ggml_get_type_traits(residual->type);
     GGML_ASSERT((weight_traits->blck_size == 32 || weight_traits->blck_size == 64) && weight_traits->to_float && weight_traits->from_float_ref);
     GGML_ASSERT(momentum_traits->blck_size == 32 && momentum_traits->to_float && momentum_traits->from_float_ref);
-    GGML_ASSERT(residual_traits->blck_size == 32 && residual_traits->to_float && residual_traits->from_float_ref);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32 ||
+        (residual_traits->blck_size == 32 && residual_traits->to_float && residual_traits->from_float_ref));
 
     const float * p = ggml_get_data_f32(opt_params);
     GGML_ASSERT(p[0] > 0.0f && std::isfinite(p[0]));
@@ -14107,7 +14177,7 @@ void ggml_compute_forward_opt_step_qlion_qat(const ggml_compute_params * params,
     for (int64_t ib = block_begin; ib < block_end; ++ib) {
         uint8_t * weight_block = weight_data + ib * weight_traits->type_size;
         uint8_t * momentum_block = momentum_data + ib * (weight_block_size / 32) * momentum_traits->type_size;
-        uint8_t * residual_block = residual_data + ib * (weight_block_size / 32) * residual_traits->type_size;
+        uint8_t * residual_block = residual_data + ib * ggml_row_size(residual->type, weight_block_size);
         float grad_block[64];
         const float * grad_values = grad_data ? grad_data + ib * weight_block_size : grad_block;
         if (!grad_data) {
@@ -14525,6 +14595,89 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+void ggml_compute_forward_mul_mat_top_k(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * w = dst->src[0];
+    const auto * h = dst->src[1];
+    const int k = ggml_get_op_params_i32(dst, 0);
+    const float temperature = ggml_get_op_params_f32(dst, 1);
+    const float softcap = ggml_get_op_params_f32(dst, 2);
+    const int nv = w->ne[1], dim = w->ne[0];
+    const auto to_float = ggml_get_type_traits(w->type)->to_float;
+    std::vector<float> weights(dim), logits(nv);
+    std::vector<int32_t> order(nv);
+    for (int64_t row = params->ith; row < h->ne[1]; row += params->nth) {
+        const auto * hidden = (const float *) ((const char *) h->data + row*h->nb[1]);
+        bool valid = true;
+        for (int token = 0; token < nv; ++token) {
+            const void * source = (const char *) w->data + token*w->nb[1];
+            const float * values = (const float *) source;
+            if (w->type != GGML_TYPE_F32) {
+                to_float(source, weights.data(), dim);
+                values = weights.data();
+            }
+            double dot = 0;
+            for (int j = 0; j < dim; ++j) dot += double(values[j])*hidden[j];
+            float value = dot;
+            if (softcap > 0) value = softcap*std::tanh(value/softcap);
+            logits[token] = value;
+            valid = valid && std::isfinite(value);
+            order[token] = token;
+        }
+        std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int a, int b) {
+            return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+        });
+        auto * out = (double *) dst->data + row*(2*k + 3);
+        const double maximum = logits[order[0]];
+        for (int j = 0; j < k; ++j) {
+            out[j] = order[j];
+            out[k + j] = logits[order[j]];
+        }
+        double total = 0, tail = 0;
+        for (int j = 0; j < nv; ++j) {
+            const double p = std::exp((double(logits[order[j]]) - maximum)/temperature);
+            total += p;
+            if (j >= k) tail += p;
+        }
+        out[2*k] = valid ? maximum : NAN;
+        out[2*k + 1] = std::log(total);
+        out[2*k + 2] = std::log(std::max(tail, 1e-300)) - std::log(total);
+    }
+}
+
+void ggml_compute_forward_top_k_stats(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * logits = dst->src[0];
+    const auto * ids = dst->src[1];
+    const int nv = logits->ne[0], k = ids->ne[0];
+    const float temperature = ggml_get_op_params_f32(dst, 0);
+    std::vector<uint8_t> selected(nv, 0);
+    for (int64_t row = params->ith; row < logits->ne[1]; row += params->nth) {
+        const auto * z = static_cast<const float *>(logits->data) + row*nv;
+        const auto * indices = static_cast<const int32_t *>(ids->data) + row*k;
+        auto * output = static_cast<double *>(dst->data) + row*(k + 3);
+        double maximum = -INFINITY;
+        bool valid = true;
+        for (int j = 0; j < nv; ++j) {
+            valid = valid && std::isfinite(z[j]);
+            maximum = std::max(maximum, double(z[j]));
+        }
+        for (int i = 0; i < k; ++i) {
+            GGML_ASSERT(indices[i] >= 0 && indices[i] < nv && !selected[indices[i]]);
+            selected[indices[i]] = 1;
+            output[i] = z[indices[i]];
+        }
+        double total = 0, tail = 0;
+        for (int j = 0; j < nv; ++j) {
+            const double p = std::exp((double(z[j]) - maximum)/temperature);
+            total += p;
+            if (!selected[j]) tail += p;
+        }
+        output[k] = valid ? maximum : NAN;
+        output[k + 1] = std::log(total);
+        output[k + 2] = std::log(std::max(tail, 1e-300)) - output[k + 1];
+        for (int i = 0; i < k; ++i) selected[indices[i]] = 0;
     }
 }
 

@@ -83,6 +83,7 @@ static int next_power_of_2(int x) {
 }
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
+    if (value == 0.0f) value = 0.0f;
     const uint32_t bits = __float_as_uint(value);
     const uint32_t mask = (uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U;
     return bits ^ mask;
@@ -209,6 +210,20 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+static __global__ void top_k_radix_fix_ties(
+        const float * src, int * dst, const top_k_radix_state * states, int ncols, int k) {
+    const int row = blockIdx.x;
+    const auto state = states[row];
+    if (state.equal_count <= state.rank) return;
+    src += size_t(row)*ncols;
+    dst += size_t(row)*k;
+    // The gather uses atomics. Repair only ties at the cutoff, in token order.
+    int index = k - state.rank;
+    for (int col = 0; col < ncols && index < k; ++col) {
+        if (top_k_float_to_ordered(src[col]) == state.prefix) dst[index++] = col;
+    }
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
@@ -244,9 +259,25 @@ static void top_k_radix_cuda(
         top_k_radix_gather<BLOCK_SIZE>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
                 src, dst, states, ncols, k, blocks_per_row);
+        top_k_radix_fix_ties<<<iter_nrows, 1, 0, stream>>>(src, dst, states, ncols, k);
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;
+    }
+}
+
+static __global__ void top_k_fix_ties(const float * src, int * dst, int ncols, int k) {
+    const int row = blockIdx.x;
+    src += size_t(row)*ncols;
+    dst += size_t(row)*k;
+    float cutoff = INFINITY;
+    for (int i = 0; i < k; ++i) cutoff = fminf(cutoff, src[dst[i]]);
+    int next = 0;
+    for (int col = 0; col < ncols; ++col) {
+        if (src[col] != cutoff) continue;
+        while (next < k && src[dst[next]] != cutoff) ++next;
+        if (next == k) break;
+        dst[next++] = col;
     }
 }
 
@@ -311,6 +342,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const int ncols_pad = next_power_of_2(ncols);
         if (ncols_pad * sizeof(int) <= ggml_cuda_info().devices[device].smpb) {
             top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, false, stream);
+            top_k_fix_ties<<<nrows, 1, 0, stream>>>(src0_d, dst_d, ncols, k);
             return;
         }
     }
@@ -324,10 +356,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // TODO: Assess perf of `DeviceBatchedTopK` for multi-row TopK & CCCL >= 3.5.0, re-running perf sweep of https://github.com/ggml-org/llama.cpp/pull/28713
     for (int64_t i = 0; i < nrows; i++) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+        top_k_fix_ties<<<1, 1, 0, stream>>>(src0_d + i*ncols, dst_d + i*k, ncols, k);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
     if (ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT) {
         top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, true, stream);
+        top_k_fix_ties<<<nrows, 1, 0, stream>>>(src0_d, dst_d, ncols, k);
     } else {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     }

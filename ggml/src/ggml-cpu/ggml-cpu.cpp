@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -484,6 +485,20 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
+        case GGML_OP_MUL_MAT_TOP_K:
+            return op->type == GGML_TYPE_F64 && ggml_is_matrix(op) &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                    src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) &&
+                src1->type == GGML_TYPE_F32 && ggml_is_matrix(src0) && ggml_is_matrix(src1) &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+                src0->ne[0] > 0 && src0->ne[0] <= 16384 && src0->ne[0] % ggml_blck_size(src0->type) == 0 &&
+                src0->ne[1] > 1 && src0->ne[1] <= 262144 && src1->ne[0] == src0->ne[0] && src1->ne[1] > 0 &&
+                ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 0) <= 512 &&
+                ggml_get_op_params_i32(op, 0) < src0->ne[1] &&
+                std::isfinite(ggml_get_op_params_f32(op, 1)) && ggml_get_op_params_f32(op, 1) >= 0.01f &&
+                ggml_get_op_params_f32(op, 1) <= 100.f &&
+                std::isfinite(ggml_get_op_params_f32(op, 2)) && ggml_get_op_params_f32(op, 2) >= 0 &&
+                op->ne[0] == 2*ggml_get_op_params_i32(op, 0) + 3 && op->ne[1] == src1->ne[1];
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 ||
                     src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&

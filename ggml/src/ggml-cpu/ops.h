@@ -26,6 +26,7 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 extern "C" {
 #endif
 
+void ggml_compute_forward_mul_mat_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dup(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -67,6 +68,7 @@ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct
 void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_distillation(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_top_k_stats(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_conv_transpose_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);

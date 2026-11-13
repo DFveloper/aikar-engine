@@ -1659,6 +1659,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (sparse_loss.active && n_outputs > 0) {
             res->add_sparse_loss();
         }
+        if (top_k_output.k > 0 && n_outputs > 0) {
+            res->add_top_k(top_k_output.k, top_k_output.temperature);
+        }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1699,6 +1702,36 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_tensor_get(t_loss, &ubatch_loss, 0, sizeof(ubatch_loss));
         sparse_loss.sum += (double) ubatch_loss*n_outputs;
         sparse_loss.n_consumed += n_outputs;
+    }
+
+    if (top_k_output.k > 0 && n_outputs > 0) {
+        GGML_ASSERT(top_k_output.n_consumed + n_outputs <= top_k_output.n_rows);
+        if (auto * packed = res->get_top_k_packed()) {
+            ggml_backend_sched_synchronize(sched.get());
+            const int k = top_k_output.k;
+            std::vector<double> output(size_t(n_outputs)*(2*k + 3));
+            ggml_backend_tensor_get(packed, output.data(), 0, ggml_nbytes(packed));
+            for (int64_t row = 0; row < n_outputs; ++row) {
+                const double * source = output.data() + row*(2*k + 3);
+                const size_t offset = top_k_output.n_consumed + row;
+                for (int j = 0; j < k; ++j) {
+                    if (!std::isfinite(source[j]) || source[j] < 0 || source[j] >= model.vocab.n_tokens()) {
+                        throw std::runtime_error("invalid fused head token ID");
+                    }
+                    top_k_output.ids[offset*k + j] = int32_t(source[j]);
+                }
+                std::copy_n(source + k, k + 3, top_k_output.stats + offset*(k + 3));
+            }
+        } else {
+            auto * ids = res->get_top_k_ids();
+            auto * stats = res->get_top_k_stats();
+            ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), ids), ids,
+                    top_k_output.ids + top_k_output.n_consumed*top_k_output.k, 0, ggml_nbytes(ids));
+            ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), stats), stats,
+                    top_k_output.stats + top_k_output.n_consumed*(top_k_output.k + 3), 0, ggml_nbytes(stats));
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        top_k_output.n_consumed += n_outputs;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2347,6 +2380,37 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     return 0;
 }
 
+int llama_context::decode_top_k(const llama_batch_ext & batch, int32_t k, float temperature,
+        int32_t * ids, double * stats, size_t n_rows) {
+    if (top_k_output.k || sparse_loss.active || cparams.embeddings || !sampling.samplers.empty() ||
+            model.arch == LLM_ARCH_T5 || k <= 0 || k > INT32_MAX - 3 || uint32_t(k) >= model.vocab.n_tokens() ||
+            !std::isfinite(temperature) || temperature < 0.01f || temperature > 100.0f ||
+            n_rows > SIZE_MAX/(size_t(k) + 3)/sizeof(double)) {
+        return -1;
+    }
+    size_t expected = 0;
+    for (const auto & token : batch.tokens) expected += token.output;
+    if (expected != n_rows || (n_rows && (!ids || !stats))) return -1;
+    top_k_output = { k, temperature, ids, stats, n_rows, 0 };
+    try {
+        const int result = decode(batch);
+        const bool complete = top_k_output.n_consumed == n_rows;
+        if (result == 0 && complete) {
+            for (const auto & swap : output_swaps) {
+                for (int32_t j = 0; j < k; ++j) std::swap(ids[swap.i0*k + j], ids[swap.i1*k + j]);
+                for (int32_t j = 0; j < k + 3; ++j) std::swap(stats[swap.i0*(k + 3) + j], stats[swap.i1*(k + 3) + j]);
+            }
+            output_swaps.clear();
+        }
+        top_k_output = {};
+        return result != 0 ? result : complete ? 0 : -1;
+    } catch (...) {
+        ggml_backend_sched_synchronize(sched.get());
+        top_k_output = {};
+        throw;
+    }
+}
+
 int llama_context::decode_sparse_cross_entropy(
         const llama_batch & batch,
         const llama_token * targets,
@@ -2394,7 +2458,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = !sparse_loss.active && (!cparams.embeddings || graph_has_logits);
+    bool has_logits     = !sparse_loss.active && top_k_output.k == 0 && (!cparams.embeddings || graph_has_logits);
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -2869,6 +2933,8 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.sparse_loss =*/ sparse_loss.active,
+        /*.top_k       =*/ top_k_output.k,
+        /*.top_k_temperature =*/ top_k_output.temperature,
         /*.training    =*/ training,
         /*.activation_recompute =*/ opt_params.activation_recompute,
         /*.cb          =*/ graph_get_cb(),
@@ -4004,10 +4070,12 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             n_batch == 0
     );
 
-    GGML_ASSERT(
-        n_batch %
-            n_ubatch == 0
-    );
+    if (n_batch % n_ubatch != 0 &&
+        (!opt_distillation_callback || !ggml_opt_optimizer_is_qlion(lopt_params.optimizer_type) ||
+         n_seq_max() != 1 || n_batch != train_n_ctx ||
+         lopt_params.critical_token_mode != LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE)) {
+        throw std::runtime_error("partial microbatches require single-sequence full-window QLion distillation");
+    }
 
     // Recreate the scheduler and gf_res_prev with a training-inflated graph size before
     // creating opt_ctx, so opt_ctx captures the new (larger) scheduler pointer.
@@ -4085,7 +4153,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         opt_params.distillation_top_k = opt_distillation_top_k;
         opt_params.distillation_temperature = opt_distillation_temperature;
     }
-    opt_params.opt_period                = n_batch / n_ubatch;
+    opt_params.opt_period                = 1 + (n_batch - 1) / n_ubatch;
     const uint32_t accumulation_steps = std::max(1u, lopt_params.grad_accum_steps);
     if (accumulation_steps > 1 && n_batch != n_ctx()) {
         throw std::runtime_error("multi-batch accumulation requires a full-window logical batch");
@@ -4318,7 +4386,7 @@ void llama_context::opt_epoch_iter(
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
         if (train && ggml_opt_optimizer_is_qlion(opt_params.optimizer_type) && accumulation_steps > 0 && pos_ctx == 0) {
-            ggml_opt_set_current_period(opt_ctx, accumulation_steps * (n_batch / n_ubatch));
+            ggml_opt_set_current_period(opt_ctx, accumulation_steps * (1 + (n_batch - 1) / n_ubatch));
         }
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
@@ -4606,7 +4674,10 @@ void llama_context::opt_epoch_iter(
                     // Leave the dense label row or sparse weight at zero.
                     if (labels_sparse[ilabel] < 0) continue;
                     GGML_ASSERT(labels_sparse[ilabel] < res->get_logits()->ne[0]);
-                    const float active_label_scale = critical_metadata ? 1.0f : sequence_scales[ilabel / sequence_length]*n_outputs/ubatch.n_tokens;
+                    const float microbatch_weight = n_batch % n_ubatch == 0 ? 1.0f :
+                        float(ubatch.n_tokens) * (1 + (n_batch - 1) / n_ubatch) / n_batch;
+                    const float active_label_scale = critical_metadata ? 1.0f :
+                        sequence_scales[ilabel / sequence_length]*n_outputs/ubatch.n_tokens*microbatch_weight;
                     if (labels) {
                         ggml_backend_tensor_set(labels, &active_label_scale, (output_row*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                     } else {
@@ -4813,7 +4884,7 @@ void llama_context::opt_epoch(
         ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
     }
 
-    const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
+    const uint32_t ubatch_per_ctx = 1 + (n_ctx - 1) / n_ubatch;
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     std::vector<llama_token> tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
@@ -4888,7 +4959,7 @@ void llama_context::opt_eval_range(
     const int64_t ndata = ggml_opt_dataset_ndata(dataset);
     GGML_ASSERT(idata_start >= 0 && idata_start <= idata_end && idata_end <= ndata);
 
-    const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
+    const uint32_t ubatch_per_ctx = 1 + (n_ctx - 1) / n_ubatch;
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
     std::vector<llama_token> tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
@@ -6012,4 +6083,9 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+int32_t llama_decode_top_k(llama_context * ctx, const llama_batch_ext * batch, int32_t k, float temperature,
+        int32_t * ids, double * stats, size_t n_rows) {
+    return ctx && batch ? ctx->decode_top_k(*batch, k, temperature, ids, stats, n_rows) : -1;
 }

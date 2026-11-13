@@ -34,6 +34,43 @@ static bool qat_type_codec(enum ggml_type type, const struct ggml_type_traits * 
     return true;
 }
 
+static void qat_preserve_weight_scale(enum ggml_type type, const std::vector<float> & target,
+        const std::vector<float> & weight, const std::vector<uint8_t> & previous, std::vector<uint8_t> & encoded) {
+    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q8_0) return;
+    const auto * traits = ggml_get_type_traits(type);
+    const size_t bytes = traits->type_size;
+    for (size_t i = 0; i < target.size(); i += 32) {
+        const size_t offset = i/32*bytes;
+        if (std::equal(target.begin() + i, target.begin() + i + 32, weight.begin() + i)) {
+            std::copy_n(previous.data() + offset, bytes, encoded.data() + offset);
+            continue;
+        }
+        ggml_fp16_t half_scale;
+        std::memcpy(&half_scale, previous.data() + offset, sizeof(half_scale));
+        const float scale = ggml_fp16_to_fp32(half_scale);
+        const float inverse = scale != 0 ? 1.0f / scale : 0.0f;
+        std::vector<uint8_t> candidate(bytes, 0);
+        std::memcpy(candidate.data(), &half_scale, sizeof(half_scale));
+        for (size_t j = 0; j < 32; ++j) {
+            if (type == GGML_TYPE_Q8_0) {
+                ((int8_t *) (candidate.data() + 2))[j] = (int8_t) std::max(-128.0f, std::min(127.0f, std::round(target[i + j]*inverse)));
+            } else {
+                const int q = (int) std::max(0.0f, std::min(15.0f, target[i + j]*inverse + 8.5f));
+                candidate[2 + j%16] |= q << (j/16*4);
+            }
+        }
+        float old_values[32], new_values[32];
+        traits->to_float(candidate.data(), old_values, 32);
+        traits->to_float(encoded.data() + offset, new_values, 32);
+        float old_error = 0, new_error = 0;
+        for (size_t j = 0; j < 32; ++j) {
+            old_error += (target[i + j] - old_values[j]) * (target[i + j] - old_values[j]);
+            new_error += (target[i + j] - new_values[j]) * (target[i + j] - new_values[j]);
+        }
+        if (old_error <= new_error) std::copy(candidate.begin(), candidate.end(), encoded.begin() + offset);
+    }
+}
+
 static bool qat_shape_valid(enum ggml_type type, int64_t ne, std::string & error) {
     const int64_t block_size = ggml_blck_size(type);
     if (ne <= 0 || block_size <= 0 || ne % block_size != 0) {
@@ -356,7 +393,8 @@ bool qat_tensor_state_step(
         const float direction = m > 0.0f ? 1.0f : (m < 0.0f ? -1.0f : 0.0f);
         update[i] = -params.learning_rate * (direction + params.weight_decay * weight[i]);
         target_no_feedback[i] = weight[i] + update[i];
-        target[i] = target_no_feedback[i] + (params.enable_residual ? residual[i] : 0.0f);
+        target[i] = std::fma(-params.learning_rate, std::fma(params.weight_decay, weight[i], direction),
+            weight[i] + (params.enable_residual ? residual[i] : 0.0f));
         if (state.format == QAT_WEIGHT_Q4_0 || state.format == QAT_WEIGHT_Q8_0) {
             const float limit = state.format == QAT_WEIGHT_Q4_0 ? QAT_Q4_0_MAX_ABS : QAT_Q8_0_MAX_ABS;
             const float clipped = std::max(-limit, std::min(limit, target[i]));
@@ -377,6 +415,8 @@ bool qat_tensor_state_step(
         return false;
     }
 
+    qat_preserve_weight_scale(weight_type, target, weight, state.weight, weight_new);
+    qat_preserve_weight_scale(weight_type, target_no_feedback, weight, state.weight, weight_no_feedback);
     std::vector<float> weight_new_f32;
     if (!qat_decode(weight_type, weight_new, state.ne, weight_new_f32, error)) {
         return false;

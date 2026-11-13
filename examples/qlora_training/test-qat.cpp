@@ -268,6 +268,163 @@ static void test_state_resume_trajectory(enum qat_weight_format format) {
     check(uninterrupted.residual == resumed.residual, "resumed QAT residual differs from uninterrupted trajectory");
 }
 
+static void test_fp32_residual_registration() {
+    auto * backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    auto * sched = ggml_backend_sched_new(&backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    auto * ctx = ggml_init({ 4*ggml_tensor_overhead(), nullptr, true });
+    ggml_tensor * weights[] = {
+        ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 32, 4),
+        ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 32, 4, 2),
+        ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 32, 4),
+        ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 32, 4),
+    };
+    const char * names[] = { "blk.5.attn_k.weight", "blk.5.ffn_up_exps.weight", "token_embd.weight", "output.weight" };
+    for (int i = 0; i < 4; ++i) ggml_set_name(weights[i], names[i]);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    auto pars = ggml_opt_get_default_optimizer_params(nullptr);
+    pars.qlion_qat.fp32_residual = true;
+    auto params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT;
+    params.get_opt_pars = ggml_opt_get_constant_optimizer_params;
+    params.get_opt_pars_ud = &pars;
+    auto * opt = ggml_opt_init(params);
+    for (int i = 0; i < 4; ++i) {
+        ggml_opt_qat_register_param(opt, weights[i]);
+        check(ggml_opt_qat_state_residual(opt, i)->type == (i == 0 ? GGML_TYPE_F32 : GGML_TYPE_Q4_0),
+            "F32 residual must select supported dense parameters only");
+    }
+    ggml_opt_free(opt);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backend);
+}
+
+static void test_fp32_residual(ggml_backend_dev_t device) {
+    for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) for (auto gradient_type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        auto * backend = ggml_backend_dev_init(device, nullptr);
+        auto * ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true});
+        auto * w = ggml_new_tensor_1d(ctx, type, 128);
+        ggml_set_param(w);
+        auto * g = ggml_new_tensor_1d(ctx, gradient_type, 128);
+        auto * m = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, 128);
+        auto * r = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        auto * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        auto * graph = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(graph, ggml_opt_step_qlion_qat(ctx, w, g, m, r, p));
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        check(buffer != nullptr, "FP32 residual allocation failed");
+        ggml_backend_buffer_clear(buffer, 0);
+        const size_t block_bytes = ggml_type_size(type);
+        std::vector<uint8_t> initial(ggml_nbytes(w), 0), actual(initial.size()), first(initial.size());
+        std::vector<float> weights(128), gradient(128), residual(128), before(128);
+        for (int block = 0; block < 4; ++block) {
+            const float scales[] = {0.125f, 0.00390625f, 0.0001f, 0};
+            const auto scale = ggml_fp32_to_fp16(scales[block]);
+            std::memcpy(initial.data() + block*block_bytes, &scale, sizeof(scale));
+            for (int j = 0; j < 32; ++j) {
+                const int code = j%11 - 5;
+                if (type == GGML_TYPE_Q8_0) ((int8_t *) (initial.data() + block*block_bytes + 2))[j] = code*16;
+                else initial[block*block_bytes + 2 + j%16] |= (code + 8) << (j/16*4);
+                gradient[block*32 + j] = code < 0 ? -1.0f : 1.0f;
+                before[block*32 + j] = scales[block]*0.01f*(j%7 - 3);
+            }
+        }
+        ggml_get_type_traits(type)->to_float(initial.data(), weights.data(), 128);
+        const auto old_weights = weights;
+        ggml_backend_tensor_set(w, initial.data(), 0, initial.size());
+        ggml_backend_tensor_set(r, before.data(), 0, before.size()*sizeof(float));
+        if (gradient_type == GGML_TYPE_F32) ggml_backend_tensor_set(g, gradient.data(), 0, 128*sizeof(float));
+        else {
+            std::vector<uint8_t> packed(ggml_nbytes(g));
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->from_float_ref(gradient.data(), packed.data(), 128);
+            ggml_backend_tensor_set(g, packed.data(), 0, packed.size());
+        }
+        const float alpha = 1e-7f;
+        const float pars[] = {alpha, 0, 0, 0, 0, -32, 0, 0};
+        ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
+        for (int step = 0; step <= 512; ++step) {
+            check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "FP32 residual update failed");
+            if (step == 0) ggml_backend_tensor_get(w, first.data(), 0, first.size());
+        }
+        ggml_backend_tensor_get(w, actual.data(), 0, actual.size());
+        ggml_backend_tensor_get(r, residual.data(), 0, 128*sizeof(float));
+        ggml_get_type_traits(type)->to_float(actual.data(), weights.data(), 128);
+        check(actual != first, "FP32 error feedback did not change quantized weights");
+        for (int j = 0; j < 128; ++j) {
+            const double expected = double(old_weights[j]) + before[j] - 512*double(alpha)*gradient[j];
+            check(std::isfinite(residual[j]) && std::abs(double(weights[j]) + residual[j] - expected) < 5e-7,
+                "FP32 error feedback lost sub-quantum updates");
+        }
+        ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_backend_free(backend);
+    }
+}
+
+static void test_preserve_weight_scale(ggml_backend_dev_t device) {
+    for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        auto * backend = ggml_backend_dev_init(device, nullptr);
+        auto * ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true});
+        auto * w = ggml_new_tensor_1d(ctx, type, 32);
+        ggml_set_param(w);
+        auto * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+        auto * m = ggml_new_tensor_1d(ctx, GGML_TYPE_Q8_0, 32);
+        auto * r = ggml_new_tensor_1d(ctx, GGML_TYPE_Q4_0, 32);
+        auto * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        auto * step = ggml_opt_step_qlion_qat(ctx, w, g, m, r, p);
+        auto * graph = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(graph, step);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        check(buffer != nullptr, "scale preservation allocation failed");
+        ggml_backend_buffer_clear(buffer, 0);
+        std::vector<uint8_t> before(ggml_nbytes(w), 0), actual(before.size());
+        const ggml_fp16_t scale = ggml_fp32_to_fp16(0.125f);
+        std::memcpy(before.data(), &scale, sizeof(scale));
+        for (int j = 0; j < 32; ++j) {
+            if (type == GGML_TYPE_Q8_0) {
+                ((int8_t *) (before.data() + 2))[j] = (j%13 - 6)*16;
+            } else {
+                before[2 + j%16] |= (j%13 + 2) << (j/16*4);
+            }
+        }
+        std::vector<float> gradient(32, 1.0f), initial(32), decoded(32), residual(32);
+        ggml_get_type_traits(type)->to_float(before.data(), initial.data(), 32);
+        ggml_backend_tensor_set(w, before.data(), 0, before.size());
+        ggml_backend_tensor_set(g, gradient.data(), 0, 32*sizeof(float));
+        float pars[] = {0.001f, 0.9f, 0, 0, 0, -32, 0, 0};
+        ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
+        check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "zero LR projection failed");
+        ggml_backend_tensor_get(w, actual.data(), 0, actual.size());
+        check(actual == before, "zero LR changed a valid noncanonical weight block");
+        std::vector<uint8_t> packed_residual(ggml_nbytes(r));
+        ggml_backend_tensor_get(r, packed_residual.data(), 0, packed_residual.size());
+        ggml_get_type_traits(GGML_TYPE_Q4_0)->to_float(packed_residual.data(), residual.data(), 32);
+        check(std::all_of(residual.begin(), residual.end(), [](float v) { return v == 0; }), "zero LR created quantization error");
+        pars[0] = 0.0001f;
+        ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
+        check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "small LR projection failed");
+        ggml_backend_tensor_get(w, actual.data(), 0, actual.size());
+        check(actual == before, "small update discarded the existing weight scale");
+        pars[0] = 0.001f;
+        ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
+        for (int i = 0; i < 8; ++i) {
+            check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "projection trajectory failed");
+        }
+        ggml_backend_tensor_get(w, actual.data(), 0, actual.size());
+        ggml_get_type_traits(type)->to_float(actual.data(), decoded.data(), 32);
+        ggml_backend_tensor_get(r, packed_residual.data(), 0, packed_residual.size());
+        ggml_get_type_traits(GGML_TYPE_Q4_0)->to_float(packed_residual.data(), residual.data(), 32);
+        for (int j = 0; j < 32; ++j) {
+            check(std::abs(decoded[j] + residual[j] - (initial[j] - 0.0081f)) < 0.0001f, "projection lost small accumulated updates");
+        }
+        pars[0] = 0.125f;
+        ggml_backend_tensor_set(p, pars, 0, sizeof(pars));
+        check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "large update projection failed");
+        ggml_backend_tensor_get(w, actual.data(), 0, actual.size());
+        check(actual != before, "scale preservation froze learning");
+        ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_backend_free(backend);
+    }
+}
+
 static void test_native_backend_step(
         enum qat_weight_format format,
         ggml_backend_dev_t device,
@@ -2345,6 +2502,9 @@ int main() {
     test_state_resume_trajectory(QAT_WEIGHT_Q4_0);
     test_state_resume_trajectory(QAT_WEIGHT_Q8_0);
     ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    test_fp32_residual_registration();
+    test_fp32_residual(cpu_device);
+    test_preserve_weight_scale(cpu_device);
     benchmark_adaptive_trajectory(cpu_device);
     test_small_q8_accumulator(cpu_device);
     test_quantized_microgradient_accumulator(cpu_device);
@@ -2416,6 +2576,8 @@ int main() {
             continue;
         }
         printf("Testing QAT backend: %s\n", ggml_backend_dev_name(device));
+        test_fp32_residual(device);
+        test_preserve_weight_scale(device);
         test_small_q8_accumulator(device);
         test_quantized_microgradient_accumulator(device);
         test_training_cache_gradient(device);
