@@ -1,0 +1,17 @@
+{
+  "accum-recompute": {
+    "momentum_relative_l2": 0.0030654157593770002,
+    "optimizer_steps": [
+      1,
+      2
+    ],
+    "momentum_norm": 19.48107237838567
+  },
+  "lumen-shared": {
+    "momentum_relative_l2": 0.0020453104403260368,
+    "optimizer_steps": [
+      1
+    ],
+    "momentum_norm": 0.9116288993332566
+  }
+}

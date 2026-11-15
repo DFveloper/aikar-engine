@@ -1,0 +1,22 @@
+[
+  {
+    "source": "26B Korean CPT",
+    "raw_data_available": true,
+    "records": 7709,
+    "assumed_raw_record_split": 7323,
+    "duplicate_normalized_inputs_across_split": 0,
+    "split_caveat": "Raw-record proxy; packed validation is sampled from held-out conversations."
+  },
+  {
+    "source": "26B Benchmaxx",
+    "raw_data_available": true,
+    "records": 1310,
+    "assumed_raw_record_split": 1244,
+    "duplicate_normalized_inputs_across_split": 0,
+    "split_caveat": "Raw-record proxy; packed validation is sampled from held-out conversations."
+  },
+  {
+    "source": "12B Agentic",
+    "raw_data_available": false
+  }
+]

@@ -1,0 +1,19 @@
+<|channel>thought
+*   Input text: "이름은 민수, 나이는 29세, 거주지는 부산입니다." (Name is Minsu, age is 29, residence is Busan.)
+    *   Target format: JSON object.
+    *   Constraints:
+        *   No other explanations or code blocks.
+        *   Output *only* the JSON.
+        *   Keys: `name`, `age`, `city`.
+        *   `age` must be a number.
+
+    *   Name: 민수 (Minsu) -> `name`: "민수"
+    *   Age: 29 -> `age`: 29
+    *   City: 부산 (Busan) -> `city`: "부산"
+
+    ```json
+    {
+      "name": "민수",
+      "age": 29,
+      
+

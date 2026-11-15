@@ -1,0 +1,178 @@
+[
+  {
+    "source": "26B Korean CPT",
+    "mismatch_pairs": [
+      {
+        "label": 236761,
+        "label_text": ".",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 161
+      },
+      {
+        "label": 856,
+        "label_text": "..",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 4
+      },
+      {
+        "label": 27677,
+        "label_text": "▁[…]",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 4
+      },
+      {
+        "label": 236888,
+        "label_text": "!",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 3
+      },
+      {
+        "label": 1781,
+        "label_text": ".\"",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 3
+      },
+      {
+        "label": 236743,
+        "label_text": "▁",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 3
+      },
+      {
+        "label": 236881,
+        "label_text": "?",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 3
+      },
+      {
+        "label": 236842,
+        "label_text": "]",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 1
+      },
+      {
+        "label": 2728,
+        "label_text": "▁..",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "source": "26B Benchmaxx",
+    "mismatch_pairs": [
+      {
+        "label": 622,
+        "label_text": "▁D",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 34
+      },
+      {
+        "label": 645,
+        "label_text": "▁E",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 28
+      },
+      {
+        "label": 562,
+        "label_text": "▁A",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 27
+      },
+      {
+        "label": 565,
+        "label_text": "▁C",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 19
+      },
+      {
+        "label": 603,
+        "label_text": "▁B",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 13
+      },
+      {
+        "label": 1018,
+        "label_text": "**",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 2
+      }
+    ]
+  },
+  {
+    "source": "12B Agentic",
+    "mismatch_pairs": [
+      {
+        "label": 101,
+        "label_text": "<channel|>",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 97
+      },
+      {
+        "label": 236761,
+        "label_text": ".",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 30
+      },
+      {
+        "label": 236787,
+        "label_text": ":",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 10
+      },
+      {
+        "label": 236813,
+        "label_text": ">",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 3
+      },
+      {
+        "label": 769,
+        "label_text": ").",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 2
+      },
+      {
+        "label": 1473,
+        "label_text": "):",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 1
+      },
+      {
+        "label": 236842,
+        "label_text": "]",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 1
+      },
+      {
+        "label": 1623,
+        "label_text": "▁much",
+        "next_token": 2,
+        "next_text": "<bos>",
+        "count": 1
+      }
+    ]
+  }
+]

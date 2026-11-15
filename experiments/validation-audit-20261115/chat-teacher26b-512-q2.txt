@@ -1,0 +1,51 @@
+<|channel>thought
+*   Input text: "이름은 민수, 나이는 29세, 거주지는 부산입니다." (Name is Minsu, age is 29, residence is Busan.)
+    *   Target format: JSON object.
+    *   Constraints:
+        *   No other explanations or code blocks.
+        *   Output *only* the JSON.
+        *   Keys: `name`, `age`, `city`.
+        *   `age` must be a number.
+
+    *   Name: 민수 (Minsu) -> `name`: "민수"
+    *   Age: 29 -> `age`: 29
+    *   City: 부산 (Busan) -> `city`: "부산"
+
+    ```json
+    {
+      "name": "민수",
+      "age": 29,
+      "city": "부산"
+    }
+    ```
+
+    *   JSON only? Yes.
+    *   No explanation? Yes.
+    *   No code blocks? (The prompt says "no code blocks", but usually in LLM responses, people want the JSON inside a code block for readability, however, the prompt specifically says "without code blocks". I will provide the raw JSON string as requested). *Wait, usually "no code blocks" means don't wrap it in ```json ... ```, but sometimes it means "don't give me a markdown explanation". I'll provide the raw JSON.*
+
+    *Self-correction on "no code blocks":* If I output just the text, it's safer.
+
+    ```json
+    {
+      "name": "민수",
+      "age": 29,
+      "city": "부산"
+    }
+    ```
+
+    *   `name`: "민수"
+    *   `age`: 29 (number)
+    *   `city`: "부산"
+
+    Result:
+    {
+    "name": "민수",
+    "age": 29,
+    "city": "부산"
+    }<channel|>{
+"name": "민수",
+"age": 29,
+"city": "부산"
+} [end of text]
+
+

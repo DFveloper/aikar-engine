@@ -1,0 +1,4 @@
+{
+  "source": "/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/logit-distillation/interleaved/runs/20261114T142347Z-3313753/interleaved.adapter.gguf.step104.gguf",
+  "copy": "/tmp/aikar-validation-checkpoints/interleaved.adapter.gguf.step104.gguf"
+}

@@ -1,0 +1,174 @@
+{
+  "sources": [
+    {
+      "source": "26B Korean CPT",
+      "path": "/mnt/data/lumen-teacher-logits/webtext-25m-benchmaxx-26b/webtext/teacher.dat",
+      "header": {
+        "context": 16384,
+        "vocab": 262144,
+        "k": 512,
+        "temperature": 1.0,
+        "tokenizer": 14926576218819999477,
+        "windows": 2945,
+        "train": 2913,
+        "metadata": "{\"data\":\"/mnt/data/lumen-teacher-logits/webtext-25m-benchmaxx-26b/webtext/train.jsonl\",\"preserve_thinking\":true,\"student\":\"/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/Lumen-3.8-Pulsar-base.gguf\",\"teacher\":\"/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XXL.gguf\",\"train_on_prompt\":false,\"val_split\":0.05000000074505806}"
+      },
+      "stats": {
+        "train": {
+          "windows": 2913,
+          "supervised": 47703951,
+          "shift_checked": 47701040,
+          "shift_mismatch": 14642,
+          "invalid_ids": 0,
+          "empty_windows": 0,
+          "sampled_rows": 384,
+          "teacher_top1_correct": 157,
+          "target_in_topk": 290,
+          "bad_teacher_rows": 0,
+          "max_mass_error": 0.0003090567966671509,
+          "supervised_density_mean": 0.9995256103767057,
+          "density_range": [
+            0.51153564453125,
+            1.0
+          ],
+          "teacher_top1_accuracy_sample": 0.4088541666666667,
+          "target_topk_rate_sample": 0.7552083333333334
+        },
+        "validation": {
+          "windows": 32,
+          "supervised": 524105,
+          "shift_checked": 524073,
+          "shift_mismatch": 183,
+          "invalid_ids": 0,
+          "empty_windows": 0,
+          "sampled_rows": 384,
+          "teacher_top1_correct": 140,
+          "target_in_topk": 285,
+          "bad_teacher_rows": 0,
+          "max_mass_error": 0.0003653655046120807,
+          "supervised_density_mean": 0.9996509552001953,
+          "density_range": [
+            0.9993896484375,
+            1.0
+          ],
+          "teacher_top1_accuracy_sample": 0.3645833333333333,
+          "target_topk_rate_sample": 0.7421875
+        }
+      }
+    },
+    {
+      "source": "26B Benchmaxx",
+      "path": "/mnt/data/lumen-teacher-logits/benchmaxx-gemma4-26b/teacher.dat",
+      "header": {
+        "context": 16384,
+        "vocab": 262144,
+        "k": 512,
+        "temperature": 1.0,
+        "tokenizer": 14926576218819999477,
+        "windows": 252,
+        "train": 243,
+        "metadata": "{\"data\":\"/mnt/data/AIKAR/Benchmaxx.jsonl\",\"preserve_thinking\":true,\"student\":\"/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/Lumen-3.8-Pulsar-base.gguf\",\"teacher\":\"/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XXL.gguf\",\"train_on_prompt\":false,\"val_split\":0.05000000074505806}"
+      },
+      "stats": {
+        "train": {
+          "windows": 243,
+          "supervised": 2286179,
+          "shift_checked": 2286038,
+          "shift_mismatch": 2474,
+          "invalid_ids": 0,
+          "empty_windows": 0,
+          "sampled_rows": 384,
+          "teacher_top1_correct": 254,
+          "target_in_topk": 373,
+          "bad_teacher_rows": 0,
+          "max_mass_error": 0.0003051119395612867,
+          "supervised_density_mean": 0.5742275410718879,
+          "density_range": [
+            0.250732421875,
+            0.92578125
+          ],
+          "teacher_top1_accuracy_sample": 0.6614583333333334,
+          "target_topk_rate_sample": 0.9713541666666666
+        },
+        "validation": {
+          "windows": 9,
+          "supervised": 104790,
+          "shift_checked": 104782,
+          "shift_mismatch": 123,
+          "invalid_ids": 0,
+          "empty_windows": 0,
+          "sampled_rows": 108,
+          "teacher_top1_correct": 66,
+          "target_in_topk": 102,
+          "bad_teacher_rows": 0,
+          "max_mass_error": 0.00025173535587219575,
+          "supervised_density_mean": 0.7106526692708334,
+          "density_range": [
+            0.42779541015625,
+            0.843017578125
+          ],
+          "teacher_top1_accuracy_sample": 0.6111111111111112,
+          "target_topk_rate_sample": 0.9444444444444444
+        }
+      }
+    },
+    {
+      "source": "12B Agentic",
+      "path": "/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/logit-distillation/agentic-gemma4-12b-fable5-composer25-v2/teacher.dat",
+      "header": {
+        "context": 16384,
+        "vocab": 262144,
+        "k": 512,
+        "temperature": 1.0,
+        "tokenizer": 14926576218819999477,
+        "windows": 2933,
+        "train": 2901,
+        "metadata": "{\"data\":\"/mnt/openwebui/AIKAR/agentic.jsonl\",\"preserve_thinking\":true,\"student\":\"/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/Lumen-3.8-Pulsar-base.gguf\",\"teacher\":\"/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/gemma4-v2-Q8_0.gguf\",\"train_on_prompt\":false,\"val_split\":0.05000000074505806}"
+      },
+      "stats": {
+        "train": {
+          "windows": 2901,
+          "supervised": 6281340,
+          "shift_checked": 6280939,
+          "shift_mismatch": 12339,
+          "invalid_ids": 0,
+          "empty_windows": 0,
+          "sampled_rows": 384,
+          "teacher_top1_correct": 221,
+          "target_in_topk": 376,
+          "bad_teacher_rows": 0,
+          "max_mass_error": 0.0004101711817526832,
+          "supervised_density_mean": 0.1321553148429421,
+          "density_range": [
+            0.000244140625,
+            0.55889892578125
+          ],
+          "teacher_top1_accuracy_sample": 0.5755208333333334,
+          "target_topk_rate_sample": 0.9791666666666666
+        },
+        "validation": {
+          "windows": 32,
+          "supervised": 72329,
+          "shift_checked": 72325,
+          "shift_mismatch": 145,
+          "invalid_ids": 0,
+          "empty_windows": 0,
+          "sampled_rows": 384,
+          "teacher_top1_correct": 199,
+          "target_in_topk": 370,
+          "bad_teacher_rows": 0,
+          "max_mass_error": 0.0004133369938102982,
+          "supervised_density_mean": 0.1379566192626953,
+          "density_range": [
+            0.0008544921875,
+            0.28350830078125
+          ],
+          "teacher_top1_accuracy_sample": 0.5182291666666666,
+          "target_topk_rate_sample": 0.9635416666666666
+        }
+      }
+    }
+  ],
+  "exact_train_validation_duplicates": [],
+  "validation_duplicate_count": 0
+}

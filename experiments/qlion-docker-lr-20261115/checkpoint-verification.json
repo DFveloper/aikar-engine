@@ -1,0 +1,8 @@
+{
+  "training.qat.optimizer": "qlion_qat",
+  "training.qat.residual_type": "f32",
+  "training.optimizer.step": 104,
+  "training.scheduler.step": 104,
+  "training.dataset.window": 624,
+  "training.qat.grad_accum_steps": 6
+}

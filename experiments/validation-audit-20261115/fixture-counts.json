@@ -1,0 +1,17 @@
+{
+  "windows": [
+    {
+      "source": "26B Korean CPT",
+      "supervised": 16375
+    },
+    {
+      "source": "26B Benchmaxx",
+      "supervised": 13812
+    },
+    {
+      "source": "12B Agentic",
+      "supervised": 3219
+    }
+  ],
+  "total": 33406
+}

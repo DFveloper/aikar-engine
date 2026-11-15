@@ -1,0 +1,3 @@
+joint test exit 0
+validation records [('0', '2.13477307', '31.2938'), ('0', '2.13274486', '31.3207')]
+PASS: serial and snapshot joint top-1 accuracy differ by less than 0.1 percentage point

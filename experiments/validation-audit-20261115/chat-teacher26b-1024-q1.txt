@@ -1,0 +1,41 @@
+<|channel>thought
+
+*   Items bought: 3 pencils, 2 notebooks.
+*   Prices: Pencil = 700 KRW each, Notebook = 1,800 KRW each.
+*   Amount paid: 10,000 KRW.
+*   Goal: Find the change (거스름돈) and explain the calculation process briefly.
+
+    *   Cost of pencils: $3 \times 700 = 2,100$ KRW.
+    *   Cost of notebooks: $2 \times 1,800 = 3,600$ KRW.
+    *   Total cost: $2,100 + 3,600 = 5,700$ KRW.
+    *   Change: $10,000 - 5,700 = 4,300$ KRW.
+
+    *   Step 1: Calculate total cost of pencils and notebooks.
+    *   Step 2: Subtract total cost from 10,000 KRW.
+
+    *   *Draft 1 (Mental):* 연필 3개는 2100원이고 공책 2권은 3600원입니다. 합치면 5700원입니다. 10000원에서 5700원을 빼면 4300원입니다.
+    *   *Refining for "short explanation" (as requested):*
+        1. 연필 값: 3 × 700 = 2,100원
+        2. 공책 값: 2 × 1,800 = 3,600원
+        3. 총 금액: 2,100 + 3,600 = 5,700원
+        4. 거스름돈: 10,000 - 5,700 = 4,300원
+
+    *   Answer: 4,300원
+    *   Process:
+        - 연필 3자루: 2,100원 (3 × 700)
+        - 공책 2권: 3,600원 (2 × 1,800)
+        - 총 구매 금액: 5,700원
+        - 거스름돈: 10,000원 - 5,700원 = 4,300원
+
+    *   3 pencils @ 700 = 2100. Correct.
+    *   2 notebooks @ 1800 = 3600. Correct.
+    *   2100 + 3600 = 5700. Correct.
+    *   10000 - 5700 = 4300. Correct.<channel|>거스름돈은 **4,300원**입니다.
+
+**[계산 과정]**
+1. **연필 값:** 3 × 700원 = 2,100원
+2. **공책 값:** 2 × 1,800원 = 3,600원
+3. **총 구매 금액:** 2,100원 + 3,600원 = 5,700원
+4. **거스름돈:** 10,000원 - 5,700원 = 4,300원 [end of text]
+
+

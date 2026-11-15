@@ -1,0 +1,26 @@
+--- train.sh
++++ train.sh
+@@ -34,7 +34,7 @@
+     --resume "$resume" "${fresh_optimizer[@]}" \
+     --auto-microbatch --microbatch-candidates 4096,2048,1024,768,512,256,128 \
+     --library-path "$root/.cache/ga16-runtime":/home/user/aikar-engine/build-validation-runtime:/home/user/aikar-engine/build-joint/bin:/home/user/aikar-engine/build/bin \
+-    --fp32-residual \
++    --fp32-residual --reset-optimizer-on-switch \
+     --source-shuffle-seed 42 --source-shuffle-from 0 \
+     --async-save \
+     --joint-validation --joint-fusion output --joint-val-microbatch 768 \
+@@ -48,12 +48,12 @@
+     --n-cpu-moe 0 --fit off -fa on -np 1 \
+     -c 16384 -b 16384 -ub 4096 --grad-accum 6 \
+     -t 8 -tb 8 -dthr 8 \
+-    --optimizer qlion2 --quant-type q4_0,q8_0 \
++    --optimizer qlion --quant-type q4_0,q8_0 \
+     --qat-targets blk.11.attn_q.weight,blk.11.attn_output.weight,blk.17.attn_q.weight,blk.17.attn_output.weight,blk.23.attn_q.weight,blk.23.attn_output.weight,blk.29.attn_q.weight,blk.29.attn_output.weight \
+     --override-tensor '^output\.weight$=CUDA0' \
+     --qat-static-graph off --activation-recompute on \
+     --epochs 1 \
+-    -lr 1e-6 -lr-min 1e-7 --lr-scheduler cosine --warmup-steps 0 \
++    -lr 1e-5 -lr-min 1e-6 --lr-scheduler cosine --warmup-steps 50 \
+     --eval-every 8 \
+     --qat-adapter-only --qat-adapter-out interleaved.adapter.gguf \
+     --save-first-at 0 --save-every 4 \

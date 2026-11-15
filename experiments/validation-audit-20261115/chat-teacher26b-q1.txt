@@ -1,0 +1,12 @@
+<|channel>thought
+
+*   Items bought: 3 pencils, 2 notebooks.
+*   Prices: Pencil = 700 KRW each, Notebook = 1,800 KRW each.
+*   Amount paid: 10,000 KRW.
+*   Goal: Find the change (거스름돈) and explain the calculation process briefly.
+
+    *   Cost of pencils: $3 \times 700 = 2,100$ KRW.
+    *   Cost of notebooks: $2 \times 1,800 = 3,600$ KRW.
+    *   Total cost: $2,100 + 3,600 = 5,700$ KRW.
+    *   Change: $10,000 - 5,700 = 4,3
+

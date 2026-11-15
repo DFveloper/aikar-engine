@@ -1,0 +1,19 @@
+--- train.sh
++++ train.sh
+@@ -33,14 +33,14 @@
+     --mode "$mode" \
+     --resume "$resume" "${fresh_optimizer[@]}" \
+     --auto-microbatch --microbatch-candidates 4096,2048,1024,768,512,256,128 \
+-    --library-path "$root/.cache/ga16-runtime":/home/user/aikar-engine/build-joint/bin:/home/user/aikar-engine/build/bin \
++    --library-path "$root/.cache/ga16-runtime":/home/user/aikar-engine/build-validation-runtime:/home/user/aikar-engine/build-joint/bin:/home/user/aikar-engine/build/bin \
+     --fp32-residual \
+     --source-shuffle-seed 42 --source-shuffle-from 0 \
+     --async-save \
+     --joint-validation --joint-fusion output --joint-val-microbatch 768 \
+     --joint-start-initial \
+     -- \
+-    "$root/logit-distillation/interleaved/recovery/llama-finetune-qo" \
++    "/home/user/aikar-engine/build-validation-runtime/llama-finetune-qo" \
+     -m "$root/Lumen-3.8-Pulsar-base.gguf" \
+     --train-file "$root/logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json" \
+     --distill-cache "$root/logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json" \

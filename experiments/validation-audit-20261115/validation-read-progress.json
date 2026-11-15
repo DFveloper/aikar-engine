@@ -1,0 +1,17 @@
+[
+  {
+    "source": "26B Korean CPT",
+    "cursor_approx": 32,
+    "total": 32
+  },
+  {
+    "source": "26B Benchmaxx",
+    "cursor_approx": 9,
+    "total": 9
+  },
+  {
+    "source": "12B Agentic",
+    "cursor_approx": 31,
+    "total": 32
+  }
+]

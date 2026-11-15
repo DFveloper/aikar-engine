@@ -1,0 +1,11 @@
+{
+  "src/llama-context.cpp": "328a39931442312f8a5214f70c9dc2d6dfef9b85d01484981a6812f9e1734bf0",
+  "src/llama-context.h": "4a90d0f48eebe5da81db332d69bfe8b243909885e0bdc022f6e043c120e88bc9",
+  "src/llama-graph.cpp": "94cb55a195bec093540afc8ba1996401c38e5bade8e94f806b50ea8f72eabf5d",
+  "src/llama-graph.h": "a8cc19b5716abf1d2d4296f104f265a7c4f9faea9a2c5aba5ff6d9703cafa3f4",
+  "src/models/gemma4.cpp": "e8cd105b86dea86b4c2dd89e355293c8d94734d5be936b7f36d6acc361b07bb9",
+  "examples/qlora_training/finetune_qat.cpp": "3488127d18d512eed25f54b85cc0f8e377056a57b4589a6fce34bb523e03e8ad",
+  "examples/qlora_training/test-logit-distillation.cpp": "853aae8348f1f26d4fbe0169b28c7d59ce5ef16b9886b83ccc3933681581b0dc",
+  "examples/qlora_training/test_qlion_integration.py": "86d4e1de5482bb35e53e9e91fbdd6ea8ab6bc08a610f3a41fe8dffd460aa77c9",
+  "examples/qlora_training/README.md": "427e4c79a33b03d3fe739d50262853a35396d096c6c6529d38929dc3904dc773"
+}

@@ -1,0 +1,20 @@
+{
+  "state": "running",
+  "current": 104,
+  "validation": {
+    "step": 104,
+    "loss": 2.59529904,
+    "accuracy": 25.7541,
+    "accuracy_estimated": false,
+    "accuracy_error_pp": null
+  },
+  "validation_history": [
+    {
+      "step": 104,
+      "loss": 2.59529904,
+      "accuracy": 25.7541,
+      "accuracy_estimated": false,
+      "accuracy_error_pp": null
+    }
+  ]
+}

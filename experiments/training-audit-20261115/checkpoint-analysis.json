@@ -1,0 +1,71 @@
+[
+  {
+    "tensor": "blk.11.attn_q.weight",
+    "changed_bytes_96_to_100": 1,
+    "bytes": 12976128,
+    "momentum_nonzero_sample": 0.9820696721311475,
+    "qlion2_factor_sample_median": 0.010068742495628858,
+    "residual_abs_sample_median": 3.4394386716485315e-07
+  },
+  {
+    "tensor": "blk.11.attn_output.weight",
+    "changed_bytes_96_to_100": 38776,
+    "bytes": 24510464,
+    "momentum_nonzero_sample": 0.9863684960798289,
+    "qlion2_factor_sample_median": 0.11675477268416203,
+    "residual_abs_sample_median": 7.887388164817821e-06
+  },
+  {
+    "tensor": "blk.17.attn_q.weight",
+    "changed_bytes_96_to_100": 1,
+    "bytes": 12976128,
+    "momentum_nonzero_sample": 0.9707991803278688,
+    "qlion2_factor_sample_median": 0.007823405861390173,
+    "residual_abs_sample_median": 3.1146578294283245e-07
+  },
+  {
+    "tensor": "blk.17.attn_output.weight",
+    "changed_bytes_96_to_100": 79883,
+    "bytes": 24510464,
+    "momentum_nonzero_sample": 0.9862014433357092,
+    "qlion2_factor_sample_median": 0.2510583065608777,
+    "residual_abs_sample_median": 1.839709875639528e-05
+  },
+  {
+    "tensor": "blk.23.attn_q.weight",
+    "changed_bytes_96_to_100": 27,
+    "bytes": 12976128,
+    "momentum_nonzero_sample": 0.9678590520313614,
+    "qlion2_factor_sample_median": 0.010935512594259778,
+    "residual_abs_sample_median": 5.189062335375638e-07
+  },
+  {
+    "tensor": "blk.23.attn_output.weight",
+    "changed_bytes_96_to_100": 26560,
+    "bytes": 12976128,
+    "momentum_nonzero_sample": 0.9861123485388453,
+    "qlion2_factor_sample_median": 0.4056689740378844,
+    "residual_abs_sample_median": 3.204558015568182e-05
+  },
+  {
+    "tensor": "blk.29.attn_q.weight",
+    "changed_bytes_96_to_100": 635,
+    "bytes": 12976128,
+    "momentum_nonzero_sample": 0.9688613684960798,
+    "qlion2_factor_sample_median": 0.034581467084584316,
+    "residual_abs_sample_median": 1.9977715055574663e-06
+  },
+  {
+    "tensor": "blk.29.attn_output.weight",
+    "changed_bytes_96_to_100": 39553,
+    "bytes": 12976128,
+    "momentum_nonzero_sample": 0.9851768531717747,
+    "qlion2_factor_sample_median": 0.644278510041691,
+    "residual_abs_sample_median": 5.494000652106479e-05
+  },
+  {
+    "tensor": "blk.5.attn_k.weight",
+    "changed_bytes_96_to_100": 0,
+    "bytes": 1622016
+  }
+]

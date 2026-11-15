@@ -1,0 +1,15 @@
+--- finetune-recovery.cpp
++++ finetune-recovery.cpp
+@@ -914,8 +914,10 @@
+     if (!status.complete || status.step == g_joint_reported) return;
+     g_joint_reported = status.step;
+     qat_flush_async_checkpoint(true);
+-    LOG_INF("validation: step=%ld epoch=%ld loss=%.8f\n",
+-        (long) status.step, (long) (g_qat_callback->epoch + 1), status.loss);
++    const double accuracy = status.supervised > 0 ? double(status.correct) / status.supervised : NAN;
++    LOG_INF("validation: step=%ld epoch=%ld loss=%.8f acc=%.4f%% correct=%ld supervised=%ld\n",
++        (long) status.step, (long) (g_qat_callback->epoch + 1), status.loss, 100.0 * accuracy,
++        (long) status.correct, (long) status.supervised);
+     LOG_INF("joint_validation: completed snapshot_step=%ld current_step=%ld windows=%ld paired_projections=%d\n",
+         (long) status.step, (long) llama_opt_step(g_qat_callback->lctx), (long) status.windows, status.paired_projections);
+     qat_guard_validation(status.loss, status.step);
