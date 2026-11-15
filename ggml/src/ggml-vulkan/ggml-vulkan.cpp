@@ -16220,6 +16220,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 (op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_Q8_KV) &&
                 ggml_nbytes(op->src[3])/2 <= UINT32_MAX;
         case GGML_OP_FLASH_ATTN_BACK: {
+            const int32_t grad_flags = ggml_get_op_params_i32(op, 5);
+            if ((grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) &&
+                !(grad_flags & (GGML_FLASH_ATTN_BACK_GRAD_K | GGML_FLASH_ATTN_BACK_GRAD_V | GGML_FLASH_ATTN_BACK_GRAD_SINKS))) {
+                return false;
+            }
             if (!device->shader_atomic_float || ggml_nbytes(op) > UINT32_MAX) {
                 return false;
             }

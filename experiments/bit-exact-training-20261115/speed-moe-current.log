@@ -1,0 +1,1636 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 16144 MiB):
+  Device 0: Tesla V100-SXM2-16GB, compute capability 7.0, VMM: yes, VRAM: 16144 MiB
+ggml_vulkan: Found 3 Vulkan devices:
+ggml_vulkan: 0 = Quadro P620 (NVIDIA) | uma: 0 | fp16: 0 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+ggml_vulkan: 1 = Tesla V100-SXM2-16GB (NVIDIA) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+ggml_vulkan: 2 = Tesla V100-SXM2-16GB (NVIDIA) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+DEPRECATED: argument '--optimizer' specified multiple times, use comma-separated values instead (only last value will be used)
+DEPRECATED: argument '-c' specified multiple times, use comma-separated values instead (only last value will be used)
+DEPRECATED: argument '-b' specified multiple times, use comma-separated values instead (only last value will be used)
+DEPRECATED: argument '-ub' specified multiple times, use comma-separated values instead (only last value will be used)
+DEPRECATED: argument '--learning-rate' specified multiple times, use comma-separated values instead (only last value will be used)
+optimizer=qlion_qat lr_scale_unit=0 tau=0.00100000005 lr_scale_warmup=0
+memory_estimate: base_quantized=4973896 momentum_q8_0=1392640 residual_q4_0=737280 gradient_q8_0=1392640 nonquantized_model=280 persistent_qat=8496456
+0.00.006.322 I cmn  common_init_: fitting params to device memory ...
+0.00.006.323 I cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.006.337 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.008.410 I llama_model_loader: loaded meta data with 42 key-value pairs and 128 tensors from /mnt/openwebui/AIKAR/QLion2-test/artifacts/gemma4-tiny-moe-q4.gguf (version GGUF V3 (latest))
+0.00.008.435 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.008.443 I llama_model_loader: - kv   0:                       general.architecture str              = gemma4
+0.00.008.445 I llama_model_loader: - kv   1:                               general.name str              = Gemma 4 Tiny Dense random initialization
+0.00.008.447 I llama_model_loader: - kv   2:               general.quantization_version u32              = 2
+0.00.008.447 I llama_model_loader: - kv   3:                          general.file_type u32              = 2
+0.00.008.448 I llama_model_loader: - kv   4:                      gemma4.context_length u32              = 512
+0.00.008.448 I llama_model_loader: - kv   5:                    gemma4.embedding_length u32              = 256
+0.00.008.460 I llama_model_loader: - kv   6:                         gemma4.block_count u32              = 6
+0.00.008.460 I llama_model_loader: - kv   7:                 gemma4.feed_forward_length u32              = 384
+0.00.008.461 I llama_model_loader: - kv   8:                gemma4.attention.head_count u32              = 4
+0.00.008.466 I llama_model_loader: - kv   9:             gemma4.attention.head_count_kv arr[i32,6]       = [2, 2, 2, 2, 2, 2]
+0.00.008.466 I llama_model_loader: - kv  10:                gemma4.attention.key_length u32              = 128
+0.00.008.492 I llama_model_loader: - kv  11:              gemma4.attention.value_length u32              = 128
+0.00.008.494 I llama_model_loader: - kv  12:            gemma4.attention.key_length_swa u32              = 64
+0.00.008.495 I llama_model_loader: - kv  13:          gemma4.attention.value_length_swa u32              = 64
+0.00.008.498 I llama_model_loader: - kv  14:    gemma4.attention.layer_norm_rms_epsilon f32              = 0.000001
+0.00.008.500 I llama_model_loader: - kv  15:             gemma4.final_logit_softcapping f32              = 30.000000
+0.00.008.500 I llama_model_loader: - kv  16:    gemma4.embedding_length_per_layer_input u32              = 0
+0.00.008.501 I llama_model_loader: - kv  17:          gemma4.attention.shared_kv_layers u32              = 0
+0.00.008.501 I llama_model_loader: - kv  18:            gemma4.attention.sliding_window u32              = 512
+0.00.008.503 I llama_model_loader: - kv  19:    gemma4.attention.sliding_window_pattern arr[bool,6]      = [true, true, true, true, true, false]
+0.00.008.505 I llama_model_loader: - kv  20:                      gemma4.rope.freq_base f32              = 1000000.000000
+0.00.008.505 I llama_model_loader: - kv  21:                  gemma4.rope.freq_base_swa f32              = 10000.000000
+0.00.008.506 I llama_model_loader: - kv  22:                gemma4.rope.dimension_count u32              = 128
+0.00.008.506 I llama_model_loader: - kv  23:            gemma4.rope.dimension_count_swa u32              = 64
+0.00.008.507 I llama_model_loader: - kv  24:                       tokenizer.ggml.model str              = gemma4
+0.00.008.507 I llama_model_loader: - kv  25:                         tokenizer.ggml.pre str              = gemma4
+0.00.008.510 I llama_model_loader: - kv  26:                      tokenizer.ggml.tokens arr[str,8192]    = ["<pad>", "<eos>", "<bos>", "<unk>", ...
+0.00.008.512 I llama_model_loader: - kv  27:                  tokenizer.ggml.token_type arr[i32,8192]    = [3, 3, 3, 2, 4, 4, 4, 3, 3, 4, 3, 4, ...
+0.00.008.515 I llama_model_loader: - kv  28:                      tokenizer.ggml.scores arr[f32,8192]    = [0.000000, 0.000000, 0.000000, 0.0000...
+0.00.008.516 I llama_model_loader: - kv  29:                      tokenizer.ggml.merges arr[str,305]     = ["u r", "t ur", "tur n", "s ▁", "< ...
+0.00.008.517 I llama_model_loader: - kv  30:                tokenizer.ggml.bos_token_id u32              = 2
+0.00.008.518 I llama_model_loader: - kv  31:                tokenizer.ggml.eos_token_id u32              = 1
+0.00.008.518 I llama_model_loader: - kv  32:            tokenizer.ggml.unknown_token_id u32              = 3
+0.00.008.519 I llama_model_loader: - kv  33:            tokenizer.ggml.padding_token_id u32              = 0
+0.00.008.519 I llama_model_loader: - kv  34:                tokenizer.ggml.eot_token_id u32              = 8
+0.00.008.520 I llama_model_loader: - kv  35:               tokenizer.ggml.add_bos_token bool             = true
+0.00.008.520 I llama_model_loader: - kv  36:               tokenizer.ggml.add_eos_token bool             = false
+0.00.008.520 I llama_model_loader: - kv  37:            tokenizer.ggml.add_space_prefix bool             = false
+0.00.008.523 I llama_model_loader: - kv  38:                    tokenizer.chat_template str              = {%- macro format_parameters(propertie...
+0.00.008.524 I llama_model_loader: - kv  39:                        gemma4.expert_count u32              = 4
+0.00.008.524 I llama_model_loader: - kv  40:                   gemma4.expert_used_count u32              = 2
+0.00.008.525 I llama_model_loader: - kv  41:          gemma4.expert_feed_forward_length u32              = 96
+0.00.008.526 I llama_model_loader: - type  f32:    7 tensors
+0.00.008.527 I llama_model_loader: - type q4_0:   59 tensors
+0.00.008.527 I llama_model_loader: - type q8_0:   62 tensors
+0.00.008.529 I print_info: file format = GGUF V3 (latest)
+0.00.008.530 I print_info: file type   = Q4_0
+0.00.008.530 I print_info: file size   = 4.74 MiB (5.71 BPW) 
+0.00.137.057 I llama_prepare_model_devices: using device CUDA0 (Tesla V100-SXM2-16GB) (0000:02:00.0) - 15826 MiB free
+0.00.138.559 D init_tokenizer: initializing tokenizer for type 2
+0.00.139.914 I load: 0 unused tokens
+0.00.140.710 D load: control token:     18 '<|video|>' is not marked as EOG
+0.00.140.712 D load: control token:     17 '<|turn>' is not marked as EOG
+0.00.140.732 D load: control token:     14 '<|tool>' is not marked as EOG
+0.00.140.732 D load: control token:     13 '<|think|>' is not marked as EOG
+0.00.140.733 D load: control token:     12 '<|image|>' is not marked as EOG
+0.00.140.733 D load: control token:     10 '<|audio|>' is not marked as EOG
+0.00.140.734 D load: control token:      7 '<tool|>' is not marked as EOG
+0.00.140.735 D load: control token:      2 '<bos>' is not marked as EOG
+0.00.140.736 D load: control token:      0 '<pad>' is not marked as EOG
+0.00.140.820 I load: printing all EOG tokens:
+0.00.140.821 I load:   - 1 ('<eos>')
+0.00.140.821 I load:   - 8 ('<turn|>')
+0.00.140.821 I load:   - 16 ('<|tool_response>')
+0.00.140.837 I load: special tokens cache size = 19
+0.00.141.251 I load: token to piece cache size = 0.0031 MB
+0.00.141.272 I print_info: arch                  = gemma4
+0.00.141.273 I print_info: vocab_only            = 0
+0.00.141.273 I print_info: no_alloc              = 1
+0.00.141.273 I print_info: n_ctx_train           = 512
+0.00.141.274 I print_info: n_embd_inp            = 256
+0.00.141.274 I print_info: n_embd                = 256
+0.00.141.275 I print_info: n_embd_out            = 256
+0.00.141.275 I print_info: n_layer               = 6
+0.00.141.276 I print_info: n_layer_all           = 6
+0.00.141.295 I print_info: n_head                = 4
+0.00.141.296 I print_info: n_head_kv             = 2
+0.00.141.297 I print_info: n_rot                 = 128
+0.00.141.297 I print_info: n_swa                 = 512
+0.00.141.298 I print_info: is_swa_any            = 1
+0.00.141.299 I print_info: non_causal_type       = 1
+0.00.141.299 I print_info: n_embd_head_k         = 128
+0.00.141.299 I print_info: n_embd_head_v         = 128
+0.00.141.300 I print_info: n_gqa                 = 2
+0.00.141.306 I print_info: n_embd_k_gqa          = [128, 128, 128, 128, 128, 256]
+0.00.141.308 I print_info: n_embd_v_gqa          = [128, 128, 128, 128, 128, 256]
+0.00.141.309 I print_info: f_norm_eps            = 0.0e+00
+0.00.141.310 I print_info: f_norm_rms_eps        = 1.0e-06
+0.00.141.310 I print_info: f_clamp_kqv           = 0.0e+00
+0.00.141.311 I print_info: f_max_alibi_bias      = 0.0e+00
+0.00.141.311 I print_info: f_logit_scale         = 0.0e+00
+0.00.141.311 I print_info: f_attn_scale          = 1.0e+00
+0.00.141.311 I print_info: f_attn_value_scale    = 0.0000
+0.00.141.313 I print_info: n_ff                  = 384
+0.00.141.313 I print_info: n_expert              = 4
+0.00.141.314 I print_info: n_expert_used         = 2
+0.00.141.314 I print_info: n_expert_groups       = 0
+0.00.141.314 I print_info: n_group_used          = 0
+0.00.141.314 I print_info: causal attn           = 1
+0.00.141.314 I print_info: pooling type          = -1
+0.00.141.315 I print_info: rope type             = 2
+0.00.141.315 I print_info: rope scaling          = linear
+0.00.141.316 I print_info: freq_base_train       = 1000000.0
+0.00.141.316 I print_info: freq_scale_train      = 1
+0.00.141.317 I print_info: freq_base_swa         = 10000.0
+0.00.141.317 I print_info: freq_scale_swa        = 1
+0.00.141.317 I print_info: n_embd_head_k_swa     = 64
+0.00.141.318 I print_info: n_embd_head_v_swa     = 64
+0.00.141.318 I print_info: n_rot_swa             = 64
+0.00.141.318 I print_info: n_ctx_orig_yarn       = 512
+0.00.141.318 I print_info: rope_yarn_log_mul     = 0.0000
+0.00.141.319 I print_info: rope_finetuned        = unknown
+0.00.141.319 I print_info: model type            = ?B
+0.00.141.320 I print_info: model params          = 6.97 M
+0.00.141.320 I print_info: general.name          = Gemma 4 Tiny Dense random initialization
+0.00.141.323 I print_info: vocab type            = BPE
+0.00.141.324 I print_info: n_vocab               = 8192
+0.00.141.324 I print_info: n_merges              = 305
+0.00.141.324 I print_info: BOS token             = 2 '<bos>'
+0.00.141.325 I print_info: EOS token             = 1 '<eos>'
+0.00.141.325 I print_info: EOT token             = 8 '<turn|>'
+0.00.141.325 I print_info: UNK token             = 3 '<unk>'
+0.00.141.325 I print_info: PAD token             = 0 '<pad>'
+0.00.141.326 I print_info: LF token              = 19 '
+'
+0.00.141.326 I print_info: EOG token             = 1 '<eos>'
+0.00.141.327 I print_info: EOG token             = 8 '<turn|>'
+0.00.141.327 I print_info: EOG token             = 16 '<|tool_response>'
+0.00.141.327 I print_info: max token length      = 94
+0.00.141.580 I load_tensors: loading model tensors, this can take a while... (load_mode = none)
+0.00.142.022 D load_tensors: layer   0 assigned to device CUDA0, is_swa = 1
+0.00.142.025 D load_tensors: layer   0 assigned to device CUDA0, is_swa = 1
+0.00.142.026 D load_tensors: layer   1 assigned to device CUDA0, is_swa = 1
+0.00.142.026 D load_tensors: layer   2 assigned to device CUDA0, is_swa = 1
+0.00.142.026 D load_tensors: layer   3 assigned to device CUDA0, is_swa = 1
+0.00.142.026 D load_tensors: layer   4 assigned to device CUDA0, is_swa = 1
+0.00.142.027 D load_tensors: layer   5 assigned to device CUDA0, is_swa = 0
+0.00.142.027 D load_tensors: layer   6 assigned to device CUDA0, is_swa = 0
+0.00.142.050 D create_tensor: loading tensor output.weight
+0.00.142.058 D create_tensor: loading tensor token_embd.weight
+0.00.142.087 D create_tensor: loading tensor token_embd.weight
+0.00.142.094 D create_tensor: loading tensor output_norm.weight
+0.00.142.103 D create_tensor: loading tensor blk.0.attn_norm.weight
+0.00.142.107 D create_tensor: loading tensor blk.0.attn_qkv.weight
+0.00.142.110 D create_tensor: loading tensor blk.0.attn_q.weight
+0.00.142.113 D create_tensor: loading tensor blk.0.attn_k.weight
+0.00.142.116 D create_tensor: loading tensor blk.0.attn_v.weight
+0.00.142.119 D create_tensor: loading tensor blk.0.attn_output.weight
+0.00.142.122 D create_tensor: loading tensor blk.0.attn_q_norm.weight
+0.00.142.126 D create_tensor: loading tensor blk.0.attn_k_norm.weight
+0.00.142.130 D create_tensor: loading tensor blk.0.post_attention_norm.weight
+0.00.142.136 D create_tensor: loading tensor blk.0.layer_output_scale.weight
+0.00.142.139 D create_tensor: loading tensor blk.0.ffn_norm.weight
+0.00.142.143 D create_tensor: loading tensor blk.0.ffn_gate.weight
+0.00.142.147 D create_tensor: loading tensor blk.0.ffn_up.weight
+0.00.142.150 D create_tensor: loading tensor blk.0.ffn_down.weight
+0.00.142.153 D create_tensor: loading tensor blk.0.post_ffw_norm.weight
+0.00.142.156 D create_tensor: loading tensor blk.0.ffn_gate_inp.weight
+0.00.142.160 D create_tensor: loading tensor blk.0.ffn_gate_inp.scale
+0.00.142.163 D create_tensor: loading tensor blk.0.pre_ffw_norm_2.weight
+0.00.142.166 D create_tensor: loading tensor blk.0.post_ffw_norm_1.weight
+0.00.142.169 D create_tensor: loading tensor blk.0.post_ffw_norm_2.weight
+0.00.142.174 D create_tensor: loading tensor blk.0.ffn_gate_up_exps.weight
+0.00.142.180 D create_tensor: loading tensor blk.0.ffn_down_exps.weight
+0.00.142.184 D create_tensor: loading tensor blk.1.attn_norm.weight
+0.00.142.187 D create_tensor: loading tensor blk.1.attn_qkv.weight
+0.00.142.190 D create_tensor: loading tensor blk.1.attn_q.weight
+0.00.142.193 D create_tensor: loading tensor blk.1.attn_k.weight
+0.00.142.196 D create_tensor: loading tensor blk.1.attn_v.weight
+0.00.142.199 D create_tensor: loading tensor blk.1.attn_output.weight
+0.00.142.202 D create_tensor: loading tensor blk.1.attn_q_norm.weight
+0.00.142.206 D create_tensor: loading tensor blk.1.attn_k_norm.weight
+0.00.142.209 D create_tensor: loading tensor blk.1.post_attention_norm.weight
+0.00.142.212 D create_tensor: loading tensor blk.1.layer_output_scale.weight
+0.00.142.217 D create_tensor: loading tensor blk.1.ffn_norm.weight
+0.00.142.221 D create_tensor: loading tensor blk.1.ffn_gate.weight
+0.00.142.224 D create_tensor: loading tensor blk.1.ffn_up.weight
+0.00.142.227 D create_tensor: loading tensor blk.1.ffn_down.weight
+0.00.142.230 D create_tensor: loading tensor blk.1.post_ffw_norm.weight
+0.00.142.234 D create_tensor: loading tensor blk.1.ffn_gate_inp.weight
+0.00.142.237 D create_tensor: loading tensor blk.1.ffn_gate_inp.scale
+0.00.142.240 D create_tensor: loading tensor blk.1.pre_ffw_norm_2.weight
+0.00.142.243 D create_tensor: loading tensor blk.1.post_ffw_norm_1.weight
+0.00.142.246 D create_tensor: loading tensor blk.1.post_ffw_norm_2.weight
+0.00.142.250 D create_tensor: loading tensor blk.1.ffn_gate_up_exps.weight
+0.00.142.255 D create_tensor: loading tensor blk.1.ffn_down_exps.weight
+0.00.142.258 D create_tensor: loading tensor blk.2.attn_norm.weight
+0.00.142.262 D create_tensor: loading tensor blk.2.attn_qkv.weight
+0.00.142.264 D create_tensor: loading tensor blk.2.attn_q.weight
+0.00.142.267 D create_tensor: loading tensor blk.2.attn_k.weight
+0.00.142.270 D create_tensor: loading tensor blk.2.attn_v.weight
+0.00.142.273 D create_tensor: loading tensor blk.2.attn_output.weight
+0.00.142.276 D create_tensor: loading tensor blk.2.attn_q_norm.weight
+0.00.142.280 D create_tensor: loading tensor blk.2.attn_k_norm.weight
+0.00.142.283 D create_tensor: loading tensor blk.2.post_attention_norm.weight
+0.00.142.286 D create_tensor: loading tensor blk.2.layer_output_scale.weight
+0.00.142.289 D create_tensor: loading tensor blk.2.ffn_norm.weight
+0.00.142.294 D create_tensor: loading tensor blk.2.ffn_gate.weight
+0.00.142.297 D create_tensor: loading tensor blk.2.ffn_up.weight
+0.00.142.300 D create_tensor: loading tensor blk.2.ffn_down.weight
+0.00.142.303 D create_tensor: loading tensor blk.2.post_ffw_norm.weight
+0.00.142.307 D create_tensor: loading tensor blk.2.ffn_gate_inp.weight
+0.00.142.310 D create_tensor: loading tensor blk.2.ffn_gate_inp.scale
+0.00.142.313 D create_tensor: loading tensor blk.2.pre_ffw_norm_2.weight
+0.00.142.317 D create_tensor: loading tensor blk.2.post_ffw_norm_1.weight
+0.00.142.320 D create_tensor: loading tensor blk.2.post_ffw_norm_2.weight
+0.00.142.323 D create_tensor: loading tensor blk.2.ffn_gate_up_exps.weight
+0.00.142.327 D create_tensor: loading tensor blk.2.ffn_down_exps.weight
+0.00.142.332 D create_tensor: loading tensor blk.3.attn_norm.weight
+0.00.142.335 D create_tensor: loading tensor blk.3.attn_qkv.weight
+0.00.142.338 D create_tensor: loading tensor blk.3.attn_q.weight
+0.00.142.347 D create_tensor: loading tensor blk.3.attn_k.weight
+0.00.142.361 D create_tensor: loading tensor blk.3.attn_v.weight
+0.00.142.365 D create_tensor: loading tensor blk.3.attn_output.weight
+0.00.142.368 D create_tensor: loading tensor blk.3.attn_q_norm.weight
+0.00.142.372 D create_tensor: loading tensor blk.3.attn_k_norm.weight
+0.00.142.375 D create_tensor: loading tensor blk.3.post_attention_norm.weight
+0.00.142.379 D create_tensor: loading tensor blk.3.layer_output_scale.weight
+0.00.142.383 D create_tensor: loading tensor blk.3.ffn_norm.weight
+0.00.142.387 D create_tensor: loading tensor blk.3.ffn_gate.weight
+0.00.142.392 D create_tensor: loading tensor blk.3.ffn_up.weight
+0.00.142.396 D create_tensor: loading tensor blk.3.ffn_down.weight
+0.00.142.399 D create_tensor: loading tensor blk.3.post_ffw_norm.weight
+0.00.142.403 D create_tensor: loading tensor blk.3.ffn_gate_inp.weight
+0.00.142.406 D create_tensor: loading tensor blk.3.ffn_gate_inp.scale
+0.00.142.409 D create_tensor: loading tensor blk.3.pre_ffw_norm_2.weight
+0.00.142.413 D create_tensor: loading tensor blk.3.post_ffw_norm_1.weight
+0.00.142.416 D create_tensor: loading tensor blk.3.post_ffw_norm_2.weight
+0.00.142.420 D create_tensor: loading tensor blk.3.ffn_gate_up_exps.weight
+0.00.142.423 D create_tensor: loading tensor blk.3.ffn_down_exps.weight
+0.00.142.427 D create_tensor: loading tensor blk.4.attn_norm.weight
+0.00.142.431 D create_tensor: loading tensor blk.4.attn_qkv.weight
+0.00.142.433 D create_tensor: loading tensor blk.4.attn_q.weight
+0.00.142.439 D create_tensor: loading tensor blk.4.attn_k.weight
+0.00.142.442 D create_tensor: loading tensor blk.4.attn_v.weight
+0.00.142.445 D create_tensor: loading tensor blk.4.attn_output.weight
+0.00.142.449 D create_tensor: loading tensor blk.4.attn_q_norm.weight
+0.00.142.452 D create_tensor: loading tensor blk.4.attn_k_norm.weight
+0.00.142.456 D create_tensor: loading tensor blk.4.post_attention_norm.weight
+0.00.142.460 D create_tensor: loading tensor blk.4.layer_output_scale.weight
+0.00.142.463 D create_tensor: loading tensor blk.4.ffn_norm.weight
+0.00.142.467 D create_tensor: loading tensor blk.4.ffn_gate.weight
+0.00.142.470 D create_tensor: loading tensor blk.4.ffn_up.weight
+0.00.142.474 D create_tensor: loading tensor blk.4.ffn_down.weight
+0.00.142.478 D create_tensor: loading tensor blk.4.post_ffw_norm.weight
+0.00.142.482 D create_tensor: loading tensor blk.4.ffn_gate_inp.weight
+0.00.142.486 D create_tensor: loading tensor blk.4.ffn_gate_inp.scale
+0.00.142.489 D create_tensor: loading tensor blk.4.pre_ffw_norm_2.weight
+0.00.142.493 D create_tensor: loading tensor blk.4.post_ffw_norm_1.weight
+0.00.142.496 D create_tensor: loading tensor blk.4.post_ffw_norm_2.weight
+0.00.142.500 D create_tensor: loading tensor blk.4.ffn_gate_up_exps.weight
+0.00.142.504 D create_tensor: loading tensor blk.4.ffn_down_exps.weight
+0.00.142.507 D create_tensor: loading tensor blk.5.attn_norm.weight
+0.00.142.511 D create_tensor: loading tensor blk.5.attn_qkv.weight
+0.00.142.514 D create_tensor: loading tensor blk.5.attn_q.weight
+0.00.142.517 D create_tensor: loading tensor blk.5.attn_k.weight
+0.00.142.522 D create_tensor: loading tensor blk.5.attn_v.weight
+0.00.142.525 D create_tensor: loading tensor blk.5.attn_output.weight
+0.00.142.528 D create_tensor: loading tensor blk.5.attn_q_norm.weight
+0.00.142.532 D create_tensor: loading tensor blk.5.attn_k_norm.weight
+0.00.142.535 D create_tensor: loading tensor blk.5.post_attention_norm.weight
+0.00.142.539 D create_tensor: loading tensor blk.5.layer_output_scale.weight
+0.00.142.542 D create_tensor: loading tensor rope_freqs.weight
+0.00.142.548 D create_tensor: loading tensor blk.5.ffn_norm.weight
+0.00.142.552 D create_tensor: loading tensor blk.5.ffn_gate.weight
+0.00.142.556 D create_tensor: loading tensor blk.5.ffn_up.weight
+0.00.142.559 D create_tensor: loading tensor blk.5.ffn_down.weight
+0.00.142.562 D create_tensor: loading tensor blk.5.post_ffw_norm.weight
+0.00.142.568 D create_tensor: loading tensor blk.5.ffn_gate_inp.weight
+0.00.142.572 D create_tensor: loading tensor blk.5.ffn_gate_inp.scale
+0.00.142.575 D create_tensor: loading tensor blk.5.pre_ffw_norm_2.weight
+0.00.142.579 D create_tensor: loading tensor blk.5.post_ffw_norm_1.weight
+0.00.142.583 D create_tensor: loading tensor blk.5.post_ffw_norm_2.weight
+0.00.142.587 D create_tensor: loading tensor blk.5.ffn_gate_up_exps.weight
+0.00.142.591 D create_tensor: loading tensor blk.5.ffn_down_exps.weight
+0.00.142.594 D create_tensor: loading tensor blk.0.attn_q.scale
+0.00.142.596 D create_tensor: loading tensor blk.0.attn_k.scale
+0.00.142.599 D create_tensor: loading tensor blk.0.attn_v.scale
+0.00.142.601 D create_tensor: loading tensor blk.0.attn_output.scale
+0.00.142.603 D create_tensor: loading tensor blk.0.ffn_gate.scale
+0.00.142.606 D create_tensor: loading tensor blk.0.ffn_down.scale
+0.00.142.608 D create_tensor: loading tensor blk.0.ffn_up.scale
+0.00.142.610 D create_tensor: loading tensor blk.0.ffn_down_exps.scale
+0.00.142.612 D create_tensor: loading tensor blk.0.attn_q.input_scale
+0.00.142.614 D create_tensor: loading tensor blk.0.attn_k.input_scale
+0.00.142.616 D create_tensor: loading tensor blk.0.attn_v.input_scale
+0.00.142.618 D create_tensor: loading tensor blk.0.attn_output.input_scale
+0.00.142.621 D create_tensor: loading tensor blk.0.ffn_gate.input_scale
+0.00.142.623 D create_tensor: loading tensor blk.0.ffn_down.input_scale
+0.00.142.624 D create_tensor: loading tensor blk.0.ffn_up.input_scale
+0.00.142.627 D create_tensor: loading tensor blk.0.ffn_down_exps.input_scale
+0.00.142.629 D create_tensor: loading tensor blk.1.attn_q.scale
+0.00.142.631 D create_tensor: loading tensor blk.1.attn_k.scale
+0.00.142.633 D create_tensor: loading tensor blk.1.attn_v.scale
+0.00.142.636 D create_tensor: loading tensor blk.1.attn_output.scale
+0.00.142.638 D create_tensor: loading tensor blk.1.ffn_gate.scale
+0.00.142.640 D create_tensor: loading tensor blk.1.ffn_down.scale
+0.00.142.642 D create_tensor: loading tensor blk.1.ffn_up.scale
+0.00.142.645 D create_tensor: loading tensor blk.1.ffn_down_exps.scale
+0.00.142.647 D create_tensor: loading tensor blk.1.attn_q.input_scale
+0.00.142.649 D create_tensor: loading tensor blk.1.attn_k.input_scale
+0.00.142.651 D create_tensor: loading tensor blk.1.attn_v.input_scale
+0.00.142.653 D create_tensor: loading tensor blk.1.attn_output.input_scale
+0.00.142.656 D create_tensor: loading tensor blk.1.ffn_gate.input_scale
+0.00.142.658 D create_tensor: loading tensor blk.1.ffn_down.input_scale
+0.00.142.660 D create_tensor: loading tensor blk.1.ffn_up.input_scale
+0.00.142.662 D create_tensor: loading tensor blk.1.ffn_down_exps.input_scale
+0.00.142.665 D create_tensor: loading tensor blk.2.attn_q.scale
+0.00.142.667 D create_tensor: loading tensor blk.2.attn_k.scale
+0.00.142.669 D create_tensor: loading tensor blk.2.attn_v.scale
+0.00.142.672 D create_tensor: loading tensor blk.2.attn_output.scale
+0.00.142.674 D create_tensor: loading tensor blk.2.ffn_gate.scale
+0.00.142.676 D create_tensor: loading tensor blk.2.ffn_down.scale
+0.00.142.679 D create_tensor: loading tensor blk.2.ffn_up.scale
+0.00.142.681 D create_tensor: loading tensor blk.2.ffn_down_exps.scale
+0.00.142.683 D create_tensor: loading tensor blk.2.attn_q.input_scale
+0.00.142.685 D create_tensor: loading tensor blk.2.attn_k.input_scale
+0.00.142.688 D create_tensor: loading tensor blk.2.attn_v.input_scale
+0.00.142.690 D create_tensor: loading tensor blk.2.attn_output.input_scale
+0.00.142.703 D create_tensor: loading tensor blk.2.ffn_gate.input_scale
+0.00.142.705 D create_tensor: loading tensor blk.2.ffn_down.input_scale
+0.00.142.707 D create_tensor: loading tensor blk.2.ffn_up.input_scale
+0.00.142.709 D create_tensor: loading tensor blk.2.ffn_down_exps.input_scale
+0.00.142.712 D create_tensor: loading tensor blk.3.attn_q.scale
+0.00.142.714 D create_tensor: loading tensor blk.3.attn_k.scale
+0.00.142.716 D create_tensor: loading tensor blk.3.attn_v.scale
+0.00.142.718 D create_tensor: loading tensor blk.3.attn_output.scale
+0.00.142.720 D create_tensor: loading tensor blk.3.ffn_gate.scale
+0.00.142.722 D create_tensor: loading tensor blk.3.ffn_down.scale
+0.00.142.724 D create_tensor: loading tensor blk.3.ffn_up.scale
+0.00.142.727 D create_tensor: loading tensor blk.3.ffn_down_exps.scale
+0.00.142.729 D create_tensor: loading tensor blk.3.attn_q.input_scale
+0.00.142.731 D create_tensor: loading tensor blk.3.attn_k.input_scale
+0.00.142.733 D create_tensor: loading tensor blk.3.attn_v.input_scale
+0.00.142.735 D create_tensor: loading tensor blk.3.attn_output.input_scale
+0.00.142.737 D create_tensor: loading tensor blk.3.ffn_gate.input_scale
+0.00.142.740 D create_tensor: loading tensor blk.3.ffn_down.input_scale
+0.00.142.742 D create_tensor: loading tensor blk.3.ffn_up.input_scale
+0.00.142.744 D create_tensor: loading tensor blk.3.ffn_down_exps.input_scale
+0.00.142.746 D create_tensor: loading tensor blk.4.attn_q.scale
+0.00.142.748 D create_tensor: loading tensor blk.4.attn_k.scale
+0.00.142.751 D create_tensor: loading tensor blk.4.attn_v.scale
+0.00.142.753 D create_tensor: loading tensor blk.4.attn_output.scale
+0.00.142.755 D create_tensor: loading tensor blk.4.ffn_gate.scale
+0.00.142.758 D create_tensor: loading tensor blk.4.ffn_down.scale
+0.00.142.760 D create_tensor: loading tensor blk.4.ffn_up.scale
+0.00.142.762 D create_tensor: loading tensor blk.4.ffn_down_exps.scale
+0.00.142.765 D create_tensor: loading tensor blk.4.attn_q.input_scale
+0.00.142.767 D create_tensor: loading tensor blk.4.attn_k.input_scale
+0.00.142.770 D create_tensor: loading tensor blk.4.attn_v.input_scale
+0.00.142.772 D create_tensor: loading tensor blk.4.attn_output.input_scale
+0.00.142.774 D create_tensor: loading tensor blk.4.ffn_gate.input_scale
+0.00.142.777 D create_tensor: loading tensor blk.4.ffn_down.input_scale
+0.00.142.779 D create_tensor: loading tensor blk.4.ffn_up.input_scale
+0.00.142.781 D create_tensor: loading tensor blk.4.ffn_down_exps.input_scale
+0.00.142.784 D create_tensor: loading tensor blk.5.attn_q.scale
+0.00.142.786 D create_tensor: loading tensor blk.5.attn_k.scale
+0.00.142.789 D create_tensor: loading tensor blk.5.attn_output.scale
+0.00.142.791 D create_tensor: loading tensor blk.5.ffn_gate.scale
+0.00.142.794 D create_tensor: loading tensor blk.5.ffn_down.scale
+0.00.142.796 D create_tensor: loading tensor blk.5.ffn_up.scale
+0.00.142.798 D create_tensor: loading tensor blk.5.ffn_down_exps.scale
+0.00.142.801 D create_tensor: loading tensor blk.5.attn_q.input_scale
+0.00.142.803 D create_tensor: loading tensor blk.5.attn_k.input_scale
+0.00.142.806 D create_tensor: loading tensor blk.5.attn_output.input_scale
+0.00.142.808 D create_tensor: loading tensor blk.5.ffn_gate.input_scale
+0.00.142.811 D create_tensor: loading tensor blk.5.ffn_down.input_scale
+0.00.142.813 D create_tensor: loading tensor blk.5.ffn_up.input_scale
+0.00.142.815 D create_tensor: loading tensor blk.5.ffn_down_exps.input_scale
+0.00.143.158 I load_tensors: offloading output layer to GPU
+0.00.143.158 I load_tensors: offloading 5 repeating layers to GPU
+0.00.143.159 I load_tensors: offloaded 7/7 layers to GPU
+0.00.143.163 I load_tensors:        CUDA0 model buffer size =     0.00 MiB
+0.00.143.232 I llama_context: constructing llama_context
+0.00.143.235 I llama_context: n_seq_max             = 1
+0.00.143.235 I llama_context: n_ctx                 = 1024
+0.00.143.235 I llama_context: n_ctx_seq             = 1024
+0.00.143.235 I llama_context: n_batch               = 1024
+0.00.143.236 I llama_context: n_ubatch              = 512
+0.00.143.236 I llama_context: causal_attn           = 1
+0.00.143.237 I llama_context: flash_attn            = enabled
+0.00.143.237 I llama_context: kv_unified            = false
+0.00.143.237 I llama_context: global K Hadamard     = false
+0.00.143.237 I llama_context: global V Hadamard     = false
+0.00.143.238 I llama_context: local K Hadamard      = false
+0.00.143.238 I llama_context: local V Hadamard      = false
+0.00.143.240 I llama_context: freq_base             = 1000000.0
+0.00.143.240 I llama_context: freq_scale            = 1
+0.00.143.240 I llama_context: n_rs_seq              = 0
+0.00.143.241 I llama_context: n_outputs_max         = 1024
+0.00.143.241 I llama_context: n_outputs_max_per_seq = 1
+0.00.143.241 W llama_context: n_ctx_seq (1024) > n_ctx_train (512) -- possible training context overflow
+0.00.155.928 D set_abort_callback: call
+0.00.156.926 I llama_context:  CUDA_Host  output buffer size =     0.03 MiB
+0.00.156.953 I llama_kv_cache_iswa: creating non-SWA KV cache, size = 1024 cells
+0.00.156.980 D llama_kv_cache: layer   0: filtered
+0.00.156.981 D llama_kv_cache: layer   1: filtered
+0.00.156.981 D llama_kv_cache: layer   2: filtered
+0.00.156.983 D llama_kv_cache: layer   3: filtered
+0.00.156.984 D llama_kv_cache: layer   4: filtered
+0.00.157.136 D llama_kv_cache: layer   5: dev = CUDA0
+0.00.157.151 D llama_kv_cache: reusing layers:
+0.00.157.152 D llama_kv_cache: - layer   0: no reuse
+0.00.157.152 D llama_kv_cache: - layer   1: no reuse
+0.00.157.152 D llama_kv_cache: - layer   2: no reuse
+0.00.157.152 D llama_kv_cache: - layer   3: no reuse
+0.00.157.153 D llama_kv_cache: - layer   4: no reuse
+0.00.157.153 D llama_kv_cache: - layer   5: no reuse
+0.00.157.155 I llama_kv_cache:      CUDA0 KV buffer size =     0.00 MiB
+0.00.157.159 I llama_kv_cache: size =    2.00 MiB (  1024 cells,   1 layers,  1/1 seqs), K (f32):    1.00 MiB, V (f32):    1.00 MiB
+0.00.157.161 I llama_kv_cache: FP16 equivalent = 1.00 MiB, compression ratio = 0.500x (K 0.500x, V 0.500x)
+0.00.157.164 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 128
+0.00.157.164 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 128
+0.00.157.165 I llama_kv_cache_iswa: creating     SWA KV cache, size = 1024 cells
+0.00.157.283 D llama_kv_cache: layer   0: dev = CUDA0
+0.00.157.408 D llama_kv_cache: layer   1: dev = CUDA0
+0.00.157.510 D llama_kv_cache: layer   2: dev = CUDA0
+0.00.157.609 D llama_kv_cache: layer   3: dev = CUDA0
+0.00.157.720 D llama_kv_cache: layer   4: dev = CUDA0
+0.00.157.723 D llama_kv_cache: layer   5: filtered
+0.00.157.723 D llama_kv_cache: reusing layers:
+0.00.157.724 D llama_kv_cache: - layer   0: no reuse
+0.00.157.724 D llama_kv_cache: - layer   1: no reuse
+0.00.157.724 D llama_kv_cache: - layer   2: no reuse
+0.00.157.724 D llama_kv_cache: - layer   3: no reuse
+0.00.157.725 D llama_kv_cache: - layer   4: no reuse
+0.00.157.725 D llama_kv_cache: - layer   5: no reuse
+0.00.157.727 I llama_kv_cache:      CUDA0 KV buffer size =     0.00 MiB
+0.00.157.728 I llama_kv_cache: size =    5.00 MiB (  1024 cells,   5 layers,  1/1 seqs), K (f32):    2.50 MiB, V (f32):    2.50 MiB
+0.00.157.741 I llama_kv_cache: FP16 equivalent = 2.50 MiB, compression ratio = 0.500x (K 0.500x, V 0.500x)
+0.00.157.742 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 64
+0.00.157.742 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 64
+0.00.157.743 D llama_context: enumerating backends
+0.00.157.852 D llama_context: backend_ptrs.size() = 2
+0.00.157.854 I sched_reserve: reserving ...
+0.00.157.856 D sched_reserve: max_nodes = 20480
+0.00.162.661 D sched_reserve: reserving full memory module
+0.00.162.687 D sched_reserve: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 1
+0.00.162.688 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.00.162.691 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.163.145 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.163.148 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.163.149 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.163.150 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.163.151 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.163.151 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.163.152 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.163.164 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.163.165 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.163.166 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.163.167 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.163.168 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.163.169 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.163.169 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.163.170 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.163.171 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.163.172 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.163.172 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.163.173 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.163.174 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.163.175 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.163.175 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.163.176 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.163.177 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.163.178 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.163.179 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.163.180 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.163.180 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.163.181 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.163.182 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.163.183 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.163.184 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.163.185 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.163.185 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.163.186 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.163.187 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.163.188 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.163.480 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.00.163.481 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.163.738 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.163.742 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.163.743 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.163.744 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.163.744 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.163.745 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.163.746 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.163.747 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.163.748 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.163.748 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.163.749 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.163.750 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.163.751 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.163.752 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.163.752 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.163.753 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.163.754 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.163.755 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.163.756 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.163.756 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.163.757 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.163.758 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.163.759 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.163.759 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.163.760 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.163.761 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.163.762 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.163.763 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.163.764 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.163.764 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.163.765 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.163.766 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.163.767 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.163.768 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.163.768 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.163.769 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.163.770 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.163.940 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.00.163.941 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.164.157 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.164.160 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.164.161 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.164.162 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.164.163 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.164.164 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.164.165 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.164.165 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.164.166 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.164.167 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.164.168 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.164.169 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.164.170 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.164.170 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.164.171 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.164.172 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.164.173 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.164.173 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.164.174 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.164.175 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.164.176 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.164.176 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.164.177 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.164.178 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.164.179 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.164.180 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.164.180 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.164.181 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.164.182 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.164.183 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.164.184 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.164.184 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.164.185 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.164.186 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.164.187 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.164.187 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.164.188 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.164.373 I resolve_fused_ops: fused DeepSeek V4 HC post enabled
+0.00.164.375 D graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+0.00.164.610 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.164.613 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.164.614 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.164.615 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.164.616 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.164.617 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.164.617 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.164.618 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.164.619 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.164.620 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.164.621 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.164.622 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.164.623 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.164.623 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.164.624 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.164.625 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.164.626 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.164.627 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.164.627 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.164.628 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.164.629 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.164.630 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.164.631 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.164.631 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.164.632 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,   512,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.164.633 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.164.634 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.164.635 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {   512,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.164.636 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,   512,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.164.637 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.164.637 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.164.638 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.164.639 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.164.640 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.164.641 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.164.642 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.164.642 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.165.230 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.165.479 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.165.483 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.165.484 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.165.485 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.165.485 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.165.486 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.165.487 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.165.488 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.165.489 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.165.490 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.165.491 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.165.492 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.165.492 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.165.493 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.165.494 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.165.495 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.165.496 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.165.496 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.165.497 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.165.498 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.165.499 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.165.500 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.165.500 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.165.501 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.165.502 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.165.503 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.165.504 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.165.505 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.165.506 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.165.506 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.165.507 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.165.508 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.165.509 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.165.510 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.165.510 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.165.511 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.165.512 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.165.692 D graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+0.00.165.919 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.165.922 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.165.923 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.165.924 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.165.924 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.165.925 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.165.926 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.165.927 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.165.928 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.165.928 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.165.929 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.165.930 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.165.931 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.165.932 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.165.933 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.165.934 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.165.934 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.165.935 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.165.936 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.165.937 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.165.937 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.165.938 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.165.939 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.165.940 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.165.941 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,   512,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.165.942 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.165.942 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.165.943 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {   512,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.165.944 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,   512,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.165.945 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.165.946 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.165.947 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.165.947 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.165.948 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.165.949 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.165.950 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.165.951 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.166.131 I sched_reserve:      CUDA0 compute buffer size =    20.03 MiB
+0.00.166.132 I sched_reserve:  CUDA_Host compute buffer size =     3.03 MiB
+0.00.166.133 I sched_reserve: graph: nodes = 517, splits = 1, input objects = 4, input tensors = 13
+0.00.166.135 I sched_reserve: reserve took 8.28 ms, sched copies = 1
+0.00.166.615 I common_memory_breakdown_print: | memory breakdown [MiB]     | total    free    self   model   context   compute    unaccounted |
+0.00.166.618 I common_memory_breakdown_print: |   - CUDA0 (V100-SXM2-16GB) | 16144 = 15826 + (  33 =     6 +       7 +      20) +         283 |
+0.00.166.618 I common_memory_breakdown_print: |   - Host                   |                     3 =     0 +       0 +       3                |
+0.00.167.899 I common_params_fit_impl: projected to use 33 MiB of device memory vs. 15826 MiB of free device memory
+0.00.167.902 I common_params_fit_impl: will leave 15792 >= 1024 MiB of free device memory, no changes needed
+0.00.167.903 I common_fit_params: successfully fit params to free device memory
+0.00.167.905 I common_fit_params: fitting params to free memory took 0.16 seconds
+0.00.169.854 I llama_model_loader: loaded meta data with 42 key-value pairs and 128 tensors from /mnt/openwebui/AIKAR/QLion2-test/artifacts/gemma4-tiny-moe-q4.gguf (version GGUF V3 (latest))
+0.00.169.863 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.169.866 I llama_model_loader: - kv   0:                       general.architecture str              = gemma4
+0.00.169.867 I llama_model_loader: - kv   1:                               general.name str              = Gemma 4 Tiny Dense random initialization
+0.00.169.868 I llama_model_loader: - kv   2:               general.quantization_version u32              = 2
+0.00.169.868 I llama_model_loader: - kv   3:                          general.file_type u32              = 2
+0.00.169.869 I llama_model_loader: - kv   4:                      gemma4.context_length u32              = 512
+0.00.169.870 I llama_model_loader: - kv   5:                    gemma4.embedding_length u32              = 256
+0.00.169.870 I llama_model_loader: - kv   6:                         gemma4.block_count u32              = 6
+0.00.169.871 I llama_model_loader: - kv   7:                 gemma4.feed_forward_length u32              = 384
+0.00.169.871 I llama_model_loader: - kv   8:                gemma4.attention.head_count u32              = 4
+0.00.169.873 I llama_model_loader: - kv   9:             gemma4.attention.head_count_kv arr[i32,6]       = [2, 2, 2, 2, 2, 2]
+0.00.169.874 I llama_model_loader: - kv  10:                gemma4.attention.key_length u32              = 128
+0.00.169.874 I llama_model_loader: - kv  11:              gemma4.attention.value_length u32              = 128
+0.00.169.875 I llama_model_loader: - kv  12:            gemma4.attention.key_length_swa u32              = 64
+0.00.169.875 I llama_model_loader: - kv  13:          gemma4.attention.value_length_swa u32              = 64
+0.00.169.877 I llama_model_loader: - kv  14:    gemma4.attention.layer_norm_rms_epsilon f32              = 0.000001
+0.00.169.879 I llama_model_loader: - kv  15:             gemma4.final_logit_softcapping f32              = 30.000000
+0.00.169.879 I llama_model_loader: - kv  16:    gemma4.embedding_length_per_layer_input u32              = 0
+0.00.169.880 I llama_model_loader: - kv  17:          gemma4.attention.shared_kv_layers u32              = 0
+0.00.169.880 I llama_model_loader: - kv  18:            gemma4.attention.sliding_window u32              = 512
+0.00.169.882 I llama_model_loader: - kv  19:    gemma4.attention.sliding_window_pattern arr[bool,6]      = [true, true, true, true, true, false]
+0.00.169.883 I llama_model_loader: - kv  20:                      gemma4.rope.freq_base f32              = 1000000.000000
+0.00.169.884 I llama_model_loader: - kv  21:                  gemma4.rope.freq_base_swa f32              = 10000.000000
+0.00.169.885 I llama_model_loader: - kv  22:                gemma4.rope.dimension_count u32              = 128
+0.00.169.885 I llama_model_loader: - kv  23:            gemma4.rope.dimension_count_swa u32              = 64
+0.00.169.886 I llama_model_loader: - kv  24:                       tokenizer.ggml.model str              = gemma4
+0.00.169.886 I llama_model_loader: - kv  25:                         tokenizer.ggml.pre str              = gemma4
+0.00.169.888 I llama_model_loader: - kv  26:                      tokenizer.ggml.tokens arr[str,8192]    = ["<pad>", "<eos>", "<bos>", "<unk>", ...
+0.00.169.890 I llama_model_loader: - kv  27:                  tokenizer.ggml.token_type arr[i32,8192]    = [3, 3, 3, 2, 4, 4, 4, 3, 3, 4, 3, 4, ...
+0.00.169.893 I llama_model_loader: - kv  28:                      tokenizer.ggml.scores arr[f32,8192]    = [0.000000, 0.000000, 0.000000, 0.0000...
+0.00.169.894 I llama_model_loader: - kv  29:                      tokenizer.ggml.merges arr[str,305]     = ["u r", "t ur", "tur n", "s ▁", "< ...
+0.00.169.895 I llama_model_loader: - kv  30:                tokenizer.ggml.bos_token_id u32              = 2
+0.00.169.895 I llama_model_loader: - kv  31:                tokenizer.ggml.eos_token_id u32              = 1
+0.00.169.896 I llama_model_loader: - kv  32:            tokenizer.ggml.unknown_token_id u32              = 3
+0.00.169.896 I llama_model_loader: - kv  33:            tokenizer.ggml.padding_token_id u32              = 0
+0.00.169.897 I llama_model_loader: - kv  34:                tokenizer.ggml.eot_token_id u32              = 8
+0.00.169.897 I llama_model_loader: - kv  35:               tokenizer.ggml.add_bos_token bool             = true
+0.00.169.898 I llama_model_loader: - kv  36:               tokenizer.ggml.add_eos_token bool             = false
+0.00.169.898 I llama_model_loader: - kv  37:            tokenizer.ggml.add_space_prefix bool             = false
+0.00.169.901 I llama_model_loader: - kv  38:                    tokenizer.chat_template str              = {%- macro format_parameters(propertie...
+0.00.169.901 I llama_model_loader: - kv  39:                        gemma4.expert_count u32              = 4
+0.00.169.902 I llama_model_loader: - kv  40:                   gemma4.expert_used_count u32              = 2
+0.00.169.902 I llama_model_loader: - kv  41:          gemma4.expert_feed_forward_length u32              = 96
+0.00.169.903 I llama_model_loader: - type  f32:    7 tensors
+0.00.169.903 I llama_model_loader: - type q4_0:   59 tensors
+0.00.169.903 I llama_model_loader: - type q8_0:   62 tensors
+0.00.169.904 I print_info: file format = GGUF V3 (latest)
+0.00.169.905 I print_info: file type   = Q4_0
+0.00.169.905 I print_info: file size   = 4.74 MiB (5.71 BPW) 
+0.00.170.169 I llama_prepare_model_devices: using device CUDA0 (Tesla V100-SXM2-16GB) (0000:02:00.0) - 15826 MiB free
+0.00.171.256 D init_tokenizer: initializing tokenizer for type 2
+0.00.172.638 I load: 0 unused tokens
+0.00.173.413 D load: control token:     18 '<|video|>' is not marked as EOG
+0.00.173.415 D load: control token:     17 '<|turn>' is not marked as EOG
+0.00.173.416 D load: control token:     14 '<|tool>' is not marked as EOG
+0.00.173.417 D load: control token:     13 '<|think|>' is not marked as EOG
+0.00.173.417 D load: control token:     12 '<|image|>' is not marked as EOG
+0.00.173.418 D load: control token:     10 '<|audio|>' is not marked as EOG
+0.00.173.419 D load: control token:      7 '<tool|>' is not marked as EOG
+0.00.173.432 D load: control token:      2 '<bos>' is not marked as EOG
+0.00.173.433 D load: control token:      0 '<pad>' is not marked as EOG
+0.00.173.519 I load: printing all EOG tokens:
+0.00.173.519 I load:   - 1 ('<eos>')
+0.00.173.520 I load:   - 8 ('<turn|>')
+0.00.173.520 I load:   - 16 ('<|tool_response>')
+0.00.173.534 I load: special tokens cache size = 19
+0.00.173.823 I load: token to piece cache size = 0.0031 MB
+0.00.173.829 I print_info: arch                  = gemma4
+0.00.173.829 I print_info: vocab_only            = 0
+0.00.173.829 I print_info: no_alloc              = 0
+0.00.173.830 I print_info: n_ctx_train           = 512
+0.00.173.830 I print_info: n_embd_inp            = 256
+0.00.173.830 I print_info: n_embd                = 256
+0.00.173.830 I print_info: n_embd_out            = 256
+0.00.173.831 I print_info: n_layer               = 6
+0.00.173.831 I print_info: n_layer_all           = 6
+0.00.173.835 I print_info: n_head                = 4
+0.00.173.836 I print_info: n_head_kv             = 2
+0.00.173.836 I print_info: n_rot                 = 128
+0.00.173.836 I print_info: n_swa                 = 512
+0.00.173.837 I print_info: is_swa_any            = 1
+0.00.173.837 I print_info: non_causal_type       = 1
+0.00.173.837 I print_info: n_embd_head_k         = 128
+0.00.173.837 I print_info: n_embd_head_v         = 128
+0.00.173.838 I print_info: n_gqa                 = 2
+0.00.173.841 I print_info: n_embd_k_gqa          = [128, 128, 128, 128, 128, 256]
+0.00.173.842 I print_info: n_embd_v_gqa          = [128, 128, 128, 128, 128, 256]
+0.00.173.842 I print_info: f_norm_eps            = 0.0e+00
+0.00.173.843 I print_info: f_norm_rms_eps        = 1.0e-06
+0.00.173.844 I print_info: f_clamp_kqv           = 0.0e+00
+0.00.173.844 I print_info: f_max_alibi_bias      = 0.0e+00
+0.00.173.844 I print_info: f_logit_scale         = 0.0e+00
+0.00.173.844 I print_info: f_attn_scale          = 1.0e+00
+0.00.173.845 I print_info: f_attn_value_scale    = 0.0000
+0.00.173.846 I print_info: n_ff                  = 384
+0.00.173.846 I print_info: n_expert              = 4
+0.00.173.846 I print_info: n_expert_used         = 2
+0.00.173.846 I print_info: n_expert_groups       = 0
+0.00.173.847 I print_info: n_group_used          = 0
+0.00.173.847 I print_info: causal attn           = 1
+0.00.173.847 I print_info: pooling type          = -1
+0.00.173.847 I print_info: rope type             = 2
+0.00.173.848 I print_info: rope scaling          = linear
+0.00.173.848 I print_info: freq_base_train       = 1000000.0
+0.00.173.849 I print_info: freq_scale_train      = 1
+0.00.173.849 I print_info: freq_base_swa         = 10000.0
+0.00.173.850 I print_info: freq_scale_swa        = 1
+0.00.173.850 I print_info: n_embd_head_k_swa     = 64
+0.00.173.850 I print_info: n_embd_head_v_swa     = 64
+0.00.173.851 I print_info: n_rot_swa             = 64
+0.00.173.851 I print_info: n_ctx_orig_yarn       = 512
+0.00.173.851 I print_info: rope_yarn_log_mul     = 0.0000
+0.00.173.851 I print_info: rope_finetuned        = unknown
+0.00.173.852 I print_info: model type            = ?B
+0.00.173.852 I print_info: model params          = 6.97 M
+0.00.173.853 I print_info: general.name          = Gemma 4 Tiny Dense random initialization
+0.00.173.853 I print_info: vocab type            = BPE
+0.00.173.854 I print_info: n_vocab               = 8192
+0.00.173.854 I print_info: n_merges              = 305
+0.00.173.854 I print_info: BOS token             = 2 '<bos>'
+0.00.173.854 I print_info: EOS token             = 1 '<eos>'
+0.00.173.855 I print_info: EOT token             = 8 '<turn|>'
+0.00.173.855 I print_info: UNK token             = 3 '<unk>'
+0.00.173.855 I print_info: PAD token             = 0 '<pad>'
+0.00.173.856 I print_info: LF token              = 19 '
+'
+0.00.173.856 I print_info: EOG token             = 1 '<eos>'
+0.00.173.856 I print_info: EOG token             = 8 '<turn|>'
+0.00.173.857 I print_info: EOG token             = 16 '<|tool_response>'
+0.00.173.857 I print_info: max token length      = 94
+0.00.174.078 I load_tensors: loading model tensors, this can take a while... (load_mode = none)
+0.00.174.488 D load_tensors: layer   0 assigned to device CUDA0, is_swa = 1
+0.00.174.491 D load_tensors: layer   0 assigned to device CUDA0, is_swa = 1
+0.00.174.491 D load_tensors: layer   1 assigned to device CUDA0, is_swa = 1
+0.00.174.491 D load_tensors: layer   2 assigned to device CUDA0, is_swa = 1
+0.00.174.492 D load_tensors: layer   3 assigned to device CUDA0, is_swa = 1
+0.00.174.492 D load_tensors: layer   4 assigned to device CUDA0, is_swa = 1
+0.00.174.492 D load_tensors: layer   5 assigned to device CUDA0, is_swa = 0
+0.00.174.493 D load_tensors: layer   6 assigned to device CUDA0, is_swa = 0
+0.00.174.496 D create_tensor: loading tensor output.weight
+0.00.174.500 D create_tensor: loading tensor token_embd.weight
+0.00.174.507 D create_tensor: loading tensor token_embd.weight
+0.00.174.510 D create_tensor: loading tensor output_norm.weight
+0.00.174.513 D create_tensor: loading tensor blk.0.attn_norm.weight
+0.00.174.517 D create_tensor: loading tensor blk.0.attn_qkv.weight
+0.00.174.520 D create_tensor: loading tensor blk.0.attn_q.weight
+0.00.174.523 D create_tensor: loading tensor blk.0.attn_k.weight
+0.00.174.526 D create_tensor: loading tensor blk.0.attn_v.weight
+0.00.174.529 D create_tensor: loading tensor blk.0.attn_output.weight
+0.00.174.532 D create_tensor: loading tensor blk.0.attn_q_norm.weight
+0.00.174.535 D create_tensor: loading tensor blk.0.attn_k_norm.weight
+0.00.174.538 D create_tensor: loading tensor blk.0.post_attention_norm.weight
+0.00.174.542 D create_tensor: loading tensor blk.0.layer_output_scale.weight
+0.00.174.545 D create_tensor: loading tensor blk.0.ffn_norm.weight
+0.00.174.549 D create_tensor: loading tensor blk.0.ffn_gate.weight
+0.00.174.552 D create_tensor: loading tensor blk.0.ffn_up.weight
+0.00.174.555 D create_tensor: loading tensor blk.0.ffn_down.weight
+0.00.174.558 D create_tensor: loading tensor blk.0.post_ffw_norm.weight
+0.00.174.561 D create_tensor: loading tensor blk.0.ffn_gate_inp.weight
+0.00.174.564 D create_tensor: loading tensor blk.0.ffn_gate_inp.scale
+0.00.174.567 D create_tensor: loading tensor blk.0.pre_ffw_norm_2.weight
+0.00.174.571 D create_tensor: loading tensor blk.0.post_ffw_norm_1.weight
+0.00.174.574 D create_tensor: loading tensor blk.0.post_ffw_norm_2.weight
+0.00.174.577 D create_tensor: loading tensor blk.0.ffn_gate_up_exps.weight
+0.00.174.581 D create_tensor: loading tensor blk.0.ffn_down_exps.weight
+0.00.174.585 D create_tensor: loading tensor blk.1.attn_norm.weight
+0.00.174.588 D create_tensor: loading tensor blk.1.attn_qkv.weight
+0.00.174.591 D create_tensor: loading tensor blk.1.attn_q.weight
+0.00.174.594 D create_tensor: loading tensor blk.1.attn_k.weight
+0.00.174.597 D create_tensor: loading tensor blk.1.attn_v.weight
+0.00.174.600 D create_tensor: loading tensor blk.1.attn_output.weight
+0.00.174.603 D create_tensor: loading tensor blk.1.attn_q_norm.weight
+0.00.174.606 D create_tensor: loading tensor blk.1.attn_k_norm.weight
+0.00.174.609 D create_tensor: loading tensor blk.1.post_attention_norm.weight
+0.00.174.612 D create_tensor: loading tensor blk.1.layer_output_scale.weight
+0.00.174.615 D create_tensor: loading tensor blk.1.ffn_norm.weight
+0.00.174.619 D create_tensor: loading tensor blk.1.ffn_gate.weight
+0.00.174.622 D create_tensor: loading tensor blk.1.ffn_up.weight
+0.00.174.626 D create_tensor: loading tensor blk.1.ffn_down.weight
+0.00.174.629 D create_tensor: loading tensor blk.1.post_ffw_norm.weight
+0.00.174.632 D create_tensor: loading tensor blk.1.ffn_gate_inp.weight
+0.00.174.635 D create_tensor: loading tensor blk.1.ffn_gate_inp.scale
+0.00.174.638 D create_tensor: loading tensor blk.1.pre_ffw_norm_2.weight
+0.00.174.642 D create_tensor: loading tensor blk.1.post_ffw_norm_1.weight
+0.00.174.645 D create_tensor: loading tensor blk.1.post_ffw_norm_2.weight
+0.00.174.648 D create_tensor: loading tensor blk.1.ffn_gate_up_exps.weight
+0.00.174.652 D create_tensor: loading tensor blk.1.ffn_down_exps.weight
+0.00.174.655 D create_tensor: loading tensor blk.2.attn_norm.weight
+0.00.174.659 D create_tensor: loading tensor blk.2.attn_qkv.weight
+0.00.174.661 D create_tensor: loading tensor blk.2.attn_q.weight
+0.00.174.664 D create_tensor: loading tensor blk.2.attn_k.weight
+0.00.174.667 D create_tensor: loading tensor blk.2.attn_v.weight
+0.00.174.670 D create_tensor: loading tensor blk.2.attn_output.weight
+0.00.174.673 D create_tensor: loading tensor blk.2.attn_q_norm.weight
+0.00.174.676 D create_tensor: loading tensor blk.2.attn_k_norm.weight
+0.00.174.680 D create_tensor: loading tensor blk.2.post_attention_norm.weight
+0.00.174.683 D create_tensor: loading tensor blk.2.layer_output_scale.weight
+0.00.174.686 D create_tensor: loading tensor blk.2.ffn_norm.weight
+0.00.174.689 D create_tensor: loading tensor blk.2.ffn_gate.weight
+0.00.174.692 D create_tensor: loading tensor blk.2.ffn_up.weight
+0.00.174.706 D create_tensor: loading tensor blk.2.ffn_down.weight
+0.00.174.709 D create_tensor: loading tensor blk.2.post_ffw_norm.weight
+0.00.174.712 D create_tensor: loading tensor blk.2.ffn_gate_inp.weight
+0.00.174.715 D create_tensor: loading tensor blk.2.ffn_gate_inp.scale
+0.00.174.718 D create_tensor: loading tensor blk.2.pre_ffw_norm_2.weight
+0.00.174.721 D create_tensor: loading tensor blk.2.post_ffw_norm_1.weight
+0.00.174.724 D create_tensor: loading tensor blk.2.post_ffw_norm_2.weight
+0.00.174.728 D create_tensor: loading tensor blk.2.ffn_gate_up_exps.weight
+0.00.174.731 D create_tensor: loading tensor blk.2.ffn_down_exps.weight
+0.00.174.734 D create_tensor: loading tensor blk.3.attn_norm.weight
+0.00.174.738 D create_tensor: loading tensor blk.3.attn_qkv.weight
+0.00.174.740 D create_tensor: loading tensor blk.3.attn_q.weight
+0.00.174.743 D create_tensor: loading tensor blk.3.attn_k.weight
+0.00.174.746 D create_tensor: loading tensor blk.3.attn_v.weight
+0.00.174.749 D create_tensor: loading tensor blk.3.attn_output.weight
+0.00.174.752 D create_tensor: loading tensor blk.3.attn_q_norm.weight
+0.00.174.755 D create_tensor: loading tensor blk.3.attn_k_norm.weight
+0.00.174.758 D create_tensor: loading tensor blk.3.post_attention_norm.weight
+0.00.174.761 D create_tensor: loading tensor blk.3.layer_output_scale.weight
+0.00.174.764 D create_tensor: loading tensor blk.3.ffn_norm.weight
+0.00.174.767 D create_tensor: loading tensor blk.3.ffn_gate.weight
+0.00.174.770 D create_tensor: loading tensor blk.3.ffn_up.weight
+0.00.174.773 D create_tensor: loading tensor blk.3.ffn_down.weight
+0.00.174.776 D create_tensor: loading tensor blk.3.post_ffw_norm.weight
+0.00.174.780 D create_tensor: loading tensor blk.3.ffn_gate_inp.weight
+0.00.174.783 D create_tensor: loading tensor blk.3.ffn_gate_inp.scale
+0.00.174.786 D create_tensor: loading tensor blk.3.pre_ffw_norm_2.weight
+0.00.174.789 D create_tensor: loading tensor blk.3.post_ffw_norm_1.weight
+0.00.174.792 D create_tensor: loading tensor blk.3.post_ffw_norm_2.weight
+0.00.174.796 D create_tensor: loading tensor blk.3.ffn_gate_up_exps.weight
+0.00.174.799 D create_tensor: loading tensor blk.3.ffn_down_exps.weight
+0.00.174.802 D create_tensor: loading tensor blk.4.attn_norm.weight
+0.00.174.806 D create_tensor: loading tensor blk.4.attn_qkv.weight
+0.00.174.808 D create_tensor: loading tensor blk.4.attn_q.weight
+0.00.174.811 D create_tensor: loading tensor blk.4.attn_k.weight
+0.00.174.814 D create_tensor: loading tensor blk.4.attn_v.weight
+0.00.174.817 D create_tensor: loading tensor blk.4.attn_output.weight
+0.00.174.820 D create_tensor: loading tensor blk.4.attn_q_norm.weight
+0.00.174.824 D create_tensor: loading tensor blk.4.attn_k_norm.weight
+0.00.174.827 D create_tensor: loading tensor blk.4.post_attention_norm.weight
+0.00.174.830 D create_tensor: loading tensor blk.4.layer_output_scale.weight
+0.00.174.834 D create_tensor: loading tensor blk.4.ffn_norm.weight
+0.00.174.837 D create_tensor: loading tensor blk.4.ffn_gate.weight
+0.00.174.840 D create_tensor: loading tensor blk.4.ffn_up.weight
+0.00.174.844 D create_tensor: loading tensor blk.4.ffn_down.weight
+0.00.174.847 D create_tensor: loading tensor blk.4.post_ffw_norm.weight
+0.00.174.850 D create_tensor: loading tensor blk.4.ffn_gate_inp.weight
+0.00.174.854 D create_tensor: loading tensor blk.4.ffn_gate_inp.scale
+0.00.174.857 D create_tensor: loading tensor blk.4.pre_ffw_norm_2.weight
+0.00.174.861 D create_tensor: loading tensor blk.4.post_ffw_norm_1.weight
+0.00.174.864 D create_tensor: loading tensor blk.4.post_ffw_norm_2.weight
+0.00.174.868 D create_tensor: loading tensor blk.4.ffn_gate_up_exps.weight
+0.00.174.871 D create_tensor: loading tensor blk.4.ffn_down_exps.weight
+0.00.174.875 D create_tensor: loading tensor blk.5.attn_norm.weight
+0.00.174.878 D create_tensor: loading tensor blk.5.attn_qkv.weight
+0.00.174.881 D create_tensor: loading tensor blk.5.attn_q.weight
+0.00.174.884 D create_tensor: loading tensor blk.5.attn_k.weight
+0.00.174.887 D create_tensor: loading tensor blk.5.attn_v.weight
+0.00.174.890 D create_tensor: loading tensor blk.5.attn_output.weight
+0.00.174.893 D create_tensor: loading tensor blk.5.attn_q_norm.weight
+0.00.174.897 D create_tensor: loading tensor blk.5.attn_k_norm.weight
+0.00.174.900 D create_tensor: loading tensor blk.5.post_attention_norm.weight
+0.00.174.904 D create_tensor: loading tensor blk.5.layer_output_scale.weight
+0.00.174.907 D create_tensor: loading tensor rope_freqs.weight
+0.00.174.910 D create_tensor: loading tensor blk.5.ffn_norm.weight
+0.00.174.914 D create_tensor: loading tensor blk.5.ffn_gate.weight
+0.00.174.917 D create_tensor: loading tensor blk.5.ffn_up.weight
+0.00.174.920 D create_tensor: loading tensor blk.5.ffn_down.weight
+0.00.174.923 D create_tensor: loading tensor blk.5.post_ffw_norm.weight
+0.00.174.927 D create_tensor: loading tensor blk.5.ffn_gate_inp.weight
+0.00.174.930 D create_tensor: loading tensor blk.5.ffn_gate_inp.scale
+0.00.174.933 D create_tensor: loading tensor blk.5.pre_ffw_norm_2.weight
+0.00.174.937 D create_tensor: loading tensor blk.5.post_ffw_norm_1.weight
+0.00.174.940 D create_tensor: loading tensor blk.5.post_ffw_norm_2.weight
+0.00.174.944 D create_tensor: loading tensor blk.5.ffn_gate_up_exps.weight
+0.00.174.948 D create_tensor: loading tensor blk.5.ffn_down_exps.weight
+0.00.174.951 D create_tensor: loading tensor blk.0.attn_q.scale
+0.00.174.953 D create_tensor: loading tensor blk.0.attn_k.scale
+0.00.174.956 D create_tensor: loading tensor blk.0.attn_v.scale
+0.00.174.958 D create_tensor: loading tensor blk.0.attn_output.scale
+0.00.174.960 D create_tensor: loading tensor blk.0.ffn_gate.scale
+0.00.174.962 D create_tensor: loading tensor blk.0.ffn_down.scale
+0.00.174.964 D create_tensor: loading tensor blk.0.ffn_up.scale
+0.00.174.966 D create_tensor: loading tensor blk.0.ffn_down_exps.scale
+0.00.174.968 D create_tensor: loading tensor blk.0.attn_q.input_scale
+0.00.174.970 D create_tensor: loading tensor blk.0.attn_k.input_scale
+0.00.174.972 D create_tensor: loading tensor blk.0.attn_v.input_scale
+0.00.174.974 D create_tensor: loading tensor blk.0.attn_output.input_scale
+0.00.174.977 D create_tensor: loading tensor blk.0.ffn_gate.input_scale
+0.00.174.979 D create_tensor: loading tensor blk.0.ffn_down.input_scale
+0.00.174.981 D create_tensor: loading tensor blk.0.ffn_up.input_scale
+0.00.174.983 D create_tensor: loading tensor blk.0.ffn_down_exps.input_scale
+0.00.174.985 D create_tensor: loading tensor blk.1.attn_q.scale
+0.00.174.987 D create_tensor: loading tensor blk.1.attn_k.scale
+0.00.174.989 D create_tensor: loading tensor blk.1.attn_v.scale
+0.00.174.992 D create_tensor: loading tensor blk.1.attn_output.scale
+0.00.174.994 D create_tensor: loading tensor blk.1.ffn_gate.scale
+0.00.174.996 D create_tensor: loading tensor blk.1.ffn_down.scale
+0.00.174.998 D create_tensor: loading tensor blk.1.ffn_up.scale
+0.00.175.001 D create_tensor: loading tensor blk.1.ffn_down_exps.scale
+0.00.175.003 D create_tensor: loading tensor blk.1.attn_q.input_scale
+0.00.175.005 D create_tensor: loading tensor blk.1.attn_k.input_scale
+0.00.175.007 D create_tensor: loading tensor blk.1.attn_v.input_scale
+0.00.175.010 D create_tensor: loading tensor blk.1.attn_output.input_scale
+0.00.175.012 D create_tensor: loading tensor blk.1.ffn_gate.input_scale
+0.00.175.014 D create_tensor: loading tensor blk.1.ffn_down.input_scale
+0.00.175.017 D create_tensor: loading tensor blk.1.ffn_up.input_scale
+0.00.175.019 D create_tensor: loading tensor blk.1.ffn_down_exps.input_scale
+0.00.175.021 D create_tensor: loading tensor blk.2.attn_q.scale
+0.00.175.024 D create_tensor: loading tensor blk.2.attn_k.scale
+0.00.175.026 D create_tensor: loading tensor blk.2.attn_v.scale
+0.00.175.028 D create_tensor: loading tensor blk.2.attn_output.scale
+0.00.175.030 D create_tensor: loading tensor blk.2.ffn_gate.scale
+0.00.175.033 D create_tensor: loading tensor blk.2.ffn_down.scale
+0.00.175.035 D create_tensor: loading tensor blk.2.ffn_up.scale
+0.00.175.037 D create_tensor: loading tensor blk.2.ffn_down_exps.scale
+0.00.175.040 D create_tensor: loading tensor blk.2.attn_q.input_scale
+0.00.175.042 D create_tensor: loading tensor blk.2.attn_k.input_scale
+0.00.175.044 D create_tensor: loading tensor blk.2.attn_v.input_scale
+0.00.175.047 D create_tensor: loading tensor blk.2.attn_output.input_scale
+0.00.175.049 D create_tensor: loading tensor blk.2.ffn_gate.input_scale
+0.00.175.051 D create_tensor: loading tensor blk.2.ffn_down.input_scale
+0.00.175.053 D create_tensor: loading tensor blk.2.ffn_up.input_scale
+0.00.175.056 D create_tensor: loading tensor blk.2.ffn_down_exps.input_scale
+0.00.175.058 D create_tensor: loading tensor blk.3.attn_q.scale
+0.00.175.060 D create_tensor: loading tensor blk.3.attn_k.scale
+0.00.175.063 D create_tensor: loading tensor blk.3.attn_v.scale
+0.00.175.065 D create_tensor: loading tensor blk.3.attn_output.scale
+0.00.175.067 D create_tensor: loading tensor blk.3.ffn_gate.scale
+0.00.175.070 D create_tensor: loading tensor blk.3.ffn_down.scale
+0.00.175.072 D create_tensor: loading tensor blk.3.ffn_up.scale
+0.00.175.074 D create_tensor: loading tensor blk.3.ffn_down_exps.scale
+0.00.175.076 D create_tensor: loading tensor blk.3.attn_q.input_scale
+0.00.175.079 D create_tensor: loading tensor blk.3.attn_k.input_scale
+0.00.175.081 D create_tensor: loading tensor blk.3.attn_v.input_scale
+0.00.175.083 D create_tensor: loading tensor blk.3.attn_output.input_scale
+0.00.175.085 D create_tensor: loading tensor blk.3.ffn_gate.input_scale
+0.00.175.088 D create_tensor: loading tensor blk.3.ffn_down.input_scale
+0.00.175.090 D create_tensor: loading tensor blk.3.ffn_up.input_scale
+0.00.175.092 D create_tensor: loading tensor blk.3.ffn_down_exps.input_scale
+0.00.175.095 D create_tensor: loading tensor blk.4.attn_q.scale
+0.00.175.097 D create_tensor: loading tensor blk.4.attn_k.scale
+0.00.175.100 D create_tensor: loading tensor blk.4.attn_v.scale
+0.00.175.102 D create_tensor: loading tensor blk.4.attn_output.scale
+0.00.175.104 D create_tensor: loading tensor blk.4.ffn_gate.scale
+0.00.175.107 D create_tensor: loading tensor blk.4.ffn_down.scale
+0.00.175.109 D create_tensor: loading tensor blk.4.ffn_up.scale
+0.00.175.112 D create_tensor: loading tensor blk.4.ffn_down_exps.scale
+0.00.175.115 D create_tensor: loading tensor blk.4.attn_q.input_scale
+0.00.175.117 D create_tensor: loading tensor blk.4.attn_k.input_scale
+0.00.175.120 D create_tensor: loading tensor blk.4.attn_v.input_scale
+0.00.175.122 D create_tensor: loading tensor blk.4.attn_output.input_scale
+0.00.175.124 D create_tensor: loading tensor blk.4.ffn_gate.input_scale
+0.00.175.127 D create_tensor: loading tensor blk.4.ffn_down.input_scale
+0.00.175.129 D create_tensor: loading tensor blk.4.ffn_up.input_scale
+0.00.175.132 D create_tensor: loading tensor blk.4.ffn_down_exps.input_scale
+0.00.175.135 D create_tensor: loading tensor blk.5.attn_q.scale
+0.00.175.137 D create_tensor: loading tensor blk.5.attn_k.scale
+0.00.175.140 D create_tensor: loading tensor blk.5.attn_output.scale
+0.00.175.143 D create_tensor: loading tensor blk.5.ffn_gate.scale
+0.00.175.145 D create_tensor: loading tensor blk.5.ffn_down.scale
+0.00.175.148 D create_tensor: loading tensor blk.5.ffn_up.scale
+0.00.175.150 D create_tensor: loading tensor blk.5.ffn_down_exps.scale
+0.00.175.153 D create_tensor: loading tensor blk.5.attn_q.input_scale
+0.00.175.155 D create_tensor: loading tensor blk.5.attn_k.input_scale
+0.00.175.158 D create_tensor: loading tensor blk.5.attn_output.input_scale
+0.00.175.161 D create_tensor: loading tensor blk.5.ffn_gate.input_scale
+0.00.175.163 D create_tensor: loading tensor blk.5.ffn_down.input_scale
+0.00.175.166 D create_tensor: loading tensor blk.5.ffn_up.input_scale
+0.00.175.169 D create_tensor: loading tensor blk.5.ffn_down_exps.input_scale
+0.00.176.578 I load_tensors: offloading output layer to GPU
+0.00.176.581 I load_tensors: offloading 5 repeating layers to GPU
+0.00.176.581 I load_tensors: offloaded 7/7 layers to GPU
+0.00.176.583 I load_tensors:        CUDA0 model buffer size =     6.91 MiB
+0.00.178.449 D load_all_data: using async uploads for device CUDA0, buffer type CUDA0, backend CUDA0
+.....................................
+0.00.181.736 I cmn  common_init_: added <eos> logit bias = -inf
+0.00.181.739 I cmn  common_init_: added <turn|> logit bias = -inf
+0.00.181.739 I cmn  common_init_: added <|tool_response> logit bias = -inf
+0.00.181.876 I llama_context: constructing llama_context
+0.00.181.879 I llama_context: n_seq_max             = 1
+0.00.181.879 I llama_context: n_ctx                 = 1024
+0.00.181.880 I llama_context: n_ctx_seq             = 1024
+0.00.181.880 I llama_context: n_batch               = 1024
+0.00.181.880 I llama_context: n_ubatch              = 512
+0.00.181.881 I llama_context: causal_attn           = 1
+0.00.181.881 I llama_context: flash_attn            = enabled
+0.00.181.881 I llama_context: kv_unified            = false
+0.00.181.882 I llama_context: global K Hadamard     = false
+0.00.181.882 I llama_context: global V Hadamard     = false
+0.00.181.882 I llama_context: local K Hadamard      = false
+0.00.181.882 I llama_context: local V Hadamard      = false
+0.00.181.885 I llama_context: freq_base             = 1000000.0
+0.00.181.886 I llama_context: freq_scale            = 1
+0.00.181.887 I llama_context: n_rs_seq              = 0
+0.00.181.887 I llama_context: n_outputs_max         = 1024
+0.00.181.887 I llama_context: n_outputs_max_per_seq = 1
+0.00.181.888 W llama_context: n_ctx_seq (1024) > n_ctx_train (512) -- possible training context overflow
+0.00.194.330 D set_abort_callback: call
+0.00.195.155 I llama_context:  CUDA_Host  output buffer size =     0.03 MiB
+0.00.195.159 I llama_kv_cache_iswa: creating non-SWA KV cache, size = 1024 cells
+0.00.195.183 D llama_kv_cache: layer   0: filtered
+0.00.195.184 D llama_kv_cache: layer   1: filtered
+0.00.195.184 D llama_kv_cache: layer   2: filtered
+0.00.195.184 D llama_kv_cache: layer   3: filtered
+0.00.195.184 D llama_kv_cache: layer   4: filtered
+0.00.195.297 D llama_kv_cache: layer   5: dev = CUDA0
+0.00.195.314 D llama_kv_cache: reusing layers:
+0.00.195.315 D llama_kv_cache: - layer   0: no reuse
+0.00.195.315 D llama_kv_cache: - layer   1: no reuse
+0.00.195.315 D llama_kv_cache: - layer   2: no reuse
+0.00.195.315 D llama_kv_cache: - layer   3: no reuse
+0.00.195.316 D llama_kv_cache: - layer   4: no reuse
+0.00.195.316 D llama_kv_cache: - layer   5: no reuse
+0.00.195.464 I llama_kv_cache:      CUDA0 KV buffer size =     2.00 MiB
+0.00.195.504 I llama_kv_cache: size =    2.00 MiB (  1024 cells,   1 layers,  1/1 seqs), K (f32):    1.00 MiB, V (f32):    1.00 MiB
+0.00.195.506 I llama_kv_cache: FP16 equivalent = 1.00 MiB, compression ratio = 0.500x (K 0.500x, V 0.500x)
+0.00.195.508 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 128
+0.00.195.508 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 128
+0.00.195.509 I llama_kv_cache_iswa: creating     SWA KV cache, size = 1024 cells
+0.00.195.637 D llama_kv_cache: layer   0: dev = CUDA0
+0.00.195.766 D llama_kv_cache: layer   1: dev = CUDA0
+0.00.195.865 D llama_kv_cache: layer   2: dev = CUDA0
+0.00.195.963 D llama_kv_cache: layer   3: dev = CUDA0
+0.00.196.060 D llama_kv_cache: layer   4: dev = CUDA0
+0.00.196.063 D llama_kv_cache: layer   5: filtered
+0.00.196.064 D llama_kv_cache: reusing layers:
+0.00.196.064 D llama_kv_cache: - layer   0: no reuse
+0.00.196.064 D llama_kv_cache: - layer   1: no reuse
+0.00.196.065 D llama_kv_cache: - layer   2: no reuse
+0.00.196.065 D llama_kv_cache: - layer   3: no reuse
+0.00.196.065 D llama_kv_cache: - layer   4: no reuse
+0.00.196.065 D llama_kv_cache: - layer   5: no reuse
+0.00.196.185 I llama_kv_cache:      CUDA0 KV buffer size =     5.00 MiB
+0.00.196.216 I llama_kv_cache: size =    5.00 MiB (  1024 cells,   5 layers,  1/1 seqs), K (f32):    2.50 MiB, V (f32):    2.50 MiB
+0.00.196.218 I llama_kv_cache: FP16 equivalent = 2.50 MiB, compression ratio = 0.500x (K 0.500x, V 0.500x)
+0.00.196.219 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 64
+0.00.196.220 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 64
+0.00.196.221 D llama_context: enumerating backends
+0.00.196.329 D llama_context: backend_ptrs.size() = 2
+0.00.196.331 I sched_reserve: reserving ...
+0.00.196.332 D sched_reserve: max_nodes = 20480
+0.00.201.056 D sched_reserve: reserving full memory module
+0.00.201.060 D sched_reserve: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 1
+0.00.201.061 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.00.201.062 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.201.300 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.201.303 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.201.304 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.201.305 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.201.306 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.201.307 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.201.308 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.201.309 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.201.310 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.201.310 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.201.312 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.201.312 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.201.313 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.201.314 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.201.315 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.201.316 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.201.317 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.201.317 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.201.318 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.201.319 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.201.320 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.201.321 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.201.321 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.201.322 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.201.323 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.201.324 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.201.325 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.201.326 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.201.327 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.201.328 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.201.329 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.201.330 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.201.330 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.201.331 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.201.332 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.201.333 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.201.334 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.201.555 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.00.201.556 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.201.805 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.201.808 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.201.810 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.201.810 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.201.811 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.201.812 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.201.813 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.201.814 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.201.815 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.201.827 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.201.828 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.201.829 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.201.830 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.201.831 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.201.832 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.201.832 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.201.833 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.201.834 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.201.835 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.201.836 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.201.836 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.201.837 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.201.838 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.201.839 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.201.840 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.201.841 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.201.841 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.201.842 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.201.843 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.201.844 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.201.845 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.201.846 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.201.847 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.201.847 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.201.848 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.201.849 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.201.850 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.202.028 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.00.202.029 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.202.269 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.202.272 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.202.273 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.202.274 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.202.275 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.202.276 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.202.277 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.202.278 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.202.279 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.202.280 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.202.280 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.202.281 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.202.282 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.202.283 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.202.284 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.202.285 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.202.286 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.202.287 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.202.287 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.202.288 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.202.289 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.202.290 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.202.291 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.202.291 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.202.292 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.202.293 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.202.294 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.202.295 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.202.296 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.202.297 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.202.298 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.202.298 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.202.299 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.202.300 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.202.301 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.202.302 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.202.303 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.202.521 I resolve_fused_ops: fused DeepSeek V4 HC post enabled
+0.00.202.522 D graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+0.00.202.795 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.202.799 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.202.800 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.202.801 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.202.802 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.202.802 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.202.803 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.202.804 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.202.805 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.202.806 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.202.807 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.202.807 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.202.808 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.202.809 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.202.810 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.202.811 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.202.812 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.202.813 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.202.813 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.202.814 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.202.815 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.202.816 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.202.817 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.202.818 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.202.819 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,   512,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.202.819 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.202.820 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.202.821 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {   512,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.202.822 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,   512,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.202.823 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.202.824 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.202.825 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.202.825 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.202.826 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.202.827 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.202.828 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.202.829 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.204.670 D graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+0.00.204.899 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.204.902 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.204.903 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.204.904 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.204.905 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.204.906 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.204.906 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,     1,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.204.907 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.204.908 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.204.909 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.204.910 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.204.911 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.204.912 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.204.912 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.204.913 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.204.914 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.204.915 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.204.916 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.204.916 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.204.917 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.204.918 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.204.918 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.204.919 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.204.920 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {     1,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.204.921 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,     1,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.204.922 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.204.922 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.204.923 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {     1,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.204.924 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,     1,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.204.925 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.204.926 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.204.927 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.204.927 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.204.928 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.204.929 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.204.930 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {     1,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.204.931 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {     1,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.205.313 D graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+0.00.205.559 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_454' (FLASH_ATTN_EXT)
+0.00.205.563 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l5 (view)' (SET_ROWS)
+0.00.205.564 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_35' (FLASH_ATTN_EXT)
+0.00.205.565 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_119' (FLASH_ATTN_EXT)
+0.00.205.566 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_203' (FLASH_ATTN_EXT)
+0.00.205.566 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_287' (FLASH_ATTN_EXT)
+0.00.205.567 D llama_graph_n_input_tensors: input tensor '                attn_inp_kq_mask' [f16, ne = {  1024,   512,     1,     1 }] is used by node 'node_371' (FLASH_ATTN_EXT)
+0.00.205.568 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l0 (view)' (SET_ROWS)
+0.00.205.569 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l1 (view)' (SET_ROWS)
+0.00.205.570 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l2 (view)' (SET_ROWS)
+0.00.205.571 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l3 (view)' (SET_ROWS)
+0.00.205.572 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l4 (view)' (SET_ROWS)
+0.00.205.573 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.205.574 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.205.575 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.205.575 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.205.576 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.205.577 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.205.578 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.205.579 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.205.579 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.205.580 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.205.581 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.205.582 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {   512,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.205.583 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,   512,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.205.584 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_457' (GET_ROWS)
+0.00.205.584 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_461' (GET_ROWS)
+0.00.205.585 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {   512,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.205.586 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,   512,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.205.587 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l0 (view)' (SET_ROWS)
+0.00.205.588 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l1 (view)' (SET_ROWS)
+0.00.205.589 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l2 (view)' (SET_ROWS)
+0.00.205.590 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l3 (view)' (SET_ROWS)
+0.00.205.590 D llama_graph_n_input_tensors: input tensor '                 attn_inp_k_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_k_l4 (view)' (SET_ROWS)
+0.00.205.591 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.205.592 D llama_graph_n_input_tensors: input tensor '                 attn_inp_v_idxs' [i64, ne = {   512,     1,     1,     1 }] is used by node 'cache_v_l5 (view)' (SET_ROWS)
+0.00.205.593 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.205.990 I sched_reserve:      CUDA0 compute buffer size =    20.03 MiB
+0.00.205.993 I sched_reserve:  CUDA_Host compute buffer size =     3.03 MiB
+0.00.205.995 I sched_reserve: graph: nodes = 517, splits = 1, input objects = 4, input tensors = 13
+0.00.205.995 I sched_reserve: reserve took 9.66 ms, sched copies = 1
+0.00.206.018 I cmn          init: llama threadpool init, n_threads = 4
+0.00.206.147 D attach_threadpool: call
+0.00.206.155 D set_adapters_lora: adapters = (nil)
+0.00.206.156 D adapters_lora_are_same: adapters = (nil)
+0.00.213.266 D Using specialized template: Gemma4
+0.00.213.292 I dataset chat template=model metadata
+0.00.213.295 I full-context gradients use projection/query tiles; full-window K/V and some activations remain allocated
+0.00.213.297 I sequence_context=1024 parallel=1 microbatch_tokens=512 grad_accum=1 effective_sequences=1
+0.00.213.362 I load_jsonl: phase=parse started total=1 workers=1
+0.00.213.678 I load_jsonl: phase=parse [==============================] complete=1/1 elapsed=00:00:00 average_rate=3205.3/s workers=1
+0.00.213.684 I load_jsonl: phase=render-targets started total=1 workers=1
+0.00.215.737 I load_jsonl: phase=render-targets [==============================] complete=1/1 elapsed=00:00:00 average_rate=488.0/s workers=1
+0.00.215.740 I load_jsonl: context crop: targets=0 skipped_messages=0 max_sample_tokens=0
+0.00.215.740 I load_jsonl: phase=tokenize started total=1 workers=1
+0.00.216.325 I load_jsonl: phase=tokenize [==============================] complete=1/1 elapsed=00:00:00 average_rate=1720.5/s workers=1
+0.00.216.327 I data_progress: phase=construct-samples started total=1
+0.00.216.330 I load_jsonl: first target: conversation=1 assistant=0 reasoning=no reasoning_bytes=0
+0.00.216.332 I load_jsonl: first prompt preview: "<|turn>user\nExplain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explain gravity. Explai..."
+0.00.216.364 I load_jsonl: first response preview: " Gravity attracts objects. Gravity attracts objects. Gravity attracts objects. Gravity attracts objects. Gravity attracts objects. Gravity attracts objects. Gravity attracts objects. Gravity attracts objects."
+0.00.216.365 I load_jsonl: first sample tokens: prompt=787 response=96
+0.00.216.368 I data_progress: phase=construct-samples [==============================] 1/1 (100.0%) rate=26224.7/s elapsed=00:00:00 eta=00:00:00
+0.00.216.369 I load_jsonl: loaded 1 training samples from 1 JSONL lines (chat_conversations=1 expanded_assistant_targets=1 nonchat=0 reasoning_targets=0 preserve_thinking=yes tokenizer_workers=1)
+0.00.216.372 I main: conversation split: train_conversations=1 val_conversations=0 train_samples=1 val_samples=0 total_samples=1
+0.00.216.384 I data_progress: phase=pack-train started total=1
+0.00.216.405 I data_progress: phase=pack-train [==============================] 1/1 (100.0%) rate=52102.3/s elapsed=00:00:00 eta=00:00:00
+0.00.216.407 I data_progress: phase=pack-validation started total=0
+0.00.216.409 I data_progress: phase=pack-validation [==============================] 0/0 (100.0%) rate=0.0/s elapsed=00:00:00 eta=unknown
+0.00.216.416 I data_progress: phase=write-train-windows started total=1
+0.00.216.421 I data_progress: phase=write-train-windows [==============================] 1/1 (100.0%) rate=378214.8/s elapsed=00:00:00 eta=00:00:00
+0.00.216.421 I data_progress: phase=write-validation-windows started total=0
+0.00.216.422 I data_progress: phase=write-validation-windows [==============================] 0/0 (100.0%) rate=0.0/s elapsed=00:00:00 eta=unknown
+0.00.216.423 I build_dataset: sample split: train=1 val=0 total=1
+0.00.216.424 I build_dataset: packed windows: train=1 val=0 total=1 (ctx=1024 stride=512 supervised=96 padded=142, dropped_train=0 dropped_val=0)
+0.00.216.424 I build_dataset: training rewards are constant; using weight 1.0
+0.00.216.429 I opt_init: full-context backward, requested ubatch=512, fixed projection/query tiles=512/256
+0.00.224.307 D graph_reserve: reserving a graph for ubatch with n_tokens = 1024, n_seqs =  1, n_outputs = 1024
+0.00.224.901 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'node_1129' (GET_ROWS)
+0.00.224.904 D llama_graph_n_input_tensors: input tensor '                         out_ids' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'node_1133' (GET_ROWS)
+0.00.224.906 D llama_graph_n_input_tensors: input tensor '                    self_kq_mask' [f16, ne = {  1024,  1024,     1,     1 }] is used by node 'self_kq_mask (view)' (VIEW)
+0.00.224.906 D llama_graph_n_input_tensors: input tensor '                    self_kq_mask' [f16, ne = {  1024,  1024,     1,     1 }] is used by node 'self_kq_mask (view)' (VIEW)
+0.00.224.907 D llama_graph_n_input_tensors: input tensor '                    self_kq_mask' [f16, ne = {  1024,  1024,     1,     1 }] is used by node 'self_kq_mask (view)' (VIEW)
+0.00.224.908 D llama_graph_n_input_tensors: input tensor '                    self_kq_mask' [f16, ne = {  1024,  1024,     1,     1 }] is used by node 'self_kq_mask (view)' (VIEW)
+0.00.224.909 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Qcur_pos-0' (ROPE)
+0.00.224.922 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Kcur_pos-0' (ROPE)
+0.00.224.922 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Qcur_pos-1' (ROPE)
+0.00.224.923 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Kcur_pos-1' (ROPE)
+0.00.224.924 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Qcur_pos-2' (ROPE)
+0.00.224.925 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Kcur_pos-2' (ROPE)
+0.00.224.926 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Qcur_pos-3' (ROPE)
+0.00.224.927 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Kcur_pos-3' (ROPE)
+0.00.224.928 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Qcur_pos-4' (ROPE)
+0.00.224.928 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Kcur_pos-4' (ROPE)
+0.00.224.929 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Qcur_pos-5' (ROPE)
+0.00.224.930 D llama_graph_n_input_tensors: input tensor '                         inp_pos' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'Kcur_pos-5' (ROPE)
+0.00.224.931 D llama_graph_n_input_tensors: input tensor '                  inp_scale_rows' [f32, ne = {     1,  1024,     1,     1 }] is used by node 'inp_scaled' (MUL)
+0.00.224.932 D llama_graph_n_input_tensors: input tensor '                 inp_mixed_slots' [i64, ne = {  1024,     1,     1,     1 }] is used by node ' (view)' (SET_ROWS)
+0.00.224.933 D llama_graph_n_input_tensors: input tensor '                  inp_mixed_embd' [f32, ne = {   256,  1024,     1,     1 }] is used by node 'node_2' (DUP)
+0.00.224.934 D llama_graph_n_input_tensors: input tensor '                inp_mixed_tokens' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'node_1' (GET_ROWS)
+0.00.224.935 D llama_graph_n_input_tensors: input tensor '                         leaf_14' [f16, ne = {  1024,  1024,     1,     1 }] is used by node ' (view)' (VIEW)
+0.00.224.936 D llama_graph_n_input_tensors: input tensor '                         leaf_14' [f16, ne = {  1024,  1024,     1,     1 }] is used by node 'leaf_14 (view)' (VIEW)
+0.00.224.937 D llama_graph_n_input_tensors: input tensor '                         leaf_14' [f16, ne = {  1024,  1024,     1,     1 }] is used by node 'leaf_14 (view)' (VIEW)
+0.00.224.938 D llama_graph_n_input_tensors: input tensor '                         leaf_14' [f16, ne = {  1024,  1024,     1,     1 }] is used by node 'leaf_14 (view)' (VIEW)
+0.00.224.939 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {  1024,     1,     1,     1 }] is used by node 'node_0' (GET_ROWS)
+0.00.225.434 I opt_init: measured training graph nodes = 1296 (n_ubatch=1024)
+0.00.233.782 I opt_init: training graph capacity = 10368 (train_fwd_nodes=1296 x8)
+0.00.233.929 I epoch 3.1e+09 lr=1e-06
+0.00.235.048 I graph: reuse requested; compatible CPU full-sequence single-stream steps are eligible; shape changes rebuild the graph
+0.00.235.057 I target: blk.0.attn_q.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.069 I target: blk.0.attn_k.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.069 I target: blk.0.attn_v.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.069 I target: blk.0.attn_output.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.070 I target: blk.1.attn_q.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.070 I target: blk.1.attn_k.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.071 I target: blk.1.attn_v.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.071 I target: blk.1.attn_output.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.071 I target: blk.2.attn_q.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.072 I target: blk.2.attn_k.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.072 I target: blk.2.attn_v.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.072 I target: blk.2.attn_output.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.073 I target: blk.3.attn_q.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.073 I target: blk.3.attn_k.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.073 I target: blk.3.attn_v.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.074 I target: blk.3.attn_output.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.074 I target: blk.4.attn_q.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.075 I target: blk.4.attn_k.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.075 I target: blk.4.attn_v.weight type=q4_0 shape=[256,128,1,1] bytes=18432
+0.00.235.075 I target: blk.4.attn_output.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.076 I target: blk.5.attn_q.weight type=q4_0 shape=[256,512,1,1] bytes=73728
+0.00.235.076 I target: blk.5.attn_k.weight type=q4_0 shape=[256,256,1,1] bytes=36864
+0.00.235.076 I target: blk.5.attn_output.weight type=q4_0 shape=[512,256,1,1] bytes=73728
+0.00.235.076 I targets: registered=23 bytes=737280
+0.00.269.923 I memory: base_quantized=4973896 momentum_q8_0=1392640 residual_q4_0=737280 lr_scale=0 dense_gradient_q8_0=0 sparse_gradient_q8_0=0 nonquantized_model=280 context=7340032 compute_workspace=0 persistent_qat=7103816 device_used=353828864
+0.00.269.943 I lr scheduler=constant warmup_steps=0 decay_steps=16 total_steps=16 schedule_steps=16 start_step=0 lr=1e-06 lr_min=0
+0.00.272.720 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.00.272.754 I opt_epoch_iter: [timing] graph capacity=10368 n_nodes=1213 size_meta=18.7MB
+0.00.284.100 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.00.284.103 I ggml_opt_build_backward: cached QLion dependency plan: 286 dependencies across 23 states
+0.00.287.755 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+qlora placement: inspecting first training graph
+qlora placement: CPU node  (view) (VIEW, 0.50 MiB)
+qlora placement: CPU node leaf_11 (view) (VIEW, 0.50 MiB)
+qlora placement: CPU node leaf_11 (view) (VIEW, 0.50 MiB)
+qlora placement: CPU node leaf_11 (view) (VIEW, 0.50 MiB)
+qlora placement: CPU node l_out-0 (CONT, 1.00 MiB)
+qlora placement: CPU node l_out-0 (view) (VIEW, 1.00 MiB)
+qlora placement: CPU node l_out-1 (CONT, 1.00 MiB)
+qlora placement: CPU node l_out-1 (view) (VIEW, 1.00 MiB)
+qlora placement: graph splits=74 CPU nodes=19 CPU node bytes=14.09 MiB
+qlora placement: activation recompute regions=27 replay nodes=1302
+qlora placement: CUDA0 scheduler buffer=35.80 MiB
+0.00.416.262 I epoch 0 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.00.554.002 I step: step=1 supervised_tokens=96 duration_us=281670
+0.00.554.011 I opt_epoch_iter: [timing] build=1ms alloc=138ms inputs=5ms eval=138ms total=282ms
+0.00.554.068 I loss: epoch=0 window=2 step=1 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.00.554.141 I epoch: epoch=1/16 loss=8.96856308 uncertainty=nan optimizer_step=1
+0.00.554.473 I memory: base_quantized=4973896 momentum_q8_0=1392640 residual_q4_0=737280 lr_scale=0 dense_gradient_q8_0=0 sparse_gradient_q8_0=0 nonquantized_model=280 context=7340032 compute_workspace=45956608 persistent_qat=7103816 device_used=454492160
+0.00.555.687 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.00.556.719 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.00.560.318 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.00.571.509 I epoch 1 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.00.696.930 I step: step=2 supervised_tokens=96 duration_us=141706
+0.00.696.974 I loss: epoch=1 window=2 step=2 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.00.697.044 I epoch: epoch=2/16 loss=8.96856308 uncertainty=nan optimizer_step=2
+0.00.698.171 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.00.699.246 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.00.702.892 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.00.713.108 I epoch 2 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.00.768.433 I step: step=3 supervised_tokens=96 duration_us=70680
+0.00.768.469 I loss: epoch=2 window=2 step=3 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.00.768.531 I epoch: epoch=3/16 loss=8.96856308 uncertainty=nan optimizer_step=3
+0.00.769.583 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.00.770.584 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.00.774.032 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.00.783.665 I epoch 3 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.00.839.108 I step: step=4 supervised_tokens=96 duration_us=69922
+0.00.839.143 I loss: epoch=3 window=2 step=4 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.00.839.202 I epoch: epoch=4/16 loss=8.96856308 uncertainty=nan optimizer_step=4
+0.00.840.275 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.00.841.313 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.00.845.213 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.00.855.258 I epoch 4 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.00.910.859 I step: step=5 supervised_tokens=96 duration_us=70990
+0.00.910.895 I loss: epoch=4 window=2 step=5 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.00.910.980 I epoch: epoch=5/16 loss=8.96856308 uncertainty=nan optimizer_step=5
+0.00.911.978 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.00.912.991 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.00.916.484 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.00.926.033 I epoch 5 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.00.981.616 I step: step=6 supervised_tokens=96 duration_us=70033
+0.00.981.654 I loss: epoch=5 window=2 step=6 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.00.981.740 I epoch: epoch=6/16 loss=8.96856308 uncertainty=nan optimizer_step=6
+0.00.982.853 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.00.983.979 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.00.987.547 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.00.997.034 I epoch 6 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.052.684 I step: step=7 supervised_tokens=96 duration_us=70250
+0.01.052.719 I loss: epoch=6 window=2 step=7 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.01.052.776 I epoch: epoch=7/16 loss=8.96856308 uncertainty=nan optimizer_step=7
+0.01.053.853 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.054.982 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.058.541 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.068.104 I epoch 7 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.96856308 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.123.753 I step: step=8 supervised_tokens=96 duration_us=70353
+0.01.123.788 I loss: epoch=7 window=2 step=8 loss=8.96856308 acc=0.000000% lr=9.99999997e-07
+
+0.01.123.870 I epoch: epoch=8/16 loss=8.96856308 uncertainty=nan optimizer_step=8
+0.01.124.988 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.126.099 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.129.550 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.138.905 I epoch 8 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.98761845 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.194.545 I step: step=9 supervised_tokens=96 duration_us=70043
+0.01.194.581 I loss: epoch=8 window=2 step=9 loss=8.98761845 acc=0.000000% lr=9.99999997e-07
+
+0.01.194.637 I epoch: epoch=9/16 loss=8.98761845 uncertainty=nan optimizer_step=9
+0.01.195.659 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.196.681 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.200.412 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.209.728 I epoch 9 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.99375343 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.265.501 I step: step=10 supervised_tokens=96 duration_us=70270
+0.01.265.538 I loss: epoch=9 window=2 step=10 loss=8.99375343 acc=0.000000% lr=9.99999997e-07
+
+0.01.265.612 I epoch: epoch=10/16 loss=8.99375343 uncertainty=nan optimizer_step=10
+0.01.266.661 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.267.709 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.271.403 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.280.570 I epoch 10 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.98967171 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.336.166 I step: step=11 supervised_tokens=96 duration_us=69948
+0.01.336.202 I loss: epoch=10 window=2 step=11 loss=8.98967171 acc=0.000000% lr=9.99999997e-07
+
+0.01.336.276 I epoch: epoch=11/16 loss=8.98967171 uncertainty=nan optimizer_step=11
+0.01.337.295 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.338.399 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.342.615 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.352.477 I epoch 11 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.99015808 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.408.223 I step: step=12 supervised_tokens=96 duration_us=71309
+0.01.408.258 I loss: epoch=11 window=2 step=12 loss=8.99015808 acc=0.000000% lr=9.99999997e-07
+
+0.01.408.317 I epoch: epoch=12/16 loss=8.99015808 uncertainty=nan optimizer_step=12
+0.01.409.360 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.410.554 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.414.695 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.424.545 I epoch 12 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.98676872 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.480.104 I step: step=13 supervised_tokens=96 duration_us=71147
+0.01.480.139 I loss: epoch=12 window=2 step=13 loss=8.98676872 acc=0.000000% lr=9.99999997e-07
+
+0.01.480.214 I epoch: epoch=13/16 loss=8.98676872 uncertainty=nan optimizer_step=13
+0.01.481.215 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.482.216 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.485.960 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.495.232 I epoch 13 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.98711967 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.550.819 I step: step=14 supervised_tokens=96 duration_us=69986
+0.01.550.854 I loss: epoch=13 window=2 step=14 loss=8.98711967 acc=0.000000% lr=9.99999997e-07
+
+0.01.550.918 I epoch: epoch=14/16 loss=8.98711967 uncertainty=nan optimizer_step=14
+0.01.551.937 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.552.898 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.556.572 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.566.495 I epoch 14 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.99046612 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.622.105 I step: step=15 supervised_tokens=96 duration_us=70578
+0.01.622.139 I loss: epoch=14 window=2 step=15 loss=8.99046612 acc=0.000000% lr=9.99999997e-07
+
+0.01.622.213 I epoch: epoch=15/16 loss=8.99046612 uncertainty=nan optimizer_step=15
+0.01.623.184 D full_context_graph: max_projection_tokens=512 max_query_tokens=256
+0.01.624.157 I ggml_opt_build_backward: RAM F32 gradient reduction for 23/23 states
+0.01.627.902 I ggml_opt_prepare_recompute: activation recompute: 27 regions, 1302 replay nodes
+0.01.637.401 I epoch 15 lr=1e-06
+train: [███████▉] data=0000002/0000002 loss=8.98993778 acc=0.000000% t=00:00:00 ETA=00:00:00 
+0.01.692.700 I step: step=16 supervised_tokens=96 duration_us=69893
+0.01.692.736 I loss: epoch=15 window=2 step=16 loss=8.98993778 acc=0.000000% lr=9.99999997e-07
+
+0.01.692.802 I epoch: epoch=16/16 loss=8.98993778 uncertainty=nan optimizer_step=16
+0.01.707.291 I adapter: tensors=23 payload_bytes=737280 layout=full
+0.01.711.722 I adapter saved to /tmp/aikar-bit-exact-speed/moe-current-qat-adapter-out.gguf (743616 bytes)
+0.01.723.271 I adapter_checkpoint: saved final path=/tmp/aikar-bit-exact-speed/moe-current-qat-adapter-out.gguf

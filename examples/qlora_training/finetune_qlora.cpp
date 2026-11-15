@@ -2366,7 +2366,7 @@ static bool save_adapter(
         return false;
     }
 
-    LOG_INF("%s: adapter saved to %s\n", __func__, real_path.c_str());
+    LOG_INF("adapter saved to %s\n", real_path.c_str());
     return true;
 }
 
@@ -2439,25 +2439,12 @@ struct save_ctx {
     ggml_opt_result_t    result_eval;
     int64_t              validation_start;
     int64_t              validation_end;
-    bool                 loss_ema_initialized = false;
-    double               loss_ema16 = 0.0;
-    double               loss_ema64 = 0.0;
-    double               loss_cumulative_sum = 0.0;
-    int64_t              loss_cumulative_count = 0;
-    double               loss_epoch_sum = 0.0;
-    int64_t              loss_epoch_count = 0;
     int32_t              optimizer_bootstrap_windows_remaining = 0;
     bool                 optimizer_bootstrap_restarted_at_epoch_end = false;
 };
 
 // TLS pointer set before each epoch so the static callback can access it.
 static thread_local save_ctx * g_save_ctx = nullptr;
-
-static void set_default_progress_ema() {
-    if (!std::getenv("GGML_OPT_EMA_N")) {
-        common_set_env("GGML_OPT_EMA_N", "100");
-    }
-}
 
 #ifdef GGML_USE_NVTX
 static constexpr auto nsys_profile_window = std::chrono::seconds(60);
@@ -2503,33 +2490,11 @@ static void save_every_callback(
         const int64_t ubatch_in_window = ibatch % g_save_ctx->ubatch_per_ctx;
         if (ibatch > 0 && ubatch_in_window == 0) {
             if (g_save_ctx->verbose_loss) {
-                double cumulative_loss_mean = 0.0;
-                ggml_opt_result_loss(result, &cumulative_loss_mean, nullptr);
-
-                const int64_t cumulative_loss_count = ibatch;
-                const double cumulative_loss_sum = cumulative_loss_mean * cumulative_loss_count;
-                const double window_loss_sum = cumulative_loss_sum - g_save_ctx->loss_cumulative_sum;
-                const int64_t window_loss_count = cumulative_loss_count - g_save_ctx->loss_cumulative_count;
-                const double window_loss = window_loss_sum / std::max<int64_t>(1, window_loss_count);
-
-                g_save_ctx->loss_ema16 = g_save_ctx->loss_ema_initialized
-                    ? 0.8825 * g_save_ctx->loss_ema16 + 0.1175 * window_loss
-                    : window_loss;
-                g_save_ctx->loss_ema64 = g_save_ctx->loss_ema_initialized
-                    ? 0.9692 * g_save_ctx->loss_ema64 + 0.0308 * window_loss
-                    : window_loss;
-                g_save_ctx->loss_ema_initialized = true;
-                g_save_ctx->loss_cumulative_sum = cumulative_loss_sum;
-                g_save_ctx->loss_cumulative_count = cumulative_loss_count;
-                g_save_ctx->loss_epoch_sum += window_loss_sum;
-                g_save_ctx->loss_epoch_count += window_loss_count;
-
-                const double epoch_mean = g_save_ctx->loss_epoch_sum /
-                    std::max<int64_t>(1, g_save_ctx->loss_epoch_count);
-                fprintf(stderr,
-                        "\nepoch=%ld window=%ld window_loss=%.6f ema16=%.6f ema64=%.6f epoch_mean=%.6f lr=%.6g\n",
-                        (long) g_save_ctx->epoch, (long) window, window_loss,
-                        g_save_ctx->loss_ema16, g_save_ctx->loss_ema64, epoch_mean,
+                double loss;
+                double accuracy;
+                ggml_opt_result_last(result, &loss, &accuracy);
+                fprintf(stderr, "\nepoch=%ld window=%ld loss=%.8f acc=%.6f%% lr=%.6g\n",
+                        (long) g_save_ctx->epoch, (long) window, loss, 100.0 * accuracy,
                         (double) g_save_ctx->schedule->current_lr);
             }
             ++g_save_ctx->schedule->step;
@@ -2567,7 +2532,7 @@ static void save_every_callback(
             saved = save_adapter(*g_save_ctx->lt, ckpt, *g_save_ctx->arch, g_save_ctx->lora_alpha,
                                  *g_save_ctx->base_model_path, &state) && saved;
             if (saved) {
-                LOG_INF("save_every_callback: target checkpoint saved -> %s (window %ld)\n",
+                LOG_INF("checkpoint saved to %s (window %ld)\n",
                         ckpt.c_str(), (long) window);
             }
         }
@@ -2580,7 +2545,7 @@ static void save_every_callback(
                 g_save_ctx->mtp_alpha, *g_save_ctx->mtp_model_path, &state);
             saved = mtp_saved && saved;
             if (mtp_saved) {
-                LOG_INF("save_every_callback: MTP checkpoint saved -> %s (window %ld)\n",
+                LOG_INF("MTP checkpoint saved to %s (window %ld)\n",
                         ckpt.c_str(), (long) window);
             }
         }
@@ -3334,7 +3299,6 @@ static bool mtp_init_training(
 #ifndef LLAMA_FINETUNE_QLORA_SHARED_ONLY
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
-    set_default_progress_ema();
 
     common_params params;
     params.escape = false;
@@ -3794,8 +3758,8 @@ int main(int argc, char ** argv) {
     }
 
     const int64_t total_windows = ggml_opt_dataset_ndata(dataset);
-    LOG_INF("%s: starting QLoRA training — rank=%d alpha=%.1f epochs=%d loss=%s\n",
-            __func__, params.lora_rank, lora_alpha, params.lr.epochs,
+    LOG_INF("training: rank=%d alpha=%.1f epochs=%d loss=%s\n",
+            params.lora_rank, lora_alpha, params.lr.epochs,
             params.train_on_prompt ? "prompt+response" : "response-only");
     llama_synchronize(ctx);
     const adapter_stats adapter_start = adapter_get_stats(lt);
@@ -3833,10 +3797,6 @@ int main(int argc, char ** argv) {
         sctx.window_offset = idata_start;
         sctx.last_saved = idata_start;
         sctx.epoch = params.lr.epoch + 1;
-        sctx.loss_cumulative_sum = 0.0;
-        sctx.loss_cumulative_count = 0;
-        sctx.loss_epoch_sum = 0.0;
-        sctx.loss_epoch_count = 0;
 #ifdef GGML_USE_NVTX
         nvtxRangePushA("qlora-train");
         nsys_profile_started = std::chrono::steady_clock::now();

@@ -1,0 +1,20 @@
+{
+  "src/llama-context.cpp": "c574f0e41667a848a7699bdbc5d8c439eb03f67bdcff1236ff23252700ef8434",
+  "src/llama-graph.cpp": "dcee14e5445f8f6c5bd5fffda58fecae66207b0b913e9d0c04e4dd1e17aeeaa4",
+  "src/llama-graph.h": "a18aabfb6c2c0d213f0227c69bd26cdf84c405112596ab13a0544f25543ee607",
+  "src/models/gemma4.cpp": "c7c05d02bbf98f1f29c1af6baeab378a3b2c0f72f06a39591ef9650d47b57ccf",
+  "ggml/src/ggml-opt.cpp": "bcf92fd0051f75e19213274cec60d21673f532b196e81f443148cab2b49bf304",
+  "ggml/src/ggml.c": "47d95054ca293638854265aeec1a45c7f56996697ca7533a6ac01f16a1a84b61",
+  "ggml/src/ggml-cpu/ops.cpp": "1fe9a9ecd5b8be82e0fe1c18a0d5775f1344d714031776cbbc0e55ea25da9f1b",
+  "ggml/src/ggml-cuda/fattn-back.cu": "9a106f9fc0c48e9463c111342278d930369aa59405196c6eab3cea9f6519ed19",
+  "examples/qlora_training/finetune_qat.cpp": "aaeeabda98968f72abcc44f80b3767c92a41f5f085d6f682664b5c354ae5474e",
+  "examples/qlora_training/mixed-cache.h": "0fadc291f5f0e8f1388c49d0a1736e6948f5575ae8b540f6a02ae379cfd4e9f8",
+  "examples/qlora_training/test-logit-distillation.cpp": "7c26fd04b0525076cdc8ab0b3989eef927e364fe2e0707fb57ee12f5a342af41",
+  "examples/qlora_training/test_qlion_integration.py": "81a23cdc58c34ae77e1a4a165533d149cd4179d693f5bfd6d0773b24c55139dc",
+  "examples/qlora_training/README.md": "00210cab3d8f6da859e4ae9bff3abaa9d85f80e4bf088e0fb7d77a1d2da59360",
+  "ggml/include/ggml.h": "18b883737b992e4ae85b70461b971fffb0367559c7de89ff9da29a5596988d0f",
+  "ggml/src/ggml-backend.cpp": "bde6189b2c63adfab9c753142b4da573d1a75c05524aaccf8b22a65ca7a04eb3",
+  "ggml/src/ggml-vulkan/ggml-vulkan.cpp": "f3c9439f17fbfbc46136dd2d0c9fd69dd4a7d92d3b4a2b7e3341acce9db39371",
+  "ggml/src/ggml-backend-meta.cpp": "2295e28e167c586b1d668aaa148b8e9aaff8b6365269a53a582d71c4e3862693",
+  "ggml/src/ggml-cuda/ggml-cuda.cu": "3ee7414dd6574b283cce00cc51940d1528810429e9308289235e829a6d700b16"
+}

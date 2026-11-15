@@ -1,0 +1,354 @@
+{
+  "dense-qlion": {
+    "optimizer_steps": 16,
+    "learning_rate": 1e-06,
+    "reference_loss": [
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.04677486,
+      9.05508327,
+      9.04906654,
+      9.04872513,
+      9.0658474,
+      9.06832218,
+      9.06395435,
+      9.0742836
+    ],
+    "tiled_loss": [
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.04677486,
+      9.05508327,
+      9.04906654,
+      9.04872513,
+      9.0658474,
+      9.06832218,
+      9.06395435,
+      9.0742836
+    ],
+    "first_step_state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "weight_relative_l2": 0.0,
+    "packed_weights_equal": true,
+    "bit_exact_ubatches": [
+      1024,
+      768,
+      512,
+      256
+    ]
+  },
+  "dense-qlion2": {
+    "optimizer_steps": 16,
+    "learning_rate": 1e-06,
+    "reference_loss": [
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05491829,
+      9.05184841,
+      9.04697418,
+      9.04114914,
+      9.06849861,
+      9.06399155
+    ],
+    "tiled_loss": [
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05794334,
+      9.05491829,
+      9.05184841,
+      9.04697418,
+      9.04114914,
+      9.06849861,
+      9.06399155
+    ],
+    "first_step_state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "weight_relative_l2": 0.0,
+    "packed_weights_equal": true,
+    "bit_exact_ubatches": [
+      1024,
+      768,
+      512,
+      256
+    ]
+  },
+  "moe-qlion": {
+    "optimizer_steps": 16,
+    "learning_rate": 1e-06,
+    "reference_loss": [
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.98761845,
+      8.99375343,
+      8.98967171,
+      8.99015808,
+      8.98676872,
+      8.98711967,
+      8.99046612,
+      8.98993778
+    ],
+    "tiled_loss": [
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.98761845,
+      8.99375343,
+      8.98967171,
+      8.99015808,
+      8.98676872,
+      8.98711967,
+      8.99046612,
+      8.98993778
+    ],
+    "first_step_state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "weight_relative_l2": 0.0,
+    "packed_weights_equal": true,
+    "bit_exact_ubatches": [
+      1024,
+      768,
+      512,
+      256
+    ]
+  },
+  "moe-qlion2": {
+    "optimizer_steps": 16,
+    "learning_rate": 1e-06,
+    "reference_loss": [
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.98445892,
+      8.98445892,
+      8.98905563,
+      8.99027634,
+      8.99321365,
+      8.97764969,
+      8.98875999
+    ],
+    "tiled_loss": [
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.96856308,
+      8.98445892,
+      8.98445892,
+      8.98905563,
+      8.99027634,
+      8.99321365,
+      8.97764969,
+      8.98875999
+    ],
+    "first_step_state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "state": {
+      "qat.m.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.r.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      },
+      "qat.lr.": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "cosine": 1.0,
+        "norm_ratio": 1.0
+      }
+    },
+    "weight_relative_l2": 0.0,
+    "packed_weights_equal": true,
+    "bit_exact_ubatches": [
+      1024,
+      768,
+      512,
+      256
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "samples": 298,
+  "peak_device_bytes": [
+    15589507072,
+    16220422144
+  ],
+  "peak_rss_kib": 26082040,
+  "started_at_unix": 1794739383.4617393,
+  "pid": 109788,
+  "peak_hwm_kib": 26082040,
+  "exit_code": 0,
+  "elapsed_seconds": 298.3170783519745
+}

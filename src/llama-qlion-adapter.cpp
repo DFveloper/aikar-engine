@@ -17,6 +17,8 @@ extern "C" {
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <tuple>
 #include <stdexcept>
 #include <utility>
 #include <sys/stat.h>
@@ -150,7 +152,34 @@ struct file {
     }
 
     std::string hash() {
+#if defined(_WIN32)
         return hash_data(read(), size);
+#else
+        check_identity();
+#if defined(__APPLE__)
+        const long change_ns = identity.st_ctimespec.tv_nsec;
+#else
+        const long change_ns = identity.st_ctim.tv_nsec;
+#endif
+        using key_type = std::tuple<std::string, uint64_t, uint64_t, int64_t, long, size_t, std::filesystem::file_time_type>;
+        static std::mutex mutex;
+        static std::map<key_type, std::string> cache;
+        const key_type key { path, uint64_t(identity.st_dev), uint64_t(identity.st_ino),
+            int64_t(identity.st_ctime), change_ns, size, modified };
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto found = cache.find(key);
+            if (found != cache.end()) return found->second;
+        }
+        const auto value = hash_data(read(), size);
+        check_identity();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (cache.size() >= 16) cache.clear();
+            cache.emplace(key, value);
+        }
+        return value;
+#endif
     }
 
     void check_identity() const {
@@ -473,7 +502,7 @@ void llama_qlion_save(const llama_qlion_snapshot & snapshot, const std::vector<g
     }
     set_hashes(meta.get(), "qlion.adapter.tensor_base_sha256", hashes_base);
     set_hashes(meta.get(), "qlion.adapter.tensor_payload_sha256", hashes_payload);
-    LLAMA_LOG_INFO("QLion adapter: tensors=%zu payload_bytes=%llu layout=%s\n", saved.size(), (unsigned long long) payload_bytes, units.c_str());
+    LLAMA_LOG_INFO("adapter: tensors=%zu payload_bytes=%llu layout=%s\n", saved.size(), (unsigned long long) payload_bytes, units.c_str());
     output_file out(output);
     std::vector<char> header(gguf_get_meta_size(meta.get()));
     gguf_get_meta_data(meta.get(), header.data());
@@ -502,7 +531,7 @@ void llama_qlion_save(const llama_qlion_snapshot & snapshot, const std::vector<g
     }
     base.check_identity();
     out.commit();
-    LLAMA_LOG_INFO("QLion adapter: saved %s (%llu bytes)\n", output.c_str(), (unsigned long long) std::filesystem::file_size(output));
+    LLAMA_LOG_INFO("adapter saved to %s (%llu bytes)\n", output.c_str(), (unsigned long long) std::filesystem::file_size(output));
 }
 
 void llama_qlion_merge(const std::string & base, const std::vector<std::string> & adapters,

@@ -27,6 +27,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+struct llama_opt_joint_validation;
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -44,6 +45,7 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    friend struct llama_opt_joint_validation;
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -309,6 +311,12 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    bool opt_joint_attach(llama_context * validation, bool fuse_all);
+    bool opt_joint_start(ggml_opt_dataset_t dataset, int64_t first, int64_t end, int64_t step);
+    llama_joint_validation_status opt_joint_status() const;
+    void opt_joint_finish();
+    void opt_joint_detach();
+
     ggml_cgraph * build_training_graph(llm_graph_result & result, const llama_ubatch & ubatch,
         ggml_backend_sched_t scheduler,
         const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> & replace_weight, bool smooth_gelu = false) const;
@@ -487,6 +495,7 @@ private:
     // Saved init arguments used to recreate opt_ctx on optimizer reset.
     struct llama_model * opt_model = nullptr;
     struct llama_opt_params opt_params {};
+    bool opt_full_sequence = false;
     bool opt_graph_reuse = false;
     bool opt_moe_compact = false;
     llm_graph_result * opt_graph_cached = nullptr;
@@ -495,6 +504,8 @@ private:
     uint64_t opt_supervised_tokens = 0;
     int64_t opt_step_started_us = 0;
     llama_context * opt_mtp_context = nullptr;
+    std::shared_ptr<llama_opt_joint_validation> opt_joint;
+    std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> opt_weight_replace;
 
     //
     // Dynamic training still rebuilds tensor metadata,

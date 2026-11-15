@@ -33,6 +33,18 @@ static bool is_turbo_kv_type(ggml_type type) {
     return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
 }
 
+static ggml_tensor * concat_tiles(ggml_context * ctx, std::vector<ggml_tensor *> tiles, int dim) {
+    GGML_ASSERT(!tiles.empty());
+    while (tiles.size() > 1) {
+        size_t count = 0;
+        for (size_t i = 0; i < tiles.size(); i += 2) {
+            tiles[count++] = i + 1 < tiles.size() ? ggml_concat(ctx, tiles[i], tiles[i + 1], dim) : tiles[i];
+        }
+        tiles.resize(count);
+    }
+    return tiles[0];
+}
+
 void llm_graph_input_moe_mask::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
     std::vector<float> values(n_expert, 0.0f);
@@ -556,6 +568,23 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
             fill_mask((float       *) self_kq_mask_swa->data, ggml_nelements(self_kq_mask_swa), hparams.n_swa, hparams.swa_type);
         }
     }
+    if (mctx) {
+        const llama_kv_cache_context * caches[] = {mctx->get_base(), mctx->get_swa()};
+        for (int i = 0; i < 2; ++i) {
+            if (k_rot[i] && k_rot[i]->buffer) caches[i]->set_input_k_rot(k_rot[i]);
+            if (v_rot[i] && v_rot[i]->buffer) caches[i]->set_input_v_rot(v_rot[i]);
+        }
+    }
+}
+
+bool llm_graph_input_attn_no_cache::can_reuse(const llm_graph_params & params) {
+    if (bool(mctx) != bool(params.full_sequence && params.mctx)) return false;
+    if (mctx) mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
+    return self_kq_mask->ne[0] == GGML_PAD(params.ubatch.n_tokens, 256) &&
+        self_kq_mask->ne[1] == params.ubatch.n_tokens &&
+        cparams.flash_attn == params.cparams.flash_attn &&
+        cparams.causal_attn == params.cparams.causal_attn &&
+        cparams.n_ubatch == params.cparams.n_ubatch;
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -1711,11 +1740,21 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    const uint32_t tile = LLM_TRAINING_PROJECTION_TILE_SIZE;
+    if (full_sequence && ggml_is_matrix(cur) && cur->ne[1] > tile) {
+        std::vector<ggml_tensor *> tiles;
+        for (int64_t start = 0; start < cur->ne[1]; start += tile) {
+            const int64_t count = std::min<int64_t>(tile, cur->ne[1] - start);
+            auto * input = ggml_view_2d(ctx0, cur, cur->ne[0], count, cur->nb[1], start*cur->nb[1]);
+            tiles.push_back(build_lora_mm(w, input, w_s));
+        }
+        return concat_tiles(ctx0, std::move(tiles), 1);
+    }
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * weight = replace_weight ? replace_weight(ctx0, w) : w;
     ggml_tensor * res = ggml_mul_mat(ctx0, weight, cur_mm);
-    if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
+    if ((training || full_sequence) && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
     }
 
@@ -1833,6 +1872,18 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots,
           ggml_tensor * priority) const {
+    const uint32_t tile = LLM_TRAINING_PROJECTION_TILE_SIZE;
+    if (full_sequence && cur->ne[3] == 1 && cur->ne[2] > tile) {
+        std::vector<ggml_tensor *> tiles;
+        for (int64_t start = 0; start < cur->ne[2]; start += tile) {
+            const int64_t count = std::min<int64_t>(tile, cur->ne[2] - start);
+            auto * input = ggml_view_3d(ctx0, cur, cur->ne[0], cur->ne[1], count, cur->nb[1], cur->nb[2], start*cur->nb[2]);
+            auto * selected = ggml_view_2d(ctx0, ids, ids->ne[0], count, ids->nb[1], start*ids->nb[1]);
+            auto * selected_slots = slots ? ggml_view_2d(ctx0, slots, slots->ne[0], count, slots->nb[1], start*slots->nb[1]) : nullptr;
+            tiles.push_back(build_lora_mm_id(w, input, selected, w_s, selected_slots, priority));
+        }
+        return concat_tiles(ctx0, std::move(tiles), 2);
+    }
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * weight = replace_weight ? replace_weight(ctx0, w) : w;
@@ -1841,7 +1892,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, weight, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
     if (priority) { ggml_mul_mat_id_set_expert_priority(res, priority); }
-    if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
+    if ((training || full_sequence) && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
     }
 
@@ -2360,6 +2411,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * lookahead_input) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
+    if (full_sequence && n_tokens > LLM_TRAINING_TILE_SIZE) {
+        std::vector<ggml_tensor *> tiles;
+        for (int64_t start = 0; start < n_tokens; start += LLM_TRAINING_TILE_SIZE) {
+            const int64_t count = std::min<int64_t>(LLM_TRAINING_TILE_SIZE, n_tokens - start);
+            const auto slice = [&](ggml_tensor * tensor) -> ggml_tensor * {
+                if (!tensor) return nullptr;
+                GGML_ASSERT(ggml_is_matrix(tensor) && tensor->ne[1] == n_tokens);
+                return ggml_view_2d(ctx0, tensor, tensor->ne[0], count, tensor->nb[1], start*tensor->nb[1]);
+            };
+            auto * input = slice(cur);
+            if (activation_recompute) input->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+            auto * output = build_moe_ffn(input, gate_inp, gate_inp_b,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b,
+                exp_probs_b, n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                slice(probs_in), gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s,
+                slice(selected_experts_in), post_exp_norm, post_exp_norm_eps, slice(lookahead_input));
+            if (activation_recompute) output->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+            tiles.push_back(output);
+        }
+        return concat_tiles(ctx0, std::move(tiles), 1);
+    }
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
@@ -3132,6 +3204,31 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * turboquant_parameters) const {
+    const uint32_t tile = LLM_TRAINING_TILE_SIZE;
+    if (full_sequence && cparams.flash_attn) {
+        // Share the F16 K/V conversion instead of reserving full-window copies in every query tile.
+        const bool shared_kv = k == v;
+        if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        if (shared_kv) v = k;
+        else if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+    }
+    if (full_sequence && q->ne[2] > tile) {
+        GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && kq_b == nullptr && turboquant_parameters == nullptr);
+        std::vector<ggml_tensor *> tiles;
+        for (int64_t start = 0; start < q->ne[2]; start += tile) {
+            const int64_t count = std::min<int64_t>(tile, q->ne[2] - start);
+            auto * query = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], count, q->nb[1], q->nb[2], start*q->nb[2]);
+            auto & mask = training_mask_tiles[{kq_mask, {start, count}}];
+            if (!mask) {
+                // Reuse mask views across layers so the scheduler shares their device copies.
+                mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], count, kq_mask->ne[2], kq_mask->ne[3],
+                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], start*kq_mask->nb[1]);
+            }
+            // Each query tile reads the same differentiable K/V tensors.
+            tiles.push_back(build_attn_mha(query, k, v, nullptr, mask, sinks, v_mla, n_kv_max, kq_scale, il));
+        }
+        return concat_tiles(ctx0, std::move(tiles), 1);
+    }
     const bool v_trans = v->nb[1] > v->nb[2];
     const auto host_cache = [](const ggml_tensor * tensor) {
         while (tensor->view_src) {
@@ -3335,6 +3432,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
+    if (full_sequence && mctx) {
+        inp->mctx = static_cast<const llama_kv_cache_iswa_context *>(mctx);
+        const llama_kv_cache_context * caches[] = {inp->mctx->get_base(), inp->mctx->get_swa()};
+        for (int i = 0; i < 2; ++i) {
+            inp->k_rot[i] = caches[i]->build_input_k_rot(ctx0);
+            inp->v_rot[i] = caches[i]->build_input_v_rot(ctx0);
+        }
+    }
+
     // flash attention requires an f16 mask
     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
@@ -3394,6 +3500,18 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
+    if (inp->mctx) {
+        const int index = is_swa ? 1 : 0;
+        const auto * cache = is_swa ? inp->mctx->get_swa() : inp->mctx->get_base();
+        if (inp->k_rot[index]) {
+            q = llama_mul_mat_hadamard(ctx0, q, inp->k_rot[index]);
+            k = llama_mul_mat_hadamard(ctx0, k, inp->k_rot[index]);
+        }
+        if (inp->v_rot[index]) v = llama_mul_mat_hadamard(ctx0, v, inp->v_rot[index]);
+        k = build_kv_fake_quant(k, cache->type_k());
+        v = build_kv_fake_quant(v, cache->type_v());
+    }
+
     // the KV values and the KQ bias are padded with zeros up to the KV dimension of the mask
     const int64_t n_kv_pad = kq_mask->ne[0] - k->ne[2];
 
@@ -3405,6 +3523,9 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    if (inp->v_rot[is_swa ? 1 : 0]) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->v_rot[is_swa ? 1 : 0]);
+    }
     cb(cur, "kqv_out", il);
 
     if (wo) {

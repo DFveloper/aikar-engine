@@ -1211,6 +1211,9 @@ static std::pair<int, int> test_result_sequence_weights(
     helper_ctx_data cd = helper_get_ctx_data(optim, sched, backend, true, false, 4, 2, GGML_OPT_LOSS_TYPE_MEAN);
     double loss = -1;
     double unc = 0;
+    double accuracy;
+    ggml_opt_result_last(cd.result, &loss, &accuracy);
+    print_ok(__func__, std::isnan(loss) && std::isnan(accuracy), npass, ntest, "subtest=empty_last");
     ggml_opt_result_loss(cd.result, &loss, nullptr);
     bool ok = loss == 0;
     ggml_opt_result_loss(cd.result, &loss, &unc);
@@ -1228,6 +1231,8 @@ static std::pair<int, int> test_result_sequence_weights(
     ggml_opt_result_weight_last(cd.result, 2, 1);
     forward(17);
     ggml_opt_result_weight_last(cd.result, 1, 0.5f);
+    ggml_opt_result_last(cd.result, &loss, &accuracy);
+    print_ok(__func__, almost_equal(loss, 10, 1e-6) && std::isnan(accuracy), npass, ntest, "subtest=last_not_cumulative");
     ggml_opt_result_loss(cd.result, &loss, &unc);
     ok = almost_equal(loss, 4, 1e-6) && std::isfinite(unc) && unc > 0;
     ggml_opt_result_loss(cd.result, &loss, nullptr);

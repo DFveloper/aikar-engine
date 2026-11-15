@@ -27,7 +27,7 @@ def compare_models(left, right):
     for name, tensor in a.items():
         assert tensor.tensor_type == b[name].tensor_type, name
         assert np.array_equal(tensor.shape, b[name].shape), name
-        assert np.array_equal(tensor.data, b[name].data), name
+        assert np.array_equal(tensor.data.view(np.uint8), b[name].data.view(np.uint8)), name
     return len(a)
 
 
@@ -77,6 +77,10 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--gpu-layers", default="0")
     parser.add_argument("--gpu-index", type=int, default=0, help="physical GPU index for NVML device-memory sampling")
+    parser.add_argument("--full-context-only", action="store_true", help="require bit-exact ctx1024 training across ub256/512/768/1024")
+    parser.add_argument("--full-context-recompute", action="store_true", help="exercise layer and head activation recomputation")
+    parser.add_argument("--cpu-gradients", action="store_true", help="store native gradient sums and accumulation buffers in RAM")
+    parser.add_argument("--full-context-learning-rate", type=float, default=1e-6, help="learning rate for the full-context trajectory comparison")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {"device": "CPU" if args.gpu_layers == "0" else "GPU (record device separately)", "runs": {}}
@@ -140,7 +144,7 @@ def main():
             entry["peak_device_vram_bytes"] = max(memory_samples)
             entry["gpu_memory_samples"] = len(memory_samples)
         steps = [(int(n), int(tokens), int(duration)) for n, tokens, duration in
-                 re.findall(r"qat_step: step=(\d+) supervised_tokens=(\d+) duration_us=(\d+)", text)]
+                 re.findall(r"(?:qat_)?step: step=(\d+) supervised_tokens=(\d+) duration_us=(\d+)", text)]
         measured = steps[2:]
         if measured:
             seconds = [duration / 1e6 for _, _, duration in measured]
@@ -168,6 +172,107 @@ def main():
                          "--verbosity", "5", "--save-every", "0", "--qat-out", full, "--qat-adapter-out", adapter, "--verbose-loss", *extra])
         return full, adapter, text
 
+    if args.full_context_only:
+        data = args.output_dir / "full-context.jsonl"
+        data.write_text(json.dumps({"messages": [{"role": "user", "content": " Explain gravity." * 70},
+            {"role": "assistant", "content": " Gravity attracts objects." * 8}]}) + "\n")
+        report["full_context"] = {}
+        # Compare optimizer states as well as packed weights: unchanged Q4 codes can hide missing gradients.
+        def compare_state(left, right, first_step=False):
+            left_reader, a = tensor_map(left)
+            right_reader, b = tensor_map(right)
+            assert a.keys() == b.keys(), "optimizer tensor directories differ"
+            metrics = {}
+            for prefix in ("qat.m.", "qat.r.", "qat.lr."):
+                error, norm, other_norm, dot, maximum = 0.0, 0.0, 0.0, 0.0, 0.0
+                for name, tensor in a.items():
+                    if not name.startswith(prefix):
+                        continue
+                    x = gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float64)
+                    y = gguf.quants.dequantize(b[name].data, b[name].tensor_type).astype(np.float64)
+                    assert np.isfinite(x).all() and np.isfinite(y).all(), name
+                    error += float(np.sum((x - y)**2))
+                    norm += float(np.sum(x*x))
+                    other_norm += float(np.sum(y*y))
+                    dot += float(np.sum(x*y))
+                    maximum = max(maximum, float(np.max(np.abs(x - y))))
+                relative = float(np.sqrt(error / max(norm, 1e-30)))
+                cosine = dot / np.sqrt(norm*other_norm) if norm > 0 and other_norm > 0 else float(norm == other_norm)
+                ratio = float(np.sqrt(other_norm / norm)) if norm > 0 else (1.0 if other_norm == 0 else float("inf"))
+                metrics[prefix] = {"relative_l2": relative, "max_abs": maximum, "cosine": float(cosine), "norm_ratio": ratio}
+                assert relative == 0 and maximum == 0, (prefix, metrics[prefix])
+                if prefix == "qat.m.":
+                    assert norm > 0, "missing momentum"
+            compare_models(left, right)
+            return metrics
+
+        for model_name, model in models.items():
+            for optimizer in ("qlion", "qlion2"):
+                runs = []
+                for tile in (1024, 768, 512, 256):
+                    name = f"full-context-{model_name}-{optimizer}-ub{tile}"
+                    device = ["--device", "CUDA0", "--split-mode", "none"] if args.gpu_layers != "0" else []
+                    extra = ["--optimizer", optimizer, "-c", "1024", "-b", "1024",
+                        "-ub", str(tile), "--qat-targets", ".attn_q.weight,.attn_k.weight,.attn_v.weight,.attn_output.weight", "-fa", "on",
+                        "--learning-rate", str(args.full_context_learning_rate), "--qat-adapter-only", "--qat-static-graph", "on",
+                        "--activation-recompute", "on" if args.full_context_recompute else "off", *device]
+                    if args.cpu_gradients:
+                        extra.extend(["--qat-grad-accumulator", "cpu"])
+                    _, first_adapter, _ = train(name + "-first", model, extra, data=data)
+                    _, adapter, log = train(name, model, extra, data=data, epochs=16)
+                    losses = [float(x) for x in re.findall(r"epoch:.*?loss=([0-9.e+-]+)", log)]
+                    if args.cpu_gradients:
+                        offloads = re.findall(r"RAM F32 gradient reduction for (\d+)/", log)
+                        assert offloads and all(int(count) > 0 for count in offloads), "RAM gradient reduction was not exercised"
+                    steps = [int(x) for x in re.findall(r"step: step=(\d+)", log)]
+                    assert len(losses) == 16 and np.isfinite(losses).all(), "missing/invalid loss trajectory"
+                    assert len(steps) == 16 and steps == list(range(1, len(steps) + 1)), "optimizer step count changed"
+                    if args.full_context_recompute:
+                        assert "activation recompute:" in log, "activation recomputation was not exercised"
+                    else:
+                        assert "reusing forward/backward/optimizer graph" in log, "full-context graph was not reused"
+                    shapes = re.findall(r"full_context_graph: max_projection_tokens=(\d+) max_query_tokens=(\d+)", log)
+                    assert shapes and all(int(p) == 512 and int(q) == 256 for p, q in shapes), "training did not use fixed arithmetic tiles"
+                    runs.append((adapter, losses, steps, first_adapter))
+                reference = runs[0]
+                for tiled in runs[1:]:
+                    assert reference[1] == tiled[1], "ubatch changed the loss trajectory"
+                    assert reference[2] == tiled[2], "ubatch changed optimizer cadence"
+                    compare_models(reference[0], tiled[0])
+                    compare_models(reference[3], tiled[3])
+                    compare_models(Path(str(reference[0]) + ".qat-state.gguf"), Path(str(tiled[0]) + ".qat-state.gguf"))
+                    compare_models(Path(str(reference[3]) + ".qat-state.gguf"), Path(str(tiled[3]) + ".qat-state.gguf"))
+                tiled = runs[-1]
+                assert reference[2] == tiled[2], "ubatch changed optimizer cadence"
+                assert reference[1] == tiled[1], "ubatch changed the loss trajectory"
+                metrics = compare_state(Path(str(reference[0]) + ".qat-state.gguf"), Path(str(tiled[0]) + ".qat-state.gguf"))
+                first_metrics = compare_state(Path(str(reference[3]) + ".qat-state.gguf"), Path(str(tiled[3]) + ".qat-state.gguf"), first_step=True)
+                _, a = tensor_map(reference[0])
+                _, b = tensor_map(tiled[0])
+                base_reader, originals = tensor_map(model)
+                weight_error, weight_norm = 0.0, 0.0
+                packed_equal = True
+                for name in a.keys() | b.keys():
+                    tensor = a.get(name, originals[name])
+                    other = b.get(name, originals[name])
+                    assert tensor.tensor_type == other.tensor_type, name
+                    x = gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float64)
+                    y = gguf.quants.dequantize(other.data, other.tensor_type).astype(np.float64)
+                    weight_error += float(np.sum((x - y)**2))
+                    weight_norm += float(np.sum(x*x))
+                    packed_equal = packed_equal and np.array_equal(tensor.data, other.data)
+                relative = float(np.sqrt(weight_error / max(weight_norm, 1e-30)))
+                assert packed_equal and relative == 0, (model_name, optimizer, relative)
+                report["full_context"][model_name + "-" + optimizer] = {
+                    "optimizer_steps": len(reference[2]), "learning_rate": args.full_context_learning_rate,
+                    "reference_loss": reference[1], "tiled_loss": tiled[1],
+                    "first_step_state": first_metrics, "state": metrics, "weight_relative_l2": relative,
+                    "packed_weights_equal": bool(packed_equal), "bit_exact_ubatches": [1024, 768, 512, 256],
+                }
+                (args.output_dir / "report.json").write_text(json.dumps(report, indent=2))
+        print(json.dumps(report["full_context"], indent=2))
+        return
+
     for model_name, model in models.items():
         reader, tensors = tensor_map(model)
         expert_parameters = sum(t.n_elements for t in tensors.values() if "_exps." in t.name)
@@ -185,7 +290,7 @@ def main():
         reused = "reusing forward/backward/optimizer graph" in static_text
         report[model_name]["static_graph_reused"] = reused
         compare_models(dynamic, static)
-        loss_pattern = r"qat_loss:.*?loss=([0-9.e+-]+)"
+        loss_pattern = r"(?:qat_)?loss:.*?loss=([0-9.e+-]+)"
         np.testing.assert_allclose([float(x) for x in re.findall(loss_pattern, dynamic_text)],
                                    [float(x) for x in re.findall(loss_pattern, static_text)], rtol=1e-5, atol=1e-5)
         merged = args.output_dir / (model_name + "-merged.gguf")
@@ -253,7 +358,7 @@ def main():
              r"blk\.0\.attn_(k|v)\.weight=CUDA0,blk\.5\.ffn_down_exps\.weight=CUDA0",
              "--qat-targets", "blk.0.attn_k.weight,blk.0.attn_v.weight,blk.5.ffn_down_exps.weight", "--save-first-at", "1"],
             data=args.fixtures / "synthetic_chat.jsonl", epochs=2)
-        selected = set(re.findall(r"qat_target: (\S+)", text))
+        selected = set(re.findall(r"(?:qat_)?target: (\S+)", text))
         assert len(selected) == 3 and re.search(r"CPU nodes=[1-9]\d*", text), "partial GPU placement was not exercised"
         state_reader, states = tensor_map(str(partial) + ".step1.gguf.qat-state.gguf")
         for index in range(3):
@@ -320,7 +425,7 @@ def main():
         values = gguf.quants.dequantize(momentum.data, momentum.tensor_type)
         assert np.isfinite(values).all() and np.any(values != 0), "missing " + name + " gradient"
     full, adapter, text = train("frozen", models["dense"], ["--qat-targets", "attn_k,attn_v", "--freeze-layers", "5"])
-    names = re.findall(r"qat_target: (\S+)", text)
+    names = re.findall(r"(?:qat_)?target: (\S+)", text)
     assert names and all(name.startswith("blk.5.") for name in names)
     base_reader, originals = tensor_map(models["dense"])
     trained_reader, trained = tensor_map(full)

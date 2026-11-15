@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
+#include "qat-snapshot.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
 }
@@ -13,6 +14,7 @@ extern "C" {
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -244,6 +246,62 @@ static void test_units(fixture & f, const std::string & units) {
     f.reset();
 }
 
+static void test_async_snapshot(fixture & f) {
+    const auto base = common_qlion_capture(f.base, f.targets);
+    f.change(f.a, 4, 0x11);
+    ggml_context_ptr state(ggml_init({ 2*ggml_tensor_overhead(), nullptr, true }));
+    auto * residual = ggml_new_tensor_1d(state.get(), GGML_TYPE_F32, 32);
+    ggml_backend_buffer_ptr state_buffer(ggml_backend_alloc_ctx_tensors_from_buft(state.get(), ggml_backend_cpu_buffer_type()));
+    ggml_set_f32(residual, 1.25f);
+    auto sources = f.targets;
+    sources.push_back(residual);
+    sources.push_back(f.a);
+    auto snapshot = std::make_shared<qat_tensor_snapshot>(sources);
+    check(snapshot->get(f.a) == snapshot->get(sources.back()), "snapshot did not preserve aliases");
+    std::promise<void> release;
+    auto ready = release.get_future();
+    auto writer = std::async(std::launch::async, [&, snapshot, ready = std::move(ready)]() mutable {
+        ready.get();
+        common_qlion_save(base, snapshot->get(f.targets), f.path("async"));
+        check(ggml_get_f32_1d(snapshot->get(residual), 0) == 1.25f, "writer observed a newer optimizer state");
+    });
+    f.change(f.a, 4, 0x22);
+    ggml_set_f32(residual, 2.5f);
+    release.set_value();
+    writer.get();
+    ggml_context * loaded = nullptr;
+    gguf_context_ptr meta(gguf_init_from_file(f.path("async").c_str(), { false, &loaded }));
+    ggml_context_ptr tensors(loaded);
+    const auto * saved = ggml_get_tensor(tensors.get(), f.a->name);
+    check(saved && static_cast<const unsigned char *>(saved->data)[4] == 0x11,
+        "async checkpoint mixed parameters from different steps");
+    auto failure = std::async(std::launch::async, [snapshot] { throw std::runtime_error("writer failed"); });
+    rejected([&] { failure.get(); });
+    f.reset();
+    f.write_base(f.base);
+}
+
+static void test_hash_cache_invalidation(fixture & f) {
+    const auto snapshot = common_qlion_capture(f.base, f.targets);
+    const auto modified = std::filesystem::last_write_time(f.base);
+    std::ifstream input(f.base, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    input.close();
+    const auto position = bytes.find("base");
+    check(position != std::string::npos, "base metadata fixture not found");
+    {
+        std::fstream output(f.base, std::ios::binary | std::ios::in | std::ios::out);
+        output.seekp(position);
+        output.put('f');
+    }
+    std::filesystem::last_write_time(f.base, modified);
+    const auto changed = common_qlion_capture(f.base, f.targets);
+    check(changed.file_hash != snapshot.file_hash, "cached base hash ignored a write with restored mtime");
+    rejected([&] { common_qlion_save(snapshot, f.targets, f.path("cached-stale-base")); });
+    common_qlion_save(changed, f.targets, f.path("cached-valid-base"));
+    f.write_base(f.base);
+}
+
 static void test_malformed_directory(fixture & f) {
     const auto path = f.path("duplicate");
     gguf_context_ptr meta(gguf_init_empty());
@@ -287,6 +345,8 @@ int main(int argc, char ** argv) {
         test_adapter(f);
         test_units(f, "rows");
         test_units(f, "experts");
+        test_async_snapshot(f);
+        test_hash_cache_invalidation(f);
         test_malformed_directory(f);
         for (auto type : { GGML_TYPE_MXFP4, GGML_TYPE_Q2_0 }) {
             const auto directory = std::string(argv[1]) + "/" + ggml_type_name(type);

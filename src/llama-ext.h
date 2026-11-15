@@ -42,6 +42,26 @@ LLAMA_API void llama_opt_set_graph_reuse(struct llama_context * ctx, bool enable
 LLAMA_API void llama_opt_set_weight_streaming(struct llama_context * ctx, bool enabled);
 
 using llama_opt_distillation_callback = void (*)(void * userdata, uint64_t row, int32_t * ids, float * logp);
+
+struct llama_joint_validation_status {
+    int64_t step = -1;
+    int64_t windows = 0;
+    int64_t total_windows = 0;
+    int32_t paired_projections = 0;
+    double loss = 0;
+    bool active = false;
+    bool complete = false;
+    int64_t correct = 0;
+    int64_t supervised = 0;
+};
+
+// Both contexts must use the same model and remain alive until detach.
+LLAMA_API bool llama_opt_joint_validation_attach(struct llama_context * train, struct llama_context * validation, bool fuse_all = true);
+LLAMA_API bool llama_opt_joint_validation_start(struct llama_context * train, struct ggml_opt_dataset * dataset,
+        int64_t first, int64_t end, int64_t step);
+LLAMA_API llama_joint_validation_status llama_opt_joint_validation_status(const struct llama_context * train);
+LLAMA_API bool llama_opt_joint_validation_finish(struct llama_context * train);
+LLAMA_API void llama_opt_joint_validation_detach(struct llama_context * train);
 // Configure before llama_opt_init. Dataset auxiliary data contains one cache row offset per token.
 LLAMA_API void llama_opt_set_distillation(
         struct llama_context * ctx, int32_t top_k, float temperature,

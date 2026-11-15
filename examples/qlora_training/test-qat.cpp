@@ -2229,7 +2229,7 @@ static void test_qlion_lazy_gradient_state(enum qat_weight_format format, ggml_b
     ggml_backend_free(backend);
 }
 
-static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device, bool grad_cpu = false) {
+static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_backend_dev_t device, bool grad_cpu = false, int period = 2) {
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
     ggml_backend_t cpu_backend = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr :
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -2254,7 +2254,7 @@ static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
     opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
-    opt_params.opt_period = 2;
+    opt_params.opt_period = period;
     opt_params.get_opt_pars = test_qlion_optimizer_params;
     opt_params.qat_grad_accumulator_cpu = grad_cpu;
     ggml_opt_context_t opt = ggml_opt_init(opt_params);
@@ -2262,7 +2262,7 @@ static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_
     qlion_accumulation_trace trace;
     ggml_backend_sched_set_eval_callback(sched, trace_qlion_accumulation, &trace);
     std::vector<ggml_context *> compute_contexts;
-    for (int micro = 0; micro < 2; ++micro) {
+    for (int micro = 0; micro < period; ++micro) {
         ggml_init_params compute_params = {
             GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 3 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
             nullptr,
@@ -2285,6 +2285,12 @@ static void test_qlion_mixed_gradient_state(enum qat_weight_format format, ggml_
         std::vector<float> labels_zero(ggml_nelements(ggml_opt_labels(opt)), 0.0f);
         ggml_backend_tensor_set(ggml_opt_labels(opt), labels_zero.data(), 0, labels_zero.size() * sizeof(float));
         ggml_opt_eval(opt, nullptr);
+        check(ggml_opt_step(opt) == (micro + 1) / period, "optimizer updated before the accumulation group completed");
+        if (micro + 1 < period) {
+            std::vector<uint8_t> actual(weight_data.size());
+            ggml_backend_tensor_get(weight, actual.data(), 0, actual.size());
+            check(actual == weight_data, "weights changed before the accumulation group completed");
+        }
     }
     if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
         check(trace.q8_microgradient_host == grad_cpu,
@@ -2641,6 +2647,7 @@ int main() {
     test_qlion_lazy_gradient_state(QAT_WEIGHT_Q8_0, cpu_device);
     test_qlion_mixed_gradient_state(QAT_WEIGHT_MXFP4, cpu_device);
     test_qlion_mixed_gradient_state(QAT_WEIGHT_Q4_0, cpu_device);
+    test_qlion_mixed_gradient_state(QAT_WEIGHT_Q4_0, cpu_device, false, 16);
     test_qlion_mixed_gradient_state(QAT_WEIGHT_Q8_0, cpu_device);
     printf("QAT reference tests passed\n");
     return 0;

@@ -1,0 +1,131 @@
+ggml_opt_build_backward: cached QLion dependency plan: 0 dependencies across 1 states
+ggml_opt_prepare_recompute: activation recompute: 1 regions, 2 replay nodes
+ggml_opt_build_backward: cached QLion dependency plan: 0 dependencies across 1 states
+ggml_opt_prepare_recompute: activation recompute: 3 regions, 6 replay nodes
+ggml_opt_build_backward: cached QLion dependency plan: 0 dependencies across 1 states
+ggml_opt_prepare_recompute: activation recompute: 6 regions, 18 replay nodes
+ggml_cuda_init: found 3 CUDA devices (Total VRAM: 34280 MiB):
+  Device 0: Tesla V100-SXM2-16GB, compute capability 7.0, VMM: yes, VRAM: 16144 MiB
+  Device 1: Tesla V100-SXM2-16GB, compute capability 7.0, VMM: yes, VRAM: 16144 MiB
+  Device 2: Quadro P620, compute capability 6.1, VMM: yes, VRAM: 1992 MiB
+ggml_vulkan: Found 3 Vulkan devices:
+ggml_vulkan: 0 = Quadro P620 (NVIDIA) | uma: 0 | fp16: 0 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+ggml_vulkan: 1 = Tesla V100-SXM2-16GB (NVIDIA) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+ggml_vulkan: 2 = Tesla V100-SXM2-16GB (NVIDIA) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+compact encoding: CPU IDs, FP16 logp, tails, ties and non-finite checks passed
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055269
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445481045
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.2811669
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055269
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445481045
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.2811669
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055269
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445481045
+full-context gradient: backend=CPU flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.2811669
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750408
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265314
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750408
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265314
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750408
+full-context gradient: backend=CPU flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265314
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051537
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445471575
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28109582
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051537
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445471575
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28109582
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051537
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445471575
+full-context gradient: backend=CPU flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28109582
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750174
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265345
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750174
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265345
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750174
+full-context gradient: backend=CPU flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265345
+full-context: ctx1024 ub256/512/768/1024 bit-exact K/V gradients and last-token-to-prefix backward passed on CPU
+paired forward: dense/routed outputs, training gradients, detached validation and mutable-weight exclusion passed on CPU
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055256
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445480986
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28116699
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055256
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445480986
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28116699
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055256
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445480986
+full-context gradient: backend=CUDA0 flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28116699
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750401
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265298
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750401
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265298
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750401
+full-context gradient: backend=CUDA0 flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265298
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051986
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445468346
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28124898
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051986
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445468346
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28124898
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051986
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445468346
+full-context gradient: backend=CUDA0 flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28124898
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114748744
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.25026949
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114748744
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.25026949
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114748744
+full-context gradient: backend=CUDA0 flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.25026949
+full-context: ctx1024 ub256/512/768/1024 bit-exact K/V gradients and last-token-to-prefix backward passed on CUDA0
+paired forward: dense/routed outputs, training gradients, detached validation and mutable-weight exclusion passed on CUDA0
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055256
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445480986
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28116699
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055256
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445480986
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28116699
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123055256
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445480986
+full-context gradient: backend=CUDA1 flash=0 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28116699
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750401
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265298
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750401
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265298
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114750401
+full-context gradient: backend=CUDA1 flash=0 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.250265298
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051986
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445468346
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28124898
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051986
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445468346
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28124898
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=0 relative_l2=0 prefix_l2=0.123051986
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=1 relative_l2=0 prefix_l2=0.445468346
+full-context gradient: backend=CUDA1 flash=1 last_only=0 qkv=2 relative_l2=0 prefix_l2=4.28124898
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114748744
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.25026949
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114748744
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.25026949
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=0 relative_l2=0 prefix_l2=0
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=1 relative_l2=0 prefix_l2=0.0114748744
+full-context gradient: backend=CUDA1 flash=1 last_only=1 qkv=2 relative_l2=0 prefix_l2=0.25026949
+full-context: ctx1024 ub256/512/768/1024 bit-exact K/V gradients and last-token-to-prefix backward passed on CUDA1
+paired forward: dense/routed outputs, training gradients, detached validation and mutable-weight exclusion passed on CUDA1
+paired forward: dense/routed outputs, training gradients, detached validation and mutable-weight exclusion passed on Meta(CUDA0,CUDA1)
+distillation: KL reference, finite-difference gradients, masks, temperatures and cache checks passed

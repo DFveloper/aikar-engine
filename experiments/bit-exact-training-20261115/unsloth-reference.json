@@ -1,0 +1,17 @@
+{
+  "source": "https://github.com/unslothai/notebooks/blob/main/nb/gpt-oss-(20B)-Fine-tuning.ipynb",
+  "user_dataset": "/mnt/openwebui/AIKAR/train-data/gpt_6.1-sol_dist.jsonl",
+  "user_runtime_seconds": 13800,
+  "context": 1024,
+  "rank": 8,
+  "alpha": 16,
+  "batch": 1,
+  "gradient_accumulation": 4,
+  "optimizer": "adamw_8bit",
+  "learning_rate": 0.0002,
+  "weight_decay": 0.001,
+  "seed": 3407,
+  "response_only": true,
+  "notebook_default_steps": 30,
+  "note": "User measured runtime is separate from notebook default 30-step demonstration."
+}

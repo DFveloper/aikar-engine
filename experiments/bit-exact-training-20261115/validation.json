@@ -1,0 +1,181 @@
+{
+  "status": "functional_checks_passed_performance_target_unverified",
+  "passed": {
+    "cpu_cuda_tensor_meta_units": true,
+    "gpu_trajectories": {
+      "runs": 32,
+      "optimizers": [
+        "qlion",
+        "qlion2"
+      ],
+      "fixtures": [
+        "dense",
+        "moe"
+      ],
+      "ubatches": [
+        1024,
+        768,
+        512,
+        256
+      ],
+      "steps": 16,
+      "comparison": "raw packed weights and all optimizer tensor bytes",
+      "report": "gpu-integration.json"
+    },
+    "tensor_context_16384": {
+      "runs": 8,
+      "fixtures": [
+        "dense",
+        "moe"
+      ],
+      "ubatches": [
+        1024,
+        768,
+        512,
+        256
+      ],
+      "steps": 2,
+      "report": "small-16k-tensor.json"
+    },
+    "tensor_distillation_accumulation": {
+      "runs": 6,
+      "fixtures": [
+        "dense",
+        "shared-kv-lumen"
+      ],
+      "ubatches": [
+        1024,
+        768,
+        256
+      ],
+      "grad_accum": 3,
+      "includes_partial_final_group": true,
+      "report": "kd-tensor.json"
+    }
+  },
+  "limits": [
+    "Bit equality is scoped to the same hardware/backend, thread count, training settings, and fixed arithmetic tiles.",
+    "Unsloth speed and VRAM superiority has not been established. The reference uses GPT-OSS 20B QLoRA, whereas this run uses Lumen native QLion2.",
+    "Actual 16K validation is a one-training-window and one-validation-window smoke run, not a full epoch.",
+    "The successful memory placement uses two 16GB V100 GPUs, not one 16GB GPU."
+  ],
+  "real_lumen_16384": {
+    "context": 16384,
+    "ubatches": [
+      768,
+      256
+    ],
+    "devices": [
+      "V100 16GB CUDA0",
+      "V100 16GB CUDA1"
+    ],
+    "split_mode": "tensor",
+    "gpu_layers": 999,
+    "qat_targets": 8,
+    "grad_accum": 6,
+    "train_windows": 1,
+    "validation_windows": 1,
+    "updates": 1,
+    "offload": "F32 layer checkpoints and reduced gradients in RAM",
+    "comparison": {
+      "weights": 658,
+      "optimizer_tensors": 24,
+      "ubatches": [
+        768,
+        256
+      ],
+      "context": 16384,
+      "split_mode": "tensor",
+      "optimizer_metadata_fields_equal": [
+        "training.qat.version",
+        "training.qat.quant_type",
+        "training.qat.optimizer",
+        "training.qat.context_length",
+        "training.qat.parallel",
+        "training.qat.grad_accum_steps",
+        "training.qat.loss",
+        "training.qat.distill_cache",
+        "training.qat.distill_top_k",
+        "training.qat.distill_temperature",
+        "training.qat.lr.unit",
+        "training.qat.lr.tau",
+        "training.qat.lr.warmup",
+        "training.qat.momentum_type",
+        "training.qat.residual_type",
+        "training.qat.state_count",
+        "training.optimizer.step",
+        "training.scheduler.step",
+        "training.dataset.epoch",
+        "training.dataset.window",
+        "training.qat.param.0",
+        "training.qat.param.1",
+        "training.qat.param.2",
+        "training.qat.param.3",
+        "training.qat.param.4",
+        "training.qat.param.5",
+        "training.qat.param.6",
+        "training.qat.param.7"
+      ],
+      "momentum_norm_squared": 137.6095886036632,
+      "frozen_weights_unchanged": true
+    },
+    "first_update": {
+      "frozen_weights_unchanged": true,
+      "changed_packed_weights": 0,
+      "state_norm_squared": {
+        "qat.m.": 137.6095886036632,
+        "qat.r.": 0.0
+      },
+      "note": "The first QLion2 update initializes nonzero momentum; packed model weights and residuals are unchanged in this one-step smoke. Multi-step weight trajectories are covered by the fixture regressions."
+    },
+    "runs": {
+      "768": {
+        "memory": {
+          "samples": 554,
+          "peak_device_bytes": [
+            15694364672,
+            16325279744
+          ],
+          "peak_rss_kib": 26079548,
+          "started_at_unix": 1794738817.5149095,
+          "pid": 102216,
+          "peak_hwm_kib": 26079548,
+          "exit_code": 0,
+          "elapsed_seconds": 554.5117540359497
+        },
+        "training_loss": 4.36751747,
+        "validation_loss": 4.4167881
+      },
+      "256": {
+        "memory": {
+          "samples": 298,
+          "peak_device_bytes": [
+            15589507072,
+            16220422144
+          ],
+          "peak_rss_kib": 26082040,
+          "started_at_unix": 1794739383.4617393,
+          "pid": 109788,
+          "peak_hwm_kib": 26082040,
+          "exit_code": 0,
+          "elapsed_seconds": 298.3170783519745
+        },
+        "training_loss": 4.36751747,
+        "validation_loss": 4.4167881
+      }
+    }
+  },
+  "native_speed": {
+    "scope": "Small dense/MoE fixtures, context 1024, one V100, median of final 12 step intervals. Old binary used the previous truncated backward path; current binary preserves full-window gradients. This is not an Unsloth or full-model benchmark.",
+    "dense": {
+      "baseline_ms": 43.95500000000008,
+      "current_ms": 48.72799999999994,
+      "change_percent": 10.85883289728098
+    },
+    "moe": {
+      "baseline_ms": 63.55049999999996,
+      "current_ms": 71.00550000000023,
+      "change_percent": 11.73082823895999
+    }
+  }
+}

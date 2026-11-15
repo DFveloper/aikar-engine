@@ -250,6 +250,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
 
 struct ggml_backend_meta_buffer_type_context {
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
+    ggml_backend_buffer_ptr measure_buffer;
 
     std::string name;
 
@@ -312,15 +313,7 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
     return max_size;
 }
 
-static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
-    size_t max_alloc_size = 0;
-    for (size_t i = 0; i < n_simple_bufts; i++) {
-        const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
-        max_alloc_size = std::max(max_alloc_size, alloc_size);
-    }
-    return max_alloc_size;
-}
+static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);
 
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
@@ -484,6 +477,15 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
     if (it == stc.simple_tensors.end()) {
+        // GGUF writers copy tensor metadata while keeping the same model storage.
+        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            for (const auto & entry : buf_ctx->stc_static.simple_tensors) {
+                if (entry.first->data == tensor->data && strcmp(entry.first->name, tensor->name) == 0 &&
+                    ggml_are_same_layout(entry.first, tensor)) {
+                    return entry.second[index];
+                }
+            }
+        }
         return nullptr;
     }
     return it->second[index];
@@ -492,12 +494,17 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
-        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
+        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync,
+        ggml_backend_buffer_t fallback = nullptr) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    ggml_backend_buffer_t buffer = tensor->buffer ? tensor->buffer : fallback;
+    if (!ggml_backend_buffer_is_meta(buffer)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -656,7 +663,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                     }
                 }
-                GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
+                GGML_ABORT("shape mismatch for %s '%s': source='%s' axis=%d input=%lld output=[%lld,%lld,%lld,%lld]", ggml_op_name(tensor->op), tensor->name,
+                    tensor->src[0]->name, int(src_ss[0].axis), (long long) base_ne_in,
+                    (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
             case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
@@ -685,7 +694,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     continue;
                 }
                 if (tensor->view_offs == offset) {
-                    return ggml_backend_meta_get_split_state(stc, source, true);
+                    return ggml_backend_meta_get_split_state(stc, source, true, buffer);
                 }
                 offset += GGML_PAD(ggml_nelements(source)*sizeof(float), GGML_MEM_ALIGN);
             }
@@ -860,8 +869,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+        if (tensor->view_src == nullptr &&
+            (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE || tensor->op == GGML_OP_NONE)) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
             if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
@@ -887,7 +897,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 continue;
             }
-            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
+            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true, buffer);
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
@@ -896,7 +906,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_NONE: {
                 if (tensor->view_src != nullptr) {
                     // full-tensor view created with ggml_view_tensor, transparent for the split state
-                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
+                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync, buffer);
                 } else {
                     split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
                 }
@@ -916,7 +926,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (axis_a == 0 && a->op == GGML_OP_SCALE && ggml_get_op_params_f32(a, 0) == 0.0f &&
                         ggml_get_op_params_f32(a, 1) == 0.0f && a->src[0]->op == GGML_OP_MUL_MAT &&
                         ggml_backend_buffer_is_meta(a->src[0]->src[0]->buffer)) {
-                    auto state = ggml_backend_meta_get_split_state(stc, a->src[0]->src[0], true);
+                    auto state = ggml_backend_meta_get_split_state(stc, a->src[0]->src[0], true, buffer);
                     if (state.axis == 1 && a->src[0]->src[0]->ne[1] == a->ne[0]) {
                         state.axis = GGML_BACKEND_SPLIT_AXIS_0;
                         GGML_ASSERT(split_states_equal(state, src_ss[0]));
@@ -1011,7 +1021,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_SUM: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
+                    split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+                } else {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                }
             } break;
             case GGML_OP_SUM_ROWS:
             case GGML_OP_CUMSUM:
@@ -1174,8 +1188,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
                         src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
                 split_state = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 0};
+                const bool q_only = ggml_nbytes(tensor) == GGML_PAD(ggml_nelements(tensor->src[0])*sizeof(float), GGML_MEM_ALIGN);
                 for (int i : {0, 1, 2, 5}) {
-                    if (!tensor->src[i]) {
+                    if (!tensor->src[i] || (q_only && i != 0)) {
                         continue;
                     }
                     const auto * source = tensor->src[i];
@@ -1262,7 +1277,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
 
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
@@ -1822,7 +1837,32 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    if (!ggml_is_contiguous(tensor) && split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        if (ggml_is_contiguously_allocated(tensor) && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS &&
+                split_state.n_segments == 1 && split_state.nr[0] == 1) {
+            const int axis = split_state.axis;
+            const size_t stride = tensor->nb[axis]*tensor->ne[axis]/(axis == 0 ? ggml_blck_size(tensor->type) : 1);
+            const size_t end = offset + size;
+            for (size_t chunk = offset/stride; chunk*stride < end; ++chunk) {
+                size_t start = chunk*stride;
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    const auto * local = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const size_t bytes = stride*split_state.ne[j]/tensor->ne[axis];
+                    const size_t first = std::max(offset, start);
+                    const size_t last = std::min(end, start + bytes);
+                    if (first < last) {
+                        ggml_backend_tensor_get(local, (char *) data + first - offset,
+                            chunk*bytes + first - start, last - first);
+                    }
+                    start += bytes;
+                }
+            }
+            return;
+        }
+        GGML_ABORT("unsupported split read: tensor=%s axis=%d shape=[%lld,%lld,%lld,%lld] strides=[%zu,%zu,%zu,%zu] offset=%zu size=%zu",
+            tensor->name, int(split_state.axis), (long long) tensor->ne[0], (long long) tensor->ne[1],
+            (long long) tensor->ne[2], (long long) tensor->ne[3], tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3], offset, size);
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -2003,6 +2043,36 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
             ggml_backend_buffer_set_usage(buf_ctx->bufs[i].get(), usage);
         }
     }
+}
+
+static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    auto * ctx = static_cast<ggml_backend_meta_buffer_type_context *>(buft->context);
+    const size_t n = ctx->simple_bufts.size();
+    if (!ctx->measure_buffer) {
+        ggml_backend_meta_simple_tensor_container data, compute0, compute1;
+        auto * measure = new ggml_backend_meta_buffer_context(data, compute0, compute1,
+                std::vector<ggml_backend_buffer_t>(n, nullptr));
+        ctx->measure_buffer.reset(ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, measure, 0));
+        ggml_backend_buffer_set_usage(ctx->measure_buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    }
+    auto * measure = static_cast<ggml_backend_meta_buffer_context *>(ctx->measure_buffer->context);
+    const auto split = ggml_backend_meta_get_split_state(measure->stc_static, tensor, true, ctx->measure_buffer.get());
+    size_t size = 0;
+    for (size_t i = 0; i < n; ++i) {
+        ggml_tensor local = *tensor;
+        if (split.axis >= 0 && split.axis < GGML_MAX_DIMS && ggml_is_contiguous(tensor)) {
+            const int axis = split.axis;
+            local.ne[axis] = 0;
+            for (size_t j = 0; j < split.n_segments; ++j) {
+                local.ne[axis] += split.ne[j*n + i]*split.nr[j];
+            }
+            for (int j = axis + 1; j < GGML_MAX_DIMS; ++j) {
+                local.nb[j] = tensor->nb[j]*local.ne[axis]/tensor->ne[axis];
+            }
+        }
+        size = std::max(size, ggml_backend_buft_get_alloc_size(ctx->simple_bufts[i], &local));
+    }
+    return size;
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {

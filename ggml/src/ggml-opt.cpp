@@ -131,6 +131,7 @@ struct ggml_opt_context {
     std::vector<std::vector<struct ggml_tensor *>> qat_aliases;
     std::vector<std::vector<struct ggml_tensor *>> qat_pending_grads;
     std::vector<size_t> qat_expected_grads;
+    std::vector<bool> qat_host_grads;
     std::set<struct ggml_tensor *> qat_forward_nodes;
     std::vector<ggml_backend_buffer_t> qat_buffers;
     std::vector<struct ggml_context *> qat_contexts;
@@ -1130,10 +1131,12 @@ static ggml_tensor * ggml_opt_clone_recompute_tensor(
         ggml_tensor * tensor,
         ggml_tensor * input,
         std::map<ggml_tensor *, bool> & dependency_memo,
-        std::map<ggml_tensor *, ggml_tensor *> & clones) {
-    // Keep the expert selection from the original forward pass.
-    if (!tensor || tensor == input || tensor->type == GGML_TYPE_I32 || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
-        return tensor;
+        std::map<ggml_tensor *, ggml_tensor *> & clones, ggml_tensor * replay_input,
+        const std::map<ggml_tensor *, ggml_tensor *> & replacements) {
+    if (tensor == input) return replay_input;
+    if (!tensor || tensor == input || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
+        const auto found = replacements.find(tensor);
+        return found == replacements.end() ? tensor : found->second;
     }
     const auto found = clones.find(tensor);
     if (found != clones.end()) {
@@ -1151,10 +1154,10 @@ static ggml_tensor * ggml_opt_clone_recompute_tensor(
     ggml_format_name(clone, "recompute_%s", tensor->name);
     clone->view_offs = tensor->view_offs;
     clone->view_src = ggml_opt_clone_recompute_tensor(
-            ctx, tensor->view_src, input, dependency_memo, clones);
+            ctx, tensor->view_src, input, dependency_memo, clones, replay_input, replacements);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         clone->src[i] = ggml_opt_clone_recompute_tensor(
-                ctx, tensor->src[i], input, dependency_memo, clones);
+                ctx, tensor->src[i], input, dependency_memo, clones, replay_input, replacements);
     }
     return clone;
 }
@@ -1165,33 +1168,42 @@ static void ggml_opt_prepare_recompute(ggml_opt_context_t opt_ctx, int n_nodes_f
     }
 
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> regions;
-    ggml_tensor * input = nullptr;
+    std::vector<ggml_tensor *> inputs;
     for (int i = 0; i < n_nodes_f; ++i) {
         ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
-        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE_INPUT) {
-            GGML_ASSERT(input == nullptr && "nested activation recompute regions are not supported");
-            input = node;
-        }
+        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE_INPUT) inputs.push_back(node);
         if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE) {
-            GGML_ASSERT(input && "activation recompute output has no input boundary");
-            regions.emplace_back(input, node);
-            input = nullptr;
+            GGML_ASSERT(!inputs.empty() && "activation recompute output has no input boundary");
+            regions.emplace_back(inputs.back(), node);
+            inputs.pop_back();
         }
     }
-    GGML_ASSERT(input == nullptr && "activation recompute input has no output boundary");
+    GGML_ASSERT(inputs.empty() && "activation recompute input has no output boundary");
 
-    for (const auto & region : regions) {
+    std::map<ggml_tensor *, ggml_tensor *> replacements;
+    // Build outer regions first; inner regions replay from the outer checkpoint.
+    for (auto it = regions.rbegin(); it != regions.rend(); ++it) {
+        const auto & region = *it;
         std::map<ggml_tensor *, bool> dependency_memo;
         std::map<ggml_tensor *, ggml_tensor *> clones;
-        ggml_tensor * replay = ggml_opt_clone_recompute_tensor(
-                opt_ctx->ctx_compute, region.second, region.first, dependency_memo, clones);
-        GGML_ASSERT(replay != region.second && "activation recompute output does not depend on its input");
-        for (const auto & entry : clones) {
-            opt_ctx->recompute_replacements.emplace_back(entry.first, entry.second);
+        const auto boundary = replacements.find(region.first);
+        ggml_tensor * replay_input = boundary == replacements.end() ? region.first : boundary->second;
+        if (boundary == replacements.end() && region.first->view_src &&
+            region.first->view_src->op == GGML_OP_CONT && (region.first->view_src->flags & GGML_TENSOR_FLAG_HOST)) {
+            // A new view makes the scheduler reload host storage for backward.
+            replay_input = ggml_view_4d(opt_ctx->ctx_compute, region.first,
+                    region.first->ne[0], region.first->ne[1], region.first->ne[2], region.first->ne[3],
+                    region.first->nb[1], region.first->nb[2], region.first->nb[3], 0);
+            replacements[region.first] = replay_input;
         }
+        ggml_tensor * replay = ggml_opt_clone_recompute_tensor(
+                opt_ctx->ctx_compute, region.second, region.first, dependency_memo, clones, replay_input, replacements);
+        GGML_ASSERT(replay != region.second && "activation recompute output does not depend on its input");
+        for (const auto & entry : clones) replacements[entry.first] = entry.second;
         opt_ctx->recompute_regions++;
         opt_ctx->recompute_nodes += (int32_t) clones.size();
     }
+    opt_ctx->recompute_replacements.assign(replacements.begin(), replacements.end());
     GGML_LOG_INFO("%s: activation recompute: %d regions, %d replay nodes\n",
             __func__, opt_ctx->recompute_regions, opt_ctx->recompute_nodes);
 }
@@ -1202,28 +1214,59 @@ static ggml_cgraph * ggml_opt_apply_recompute(ggml_opt_context_t opt_ctx, int n_
     }
 
     ggml_cgraph * graph = opt_ctx->gb_grad;
+    std::unordered_map<ggml_tensor *, ggml_tensor *> replacements;
+    for (const auto & entry : opt_ctx->recompute_replacements) {
+        replacements.emplace(entry.first, entry.second);
+    }
     for (int i = n_nodes_f; i < opt_ctx->gb_grad->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
-        for (const auto & entry : opt_ctx->recompute_replacements) {
-            if (node->view_src == entry.first) {
-                node->view_src = entry.second;
-                break;
-            }
+        const auto view = replacements.find(node->view_src);
+        if (view != replacements.end()) {
+            node->view_src = view->second;
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            for (const auto & entry : opt_ctx->recompute_replacements) {
-                if (node->src[j] == entry.first) {
-                    node->src[j] = entry.second;
-                    break;
-                }
+            const auto source = replacements.find(node->src[j]);
+            if (source != replacements.end()) {
+                node->src[j] = source->second;
             }
         }
     }
 
     ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, /*grads =*/ true);
+    std::set<ggml_tensor *> consumed;
+    std::set<ggml_tensor *> gradient_roots;
+    for (size_t i = 0; i < graph->visited_hash_set.size; ++i) {
+        if (ggml_bitset_get(graph->visited_hash_set.used, i) &&
+            (graph->visited_hash_set.keys[i]->flags & GGML_TENSOR_FLAG_PARAM)) {
+            gradient_roots.insert(graph->grads[i]);
+            gradient_roots.insert(graph->grad_accs[i]);
+        }
+    }
+    if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer)) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            const auto * node = graph->nodes[i];
+            if (node->view_src) consumed.insert(node->view_src);
+            for (auto * src : node->src) {
+                if (src) consumed.insert(src);
+            }
+        }
+    }
     for (int i = 0; i < graph->n_nodes; ++i) {
+        if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer) && i >= n_nodes_f &&
+            ggml_op_is_empty(graph->nodes[i]->op) && !gradient_roots.count(graph->nodes[i]) &&
+            !(graph->nodes[i]->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_OUTPUT))) {
+            continue;
+        }
         if (graph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
-            ggml_build_forward_expand(reordered, graph->nodes[i]);
+            auto * node = graph->nodes[i];
+            ggml_build_forward_expand(reordered, node);
+            if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer) && node->type == GGML_TYPE_F32 &&
+                !node->buffer && !node->view_src && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                strncmp(node->name, "grad for ", 9) == 0 && !consumed.count(node) && ggml_nelements(node) > 1) {
+                // Consume terminal gradients to release their buffers, including tensor-split gradients.
+                auto * dependency = ggml_sum(opt_ctx->ctx_compute, node);
+                ggml_build_forward_expand(reordered, dependency);
+            }
         } else {
             ggml_build_forward_order(reordered, graph->nodes[i]);
         }
@@ -1428,6 +1471,17 @@ static uint64_t ggml_opt_qat_graph_signature(
 
     return h;
 }
+static ggml_tensor * ggml_opt_stream_gradient(ggml_opt_context_t opt_ctx, ggml_context * ctx, ggml_tensor * grad) {
+    ggml_tensor * sum = grad;
+    if (grad->op == GGML_OP_ADD) {
+        auto * left = ggml_opt_stream_gradient(opt_ctx, ctx, grad->src[0]);
+        auto * right = ggml_opt_stream_gradient(opt_ctx, ctx, grad->src[1]);
+        sum = ggml_add(ctx, left, right);
+    }
+    ggml_build_forward_expand(opt_ctx->gb_grad, sum);
+    return sum;
+}
+
 static struct ggml_tensor *
 ggml_opt_qlion_qat_backward_callback(
         struct ggml_context * ctx,
@@ -1604,9 +1658,24 @@ if (!dumped_qat_placement &&
         opt_ctx->
             qat_pending_grads[i];
 
-    pending.push_back(
-        grad
-    );
+    if (pending.empty() && opt_ctx->qat_grad_accumulator_cpu && grad->type == GGML_TYPE_F32 &&
+        (grad->op == GGML_OP_OUT_PROD || grad->op == GGML_OP_ADD)) {
+        opt_ctx->qat_host_grads[i] = true;
+    }
+    if (opt_ctx->qat_host_grads[i]) {
+        auto * host = ggml_cont(ctx, ggml_opt_stream_gradient(opt_ctx, ctx, grad));
+        host->flags |= GGML_TENSOR_FLAG_HOST;
+        if (!pending.empty()) {
+            host = ggml_add(ctx, pending.back(), host);
+            host->flags |= GGML_TENSOR_FLAG_HOST;
+        }
+        ggml_format_name(host, "QLion gradient for %s", opt_ctx->qat_params[i]->name);
+        pending.push_back(host);
+        // Consume each tile in order instead of retaining all full-size gradients on the GPU.
+        ggml_build_forward_expand(opt_ctx->gb_grad, host);
+    } else {
+        pending.push_back(grad);
+    }
 
     if (pending.size() <
         opt_ctx->
@@ -1933,11 +2002,10 @@ if (!dumped_qat_placement &&
 
     if (!step) {
 
-        ggml_tensor * combined =
-            pending[0];
+        ggml_tensor * combined = opt_ctx->qat_host_grads[i] ? pending.back() : pending[0];
 
         
-        for (size_t j = 1;
+        for (size_t j = opt_ctx->qat_host_grads[i] ? pending.size() : 1;
             j < pending.size();
             ++j) {
 
@@ -2172,6 +2240,7 @@ static void ggml_opt_build_backward(ggml_opt_context_t opt_ctx) {
         }
         opt_ctx->qat_pending_grads.assign(opt_ctx->qat_params.size(), {});
         opt_ctx->qat_expected_grads.assign(opt_ctx->qat_params.size(), 0);
+        opt_ctx->qat_host_grads.assign(opt_ctx->qat_params.size(), false);
         for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
             struct ggml_tensor * node = opt_ctx->gf->nodes[i];
             if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
@@ -2188,6 +2257,10 @@ static void ggml_opt_build_backward(ggml_opt_context_t opt_ctx) {
         ggml_build_backward_expand_with_callback(
             opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(),
             ggml_opt_qlion_qat_backward_callback, opt_ctx);
+        if (opt_ctx->qat_grad_accumulator_cpu) {
+            const size_t count = std::count(opt_ctx->qat_host_grads.begin(), opt_ctx->qat_host_grads.end(), true);
+            GGML_LOG_INFO("%s: RAM F32 gradient reduction for %zu/%zu states\n", __func__, count, opt_ctx->qat_host_grads.size());
+        }
         if (qlion_qat && !opt_ctx->qat_route_probe &&
             !opt_ctx->
                 qat_dependency_plan_ready) {
@@ -2331,6 +2404,31 @@ static void ggml_opt_build_backward(ggml_opt_context_t opt_ctx) {
     if (!opt_ctx->buf_cpu) opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
 }
 
+static std::pair<ggml_tensor *, ggml_tensor *> ggml_opt_distillation_tiles(
+        ggml_context * ctx, ggml_cgraph * graph, ggml_tensor * logits,
+        ggml_tensor * ids, ggml_tensor * logp, ggml_tensor * weights, float temperature, int64_t total_rows) {
+    if (logits->op == GGML_OP_CONCAT && ggml_get_op_params_i32(logits, 0) == 1) {
+        const int64_t left_rows = logits->src[0]->ne[1];
+        const int64_t right_rows = logits->src[1]->ne[1];
+        const auto left = ggml_opt_distillation_tiles(ctx, graph, logits->src[0],
+            ggml_view_2d(ctx, ids, ids->ne[0], left_rows, ids->nb[1], 0),
+            ggml_view_2d(ctx, logp, logp->ne[0], left_rows, logp->nb[1], 0),
+            ggml_view_1d(ctx, weights, left_rows, 0), temperature, total_rows);
+        const auto right = ggml_opt_distillation_tiles(ctx, graph, logits->src[1],
+            ggml_view_2d(ctx, ids, ids->ne[0], right_rows, ids->nb[1], left_rows*ids->nb[1]),
+            ggml_view_2d(ctx, logp, logp->ne[0], right_rows, logp->nb[1], left_rows*logp->nb[1]),
+            ggml_view_1d(ctx, weights, right_rows, left_rows*weights->nb[0]), temperature, total_rows);
+        return {ggml_add(ctx, left.first, right.first), ggml_concat(ctx, left.second, right.second, 0)};
+    }
+    auto * loss = ggml_opt_distillation_loss(ctx, logits, ids, logp, weights, temperature);
+    loss = ggml_scale(ctx, loss, float(ggml_nrows(logits))/total_rows);
+    auto * pred = ggml_argmax(ctx, logits);
+    // Consume predictions before the next head tile, so logits can be released and replayed for backward.
+    ggml_build_forward_expand(graph, loss);
+    ggml_build_forward_expand(graph, pred);
+    return {loss, pred};
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     opt_ctx->recompute_regions = 0;
     opt_ctx->recompute_nodes = 0;
@@ -2351,8 +2449,11 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0;
     const bool need_qat_state = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && qlion_qat;
 
+    const bool tiled_distillation = qlion_qat && opt_ctx->activation_recompute && !opt_ctx->static_graphs &&
+        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_DISTILLATION && opt_ctx->outputs->op == GGML_OP_CONCAT &&
+        ggml_get_op_params_i32(opt_ctx->outputs, 0) == 1 && !(opt_ctx->outputs->flags & GGML_TENSOR_FLAG_OUTPUT);
     ggml_set_input(opt_ctx->inputs);
-    ggml_set_output(opt_ctx->outputs);
+    if (!tiled_distillation) ggml_set_output(opt_ctx->outputs);
 
     int n_param = 0;
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
@@ -2403,6 +2504,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     struct ggml_context * ctx_results = opt_ctx->static_graphs ? opt_ctx->ctx_static : opt_ctx->ctx_compute;
     ggml_set_fused_backward(ctx_results, opt_ctx->fused_backward);
+    if (tiled_distillation) {
+        opt_ctx->gf = ggml_new_graph_custom(ctx_results, opt_ctx->gf->size, true);
+    }
+    ggml_tensor * tiled_predictions = nullptr;
 
     switch (opt_ctx->loss_type) {
         case GGML_OPT_LOSS_TYPE_DISTILLATION: {
@@ -2420,9 +2525,17 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_set_input(opt_ctx->sparse_weights);
             ggml_set_name(opt_ctx->distillation_ids, "teacher_ids");
             ggml_set_name(opt_ctx->distillation_logp, "teacher_logp");
-            opt_ctx->loss = ggml_opt_distillation_loss(ctx_results, opt_ctx->outputs,
-                    opt_ctx->distillation_ids, opt_ctx->distillation_logp,
-                    opt_ctx->sparse_weights, opt_ctx->distillation_temperature);
+            if (tiled_distillation) {
+                const auto tiles = ggml_opt_distillation_tiles(ctx_results, opt_ctx->gf, opt_ctx->outputs,
+                    opt_ctx->distillation_ids, opt_ctx->distillation_logp, opt_ctx->sparse_weights,
+                    opt_ctx->distillation_temperature, nrows);
+                opt_ctx->loss = tiles.first;
+                tiled_predictions = tiles.second;
+            } else {
+                opt_ctx->loss = ggml_opt_distillation_loss(ctx_results, opt_ctx->outputs,
+                        opt_ctx->distillation_ids, opt_ctx->distillation_logp,
+                        opt_ctx->sparse_weights, opt_ctx->distillation_temperature);
+            }
             if (opt_ctx->opt_period > 1) {
                 opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
             }
@@ -2671,7 +2784,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
 
     if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_DISTILLATION) {
-        opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
+        opt_ctx->pred = tiled_predictions ? tiled_predictions : ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
@@ -3401,6 +3514,17 @@ void ggml_opt_result_accuracy(ggml_opt_result_t result, double * accuracy, doubl
         sqrt((*accuracy) * (1.0 - (*accuracy)) / double(result->nvalid - 1)) : NAN;
 }
 
+void ggml_opt_result_last(ggml_opt_result_t result, double * loss, double * accuracy) {
+    *loss = result->loss.empty() ? NAN :
+        double(result->loss.back()) * (result->loss_per_datapoint ? result->opt_period : 1);
+    const bool have_accuracy = !result->loss.empty() &&
+        result->nvalid_batch.size() == result->loss.size() &&
+        result->ncorrect_batch.size() == result->loss.size() &&
+        result->nvalid_batch.back() > 0 && result->ncorrect_batch.back() >= 0;
+    *accuracy = have_accuracy ?
+        double(result->ncorrect_batch.back()) / result->nvalid_batch.back() : NAN;
+}
+
 // ====== Computation ======
 
 void ggml_opt_prepare_alloc(
@@ -3538,26 +3662,20 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer)) {
-        ggml_backend_t gpu_backend = nullptr;
         ggml_backend_t cpu_backend = nullptr;
         for (int i = 0; i < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++i) {
             ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
             const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
-            if ((device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_META) && !gpu_backend) {
-                gpu_backend = backend;
-            } else if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 cpu_backend = backend;
             }
         }
-        if (gpu_backend || cpu_backend) {
+        if (cpu_backend) {
             for (int i = 0; i < ggml_graph_n_nodes(opt_ctx->allocated_graph_copy); ++i) {
                 ggml_tensor * node = ggml_graph_node(opt_ctx->allocated_graph_copy, i);
                 const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
                     node->src[0] && node->src[0]->type == GGML_TYPE_F32;
-                if ((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) &&
-                    !node->buffer && gpu_backend && ggml_backend_supports_op(gpu_backend, node)) {
-                    ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, gpu_backend);
-                } else if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && !node->buffer && cpu_backend &&
+                if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && !node->buffer &&
                     ggml_backend_supports_op(cpu_backend, node)) {
                     ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, cpu_backend);
                 }
@@ -3686,9 +3804,7 @@ static void ggml_opt_plan_actual_routes(ggml_opt_context_t opt_ctx) {
             if (opt_ctx->qat_forward_nodes.count(node) || node->buffer) continue;
             const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
                 node->src[0] && node->src[0]->type == GGML_TYPE_F32;
-            if (((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) &&
-                    (device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_META)) ||
-                (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && device_type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 if (!ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, node) && ggml_backend_supports_op(backend, node)) {
                     ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, backend);
                 }
@@ -3953,80 +4069,8 @@ void ggml_opt_epoch_callback_progress_bar(
     const int64_t idata_max  = ibatch_max*batch_size;
 
     double loss;
-    double loss_unc;
     double accuracy;
-    double accuracy_unc;
-    int64_t ema_n = 0;
-    if (const char * value = std::getenv("GGML_OPT_EMA_N")) {
-        char * end = nullptr;
-        const long parsed = std::strtol(value, &end, 10);
-        if (end != value && *end == '\0' && parsed > 0) {
-            ema_n = parsed;
-        }
-    }
-
-    if (ema_n > 0 && !result->loss.empty()) {
-        const double alpha = 2.0 / (double(ema_n) + 1.0);
-        double loss_mean = 0.0;
-        double loss_var = 0.0;
-        double accuracy_mean = 0.0;
-        double accuracy_var = 0.0;
-        double accuracy_weight_ema = 0.0;
-        double accuracy_correct_ema = 0.0;
-        double accuracy_square_ema = 0.0;
-        bool have_loss = false;
-        bool have_accuracy = false;
-        const size_t history_limit = size_t(ema_n) * 20;
-        const size_t history_start = result->loss.size() > history_limit ?
-            result->loss.size() - history_limit : 0;
-        for (size_t i = history_start; i < result->loss.size(); ++i) {
-            const double sample = result->loss_per_datapoint ?
-                double(result->loss[i]) * result->opt_period : double(result->loss[i]);
-            if (!have_loss) {
-                loss_mean = sample;
-                have_loss = true;
-            } else {
-                const double delta = sample - loss_mean;
-                loss_mean += alpha * delta;
-                loss_var = (1.0 - alpha) * (loss_var + alpha * delta * delta);
-            }
-
-            if (i >= result->nvalid_batch.size() || result->nvalid_batch[i] <= 0 ||
-                    result->ncorrect_batch[i] < 0) {
-                continue;
-            }
-            const double sample_accuracy = double(result->ncorrect_batch[i]) / result->nvalid_batch[i];
-            const double sample_weight = double(result->nvalid_batch[i]);
-            if (!have_accuracy) {
-                accuracy_mean = sample_accuracy;
-                accuracy_weight_ema = sample_weight;
-                accuracy_correct_ema = double(result->ncorrect_batch[i]);
-                accuracy_square_ema = sample_weight * sample_accuracy * sample_accuracy;
-                have_accuracy = true;
-            } else {
-                // Decay step history as usual, but weight every step by its
-                // supervised-token count. This is equivalent to maintaining
-                // EMA(correct tokens) / EMA(supervised tokens), so a window
-                // with only a few labels cannot influence accuracy as much as
-                // a densely supervised window.
-                accuracy_weight_ema = (1.0 - alpha) * accuracy_weight_ema + alpha * sample_weight;
-                accuracy_correct_ema = (1.0 - alpha) * accuracy_correct_ema +
-                    alpha * double(result->ncorrect_batch[i]);
-                accuracy_square_ema = (1.0 - alpha) * accuracy_square_ema +
-                    alpha * sample_weight * sample_accuracy * sample_accuracy;
-                accuracy_mean = accuracy_correct_ema / accuracy_weight_ema;
-                accuracy_var = std::max(0.0,
-                    accuracy_square_ema / accuracy_weight_ema - accuracy_mean * accuracy_mean);
-            }
-        }
-        loss = loss_mean;
-        loss_unc = sqrt(loss_var);
-        accuracy = have_accuracy ? accuracy_mean : NAN;
-        accuracy_unc = have_accuracy ? sqrt(accuracy_var) : NAN;
-    } else {
-        ggml_opt_result_loss(result, &loss, &loss_unc);
-        ggml_opt_result_accuracy(result, &accuracy, &accuracy_unc);
-    }
+    ggml_opt_result_last(result, &loss, &accuracy);
 
     const int64_t t_ibatch_us = ggml_time_us() - t_start_us;
     int64_t t_ibatch_s = t_ibatch_us / 1000000;
@@ -4042,18 +4086,10 @@ void ggml_opt_epoch_callback_progress_bar(
     const int64_t t_eta_m = t_eta_s / 60;
     t_eta_s -= t_eta_m * 60;
 
-    if (ema_n > 0) {
-        fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss_ema%" PRId64 "=%.5lf±%.5lf "
-                "acc_ema%" PRId64 "=%.2lf±%.2lf%% t=%02" PRId64 ":%02" PRId64 ":%02" PRId64
-                " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
-                idata, idata_max, ema_n, loss, loss_unc, ema_n, 100.0*accuracy, 100.0*accuracy_unc,
-                t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
-    } else {
-        fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss=%.5lf±%.5lf acc=%.2lf±%.2lf%% "
-                "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
-                idata, idata_max, loss, loss_unc, 100.0*accuracy, 100.0*accuracy_unc,
-                t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
-    }
+    fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss=%.8lf acc=%.6lf%% "
+            "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
+            idata, idata_max, loss, 100.0*accuracy,
+            t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
     if (ibatch == ibatch_max) {
         fprintf(stderr, "\n");
     }

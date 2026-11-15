@@ -693,6 +693,8 @@ extern "C" {
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_RECOMPUTE = 32, // ...is the output of an activation recompute region
         GGML_TENSOR_FLAG_RECOMPUTE_INPUT = 64, // ...is the input to an activation recompute region
+        GGML_TENSOR_FLAG_STOP_GRAD = 128, // ...stops gradient propagation
+        GGML_TENSOR_FLAG_HOST = 256, // ...stores the result on the CPU backend
     };
 
     enum ggml_tri_type {
@@ -898,6 +900,9 @@ extern "C" {
 
     GGML_API struct ggml_tensor * ggml_dup_tensor (struct ggml_context * ctx, const struct ggml_tensor * src);
     GGML_API struct ggml_tensor * ggml_view_tensor(struct ggml_context * ctx, struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_detach(struct ggml_context * ctx, struct ggml_tensor * src);
+    // Skip the unused gradient suffix of a shared matrix projection with frozen weights.
+    GGML_API bool ggml_set_matmul_prefix_grad(struct ggml_tensor * view);
 
     // Context tensor enumeration and lookup
     GGML_API struct ggml_tensor * ggml_get_first_tensor(const struct ggml_context * ctx);

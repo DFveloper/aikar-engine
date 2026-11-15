@@ -5,7 +5,7 @@
 #include "llama-impl.h"
 #include "llama-model-saver.h"
 #include "qlion-adapter.h"
-#include "logit-distillation.h"
+#include "mixed-cache.h"
 
 static int64_t train_sample_split_by_conversation(
         const std::vector<training_sample> & samples,
@@ -124,7 +124,7 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
     struct gguf_init_params params = { true, &ctx_meta };
     struct gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
     if (!gctx) {
-        LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
+        LOG_ERR("cannot open %s\n", path.c_str());
         return false;
     }
     filter.tied_embedding = gguf_find_tensor(gctx, "token_embd.weight") >= 0 && gguf_find_tensor(gctx, "output.weight") < 0;
@@ -135,7 +135,7 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
     const bool valid_layers = layers_id >= 0 && gguf_get_kv_type(gctx, layers_id) == GGUF_TYPE_UINT32 &&
         filter.freeze_layers >= 0 && uint32_t(filter.freeze_layers) <= gguf_get_val_u32(gctx, layers_id);
     if (!valid_layers) {
-        LOG_ERR("%s: --freeze-layers is outside the model layer range\n", __func__);
+        LOG_ERR("--freeze-layers is outside the model layer range\n");
         gguf_free(gctx);
         ggml_free(ctx_meta);
         return false;
@@ -149,8 +149,7 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
         if (ggml_is_quantized(tensor->type)) {
             const auto found = std::find(expected.begin(), expected.end(), tensor->type);
             if (found == expected.end() && qat_name_filter(tensor, filter)) {
-                LOG_ERR("%s: tensor %s has unsupported type %s\n",
-                    __func__, name, ggml_type_name(tensor->type));
+                LOG_ERR("tensor %s has unsupported type %s\n", name, ggml_type_name(tensor->type));
                 gguf_free(gctx);
                 ggml_free(ctx_meta);
                 return false;
@@ -162,7 +161,7 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
                 info.residual_bytes += ggml_row_size(GGML_TYPE_Q4_0, tensor->ne[0]) * ggml_nrows(tensor);
                 info.quantized_tensors++;
                 if (filter.tied_embedding && strcmp(name, "token_embd.weight") == 0) {
-                    LOG_WRN("qat_targets: tied token_embd/output selected; gradient covers the full vocabulary; dense_f32_bytes=%llu full_adapter_bytes=%llu\n",
+                    LOG_WRN("targets: tied token_embd/output selected; gradient covers the full vocabulary; dense_f32_bytes=%llu full_adapter_bytes=%llu\n",
                         (unsigned long long) (ggml_nelements(tensor) * sizeof(float)), (unsigned long long) ggml_nbytes(tensor));
                 }
             }
@@ -174,12 +173,12 @@ static bool qat_inspect_model(const std::string & path, const std::vector<enum g
     ggml_free(ctx_meta);
     for (size_t i = 0; i < expected.size(); ++i) {
         if (counts[i] == 0) {
-            LOG_ERR("%s: model contains no %s tensors\n", __func__, ggml_type_name(expected[i]));
+            LOG_ERR("model contains no %s tensors\n", ggml_type_name(expected[i]));
             return false;
         }
     }
     if (info.quantized_tensors == 0) {
-        LOG_ERR("%s: --qat-targets and --freeze-layers select no supported quantized tensors\n", __func__);
+        LOG_ERR("--qat-targets and --freeze-layers select no supported quantized tensors\n");
         return false;
     }
     return true;
@@ -229,6 +228,7 @@ struct qat_resume_state {
     int64_t epoch = 0;
     int64_t window = 0;
     int64_t schedule_step = 0;
+    int64_t windows_per_update = 1;
 };
 
 static std::string qat_state_path(const std::string & model_path) {
@@ -299,7 +299,7 @@ static bool qat_save_state(
     const std::string path = qat_state_path(model_path);
     std::ofstream out(path, std::ios::binary);
     if (!out.is_open()) {
-        LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
+        LOG_ERR("cannot open %s\n", path.c_str());
         gguf_free(gctx);
         ggml_free(tensor_ctx);
         return false;
@@ -344,7 +344,7 @@ static bool qat_load_state(
     const std::string path = qat_state_path(model_path);
     struct gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
     if (!gctx) {
-        LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
+        LOG_ERR("cannot open %s\n", path.c_str());
         return false;
     }
     const int context_key = gguf_find_key(gctx, "training.qat.context_length");
@@ -360,14 +360,14 @@ static bool qat_load_state(
             k_key >= 0 && gguf_get_kv_type(gctx, k_key) == GGUF_TYPE_UINT32 && gguf_get_val_u32(gctx, k_key) == uint32_t(config.distill_top_k) &&
             t_key >= 0 && gguf_get_kv_type(gctx, t_key) == GGUF_TYPE_FLOAT32 && gguf_get_val_f32(gctx, t_key) == config.distill_temperature);
     if (!loss_valid || !cache_valid) {
-        LOG_ERR("%s: checkpoint loss or teacher cache configuration differs\n", __func__);
+        LOG_ERR("checkpoint loss or teacher cache configuration differs\n");
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
     }
     if (context_key >= 0 && (gguf_get_kv_type(gctx, context_key) != GGUF_TYPE_UINT32 ||
         gguf_get_val_u32(gctx, context_key) != (uint32_t) config.n_ctx)) {
-        LOG_ERR("%s: checkpoint sequence context differs from --ctx-size\n", __func__);
+        LOG_ERR("checkpoint sequence context differs from --ctx-size\n");
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
@@ -382,7 +382,7 @@ static bool qat_load_state(
     const int optimizer_key = gguf_find_key(gctx, "training.qat.optimizer");
     if (optimizer_key >= 0 && (gguf_get_kv_type(gctx, optimizer_key) != GGUF_TYPE_STRING ||
         std::strcmp(gguf_get_val_str(gctx, optimizer_key), ggml_opt_optimizer_name(config.optimizer)) != 0)) {
-        LOG_ERR("%s: checkpoint optimizer does not match --optimizer\n", __func__);
+        LOG_ERR("checkpoint optimizer does not match --optimizer\n");
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
@@ -391,7 +391,7 @@ static bool qat_load_state(
         (has_lr && (gguf_get_val_u32(gctx, lr_unit) != (uint32_t) config.qat_lr_scale_unit ||
                     gguf_get_val_f32(gctx, lr_tau) != config.qat_lr_scale_tau ||
                     gguf_get_val_u32(gctx, lr_warmup) != (uint32_t) config.qat_lr_scale_warmup))) {
-        LOG_ERR("%s: adaptive LR settings differ from checkpoint\n", __func__);
+        LOG_ERR("adaptive LR settings differ from checkpoint\n");
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
@@ -400,14 +400,14 @@ static bool qat_load_state(
     const int64_t type_key = gguf_find_key(gctx, "training.qat.quant_type");
     const int64_t count = count_key >= 0 ? gguf_get_val_i64(gctx, count_key) : -1;
     if (type_key < 0 || quant_type != gguf_get_val_str(gctx, type_key) || count != llama_opt_qat_state_count(lctx)) {
-        LOG_ERR("%s: checkpoint state does not match the current model\n", __func__);
+        LOG_ERR("checkpoint state does not match the current model\n");
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
     }
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
-        LOG_ERR("%s: cannot open %s\n", __func__, path.c_str());
+        LOG_ERR("cannot open %s\n", path.c_str());
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
@@ -429,7 +429,7 @@ static bool qat_load_state(
         struct ggml_tensor * residual_saved = ggml_get_tensor(data_ctx, residual_name);
         if (key < 0 || strcmp(gguf_get_val_str(gctx, key), param->name) != 0 || !momentum_saved || !residual_saved ||
             ggml_nbytes(momentum_saved) != ggml_nbytes(momentum) || ggml_nbytes(residual_saved) != ggml_nbytes(residual)) {
-            LOG_ERR("%s: state %ld does not match parameter %s\n", __func__, (long) i, param->name);
+            LOG_ERR("state %ld does not match parameter %s\n", (long) i, param->name);
             gguf_free(gctx);
             ggml_free(data_ctx);
             return false;
@@ -441,7 +441,7 @@ static bool qat_load_state(
         snprintf(lr_name, sizeof(lr_name), "qat.lr.%06ld", (long) i);
         struct ggml_tensor * lr_saved = ggml_get_tensor(data_ctx, lr_name);
         if (lr_state && (!lr_saved || lr_saved->type != GGML_TYPE_F32 || ggml_nelements(lr_saved) != 2)) {
-            LOG_ERR("%s: checkpoint lacks adaptive LR state for %s\n", __func__, param->name);
+            LOG_ERR("checkpoint lacks adaptive LR state for %s\n", param->name);
             gguf_free(gctx);
             ggml_free(data_ctx);
             return false;
@@ -458,7 +458,7 @@ static bool qat_load_state(
                 in.seekg(file_offset + offset);
                 in.read((char *) data.data(), chunk);
                 if (!in.good()) {
-                    LOG_ERR("%s: failed to read state for parameter %s\n", __func__, param->name);
+                    LOG_ERR("failed to read state for parameter %s\n", param->name);
                     gguf_free(gctx);
                     ggml_free(data_ctx);
                     return false;
@@ -468,7 +468,7 @@ static bool qat_load_state(
                     memcpy(lr, data.data(), sizeof(lr));
                     if (!std::isfinite(lr[0]) || lr[0] < 0 || !std::isfinite(lr[1]) ||
                         lr[1] < 0 || lr[1] > 16777216 || lr[1] != std::floor(lr[1])) {
-                        LOG_ERR("%s: invalid adaptive LR checkpoint state\n", __func__);
+                        LOG_ERR("invalid adaptive LR checkpoint state\n");
                         gguf_free(gctx);
                         ggml_free(data_ctx);
                         return false;
@@ -477,7 +477,7 @@ static bool qat_load_state(
                 ggml_backend_tensor_set(targets[state], data.data(), offset, chunk);
                 ggml_backend_tensor_get(targets[state], check_data.data(), offset, chunk);
                 if (memcmp(check_data.data(), data.data(), chunk) != 0) {
-                    LOG_ERR("%s: backend changed state data for parameter %s\n", __func__, param->name);
+                    LOG_ERR("backend changed state data for parameter %s\n", param->name);
                     gguf_free(gctx);
                     ggml_free(data_ctx);
                     return false;
@@ -490,7 +490,7 @@ static bool qat_load_state(
     const int64_t epoch_key = gguf_find_key(gctx, "training.dataset.epoch");
     const int64_t window_key = gguf_find_key(gctx, "training.dataset.window");
     if (step_key < 0 || schedule_key < 0 || epoch_key < 0 || window_key < 0) {
-        LOG_ERR("%s: checkpoint progress metadata is incomplete\n", __func__);
+        LOG_ERR("checkpoint progress metadata is incomplete\n");
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
@@ -499,6 +499,18 @@ static bool qat_load_state(
     resume.schedule_step = gguf_get_val_i64(gctx, schedule_key);
     resume.epoch = gguf_get_val_i64(gctx, epoch_key);
     resume.window = gguf_get_val_i64(gctx, window_key);
+    for (const char * name : {"training.qat.parallel", "training.qat.grad_accum_steps"}) {
+        const int key = gguf_find_key(gctx, name);
+        if (key < 0) continue;
+        if (gguf_get_kv_type(gctx, key) != GGUF_TYPE_UINT32 || gguf_get_val_u32(gctx, key) < 1 ||
+                gguf_get_val_u32(gctx, key) > INT32_MAX) {
+            LOG_ERR("invalid checkpoint accumulation setting: %s\n", name);
+            gguf_free(gctx);
+            ggml_free(data_ctx);
+            return false;
+        }
+        resume.windows_per_update *= gguf_get_val_u32(gctx, key);
+    }
     gguf_free(gctx);
     ggml_free(data_ctx);
     return true;
@@ -512,7 +524,7 @@ static bool qat_validate_saved_metadata(const std::string & source_path, const s
     struct gguf_context * source = gguf_init_from_file(source_path.c_str(), source_params);
     struct gguf_context * output = gguf_init_from_file(output_path.c_str(), output_params);
     if (!source || !output) {
-        LOG_ERR("%s: cannot reopen saved model metadata\n", __func__);
+        LOG_ERR("cannot reopen saved model metadata\n");
         if (source) {
             gguf_free(source);
         }
@@ -533,20 +545,20 @@ static bool qat_validate_saved_metadata(const std::string & source_path, const s
         const int64_t output_key = gguf_find_key(output, key);
         if (output_key < 0 || gguf_get_kv_type(source, i) != gguf_get_kv_type(output, output_key) ||
             gguf_kv_to_str(source, i) != gguf_kv_to_str(output, output_key)) {
-            LOG_ERR("%s: saved metadata mismatch for %s\n", __func__, key);
+            LOG_ERR("saved metadata mismatch for %s\n", key);
             valid = false;
             break;
         }
         if (gguf_get_kv_type(source, i) == GGUF_TYPE_ARRAY &&
             gguf_get_arr_type(source, i) != gguf_get_arr_type(output, output_key)) {
-            LOG_ERR("%s: saved metadata array type mismatch for %s\n", __func__, key);
+            LOG_ERR("saved metadata array type mismatch for %s\n", key);
             valid = false;
             break;
         }
     }
 
     if (valid) {
-        LOG_INF("%s: preserved source metadata (%ld keys)\n", __func__, (long) gguf_get_n_kv(source));
+        LOG_INF("preserved source metadata (%ld keys)\n", (long) gguf_get_n_kv(source));
     }
     gguf_free(source);
     gguf_free(output);
@@ -563,7 +575,7 @@ static bool qat_save_model(
     struct gguf_init_params init_params = { true, &source_data };
     struct gguf_context * source = gguf_init_from_file(source_path.c_str(), init_params);
     if (!source) {
-        LOG_ERR("%s: cannot open source metadata from %s\n", __func__, source_path.c_str());
+        LOG_ERR("cannot open source metadata from %s\n", source_path.c_str());
         return false;
     }
 
@@ -579,7 +591,7 @@ static bool qat_save_model(
     ggml_free(source_data);
 
     if (!saved) {
-        LOG_ERR("%s: failed to save %s\n", __func__, output_path.c_str());
+        LOG_ERR("failed to save %s\n", output_path.c_str());
         return false;
     }
     return qat_validate_saved_metadata(source_path, output_path);
@@ -611,7 +623,7 @@ static bool qat_save_checkpoint(
     if (!qat_save_state(lctx, path, epoch, window, schedule_step, quant_type, config)) {
         return false;
     }
-    LOG_INF("%s: saved %s and %s\n", __func__, path.c_str(), qat_state_path(path).c_str());
+    LOG_INF("checkpoint saved to %s and %s\n", path.c_str(), qat_state_path(path).c_str());
     return true;
 }
 
@@ -633,9 +645,9 @@ static void qat_prune_checkpoints(const std::string & prefix, const std::string 
         std::error_code remove_ec;
         std::filesystem::remove(entry.path(), remove_ec);
         if (remove_ec) {
-            LOG_ERR("%s: cannot remove %s: %s\n", __func__, entry.path().c_str(), remove_ec.message().c_str());
+            LOG_ERR("cannot remove %s: %s\n", entry.path().c_str(), remove_ec.message().c_str());
         } else {
-            LOG_INF("%s: removed %s\n", __func__, entry.path().c_str());
+            LOG_INF("removed %s\n", entry.path().c_str());
         }
     }
 }
@@ -696,7 +708,7 @@ static void qat_epoch_callback(
         const int64_t context = ggml_opt_dataset_labels(dataset)->ne[0];
         const int64_t supervised = std::count_if(labels + g_qat_callback->window_start*context,
                 labels + g_qat_callback->validation_start*context, [](int32_t token) { return token >= 0; });
-        LOG_INF("qat_throughput: input_tokens=%ld supervised_tokens=%ld elapsed_s=%.3f input_tok_s=%.3f supervised_tok_s=%.3f\n",
+        LOG_INF("throughput: input_tokens=%ld supervised_tokens=%ld elapsed_s=%.3f input_tok_s=%.3f supervised_tok_s=%.3f\n",
                 (long) input_tokens, (long) supervised, elapsed, elapsed > 0 ? input_tokens/elapsed : 0,
                 elapsed > 0 ? supervised/elapsed : 0);
     }
@@ -712,11 +724,12 @@ static void qat_epoch_callback(
         qat_run_periodic_eval(dataset, step);
     }
     if (g_qat_callback->params->verbose_loss) {
-        double loss = 0.0;
-        ggml_opt_result_loss(result, &loss, nullptr);
-        LOG_INF("qat_loss: epoch=%ld window=%ld step=%ld loss=%.8f lr=%.9g\n",
+        double loss;
+        double accuracy;
+        ggml_opt_result_last(result, &loss, &accuracy);
+        LOG_INF("loss: epoch=%ld window=%ld step=%ld loss=%.8f acc=%.6f%% lr=%.9g\n",
             (long) g_qat_callback->epoch, (long) ibatch, (long) step,
-            loss, (double) g_qat_callback->schedule->current_lr);
+            loss, 100.0 * accuracy, (double) g_qat_callback->schedule->current_lr);
     }
     const bool window_complete = ibatch > 0 && ibatch % g_qat_callback->ubatches_per_window == 0;
     const bool first_save_due = g_qat_callback->first_save_pending &&
@@ -763,22 +776,20 @@ static void qat_epoch_callback(
                         g_qat_callback->schedule->step, g_qat_callback->params->qat_quant_type, *g_qat_callback->params);
                 }
                 if (saved) {
-                    LOG_INF("qat_adapter_checkpoint: saved step=%ld path=%s\n", (long) step, path.c_str());
+                    LOG_INF("adapter_checkpoint: saved step=%ld path=%s\n", (long) step, path.c_str());
                     qat_prune_checkpoints(g_qat_callback->params->qat_adapter_out, path);
                 }
             } catch (const std::exception & e) {
-                LOG_ERR("qat_adapter_checkpoint: %s\n", e.what());
+                LOG_ERR("adapter_checkpoint: %s\n", e.what());
                 saved = false;
             }
         }
         if (saved) {
             g_qat_callback->last_saved_step = step;
             g_qat_callback->first_save_pending = false;
-            LOG_INF("%s: checkpoint set saved at step %ld window %ld\n",
-                __func__, (long) step, (long) window);
+            LOG_INF("checkpoint set saved at step %ld window %ld\n", (long) step, (long) window);
         } else {
-            LOG_ERR("%s: checkpoint set failed at step %ld window %ld\n",
-                __func__, (long) step, (long) window);
+            LOG_ERR("checkpoint set failed at step %ld window %ld\n", (long) step, (long) window);
         }
     }
 }
@@ -822,7 +833,7 @@ static void qat_print_memory(struct llama_context * lctx, const struct qat_model
             device_used_bytes = total_bytes - free_bytes;
         }
     }
-    LOG_INF("qat_memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu lr_scale=%llu dense_gradient_q8_0=%llu sparse_gradient_q8_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu device_used=%zu\n",
+    LOG_INF("memory: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu lr_scale=%llu dense_gradient_q8_0=%llu sparse_gradient_q8_0=%llu nonquantized_model=%llu context=%llu compute_workspace=%llu persistent_qat=%llu device_used=%zu\n",
         (unsigned long long) model_info.quantized_bytes, (unsigned long long) momentum_bytes,
         (unsigned long long) residual_bytes, (unsigned long long) lr_scale_bytes, (unsigned long long) dense_gradient_bytes,
         (unsigned long long) sparse_gradient_bytes,
@@ -859,7 +870,6 @@ static void distillation_limit_dataset(ggml_opt_dataset_t & dataset, int64_t & s
 #ifndef LLAMA_LOGIT_EXTRACT_SHARED_ONLY
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
-    set_default_progress_ema();
     common_params params;
     params.escape = false;
     params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
@@ -878,40 +888,39 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (params.train_file.empty()) {
-        LOG_ERR("%s: --train-file is required\n", __func__);
+        LOG_ERR("--train-file is required\n");
         return 1;
     }
     if (params.qat_out.empty() && params.qat_adapter_out.empty()) {
-        LOG_ERR("%s: adapter-only saving requires --qat-adapter-out\n", __func__);
+        LOG_ERR("adapter-only saving requires --qat-adapter-out\n");
         return 1;
     }
     if (params.grpo_mode || !params.lora_adapters.empty()) {
-        LOG_ERR("%s: native QAT does not accept GRPO or LoRA adapters\n", __func__);
+        LOG_ERR("training does not accept GRPO or LoRA adapters\n");
         return 1;
     }
     if (!ggml_opt_optimizer_is_qlion(params.optimizer)) {
-        LOG_ERR("%s: native QAT only supports --optimizer qlion or qlion2\n", __func__);
+        LOG_ERR("training only supports --optimizer qlion or qlion2\n");
         return 1;
     }
     if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_QLION2_QAT) {
         params.qat_lr_scale_unit = 32;
     }
-    LOG_INF("%s: optimizer=%s lr_scale_unit=%d tau=%.9g lr_scale_warmup=%d\n", __func__,
+    LOG_INF("optimizer=%s lr_scale_unit=%d tau=%.9g lr_scale_warmup=%d\n",
             ggml_opt_optimizer_name(params.optimizer), params.qat_lr_scale_unit, params.qat_lr_scale_tau, params.qat_lr_scale_warmup);
-    if (params.n_ctx <= 0 || params.n_batch != params.n_ctx || params.n_ubatch <= 0 ||
-        params.n_batch % params.n_ubatch != 0) {
-        LOG_ERR("%s: native QLion requires explicit -c N -b N with -ub M where N is divisible by M\n", __func__);
+    if (params.n_ctx <= 0 || params.n_batch != params.n_ctx || params.n_ubatch <= 0) {
+        LOG_ERR("training requires explicit -c N -b N with positive -ub M\n");
         return 1;
     }
     if (params.n_parallel < 1 || (size_t) params.n_parallel > llama_max_parallel_sequences() ||
         params.n_ctx > INT32_MAX / params.n_parallel ||
         (params.n_parallel > 1 && (params.n_ctx % 256 != 0 || params.kv_unified))) {
-        LOG_ERR("%s: parallel QAT requires positive parallel count, separate KV streams and context divisible by 256\n", __func__);
+        LOG_ERR("parallel training requires positive parallel count, separate KV streams and context divisible by 256\n");
         return 1;
     }
     if ((params.n_parallel > 1 || params.grad_accum_steps > 1) &&
         (params.mtp_mode != "off" || params.critical_token_mode != "none")) {
-        LOG_ERR("%s: parallel/accumulated QAT does not yet support MTP or critical-token weighting\n", __func__);
+        LOG_ERR("parallel/accumulated training does not yet support MTP or critical-token weighting\n");
         return 1;
     }
     params.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -919,8 +928,7 @@ int main(int argc, char ** argv) {
         params.cache_type_k = GGML_TYPE_F32;
         params.cache_type_v = GGML_TYPE_F32;
     } else {
-        LOG_INF("%s: KV cache training target: K=%s V=%s hadamard_k=%d hadamard_v=%d\n",
-                __func__, ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
+        LOG_INF("KV cache training target: K=%s V=%s hadamard_k=%d hadamard_v=%d\n", ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
                 params.cache_hadamard_k, params.cache_hadamard_v);
     }
     params.warmup = false;
@@ -931,11 +939,11 @@ int main(int argc, char ** argv) {
     }
     std::vector<enum ggml_type> weight_types = qat_weight_types(params.qat_quant_type);
     if (weight_types.empty()) {
-        LOG_ERR("%s: invalid --quant-type list\n", __func__);
+        LOG_ERR("invalid --quant-type list\n");
         return 1;
     }
     if (params.qat_quant_type == "q2_0" && params.n_gpu_layers > 0) {
-        LOG_ERR("%s: q2_0 native QAT currently requires CPU weights; set -ngl 0\n", __func__);
+        LOG_ERR("q2_0 training requires CPU weights; set -ngl 0\n");
         return 1;
     }
     qat_param_filter_context qat_filter { &weight_types, {}, params.lora_freeze_layers, false };
@@ -949,7 +957,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const uint64_t gradient_estimate = params.n_ubatch < params.n_batch ? model_info.momentum_bytes : 0;
-    LOG_INF("qat_memory_estimate: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu gradient_q8_0=%llu nonquantized_model=%llu persistent_qat=%llu\n",
+    LOG_INF("memory_estimate: base_quantized=%llu momentum_q8_0=%llu residual_q4_0=%llu gradient_q8_0=%llu nonquantized_model=%llu persistent_qat=%llu\n",
         (unsigned long long) model_info.quantized_bytes, (unsigned long long) model_info.momentum_bytes,
         (unsigned long long) model_info.residual_bytes, (unsigned long long) gradient_estimate,
         (unsigned long long) model_info.nonquantized_bytes,
@@ -967,120 +975,146 @@ int main(int argc, char ** argv) {
     struct llama_model * model = llama_init->model();
     struct llama_context * lctx = llama_init->context();
     if (!model || !lctx) {
-        LOG_ERR("%s: failed to load model and training context\n", __func__);
+        LOG_ERR("failed to load model and training context\n");
         return 1;
     }
     auto templates = common_chat_templates_init(model, params.chat_template);
     if (!params.chat_template.empty() && common_chat_templates_source(templates.get()) != qat_normalize_chat_template(params.chat_template)) {
-        LOG_ERR("%s: chat template override was not applied\n", __func__);
+        LOG_ERR("chat template override was not applied\n");
         return 1;
     }
-    LOG_INF("%s: dataset chat template=%s\n", __func__, params.chat_template.empty() ? "model metadata" : "command-line override");
+    LOG_INF("dataset chat template=%s\n", params.chat_template.empty() ? "model metadata" : "command-line override");
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_ctx = llama_n_ctx(lctx) / params.n_parallel;
     if (params.n_ubatch < n_ctx) {
-        LOG_WRN("%s: past KV rows are detached at microbatch boundaries; use -ub equal to sequence_context for full-sequence K/V gradients\n", __func__);
+        char arch[64] = {};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        if (params.n_parallel == 1 && (strcmp(arch, "gemma4") == 0 || strcmp(arch, "lumen4exp") == 0)) {
+            LOG_INF("full-context gradients use projection/query tiles; full-window K/V and some activations remain allocated\n");
+        } else {
+            LOG_WRN("past KV rows are detached at microbatch boundaries for this architecture/parallel mode\n");
+        }
     }
-    LOG_INF("%s: sequence_context=%d parallel=%d microbatch_tokens=%u grad_accum=%d effective_sequences=%ld\n",
-            __func__, n_ctx, params.n_parallel, llama_n_ubatch(lctx), params.grad_accum_steps,
+    LOG_INF("sequence_context=%d parallel=%d microbatch_tokens=%u grad_accum=%d effective_sequences=%ld\n", n_ctx, params.n_parallel, llama_n_ubatch(lctx), params.grad_accum_steps,
             (long) params.n_parallel * params.grad_accum_steps);
-    const size_t render_max_tokens = 0;
-    std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
-        params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
-        params.preserve_thinking ? 1 : 0, render_max_tokens);
-    if (samples.empty()) {
-        LOG_ERR("%s: no training samples loaded\n", __func__);
-        return 1;
-    }
-    int64_t train_conversations = 0;
-    int64_t val_conversations = 0;
-
-    const int64_t sample_split =
-        train_sample_split_by_conversation(
-            samples,
-            params.val_split,
-            train_conversations,
-            val_conversations);
-
-    LOG_INF(
-        "%s: conversation split: "
-        "train_conversations=%ld "
-        "val_conversations=%ld "
-        "train_samples=%ld "
-        "val_samples=%ld "
-        "total_samples=%zu\n",
-        __func__,
-        (long) train_conversations,
-        (long) val_conversations,
-        (long) sample_split,
-        (long) (samples.size() - sample_split),
-        samples.size());
-
-    if (sample_split <= 0) {
-
-        LOG_ERR(
-            "%s: no training samples after val split "
-            "(samples=%zu val_split=%.3f)\n",
-            __func__,
-            samples.size(),
-            (double) params.val_split);
-
-        return 1;
-    }
-
-    if (params.val_split > 0.0f &&
-        sample_split ==
-            (int64_t) samples.size()) {
-
-        LOG_WRN(
-            "%s: validation split produced "
-            "no validation samples "
-            "(samples=%zu val_split=%.3f)\n",
-            __func__,
-            samples.size(),
-            (double) params.val_split);
-    }
     std::vector<float> window_rewards;
     std::vector<llama_opt_critical_token_metadata> critical_metadata;
     const bool critical_enabled = params.critical_token_mode != "none";
     int64_t idata_split = 0;
+    ggml_opt_dataset_t dataset = nullptr;
+    std::unique_ptr<mixed_cache> mixed;
+    if (!params.distill_cache.empty() && params.train_file == params.distill_cache &&
+            std::filesystem::path(params.distill_cache).extension() == ".json") {
+        try {
+            mixed = std::make_unique<mixed_cache>(params.distill_cache);
+            dataset = mixed->dataset(n_ctx, idata_split, params.distill_max_windows, params.distill_validation_windows);
+            window_rewards.assign(ggml_opt_dataset_ndata(dataset), 1.0f);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s\n", e.what());
+            return 1;
+        }
+    } else {
+        const size_t render_max_tokens = 0;
+        std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
+            params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
+            params.preserve_thinking ? 1 : 0, render_max_tokens);
+        if (samples.empty()) {
+            LOG_ERR("no training samples loaded\n");
+            return 1;
+        }
+        int64_t train_conversations = 0;
+        int64_t val_conversations = 0;
 
-    ggml_opt_dataset_t dataset =
-        build_dataset(
-            samples,
-            n_ctx,
-            window_rewards,
+        const int64_t sample_split =
+            train_sample_split_by_conversation(
+                samples,
+                params.val_split,
+                train_conversations,
+                val_conversations);
 
-            // NEW:
-            // Raw JSONL sample boundary.
-            sample_split,
+        LOG_INF(
+            "%s: conversation split: "
+            "train_conversations=%ld "
+            "val_conversations=%ld "
+            "train_samples=%ld "
+            "val_samples=%ld "
+            "total_samples=%zu\n",
+            __func__,
+            (long) train_conversations,
+            (long) val_conversations,
+            (long) sample_split,
+            (long) (samples.size() - sample_split),
+            samples.size());
 
-            // NEW:
-            // build_dataset() fills this with
-            // the actual number of TRAIN windows.
-            idata_split,
+        if (sample_split <= 0) {
 
-            params.train_on_prompt,
-            llama_vocab_bos(vocab),
-            critical_enabled,
-            &critical_metadata);
+            LOG_ERR(
+                "%s: no training samples after val split "
+                "(samples=%zu val_split=%.3f)\n",
+                __func__,
+                samples.size(),
+                (double) params.val_split);
 
+            return 1;
+        }
+
+        if (params.val_split > 0.0f &&
+            sample_split ==
+                (int64_t) samples.size()) {
+
+            LOG_WRN(
+                "%s: validation split produced "
+                "no validation samples "
+                "(samples=%zu val_split=%.3f)\n",
+                __func__,
+                samples.size(),
+                (double) params.val_split);
+        }
+
+        dataset =
+            build_dataset(
+                samples,
+                n_ctx,
+                window_rewards,
+
+                // NEW:
+                // Raw JSONL sample boundary.
+                sample_split,
+
+                // NEW:
+                // build_dataset() fills this with
+                // the actual number of TRAIN windows.
+                idata_split,
+
+                params.train_on_prompt,
+                llama_vocab_bos(vocab),
+                critical_enabled,
+                &critical_metadata);
+
+    }
     if (!dataset) {
         return 1;
     }
-    distillation_limit_dataset(dataset, idata_split, params.distill_max_windows, window_rewards, params.distill_validation_windows);
+    if (!mixed) distillation_limit_dataset(dataset, idata_split, params.distill_max_windows, window_rewards, params.distill_validation_windows);
     const int64_t ndata = ggml_opt_dataset_ndata(dataset);
     std::unique_ptr<logit_distillation::cache> teacher_cache;
     if (!params.distill_cache.empty()) {
         try {
-            teacher_cache.reset(new logit_distillation::cache(params.distill_cache));
-            teacher_cache->attach(dataset, idata_split, vocab);
-            params.distill_top_k = teacher_cache->info.top_k;
-            params.distill_temperature = teacher_cache->info.temperature;
-            llama_opt_set_distillation(lctx, teacher_cache->info.top_k, teacher_cache->info.temperature,
-                    logit_distillation::cache::fetch, teacher_cache.get());
-            LOG_INF("distillation: pure top-%u + tail KL, temperature=%.6g, no hard-label CE, train_windows=%ld validation_windows=%ld\n",
-                    teacher_cache->info.top_k, teacher_cache->info.temperature, (long) idata_split, (long) (ndata - idata_split));
+            if (mixed) {
+                mixed->attach(dataset, idata_split, vocab);
+                params.distill_top_k = mixed->info.top_k;
+                params.distill_temperature = mixed->info.temperature;
+                llama_opt_set_distillation(lctx, params.distill_top_k, params.distill_temperature, mixed_cache::fetch, mixed.get());
+            } else {
+                teacher_cache.reset(new logit_distillation::cache(params.distill_cache));
+                teacher_cache->attach(dataset, idata_split, vocab);
+                params.distill_top_k = teacher_cache->info.top_k;
+                params.distill_temperature = teacher_cache->info.temperature;
+                llama_opt_set_distillation(lctx, params.distill_top_k, params.distill_temperature,
+                        logit_distillation::cache::fetch, teacher_cache.get());
+            }
+            LOG_INF("distillation: top-%u + tail KL, temperature=%.6g, train_windows=%ld validation_windows=%ld\n",
+                    params.distill_top_k, params.distill_temperature, (long) idata_split, (long) (ndata - idata_split));
         } catch (const std::exception & e) {
             LOG_ERR("%s\n", e.what());
             ggml_opt_dataset_free(dataset);
@@ -1135,10 +1169,10 @@ int main(int argc, char ** argv) {
     if (params.qat_moe_gradient != "auto") llama_opt_set_moe_fused(lctx, params.qat_moe_gradient != "dense");
     llama_opt_set_moe_compact(lctx, params.qat_moe_gradient == "compact");
     if (params.qat_static_graph) {
-        LOG_INF("qat_graph: reuse requested; compatible CPU full-sequence single-stream steps are eligible; shape changes rebuild the graph\n");
+        LOG_INF("graph: reuse requested; compatible CPU full-sequence single-stream steps are eligible; shape changes rebuild the graph\n");
     }
     if (params.mtp_mode != "only" && llama_opt_qat_state_count(lctx) == 0) {
-        LOG_ERR("%s: the training graph contains no trainable %s tensors\n", __func__, params.qat_quant_type.c_str());
+        LOG_ERR("the training graph contains no trainable %s tensors\n", params.qat_quant_type.c_str());
         return 1;
     }
     std::vector<ggml_tensor *> adapter_tensors;
@@ -1147,11 +1181,11 @@ int main(int argc, char ** argv) {
         auto * tensor = llama_opt_qat_state_param(lctx, i);
         adapter_tensors.push_back(tensor);
         selected_bytes += ggml_nbytes(tensor);
-        LOG_INF("qat_target: %s type=%s shape=[%lld,%lld,%lld,%lld] bytes=%zu\n", tensor->name,
+        LOG_INF("target: %s type=%s shape=[%lld,%lld,%lld,%lld] bytes=%zu\n", tensor->name,
             ggml_type_name(tensor->type), (long long) tensor->ne[0], (long long) tensor->ne[1],
             (long long) tensor->ne[2], (long long) tensor->ne[3], ggml_nbytes(tensor));
     }
-    LOG_INF("qat_targets: registered=%zu bytes=%llu\n", adapter_tensors.size(), (unsigned long long) selected_bytes);
+    LOG_INF("targets: registered=%zu bytes=%llu\n", adapter_tensors.size(), (unsigned long long) selected_bytes);
     common_qlion_snapshot adapter_base;
     if (!params.qat_adapter_out.empty()) {
         try {
@@ -1168,7 +1202,7 @@ int main(int argc, char ** argv) {
             }
             adapter_base = common_qlion_capture(params.model.path, adapter_tensors);
         } catch (const std::exception & e) {
-            LOG_ERR("%s: %s\n", __func__, e.what());
+            LOG_ERR("%s\n", e.what());
             return 1;
         }
     }
@@ -1180,11 +1214,11 @@ int main(int argc, char ** argv) {
     }
 //    const int64_t idata_split = train_split_from_val_fraction(ndata, params.val_split);
     if (idata_split <= 0) {
-        LOG_ERR("%s: no training windows after validation split\n", __func__);
+        LOG_ERR("no training windows after validation split\n");
         return 1;
     }
-    if (resume.epoch < 0 || resume.window < 0 || resume.window > idata_split) {
-        LOG_ERR("%s: checkpoint dataset position is invalid\n", __func__);
+    if (resume.epoch < 0 || resume.epoch > params.lr.epochs || resume.window < 0 || resume.window > idata_split) {
+        LOG_ERR("checkpoint dataset position is invalid\n");
         return 1;
     }
     if (resume.window == idata_split) {
@@ -1192,31 +1226,35 @@ int main(int argc, char ** argv) {
         resume.window = 0;
     }
     if (params.lr.epochs > 0 && idata_split > INT64_MAX / params.lr.epochs) {
-        LOG_ERR("%s: total training step count overflows int64\n", __func__);
+        LOG_ERR("total training step count overflows int64\n");
         return 1;
     }
     const int64_t windows_per_update = (int64_t) params.n_parallel * params.grad_accum_steps;
     schedule.total_steps = ((idata_split - 1) / windows_per_update + 1) * params.lr.epochs;
     if (schedule.total_steps <= 0 || params.warmup_steps > schedule.total_steps) {
-        LOG_ERR("%s: invalid schedule: warmup_steps=%d total_steps=%ld\n",
-                __func__, params.warmup_steps, (long) schedule.total_steps);
+        LOG_ERR("invalid schedule: warmup_steps=%d total_steps=%ld\n", params.warmup_steps, (long) schedule.total_steps);
         return 1;
     }
     schedule.step = resume.schedule_step;
+    if (resume.windows_per_update != windows_per_update) {
+        const int64_t updates_per_epoch = (idata_split - 1) / windows_per_update + 1;
+        schedule.step = resume.epoch * updates_per_epoch + resume.window / windows_per_update;
+        LOG_INF("accumulation: windows_per_update=%ld -> %ld schedule_step=%ld -> %ld\n",
+                (long) resume.windows_per_update, (long) windows_per_update,
+                (long) resume.schedule_step, (long) schedule.step);
+    }
+    const int64_t optimizer_total_steps = llama_opt_step(lctx) + std::max<int64_t>(0, schedule.total_steps - schedule.step);
     if (params.lr_scheduler == "cosine" && params.lr_decay_steps > 0 &&
         params.lr_decay_steps <= params.warmup_steps) {
-        LOG_ERR("%s: --lr-decay-steps %d must exceed --warmup-steps %d\n",
-                __func__, params.lr_decay_steps, params.warmup_steps);
+        LOG_ERR("--lr-decay-steps %d must exceed --warmup-steps %d\n", params.lr_decay_steps, params.warmup_steps);
         return 1;
     }
-    LOG_INF("%s: lr scheduler=%s warmup_steps=%d decay_steps=%ld total_steps=%ld start_step=%ld lr=%.3g lr_min=%.3g\n",
-            __func__, params.lr_scheduler.c_str(), params.warmup_steps,
+    LOG_INF("lr scheduler=%s warmup_steps=%d decay_steps=%ld total_steps=%ld schedule_steps=%ld start_step=%ld lr=%.3g lr_min=%.3g\n", params.lr_scheduler.c_str(), params.warmup_steps,
             (long) (params.lr_decay_steps > 0 ? std::min<int64_t>(params.lr_decay_steps, schedule.total_steps) : schedule.total_steps),
-            (long) schedule.total_steps, (long) schedule.step,
+            (long) optimizer_total_steps, (long) schedule.total_steps, (long) schedule.step,
             (double) params.lr.lr0, (double) std::max(0.0f, params.lr.lr_min));
     if (params.save_first_at > schedule.step) {
-        LOG_INF("%s: first checkpoint will be saved at or after optimizer step %d\n",
-                __func__, params.save_first_at);
+        LOG_INF("first checkpoint will be saved at or after optimizer step %d\n", params.save_first_at);
     }
     mtp_training_state mtp;
     if (!mtp_init_training(params, lctx, schedule, mtp)) {
@@ -1251,7 +1289,7 @@ int main(int argc, char ** argv) {
             llama_opt_epoch_range(lctx, dataset, result_train, result_eval, start, idata_split,
                 qat_epoch_callback, ggml_opt_epoch_callback_progress_bar, params.shuffle_dataset);
         } catch (const std::exception & e) {
-            LOG_ERR("%s: QAT epoch failed: %s\n", __func__, e.what());
+            LOG_ERR("training failed: %s\n", e.what());
             return 1;
         }
         fprintf(stderr, "\n");
@@ -1260,7 +1298,7 @@ int main(int argc, char ** argv) {
         ggml_opt_result_loss(result_train, &train_loss, &train_unc);
         const int64_t optimizer_step = llama_opt_step(
             params.mtp_mode == "only" ? mtp.ctx.get() : lctx);
-        LOG_INF("qat_epoch: epoch=%d/%d loss=%.8f uncertainty=%.8f optimizer_step=%ld\n",
+        LOG_INF("epoch: epoch=%d/%d loss=%.8f uncertainty=%.8f optimizer_step=%ld\n",
             params.lr.epoch + 1, params.lr.epochs, train_loss, train_unc, (long) optimizer_step);
         if ((int64_t) params.lr.epoch == resume.epoch) {
             qat_print_memory(lctx, model_info);
@@ -1282,7 +1320,7 @@ int main(int argc, char ** argv) {
         if (!qat_save_model(model, params.model.path, params.qat_out)) {
             final_save_ok = false;
         } else {
-            LOG_INF("%s: trained native %s %s model saved to %s\n", __func__, ggml_opt_optimizer_name(params.optimizer), params.qat_quant_type.c_str(), params.qat_out.c_str());
+            LOG_INF("model saved to %s\n", params.qat_out.c_str());
             if (!params.distill_cache.empty()) {
                 final_save_ok = qat_save_state(lctx, params.qat_out, params.lr.epochs, 0,
                         schedule.step, params.qat_quant_type, params) && final_save_ok;
@@ -1298,11 +1336,11 @@ int main(int argc, char ** argv) {
                     schedule.step, params.qat_quant_type, params) && final_save_ok;
             }
             if (final_save_ok) {
-                LOG_INF("qat_adapter_checkpoint: saved final path=%s\n", params.qat_adapter_out.c_str());
+                LOG_INF("adapter_checkpoint: saved final path=%s\n", params.qat_adapter_out.c_str());
                 qat_prune_checkpoints(params.qat_adapter_out, params.qat_adapter_out);
             }
         } catch (const std::exception & e) {
-            LOG_ERR("%s: %s\n", __func__, e.what());
+            LOG_ERR("%s\n", e.what());
             final_save_ok = false;
         }
     }

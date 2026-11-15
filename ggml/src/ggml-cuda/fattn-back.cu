@@ -331,9 +331,10 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
     const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
     float * grad_q = (float *) dst->data;
-    float * grad_k = (float *) ((char *) dst->data + offs_k);
-    float * grad_v = (float *) ((char *) dst->data + offs_v);
-    float * grad_s = (float *) ((char *) dst->data + offs_s);
+    float * grad_k = need_k ? (float *) ((char *) dst->data + offs_k) : nullptr;
+    float * grad_v = need_v ? (float *) ((char *) dst->data + offs_v) : nullptr;
+    float * grad_s = sinks && (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS)) ?
+        (float *) ((char *) dst->data + offs_s) : nullptr;
 
     for (int ib = 0; ib < B; ++ib) {
         for (int ikh = 0; ikh < HK; ++ikh) {
@@ -341,8 +342,8 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
                 (const T *) ((const char *) k->data + ikh*k->nb[2] + ib*k->nb[3]);
             const T * pv = fp32 ? v_data.ptr + (size_t) DV*M*(ikh + HK*ib) :
                 (const T *) ((const char *) v->data + ikh*v->nb[2] + ib*v->nb[3]);
-            float * pgk = grad_k + (size_t) DK*M*(ikh + HK*ib);
-            float * pgv = grad_v + (size_t) DV*M*(ikh + HK*ib);
+            float * pgk = grad_k ? grad_k + (size_t) DK*M*(ikh + HK*ib) : nullptr;
+            float * pgv = grad_v ? grad_v + (size_t) DV*M*(ikh + HK*ib) : nullptr;
 
             for (int ih = 0; ih < q_per_kv; ++ih) {
                 const int iqh = ikh*q_per_kv + ih;
@@ -522,8 +523,10 @@ static __global__ void flash_attn_back_kernel(
     const float mean = weighted_dp*inv_sum;
 
     float * grad_q = dst;
-    float * grad_k = (float *) ((char *) dst + offs_k);
-    float * grad_v = (float *) ((char *) dst + offs_v);
+    float * grad_k = (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_K)) ?
+        (float *) ((char *) dst + offs_k) : nullptr;
+    float * grad_v = (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_V)) ?
+        (float *) ((char *) dst + offs_v) : nullptr;
     const bool need_q = !(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) ||
         (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_Q);
     const bool need_k = !(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) ||

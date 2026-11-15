@@ -18,6 +18,10 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+// Keep training reductions independent of the requested microbatch size.
+constexpr uint32_t LLM_TRAINING_TILE_SIZE = 256;
+constexpr uint32_t LLM_TRAINING_PROJECTION_TILE_SIZE = 512;
+
 struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
@@ -341,6 +345,7 @@ public:
     ~llm_graph_input_attn_no_cache() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
@@ -350,6 +355,10 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    const llama_kv_cache_iswa_context * mctx = nullptr;
+    ggml_tensor * k_rot[2] = {};
+    ggml_tensor * v_rot[2] = {};
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -1121,6 +1130,7 @@ struct llm_graph_context {
     const bool training;
     const bool activation_recompute;
     const bool full_sequence;
+    mutable std::map<std::pair<const ggml_tensor *, std::pair<int64_t, int64_t>>, ggml_tensor *> training_mask_tiles;
     const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> replace_weight;
     const bool smooth_gelu;
     const int32_t n_ctx_orig; // yarn

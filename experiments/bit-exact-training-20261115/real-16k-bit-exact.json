@@ -1,0 +1,42 @@
+{
+  "weights": 658,
+  "optimizer_tensors": 24,
+  "ubatches": [
+    768,
+    256
+  ],
+  "context": 16384,
+  "split_mode": "tensor",
+  "optimizer_metadata_fields_equal": [
+    "training.qat.version",
+    "training.qat.quant_type",
+    "training.qat.optimizer",
+    "training.qat.context_length",
+    "training.qat.parallel",
+    "training.qat.grad_accum_steps",
+    "training.qat.loss",
+    "training.qat.distill_cache",
+    "training.qat.distill_top_k",
+    "training.qat.distill_temperature",
+    "training.qat.lr.unit",
+    "training.qat.lr.tau",
+    "training.qat.lr.warmup",
+    "training.qat.momentum_type",
+    "training.qat.residual_type",
+    "training.qat.state_count",
+    "training.optimizer.step",
+    "training.scheduler.step",
+    "training.dataset.epoch",
+    "training.dataset.window",
+    "training.qat.param.0",
+    "training.qat.param.1",
+    "training.qat.param.2",
+    "training.qat.param.3",
+    "training.qat.param.4",
+    "training.qat.param.5",
+    "training.qat.param.6",
+    "training.qat.param.7"
+  ],
+  "momentum_norm_squared": 137.6095886036632,
+  "frozen_weights_unchanged": true
+}

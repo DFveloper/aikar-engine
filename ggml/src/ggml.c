@@ -2072,6 +2072,12 @@ struct ggml_tensor * ggml_view_tensor(
     return result;
 }
 
+struct ggml_tensor * ggml_detach(struct ggml_context * ctx, struct ggml_tensor * src) {
+    struct ggml_tensor * result = ggml_view_4d(ctx, src, src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3], 0);
+    result->flags |= GGML_TENSOR_FLAG_STOP_GRAD;
+    return result;
+}
+
 struct ggml_tensor * ggml_get_first_tensor(const struct ggml_context * ctx) {
     struct ggml_object * obj = ctx->objects_begin;
 
@@ -2086,6 +2092,19 @@ struct ggml_tensor * ggml_get_first_tensor(const struct ggml_context * ctx) {
     }
 
     return NULL;
+}
+
+bool ggml_set_matmul_prefix_grad(struct ggml_tensor * view) {
+    if (view->op != GGML_OP_VIEW || !ggml_is_matrix(view) || !view->src[0] || view->src[0]->op != GGML_OP_MUL_MAT) return false;
+    struct ggml_tensor * projection = view->src[0];
+    struct ggml_tensor * input = projection->src[1];
+    size_t offset;
+    memcpy(&offset, view->op_params, sizeof(offset));
+    if (!ggml_is_matrix(projection) || !input || input->op != GGML_OP_CONCAT ||
+        ggml_get_op_params_i32(input, 0) != 1 || offset != 0 || view->ne[0] != projection->ne[0] ||
+        view->ne[1] != input->src[0]->ne[1] || view->nb[1] != projection->nb[1]) return false;
+    ggml_set_op_params_i32(view, 2, 1);
+    return true;
 }
 
 struct ggml_tensor * ggml_get_next_tensor(const struct ggml_context * ctx, struct ggml_tensor * tensor) {
@@ -5844,10 +5863,11 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-struct ggml_tensor * ggml_flash_attn_ext_back(
+static struct ggml_tensor * ggml_flash_attn_ext_back_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * forward,
-        struct ggml_tensor  * grad) {
+        struct ggml_tensor  * grad,
+        bool                  q_only) {
     GGML_ASSERT(forward->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(ggml_are_same_shape(forward, grad));
     GGML_ASSERT(grad->type == GGML_TYPE_F32);
@@ -5862,7 +5882,8 @@ struct ggml_tensor * ggml_flash_attn_ext_back(
     const size_t size_v = GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
     const size_t size_s = sinks ? GGML_PAD(ggml_nelements(sinks)*sizeof(float), GGML_MEM_ALIGN) : 0;
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (size_q + size_k + size_v + size_s)/sizeof(float));
+    const size_t size = q_only ? size_q : size_q + size_k + size_v + size_s;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, size/sizeof(float));
     memcpy(result->op_params, forward->op_params, GGML_MAX_OP_PARAMS);
 
     result->op     = GGML_OP_FLASH_ATTN_BACK;
@@ -5874,6 +5895,13 @@ struct ggml_tensor * ggml_flash_attn_ext_back(
     result->src[5] = sinks;
 
     return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * forward,
+        struct ggml_tensor  * grad) {
+    return ggml_flash_attn_ext_back_impl(ctx, forward, grad, false);
 }
 
 // ggml_flash_attn_back
@@ -8214,6 +8242,19 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_VIEW: {
             if (src0_needs_grads) {
+                if (ggml_get_op_params_i32(tensor, 2) == 1 && src0->op == GGML_OP_MUL_MAT) {
+                    struct ggml_tensor * weight = src0->src[0];
+                    struct ggml_tensor * input = src0->src[1]->src[0];
+                    const size_t iw = ggml_hash_find(hash_set, weight);
+                    const bool weight_needs_grad = iw != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, iw) && grads_needed[iw];
+                    if (!weight_needs_grad) {
+                        const size_t ix = ggml_hash_find(hash_set, input);
+                        if (ix != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, ix) && grads_needed[ix]) {
+                            ggml_add_or_set(ctx, cgraph, ix, ggml_out_prod(ctx, weight, ggml_transpose(ctx, grad)));
+                        }
+                        return;
+                    }
+                }
                 size_t offset;
 
                 memcpy(&offset, tensor->op_params, sizeof(offset));
@@ -8543,7 +8584,8 @@ static void ggml_compute_backward(
             GGML_ASSERT(!tensor->src[3] || tensor->src[3]->type == GGML_TYPE_F16);
 
             if (src0_needs_grads || src1_needs_grads || src2_needs_grads || src4_needs_grads) {
-                struct ggml_tensor * back = ggml_flash_attn_ext_back(ctx, tensor, grad);
+                const bool q_only = src0_needs_grads && !src1_needs_grads && !src2_needs_grads && !src4_needs_grads;
+                struct ggml_tensor * back = ggml_flash_attn_ext_back_impl(ctx, tensor, grad, q_only);
                 ggml_set_op_params_i32(back, 5,
                         GGML_FLASH_ATTN_BACK_GRAD_VALID |
                         (src0_needs_grads ? GGML_FLASH_ATTN_BACK_GRAD_Q : 0) |
@@ -8739,7 +8781,7 @@ void ggml_build_backward_expand_with_callback(
     for (int i = 0; i < n_nodes_f; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
-        if (node->type == GGML_TYPE_I32) {
+        if (node->type == GGML_TYPE_I32 || (node->flags & GGML_TENSOR_FLAG_STOP_GRAD)) {
             continue;
         }
 

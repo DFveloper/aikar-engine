@@ -10828,10 +10828,15 @@ static void ggml_compute_forward_flash_attn_back_ext(
     const size_t offs_k = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN);
     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
     const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+    const int flags = ggml_get_op_params_i32(dst, 5);
+    const bool need_q = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_Q);
+    const bool need_k = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_K);
+    const bool need_v = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_V);
+    const bool need_s = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS);
     float * grad_q = (float *) dst->data;
-    float * grad_k = (float *) ((char *) dst->data + offs_k);
-    float * grad_v = (float *) ((char *) dst->data + offs_v);
-    float * grad_s = sinks ? (float *) ((char *) dst->data + offs_s) : NULL;
+    float * grad_k = need_k ? (float *) ((char *) dst->data + offs_k) : NULL;
+    float * grad_v = need_v ? (float *) ((char *) dst->data + offs_v) : NULL;
+    float * grad_s = sinks && need_s ? (float *) ((char *) dst->data + offs_s) : NULL;
 
     const size_t gq1 = DK;
     const size_t gq2 = DK*N;
@@ -10909,7 +10914,7 @@ static void ggml_compute_forward_flash_attn_back_ext(
                     float dp = 0.0f;
                     for (int64_t id = 0; id < DV; ++id) {
                         dp += pd[id]*ggml_flash_attn_back_load(v, pv, id);
-                        grad_v[id + ik*gv1 + ikh*gv2 + ib*gv3] += probs[ik]*pd[id];
+                        if (grad_v) grad_v[id + ik*gv1 + ikh*gv2 + ib*gv3] += probs[ik]*pd[id];
                     }
                     logits[ik] = dp;
                     mean += probs[ik]*dp;
@@ -10936,11 +10941,11 @@ static void ggml_compute_forward_flash_attn_back_ext(
                         derivative *= 1.0f - t*t;
                     }
                     const float ds = probs[ik]*(logits[ik] - mean)*derivative;
-                    float * pgk = grad_k + ik*gk1 + ikh*gk2 + ib*gk3;
+                    float * pgk = grad_k ? grad_k + ik*gk1 + ikh*gk2 + ib*gk3 : NULL;
                     for (int64_t id = 0; id < DK; ++id) {
                         const float kval = ggml_flash_attn_back_load(k, pk, id);
-                        pgq[id] += ds*kval;
-                        pgk[id] += ds*pq[id];
+                        if (need_q) pgq[id] += ds*kval;
+                        if (pgk) pgk[id] += ds*pq[id];
                     }
                 }
             }

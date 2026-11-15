@@ -1,0 +1,2127 @@
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -390,7 +390,6 @@
+     cparams.moe_cache_size = params.moe_cache_size;
+ 
+     // initialized later
+-    cparams.pipeline_parallel = false;
+     cparams.training = false;
+ 
+     {
+@@ -3020,6 +3019,10 @@
+     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+         return true;
+     }
++    // Fixed query/FFN tiles reuse the weight copy with different expert IDs.
++    if (lctx->opt_full_sequence) {
++        return false;
++    }
+ 
+     auto & st = lctx->copy_experts;
+ 
+@@ -4036,6 +4039,7 @@
+     cparams.fused_gdn_ar = false;
+     cparams.fused_gdn_ch = false;
+     cparams.auto_fgdn    = false;
++    cparams.pipeline_parallel = false;
+     //
+     // Context used for THIS fine-tuning run.
+     //
+@@ -4061,8 +4065,13 @@
+         cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_seq_max() == 1 &&
+         this->n_batch() >= train_n_ctx;
+     if (opt_full_sequence) {
+-        LLAMA_LOG_INFO("%s: full-context backward, projection/query tile=%u; full-window K/V and activations remain live\n",
+-                __func__, this->n_ubatch());
++        cparams.pipeline_parallel = false;
++        const uint32_t tile = std::min(LLM_TRAINING_TILE_SIZE, train_n_ctx);
++        if (this->n_ubatch() < tile) {
++            throw std::runtime_error("full-context QLion requires -ub >= " + std::to_string(tile) + " for fixed-order training");
++        }
++        LLAMA_LOG_INFO("%s: full-context backward, requested ubatch=%u, fixed projection/query tiles=%u/%u\n",
++                __func__, this->n_ubatch(), LLM_TRAINING_PROJECTION_TILE_SIZE, tile);
+     }
+ 
+     const uint32_t n_batch =
+@@ -4106,14 +4115,15 @@
+                 // graph_reserve() uses gf_res_reserve to build the graph, so both
+                 // must be large enough to hold the training forward graph.
+                 // Chunked recurrent graphs add nodes in proportion to the training context.
+-                const uint32_t n_tiles = 1 + (n_ubatch - 1) / this->n_ubatch();
+-                const uint32_t tile_nodes = opt_full_sequence ? 64u * model->hparams.n_layer() * n_tiles : 16u * n_ubatch;
++                const uint32_t n_tiles = 1 + (n_ubatch - 1) / LLM_TRAINING_TILE_SIZE;
++                const uint32_t tile_nodes = opt_full_sequence ? 256u * model->hparams.n_layer() * n_tiles : 16u * n_ubatch;
+                 const uint32_t tmp_cap = std::max<uint32_t>(4096u, 32u * model->n_tensors() + tile_nodes);
+                 for (auto & res : gf_res_prev) {
+                     res.reset(new llm_graph_result(tmp_cap));
+                 }
+                 gf_res_prev_active = nullptr;
+                 gf_res_reserve.reset(new llm_graph_result(tmp_cap));
++                sched_new(2ull * tmp_cap, cparams.pipeline_parallel);
+                 // split_only=true: only splits the graph, doesn't reallocate compute buffers
+                 auto * gf_train = graph_reserve(n_ubatch, n_seq_max(), n_ubatch, mctx_tmp.get(), /*split_only=*/true, /*sizes=*/nullptr, /*training=*/true);
+                 if (gf_train) {
+@@ -4545,7 +4555,7 @@
+                     4 *
+                         size_gf *
+                         ggml_tensor_overhead() +
+-                    3 *
++                    4 *
+                         ggml_graph_overhead_custom(
+                             size_gf,
+                             /*grads=*/ true
+@@ -4627,6 +4637,9 @@
+                         max_tokens);
+                 }
+ 
++                if (opt_full_sequence && opt_distillation_callback && opt_params.activation_recompute && !opt_joint) {
++                    res->get_logits()->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
++                }
+                 ggml_opt_prepare_alloc(
+                     opt_ctx,
+                     ctx_compute_opt,
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1740,7 +1740,7 @@
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
+-    const uint32_t tile = cparams.n_ubatch;
++    const uint32_t tile = LLM_TRAINING_PROJECTION_TILE_SIZE;
+     if (full_sequence && ggml_is_matrix(cur) && cur->ne[1] > tile) {
+         std::vector<ggml_tensor *> tiles;
+         for (int64_t start = 0; start < cur->ne[1]; start += tile) {
+@@ -1754,7 +1754,7 @@
+     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+     ggml_tensor * weight = replace_weight ? replace_weight(ctx0, w) : w;
+     ggml_tensor * res = ggml_mul_mat(ctx0, weight, cur_mm);
+-    if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
++    if ((training || full_sequence) && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
+         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
+     }
+ 
+@@ -1872,7 +1872,7 @@
+           ggml_tensor * w_s,
+           ggml_tensor * slots,
+           ggml_tensor * priority) const {
+-    const uint32_t tile = cparams.n_ubatch;
++    const uint32_t tile = LLM_TRAINING_PROJECTION_TILE_SIZE;
+     if (full_sequence && cur->ne[3] == 1 && cur->ne[2] > tile) {
+         std::vector<ggml_tensor *> tiles;
+         for (int64_t start = 0; start < cur->ne[2]; start += tile) {
+@@ -1892,7 +1892,7 @@
+         ggml_mul_mat_id(ctx0, weight, cur_mm, ids) :
+         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+     if (priority) { ggml_mul_mat_id_set_expert_priority(res, priority); }
+-    if (training && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
++    if ((training || full_sequence) && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
+         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
+     }
+ 
+@@ -2411,6 +2411,27 @@
+          ggml_tensor * lookahead_input) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
++    if (full_sequence && n_tokens > LLM_TRAINING_TILE_SIZE) {
++        std::vector<ggml_tensor *> tiles;
++        for (int64_t start = 0; start < n_tokens; start += LLM_TRAINING_TILE_SIZE) {
++            const int64_t count = std::min<int64_t>(LLM_TRAINING_TILE_SIZE, n_tokens - start);
++            const auto slice = [&](ggml_tensor * tensor) -> ggml_tensor * {
++                if (!tensor) return nullptr;
++                GGML_ASSERT(ggml_is_matrix(tensor) && tensor->ne[1] == n_tokens);
++                return ggml_view_2d(ctx0, tensor, tensor->ne[0], count, tensor->nb[1], start*tensor->nb[1]);
++            };
++            auto * input = slice(cur);
++            if (activation_recompute) input->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
++            auto * output = build_moe_ffn(input, gate_inp, gate_inp_b,
++                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b,
++                exp_probs_b, n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
++                slice(probs_in), gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s,
++                slice(selected_experts_in), post_exp_norm, post_exp_norm_eps, slice(lookahead_input));
++            if (activation_recompute) output->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
++            tiles.push_back(output);
++        }
++        return concat_tiles(ctx0, std::move(tiles), 1);
++    }
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+ 
+     ggml_tensor * logits = nullptr;
+@@ -3183,15 +3204,26 @@
+                float   kq_scale,
+                  int   il,
+          ggml_tensor * turboquant_parameters) const {
+-    const uint32_t tile = cparams.n_ubatch;
++    const uint32_t tile = LLM_TRAINING_TILE_SIZE;
++    if (full_sequence && cparams.flash_attn) {
++        // Share the F16 K/V conversion instead of reserving full-window copies in every query tile.
++        const bool shared_kv = k == v;
++        if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx0, k, GGML_TYPE_F16);
++        if (shared_kv) v = k;
++        else if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx0, v, GGML_TYPE_F16);
++    }
+     if (full_sequence && q->ne[2] > tile) {
+         GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && kq_b == nullptr && turboquant_parameters == nullptr);
+         std::vector<ggml_tensor *> tiles;
+         for (int64_t start = 0; start < q->ne[2]; start += tile) {
+             const int64_t count = std::min<int64_t>(tile, q->ne[2] - start);
+             auto * query = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], count, q->nb[1], q->nb[2], start*q->nb[2]);
+-            auto * mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], count, kq_mask->ne[2], kq_mask->ne[3],
+-                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], start*kq_mask->nb[1]);
++            auto & mask = training_mask_tiles[{kq_mask, {start, count}}];
++            if (!mask) {
++                // Reuse mask views across layers so the scheduler shares their device copies.
++                mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], count, kq_mask->ne[2], kq_mask->ne[3],
++                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], start*kq_mask->nb[1]);
++            }
+             // Each query tile reads the same differentiable K/V tensors.
+             tiles.push_back(build_attn_mha(query, k, v, nullptr, mask, sinks, v_mla, n_kv_max, kq_scale, il));
+         }
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -17,6 +17,10 @@
+ struct ggml_cgraph;
+ struct ggml_context;
+ struct ggml_tensor;
++
++// Keep training reductions independent of the requested microbatch size.
++constexpr uint32_t LLM_TRAINING_TILE_SIZE = 256;
++constexpr uint32_t LLM_TRAINING_PROJECTION_TILE_SIZE = 512;
+ 
+ struct llama_cparams;
+ struct llama_layer;
+@@ -1126,6 +1130,7 @@
+     const bool training;
+     const bool activation_recompute;
+     const bool full_sequence;
++    mutable std::map<std::pair<const ggml_tensor *, std::pair<int64_t, int64_t>>, ggml_tensor *> training_mask_tiles;
+     const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> replace_weight;
+     const bool smooth_gelu;
+     const int32_t n_ctx_orig; // yarn
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -220,6 +220,10 @@
+         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+         const int   n_rot_l      = hparams.n_rot(il);
+ 
++        if (full_sequence && activation_recompute) {
++            inpL = ggml_view_2d(ctx0, inpL, inpL->ne[0], inpL->ne[1], inpL->nb[1], 0);
++            inpL->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
++        }
+         res->t_layer_inp[il] = inpL;
+ 
+         // norm
+@@ -340,7 +344,7 @@
+         cb(attn_out, "attn_out", il);
+ 
+         // feed-forward network
+-        if (training && activation_recompute) {
++        if (training && activation_recompute && !full_sequence) {
+             attn_out->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+         }
+         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
+@@ -401,7 +405,7 @@
+             cb(cur_moe, "ffn_moe", il);
+ 
+             cur = ggml_add(ctx0, cur_mlp, cur_moe);
+-            if (training && activation_recompute) {
++            if (training && activation_recompute && !full_sequence) {
+                 cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+             }
+             cb(cur, "ffn_moe_combined", il);
+@@ -419,7 +423,7 @@
+                     nullptr,
+                     LLM_FFN_GELU, LLM_FFN_PAR, il, &ffn_down_input);
+             GGML_ASSERT(ffn_down_input);
+-            if (training && activation_recompute) {
++            if (training && activation_recompute && !full_sequence) {
+                 ffn_down_input->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+             }
+             cb(cur, "ffn_out", il);
+@@ -467,6 +471,14 @@
+ 
+         if (!hparams.kv_global_only) {
+             cur = build_cvec(cur, il);
++        }
++        if (full_sequence && activation_recompute) {
++            cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
++            if (model.dev_layer(il) != ggml_backend_get_device(backend_cpu)) {
++                // Save exact boundaries in RAM and keep the backward edge.
++                cur = ggml_cont(ctx0, cur);
++                cur->flags |= GGML_TENSOR_FLAG_HOST;
++            }
+         }
+         cb(cur, "l_out", il);
+ 
+@@ -520,12 +532,36 @@
+             return;
+         }
+     }
+-    cur = build_lora_mm(model.output, cur, model.output_s);
+-
+-    if (hparams.f_final_logit_softcapping) {
+-        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+-        cur = ggml_tanh(ctx0, cur);
+-        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
++    const auto head = [&](ggml_tensor * input) {
++        auto * logits = build_lora_mm(model.output, input, model.output_s);
++        if (hparams.f_final_logit_softcapping) {
++            logits = ggml_scale(ctx0, logits, 1.0f / hparams.f_final_logit_softcapping);
++            logits = ggml_tanh(ctx0, logits);
++            logits = ggml_scale(ctx0, logits, hparams.f_final_logit_softcapping);
++        }
++        if (full_sequence && activation_recompute) {
++            input->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
++            logits->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
++        }
++        return logits;
++    };
++    if (full_sequence && cur->ne[1] > LLM_TRAINING_TILE_SIZE) {
++        std::vector<ggml_tensor *> tiles;
++        for (int64_t start = 0; start < cur->ne[1]; start += LLM_TRAINING_TILE_SIZE) {
++            const int64_t count = std::min<int64_t>(LLM_TRAINING_TILE_SIZE, cur->ne[1] - start);
++            auto * input = ggml_view_2d(ctx0, cur, cur->ne[0], count, cur->nb[1], start*cur->nb[1]);
++            tiles.push_back(head(input));
++        }
++        while (tiles.size() > 1) {
++            size_t count = 0;
++            for (size_t i = 0; i < tiles.size(); i += 2) {
++                tiles[count++] = i + 1 < tiles.size() ? ggml_concat(ctx0, tiles[i], tiles[i + 1], 1) : tiles[i];
++            }
++            tiles.resize(count);
++        }
++        cur = tiles[0];
++    } else {
++        cur = head(cur);
+     }
+ 
+     cb(cur, "result_output", -1);
+--- a/ggml/src/ggml-opt.cpp
++++ b/ggml/src/ggml-opt.cpp
+@@ -131,6 +131,7 @@
+     std::vector<std::vector<struct ggml_tensor *>> qat_aliases;
+     std::vector<std::vector<struct ggml_tensor *>> qat_pending_grads;
+     std::vector<size_t> qat_expected_grads;
++    std::vector<bool> qat_host_grads;
+     std::set<struct ggml_tensor *> qat_forward_nodes;
+     std::vector<ggml_backend_buffer_t> qat_buffers;
+     std::vector<struct ggml_context *> qat_contexts;
+@@ -1130,10 +1131,12 @@
+         ggml_tensor * tensor,
+         ggml_tensor * input,
+         std::map<ggml_tensor *, bool> & dependency_memo,
+-        std::map<ggml_tensor *, ggml_tensor *> & clones) {
+-    // Keep the expert selection from the original forward pass.
+-    if (!tensor || tensor == input || tensor->type == GGML_TYPE_I32 || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
+-        return tensor;
++        std::map<ggml_tensor *, ggml_tensor *> & clones, ggml_tensor * replay_input,
++        const std::map<ggml_tensor *, ggml_tensor *> & replacements) {
++    if (tensor == input) return replay_input;
++    if (!tensor || tensor == input || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
++        const auto found = replacements.find(tensor);
++        return found == replacements.end() ? tensor : found->second;
+     }
+     const auto found = clones.find(tensor);
+     if (found != clones.end()) {
+@@ -1151,10 +1154,10 @@
+     ggml_format_name(clone, "recompute_%s", tensor->name);
+     clone->view_offs = tensor->view_offs;
+     clone->view_src = ggml_opt_clone_recompute_tensor(
+-            ctx, tensor->view_src, input, dependency_memo, clones);
++            ctx, tensor->view_src, input, dependency_memo, clones, replay_input, replacements);
+     for (int i = 0; i < GGML_MAX_SRC; ++i) {
+         clone->src[i] = ggml_opt_clone_recompute_tensor(
+-                ctx, tensor->src[i], input, dependency_memo, clones);
++                ctx, tensor->src[i], input, dependency_memo, clones, replay_input, replacements);
+     }
+     return clone;
+ }
+@@ -1165,33 +1168,42 @@
+     }
+ 
+     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> regions;
+-    ggml_tensor * input = nullptr;
++    std::vector<ggml_tensor *> inputs;
+     for (int i = 0; i < n_nodes_f; ++i) {
+         ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
+-        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE_INPUT) {
+-            GGML_ASSERT(input == nullptr && "nested activation recompute regions are not supported");
+-            input = node;
+-        }
++        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE_INPUT) inputs.push_back(node);
+         if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE) {
+-            GGML_ASSERT(input && "activation recompute output has no input boundary");
+-            regions.emplace_back(input, node);
+-            input = nullptr;
+-        }
+-    }
+-    GGML_ASSERT(input == nullptr && "activation recompute input has no output boundary");
+-
+-    for (const auto & region : regions) {
++            GGML_ASSERT(!inputs.empty() && "activation recompute output has no input boundary");
++            regions.emplace_back(inputs.back(), node);
++            inputs.pop_back();
++        }
++    }
++    GGML_ASSERT(inputs.empty() && "activation recompute input has no output boundary");
++
++    std::map<ggml_tensor *, ggml_tensor *> replacements;
++    // Build outer regions first; inner regions replay from the outer checkpoint.
++    for (auto it = regions.rbegin(); it != regions.rend(); ++it) {
++        const auto & region = *it;
+         std::map<ggml_tensor *, bool> dependency_memo;
+         std::map<ggml_tensor *, ggml_tensor *> clones;
++        const auto boundary = replacements.find(region.first);
++        ggml_tensor * replay_input = boundary == replacements.end() ? region.first : boundary->second;
++        if (boundary == replacements.end() && region.first->view_src &&
++            region.first->view_src->op == GGML_OP_CONT && (region.first->view_src->flags & GGML_TENSOR_FLAG_HOST)) {
++            // A new view makes the scheduler reload host storage for backward.
++            replay_input = ggml_view_4d(opt_ctx->ctx_compute, region.first,
++                    region.first->ne[0], region.first->ne[1], region.first->ne[2], region.first->ne[3],
++                    region.first->nb[1], region.first->nb[2], region.first->nb[3], 0);
++            replacements[region.first] = replay_input;
++        }
+         ggml_tensor * replay = ggml_opt_clone_recompute_tensor(
+-                opt_ctx->ctx_compute, region.second, region.first, dependency_memo, clones);
++                opt_ctx->ctx_compute, region.second, region.first, dependency_memo, clones, replay_input, replacements);
+         GGML_ASSERT(replay != region.second && "activation recompute output does not depend on its input");
+-        for (const auto & entry : clones) {
+-            opt_ctx->recompute_replacements.emplace_back(entry.first, entry.second);
+-        }
++        for (const auto & entry : clones) replacements[entry.first] = entry.second;
+         opt_ctx->recompute_regions++;
+         opt_ctx->recompute_nodes += (int32_t) clones.size();
+     }
++    opt_ctx->recompute_replacements.assign(replacements.begin(), replacements.end());
+     GGML_LOG_INFO("%s: activation recompute: %d regions, %d replay nodes\n",
+             __func__, opt_ctx->recompute_regions, opt_ctx->recompute_nodes);
+ }
+@@ -1202,28 +1214,59 @@
+     }
+ 
+     ggml_cgraph * graph = opt_ctx->gb_grad;
++    std::unordered_map<ggml_tensor *, ggml_tensor *> replacements;
++    for (const auto & entry : opt_ctx->recompute_replacements) {
++        replacements.emplace(entry.first, entry.second);
++    }
+     for (int i = n_nodes_f; i < opt_ctx->gb_grad->n_nodes; ++i) {
+         ggml_tensor * node = graph->nodes[i];
+-        for (const auto & entry : opt_ctx->recompute_replacements) {
+-            if (node->view_src == entry.first) {
+-                node->view_src = entry.second;
+-                break;
+-            }
++        const auto view = replacements.find(node->view_src);
++        if (view != replacements.end()) {
++            node->view_src = view->second;
+         }
+         for (int j = 0; j < GGML_MAX_SRC; ++j) {
+-            for (const auto & entry : opt_ctx->recompute_replacements) {
+-                if (node->src[j] == entry.first) {
+-                    node->src[j] = entry.second;
+-                    break;
+-                }
++            const auto source = replacements.find(node->src[j]);
++            if (source != replacements.end()) {
++                node->src[j] = source->second;
+             }
+         }
+     }
+ 
+     ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, /*grads =*/ true);
++    std::set<ggml_tensor *> consumed;
++    std::set<ggml_tensor *> gradient_roots;
++    for (size_t i = 0; i < graph->visited_hash_set.size; ++i) {
++        if (ggml_bitset_get(graph->visited_hash_set.used, i) &&
++            (graph->visited_hash_set.keys[i]->flags & GGML_TENSOR_FLAG_PARAM)) {
++            gradient_roots.insert(graph->grads[i]);
++            gradient_roots.insert(graph->grad_accs[i]);
++        }
++    }
++    if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer)) {
++        for (int i = 0; i < graph->n_nodes; ++i) {
++            const auto * node = graph->nodes[i];
++            if (node->view_src) consumed.insert(node->view_src);
++            for (auto * src : node->src) {
++                if (src) consumed.insert(src);
++            }
++        }
++    }
+     for (int i = 0; i < graph->n_nodes; ++i) {
++        if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer) && i >= n_nodes_f &&
++            ggml_op_is_empty(graph->nodes[i]->op) && !gradient_roots.count(graph->nodes[i]) &&
++            !(graph->nodes[i]->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_OUTPUT))) {
++            continue;
++        }
+         if (graph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+-            ggml_build_forward_expand(reordered, graph->nodes[i]);
++            auto * node = graph->nodes[i];
++            ggml_build_forward_expand(reordered, node);
++            if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer) && node->type == GGML_TYPE_F32 &&
++                !node->buffer && !node->view_src && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
++                strncmp(node->name, "grad for ", 9) == 0 && !consumed.count(node) && ggml_nelements(node) > 1) {
++                // Consume terminal gradients to release their buffers, including tensor-split gradients.
++                auto * dependency = ggml_sum(opt_ctx->ctx_compute, node);
++                ggml_build_forward_expand(reordered, dependency);
++            }
+         } else {
+             ggml_build_forward_order(reordered, graph->nodes[i]);
+         }
+@@ -1428,6 +1471,17 @@
+ 
+     return h;
+ }
++static ggml_tensor * ggml_opt_stream_gradient(ggml_opt_context_t opt_ctx, ggml_context * ctx, ggml_tensor * grad) {
++    ggml_tensor * sum = grad;
++    if (grad->op == GGML_OP_ADD) {
++        auto * left = ggml_opt_stream_gradient(opt_ctx, ctx, grad->src[0]);
++        auto * right = ggml_opt_stream_gradient(opt_ctx, ctx, grad->src[1]);
++        sum = ggml_add(ctx, left, right);
++    }
++    ggml_build_forward_expand(opt_ctx->gb_grad, sum);
++    return sum;
++}
++
+ static struct ggml_tensor *
+ ggml_opt_qlion_qat_backward_callback(
+         struct ggml_context * ctx,
+@@ -1604,9 +1658,24 @@
+         opt_ctx->
+             qat_pending_grads[i];
+ 
+-    pending.push_back(
+-        grad
+-    );
++    if (pending.empty() && opt_ctx->qat_grad_accumulator_cpu && grad->type == GGML_TYPE_F32 &&
++        (grad->op == GGML_OP_OUT_PROD || grad->op == GGML_OP_ADD)) {
++        opt_ctx->qat_host_grads[i] = true;
++    }
++    if (opt_ctx->qat_host_grads[i]) {
++        auto * host = ggml_cont(ctx, ggml_opt_stream_gradient(opt_ctx, ctx, grad));
++        host->flags |= GGML_TENSOR_FLAG_HOST;
++        if (!pending.empty()) {
++            host = ggml_add(ctx, pending.back(), host);
++            host->flags |= GGML_TENSOR_FLAG_HOST;
++        }
++        ggml_format_name(host, "QLion gradient for %s", opt_ctx->qat_params[i]->name);
++        pending.push_back(host);
++        // Consume each tile in order instead of retaining all full-size gradients on the GPU.
++        ggml_build_forward_expand(opt_ctx->gb_grad, host);
++    } else {
++        pending.push_back(grad);
++    }
+ 
+     if (pending.size() <
+         opt_ctx->
+@@ -1933,11 +2002,10 @@
+ 
+     if (!step) {
+ 
+-        ggml_tensor * combined =
+-            pending[0];
++        ggml_tensor * combined = opt_ctx->qat_host_grads[i] ? pending.back() : pending[0];
+ 
+         
+-        for (size_t j = 1;
++        for (size_t j = opt_ctx->qat_host_grads[i] ? pending.size() : 1;
+             j < pending.size();
+             ++j) {
+ 
+@@ -2172,6 +2240,7 @@
+         }
+         opt_ctx->qat_pending_grads.assign(opt_ctx->qat_params.size(), {});
+         opt_ctx->qat_expected_grads.assign(opt_ctx->qat_params.size(), 0);
++        opt_ctx->qat_host_grads.assign(opt_ctx->qat_params.size(), false);
+         for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+             struct ggml_tensor * node = opt_ctx->gf->nodes[i];
+             if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+@@ -2188,6 +2257,10 @@
+         ggml_build_backward_expand_with_callback(
+             opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(),
+             ggml_opt_qlion_qat_backward_callback, opt_ctx);
++        if (opt_ctx->qat_grad_accumulator_cpu) {
++            const size_t count = std::count(opt_ctx->qat_host_grads.begin(), opt_ctx->qat_host_grads.end(), true);
++            GGML_LOG_INFO("%s: RAM F32 gradient reduction for %zu/%zu states\n", __func__, count, opt_ctx->qat_host_grads.size());
++        }
+         if (qlion_qat && !opt_ctx->qat_route_probe &&
+             !opt_ctx->
+                 qat_dependency_plan_ready) {
+@@ -2331,6 +2404,31 @@
+     if (!opt_ctx->buf_cpu) opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
+ }
+ 
++static std::pair<ggml_tensor *, ggml_tensor *> ggml_opt_distillation_tiles(
++        ggml_context * ctx, ggml_cgraph * graph, ggml_tensor * logits,
++        ggml_tensor * ids, ggml_tensor * logp, ggml_tensor * weights, float temperature, int64_t total_rows) {
++    if (logits->op == GGML_OP_CONCAT && ggml_get_op_params_i32(logits, 0) == 1) {
++        const int64_t left_rows = logits->src[0]->ne[1];
++        const int64_t right_rows = logits->src[1]->ne[1];
++        const auto left = ggml_opt_distillation_tiles(ctx, graph, logits->src[0],
++            ggml_view_2d(ctx, ids, ids->ne[0], left_rows, ids->nb[1], 0),
++            ggml_view_2d(ctx, logp, logp->ne[0], left_rows, logp->nb[1], 0),
++            ggml_view_1d(ctx, weights, left_rows, 0), temperature, total_rows);
++        const auto right = ggml_opt_distillation_tiles(ctx, graph, logits->src[1],
++            ggml_view_2d(ctx, ids, ids->ne[0], right_rows, ids->nb[1], left_rows*ids->nb[1]),
++            ggml_view_2d(ctx, logp, logp->ne[0], right_rows, logp->nb[1], left_rows*logp->nb[1]),
++            ggml_view_1d(ctx, weights, right_rows, left_rows*weights->nb[0]), temperature, total_rows);
++        return {ggml_add(ctx, left.first, right.first), ggml_concat(ctx, left.second, right.second, 0)};
++    }
++    auto * loss = ggml_opt_distillation_loss(ctx, logits, ids, logp, weights, temperature);
++    loss = ggml_scale(ctx, loss, float(ggml_nrows(logits))/total_rows);
++    auto * pred = ggml_argmax(ctx, logits);
++    // Consume predictions before the next head tile, so logits can be released and replayed for backward.
++    ggml_build_forward_expand(graph, loss);
++    ggml_build_forward_expand(graph, pred);
++    return {loss, pred};
++}
++
+ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
+     opt_ctx->recompute_regions = 0;
+     opt_ctx->recompute_nodes = 0;
+@@ -2351,8 +2449,11 @@
+         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW_Q8_0;
+     const bool need_qat_state = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && qlion_qat;
+ 
++    const bool tiled_distillation = qlion_qat && opt_ctx->activation_recompute && !opt_ctx->static_graphs &&
++        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_DISTILLATION && opt_ctx->outputs->op == GGML_OP_CONCAT &&
++        ggml_get_op_params_i32(opt_ctx->outputs, 0) == 1 && !(opt_ctx->outputs->flags & GGML_TENSOR_FLAG_OUTPUT);
+     ggml_set_input(opt_ctx->inputs);
+-    ggml_set_output(opt_ctx->outputs);
++    if (!tiled_distillation) ggml_set_output(opt_ctx->outputs);
+ 
+     int n_param = 0;
+     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+@@ -2403,6 +2504,10 @@
+ 
+     struct ggml_context * ctx_results = opt_ctx->static_graphs ? opt_ctx->ctx_static : opt_ctx->ctx_compute;
+     ggml_set_fused_backward(ctx_results, opt_ctx->fused_backward);
++    if (tiled_distillation) {
++        opt_ctx->gf = ggml_new_graph_custom(ctx_results, opt_ctx->gf->size, true);
++    }
++    ggml_tensor * tiled_predictions = nullptr;
+ 
+     switch (opt_ctx->loss_type) {
+         case GGML_OPT_LOSS_TYPE_DISTILLATION: {
+@@ -2420,9 +2525,17 @@
+             ggml_set_input(opt_ctx->sparse_weights);
+             ggml_set_name(opt_ctx->distillation_ids, "teacher_ids");
+             ggml_set_name(opt_ctx->distillation_logp, "teacher_logp");
+-            opt_ctx->loss = ggml_opt_distillation_loss(ctx_results, opt_ctx->outputs,
+-                    opt_ctx->distillation_ids, opt_ctx->distillation_logp,
+-                    opt_ctx->sparse_weights, opt_ctx->distillation_temperature);
++            if (tiled_distillation) {
++                const auto tiles = ggml_opt_distillation_tiles(ctx_results, opt_ctx->gf, opt_ctx->outputs,
++                    opt_ctx->distillation_ids, opt_ctx->distillation_logp, opt_ctx->sparse_weights,
++                    opt_ctx->distillation_temperature, nrows);
++                opt_ctx->loss = tiles.first;
++                tiled_predictions = tiles.second;
++            } else {
++                opt_ctx->loss = ggml_opt_distillation_loss(ctx_results, opt_ctx->outputs,
++                        opt_ctx->distillation_ids, opt_ctx->distillation_logp,
++                        opt_ctx->sparse_weights, opt_ctx->distillation_temperature);
++            }
+             if (opt_ctx->opt_period > 1) {
+                 opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
+             }
+@@ -2671,7 +2784,7 @@
+     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
+ 
+     if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_DISTILLATION) {
+-        opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
++        opt_ctx->pred = tiled_predictions ? tiled_predictions : ggml_argmax(ctx_results, opt_ctx->outputs);
+         ggml_set_name(opt_ctx->pred, "pred");
+         ggml_set_output(opt_ctx->pred);
+         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
+@@ -3549,26 +3662,20 @@
+     }
+ 
+     if (ggml_opt_optimizer_is_qlion(opt_ctx->optimizer)) {
+-        ggml_backend_t gpu_backend = nullptr;
+         ggml_backend_t cpu_backend = nullptr;
+         for (int i = 0; i < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++i) {
+             ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
+             const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+-            if ((device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_META) && !gpu_backend) {
+-                gpu_backend = backend;
+-            } else if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                 cpu_backend = backend;
+             }
+         }
+-        if (gpu_backend || cpu_backend) {
++        if (cpu_backend) {
+             for (int i = 0; i < ggml_graph_n_nodes(opt_ctx->allocated_graph_copy); ++i) {
+                 ggml_tensor * node = ggml_graph_node(opt_ctx->allocated_graph_copy, i);
+                 const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
+                     node->src[0] && node->src[0]->type == GGML_TYPE_F32;
+-                if ((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) &&
+-                    !node->buffer && gpu_backend && ggml_backend_supports_op(gpu_backend, node)) {
+-                    ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, gpu_backend);
+-                } else if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && !node->buffer && cpu_backend &&
++                if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && !node->buffer &&
+                     ggml_backend_supports_op(cpu_backend, node)) {
+                     ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, cpu_backend);
+                 }
+@@ -3697,9 +3804,7 @@
+             if (opt_ctx->qat_forward_nodes.count(node) || node->buffer) continue;
+             const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
+                 node->src[0] && node->src[0]->type == GGML_TYPE_F32;
+-            if (((node->op == GGML_OP_OUT_PROD || node->op == GGML_OP_GLU) &&
+-                    (device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_META)) ||
+-                (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && device_type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
++            if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                 if (!ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, node) && ggml_backend_supports_op(backend, node)) {
+                     ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, backend);
+                 }
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5863,10 +5863,11 @@
+     a->src[4] = sinks;
+ }
+ 
+-struct ggml_tensor * ggml_flash_attn_ext_back(
++static struct ggml_tensor * ggml_flash_attn_ext_back_impl(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * forward,
+-        struct ggml_tensor  * grad) {
++        struct ggml_tensor  * grad,
++        bool                  q_only) {
+     GGML_ASSERT(forward->op == GGML_OP_FLASH_ATTN_EXT);
+     GGML_ASSERT(ggml_are_same_shape(forward, grad));
+     GGML_ASSERT(grad->type == GGML_TYPE_F32);
+@@ -5881,7 +5882,8 @@
+     const size_t size_v = GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+     const size_t size_s = sinks ? GGML_PAD(ggml_nelements(sinks)*sizeof(float), GGML_MEM_ALIGN) : 0;
+ 
+-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (size_q + size_k + size_v + size_s)/sizeof(float));
++    const size_t size = q_only ? size_q : size_q + size_k + size_v + size_s;
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, size/sizeof(float));
+     memcpy(result->op_params, forward->op_params, GGML_MAX_OP_PARAMS);
+ 
+     result->op     = GGML_OP_FLASH_ATTN_BACK;
+@@ -5893,6 +5895,13 @@
+     result->src[5] = sinks;
+ 
+     return result;
++}
++
++struct ggml_tensor * ggml_flash_attn_ext_back(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * forward,
++        struct ggml_tensor  * grad) {
++    return ggml_flash_attn_ext_back_impl(ctx, forward, grad, false);
+ }
+ 
+ // ggml_flash_attn_back
+@@ -8575,7 +8584,8 @@
+             GGML_ASSERT(!tensor->src[3] || tensor->src[3]->type == GGML_TYPE_F16);
+ 
+             if (src0_needs_grads || src1_needs_grads || src2_needs_grads || src4_needs_grads) {
+-                struct ggml_tensor * back = ggml_flash_attn_ext_back(ctx, tensor, grad);
++                const bool q_only = src0_needs_grads && !src1_needs_grads && !src2_needs_grads && !src4_needs_grads;
++                struct ggml_tensor * back = ggml_flash_attn_ext_back_impl(ctx, tensor, grad, q_only);
+                 ggml_set_op_params_i32(back, 5,
+                         GGML_FLASH_ATTN_BACK_GRAD_VALID |
+                         (src0_needs_grads ? GGML_FLASH_ATTN_BACK_GRAD_Q : 0) |
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -10828,10 +10828,15 @@
+     const size_t offs_k = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN);
+     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+     const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
++    const int flags = ggml_get_op_params_i32(dst, 5);
++    const bool need_q = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_Q);
++    const bool need_k = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_K);
++    const bool need_v = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_V);
++    const bool need_s = !(flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS);
+     float * grad_q = (float *) dst->data;
+-    float * grad_k = (float *) ((char *) dst->data + offs_k);
+-    float * grad_v = (float *) ((char *) dst->data + offs_v);
+-    float * grad_s = sinks ? (float *) ((char *) dst->data + offs_s) : NULL;
++    float * grad_k = need_k ? (float *) ((char *) dst->data + offs_k) : NULL;
++    float * grad_v = need_v ? (float *) ((char *) dst->data + offs_v) : NULL;
++    float * grad_s = sinks && need_s ? (float *) ((char *) dst->data + offs_s) : NULL;
+ 
+     const size_t gq1 = DK;
+     const size_t gq2 = DK*N;
+@@ -10909,7 +10914,7 @@
+                     float dp = 0.0f;
+                     for (int64_t id = 0; id < DV; ++id) {
+                         dp += pd[id]*ggml_flash_attn_back_load(v, pv, id);
+-                        grad_v[id + ik*gv1 + ikh*gv2 + ib*gv3] += probs[ik]*pd[id];
++                        if (grad_v) grad_v[id + ik*gv1 + ikh*gv2 + ib*gv3] += probs[ik]*pd[id];
+                     }
+                     logits[ik] = dp;
+                     mean += probs[ik]*dp;
+@@ -10936,11 +10941,11 @@
+                         derivative *= 1.0f - t*t;
+                     }
+                     const float ds = probs[ik]*(logits[ik] - mean)*derivative;
+-                    float * pgk = grad_k + ik*gk1 + ikh*gk2 + ib*gk3;
++                    float * pgk = grad_k ? grad_k + ik*gk1 + ikh*gk2 + ib*gk3 : NULL;
+                     for (int64_t id = 0; id < DK; ++id) {
+                         const float kval = ggml_flash_attn_back_load(k, pk, id);
+-                        pgq[id] += ds*kval;
+-                        pgk[id] += ds*pq[id];
++                        if (need_q) pgq[id] += ds*kval;
++                        if (pgk) pgk[id] += ds*pq[id];
+                     }
+                 }
+             }
+--- a/ggml/src/ggml-cuda/fattn-back.cu
++++ b/ggml/src/ggml-cuda/fattn-back.cu
+@@ -331,9 +331,10 @@
+     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+     const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+     float * grad_q = (float *) dst->data;
+-    float * grad_k = (float *) ((char *) dst->data + offs_k);
+-    float * grad_v = (float *) ((char *) dst->data + offs_v);
+-    float * grad_s = (float *) ((char *) dst->data + offs_s);
++    float * grad_k = need_k ? (float *) ((char *) dst->data + offs_k) : nullptr;
++    float * grad_v = need_v ? (float *) ((char *) dst->data + offs_v) : nullptr;
++    float * grad_s = sinks && (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS)) ?
++        (float *) ((char *) dst->data + offs_s) : nullptr;
+ 
+     for (int ib = 0; ib < B; ++ib) {
+         for (int ikh = 0; ikh < HK; ++ikh) {
+@@ -341,8 +342,8 @@
+                 (const T *) ((const char *) k->data + ikh*k->nb[2] + ib*k->nb[3]);
+             const T * pv = fp32 ? v_data.ptr + (size_t) DV*M*(ikh + HK*ib) :
+                 (const T *) ((const char *) v->data + ikh*v->nb[2] + ib*v->nb[3]);
+-            float * pgk = grad_k + (size_t) DK*M*(ikh + HK*ib);
+-            float * pgv = grad_v + (size_t) DV*M*(ikh + HK*ib);
++            float * pgk = grad_k ? grad_k + (size_t) DK*M*(ikh + HK*ib) : nullptr;
++            float * pgv = grad_v ? grad_v + (size_t) DV*M*(ikh + HK*ib) : nullptr;
+ 
+             for (int ih = 0; ih < q_per_kv; ++ih) {
+                 const int iqh = ikh*q_per_kv + ih;
+@@ -522,8 +523,10 @@
+     const float mean = weighted_dp*inv_sum;
+ 
+     float * grad_q = dst;
+-    float * grad_k = (float *) ((char *) dst + offs_k);
+-    float * grad_v = (float *) ((char *) dst + offs_v);
++    float * grad_k = (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_K)) ?
++        (float *) ((char *) dst + offs_k) : nullptr;
++    float * grad_v = (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_V)) ?
++        (float *) ((char *) dst + offs_v) : nullptr;
+     const bool need_q = !(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) ||
+         (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_Q);
+     const bool need_k = !(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) ||
+--- a/examples/qlora_training/finetune_qat.cpp
++++ b/examples/qlora_training/finetune_qat.cpp
+@@ -5,7 +5,7 @@
+ #include "llama-impl.h"
+ #include "llama-model-saver.h"
+ #include "qlion-adapter.h"
+-#include "logit-distillation.h"
++#include "mixed-cache.h"
+ 
+ static int64_t train_sample_split_by_conversation(
+         const std::vector<training_sample> & samples,
+@@ -908,9 +908,8 @@
+     }
+     LOG_INF("optimizer=%s lr_scale_unit=%d tau=%.9g lr_scale_warmup=%d\n",
+             ggml_opt_optimizer_name(params.optimizer), params.qat_lr_scale_unit, params.qat_lr_scale_tau, params.qat_lr_scale_warmup);
+-    if (params.n_ctx <= 0 || params.n_batch != params.n_ctx || params.n_ubatch <= 0 ||
+-        params.n_batch % params.n_ubatch != 0) {
+-        LOG_ERR("training requires explicit -c N -b N with -ub M where N is divisible by M\n");
++    if (params.n_ctx <= 0 || params.n_batch != params.n_ctx || params.n_ubatch <= 0) {
++        LOG_ERR("training requires explicit -c N -b N with positive -ub M\n");
+         return 1;
+     }
+     if (params.n_parallel < 1 || (size_t) params.n_parallel > llama_max_parallel_sequences() ||
+@@ -998,103 +997,124 @@
+     }
+     LOG_INF("sequence_context=%d parallel=%d microbatch_tokens=%u grad_accum=%d effective_sequences=%ld\n", n_ctx, params.n_parallel, llama_n_ubatch(lctx), params.grad_accum_steps,
+             (long) params.n_parallel * params.grad_accum_steps);
+-    const size_t render_max_tokens = 0;
+-    std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
+-        params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
+-        params.preserve_thinking ? 1 : 0, render_max_tokens);
+-    if (samples.empty()) {
+-        LOG_ERR("no training samples loaded\n");
+-        return 1;
+-    }
+-    int64_t train_conversations = 0;
+-    int64_t val_conversations = 0;
+-
+-    const int64_t sample_split =
+-        train_sample_split_by_conversation(
+-            samples,
+-            params.val_split,
+-            train_conversations,
+-            val_conversations);
+-
+-    LOG_INF(
+-        "%s: conversation split: "
+-        "train_conversations=%ld "
+-        "val_conversations=%ld "
+-        "train_samples=%ld "
+-        "val_samples=%ld "
+-        "total_samples=%zu\n",
+-        __func__,
+-        (long) train_conversations,
+-        (long) val_conversations,
+-        (long) sample_split,
+-        (long) (samples.size() - sample_split),
+-        samples.size());
+-
+-    if (sample_split <= 0) {
+-
+-        LOG_ERR(
+-            "%s: no training samples after val split "
+-            "(samples=%zu val_split=%.3f)\n",
+-            __func__,
+-            samples.size(),
+-            (double) params.val_split);
+-
+-        return 1;
+-    }
+-
+-    if (params.val_split > 0.0f &&
+-        sample_split ==
+-            (int64_t) samples.size()) {
+-
+-        LOG_WRN(
+-            "%s: validation split produced "
+-            "no validation samples "
+-            "(samples=%zu val_split=%.3f)\n",
+-            __func__,
+-            samples.size(),
+-            (double) params.val_split);
+-    }
+     std::vector<float> window_rewards;
+     std::vector<llama_opt_critical_token_metadata> critical_metadata;
+     const bool critical_enabled = params.critical_token_mode != "none";
+     int64_t idata_split = 0;
+-
+-    ggml_opt_dataset_t dataset =
+-        build_dataset(
+-            samples,
+-            n_ctx,
+-            window_rewards,
+-
+-            // NEW:
+-            // Raw JSONL sample boundary.
+-            sample_split,
+-
+-            // NEW:
+-            // build_dataset() fills this with
+-            // the actual number of TRAIN windows.
+-            idata_split,
+-
+-            params.train_on_prompt,
+-            llama_vocab_bos(vocab),
+-            critical_enabled,
+-            &critical_metadata);
+-
++    ggml_opt_dataset_t dataset = nullptr;
++    std::unique_ptr<mixed_cache> mixed;
++    if (!params.distill_cache.empty() && params.train_file == params.distill_cache &&
++            std::filesystem::path(params.distill_cache).extension() == ".json") {
++        try {
++            mixed = std::make_unique<mixed_cache>(params.distill_cache);
++            dataset = mixed->dataset(n_ctx, idata_split, params.distill_max_windows, params.distill_validation_windows);
++            window_rewards.assign(ggml_opt_dataset_ndata(dataset), 1.0f);
++        } catch (const std::exception & e) {
++            LOG_ERR("%s\n", e.what());
++            return 1;
++        }
++    } else {
++        const size_t render_max_tokens = 0;
++        std::vector<training_sample> samples = load_jsonl(params.train_file, vocab, templates.get(),
++            params.dataset_threads, params.critical_token_mode, params.critical_token_weight,
++            params.preserve_thinking ? 1 : 0, render_max_tokens);
++        if (samples.empty()) {
++            LOG_ERR("no training samples loaded\n");
++            return 1;
++        }
++        int64_t train_conversations = 0;
++        int64_t val_conversations = 0;
++
++        const int64_t sample_split =
++            train_sample_split_by_conversation(
++                samples,
++                params.val_split,
++                train_conversations,
++                val_conversations);
++
++        LOG_INF(
++            "%s: conversation split: "
++            "train_conversations=%ld "
++            "val_conversations=%ld "
++            "train_samples=%ld "
++            "val_samples=%ld "
++            "total_samples=%zu\n",
++            __func__,
++            (long) train_conversations,
++            (long) val_conversations,
++            (long) sample_split,
++            (long) (samples.size() - sample_split),
++            samples.size());
++
++        if (sample_split <= 0) {
++
++            LOG_ERR(
++                "%s: no training samples after val split "
++                "(samples=%zu val_split=%.3f)\n",
++                __func__,
++                samples.size(),
++                (double) params.val_split);
++
++            return 1;
++        }
++
++        if (params.val_split > 0.0f &&
++            sample_split ==
++                (int64_t) samples.size()) {
++
++            LOG_WRN(
++                "%s: validation split produced "
++                "no validation samples "
++                "(samples=%zu val_split=%.3f)\n",
++                __func__,
++                samples.size(),
++                (double) params.val_split);
++        }
++
++        dataset =
++            build_dataset(
++                samples,
++                n_ctx,
++                window_rewards,
++
++                // NEW:
++                // Raw JSONL sample boundary.
++                sample_split,
++
++                // NEW:
++                // build_dataset() fills this with
++                // the actual number of TRAIN windows.
++                idata_split,
++
++                params.train_on_prompt,
++                llama_vocab_bos(vocab),
++                critical_enabled,
++                &critical_metadata);
++
++    }
+     if (!dataset) {
+         return 1;
+     }
+-    distillation_limit_dataset(dataset, idata_split, params.distill_max_windows, window_rewards, params.distill_validation_windows);
++    if (!mixed) distillation_limit_dataset(dataset, idata_split, params.distill_max_windows, window_rewards, params.distill_validation_windows);
+     const int64_t ndata = ggml_opt_dataset_ndata(dataset);
+     std::unique_ptr<logit_distillation::cache> teacher_cache;
+     if (!params.distill_cache.empty()) {
+         try {
+-            teacher_cache.reset(new logit_distillation::cache(params.distill_cache));
+-            teacher_cache->attach(dataset, idata_split, vocab);
+-            params.distill_top_k = teacher_cache->info.top_k;
+-            params.distill_temperature = teacher_cache->info.temperature;
+-            llama_opt_set_distillation(lctx, teacher_cache->info.top_k, teacher_cache->info.temperature,
+-                    logit_distillation::cache::fetch, teacher_cache.get());
++            if (mixed) {
++                mixed->attach(dataset, idata_split, vocab);
++                params.distill_top_k = mixed->info.top_k;
++                params.distill_temperature = mixed->info.temperature;
++                llama_opt_set_distillation(lctx, params.distill_top_k, params.distill_temperature, mixed_cache::fetch, mixed.get());
++            } else {
++                teacher_cache.reset(new logit_distillation::cache(params.distill_cache));
++                teacher_cache->attach(dataset, idata_split, vocab);
++                params.distill_top_k = teacher_cache->info.top_k;
++                params.distill_temperature = teacher_cache->info.temperature;
++                llama_opt_set_distillation(lctx, params.distill_top_k, params.distill_temperature,
++                        logit_distillation::cache::fetch, teacher_cache.get());
++            }
+             LOG_INF("distillation: top-%u + tail KL, temperature=%.6g, train_windows=%ld validation_windows=%ld\n",
+-                    teacher_cache->info.top_k, teacher_cache->info.temperature, (long) idata_split, (long) (ndata - idata_split));
++                    params.distill_top_k, params.distill_temperature, (long) idata_split, (long) (ndata - idata_split));
+         } catch (const std::exception & e) {
+             LOG_ERR("%s\n", e.what());
+             ggml_opt_dataset_free(dataset);
+--- a/examples/qlora_training/mixed-cache.h
++++ b/examples/qlora_training/mixed-cache.h
+@@ -0,0 +1,132 @@
++#pragma once
++#include "logit-distillation.h"
++#include "nlohmann/json.hpp"
++#include <memory>
++
++// A virtual cache: retain each source's packed tokens, masks and logits exactly.
++// Only the window order changes; no logits are copied to a new disk cache.
++class mixed_cache {
++    struct window { uint64_t offset; uint64_t bytes; };
++    std::vector<std::unique_ptr<logit_distillation::cache>> sources;
++    std::vector<std::vector<window>> windows;
++    std::vector<uint64_t> offsets;
++
++public:
++    logit_distillation::header info;
++
++    explicit mixed_cache(const std::string & path) {
++        using logit_distillation::require;
++        std::ifstream manifest(path);
++        nlohmann::json config;
++        manifest >> config;
++        require(config.at("format") == "lumen-mixed-cache-v1", "unknown mixed manifest");
++        const auto & paths = config.at("caches");
++        require(paths.is_array() && paths.size() >= 2 && paths.size() <= 255, "use 2 to 255 caches");
++        for (const auto & entry : paths) {
++            auto source = std::make_unique<logit_distillation::cache>(entry.at("path").get<std::string>());
++            const auto & h = source->info;
++            if (sources.empty()) {
++                info = h;
++                info.windows = info.train_windows = 0;
++            }
++            require(h.context == info.context && h.vocab == info.vocab && h.top_k == info.top_k &&
++                    h.temperature == info.temperature && h.tokenizer == info.tokenizer,
++                    "source cache dimensions/tokenizer differ");
++            require(h.windows == entry.at("windows").get<uint64_t>() &&
++                    h.train_windows == entry.at("train_windows").get<uint64_t>(), "source partition changed");
++            const auto length = std::filesystem::file_size(entry.at("path").get<std::string>());
++            std::vector<window> index;
++            std::vector<int32_t> labels(h.context);
++            for (uint64_t i = 0; i < h.windows; ++i) {
++                const uint64_t start = source->in.tellg();
++                source->in.seekg(uint64_t(h.context)*4, std::ios::cur);
++                logit_distillation::read(source->in, labels.data(), labels.size()*4);
++                const auto rows = std::count_if(labels.begin(), labels.end(), [](int32_t v) { return v >= 0; });
++                const uint64_t bytes = uint64_t(h.context)*8 + rows*h.row_bytes();
++                require(start <= length && bytes <= length - start, "truncated source cache");
++                index.push_back({start, bytes});
++                source->in.seekg(start + bytes);
++            }
++            require(uint64_t(source->in.tellg()) == length, "extra source cache data");
++            require(h.windows <= uint64_t(INT64_MAX)/h.context - info.windows, "mixed dataset is too large");
++            info.windows += h.windows;
++            info.train_windows += h.train_windows;
++            windows.push_back(std::move(index));
++            sources.push_back(std::move(source));
++        }
++    }
++
++    ggml_opt_dataset_t dataset(int32_t context, int64_t & split, int32_t limit = 0, int32_t validation_limit = 0) {
++        using logit_distillation::require;
++        require(context == int32_t(info.context), "mixed context mismatch");
++        const uint64_t train_count = limit > 0 ? std::min<uint64_t>(limit, info.train_windows) : info.train_windows;
++        uint64_t val_count = info.windows - info.train_windows;
++        if (limit > 0) val_count = std::min<uint64_t>(limit, val_count);
++        if (validation_limit > 0) val_count = std::min<uint64_t>(validation_limit, val_count);
++        const uint64_t total = train_count + val_count;
++        require(total <= SIZE_MAX / (size_t(context)*sizeof(uint64_t)), "mixed offsets are too large");
++        auto result = ggml_opt_dataset_init(GGML_TYPE_I32, GGML_TYPE_I32, context, context, total, 1);
++        require(result != nullptr, "mixed dataset allocation failed");
++        auto * tokens = static_cast<int32_t *>(ggml_opt_dataset_data(result)->data);
++        auto * labels = static_cast<int32_t *>(ggml_opt_dataset_labels(result)->data);
++        offsets.assign(size_t(total)*context, 0);
++        uint64_t destination = 0;
++        // Interleave TRAIN and VAL independently. Midpoint ordering spreads the
++        // smaller source evenly without repeating or dropping any window.
++        for (int partition = 0; partition < 2; ++partition) {
++            const size_t n = sources.size();
++            std::vector<uint64_t> cursor(n, 0), count(n), begin(n);
++            for (size_t s = 0; s < n; ++s) {
++                const auto & h = sources[s]->info;
++                begin[s] = partition ? h.train_windows : 0;
++                count[s] = partition ? h.windows - h.train_windows : h.train_windows;
++            }
++            const uint64_t end = partition ? total : train_count;
++            while (destination < end) {
++                size_t s = n;
++                for (size_t candidate = 0; candidate < n; ++candidate) {
++                    if (cursor[candidate] == count[candidate]) continue;
++                    if (s == n || static_cast<long double>(2*cursor[candidate]+1)*count[s] <
++                                  static_cast<long double>(2*cursor[s]+1)*count[candidate]) s = candidate;
++                }
++                if (s == n) break;
++                auto & source = *sources[s];
++                const auto & w = windows[s][begin[s] + cursor[s]++];
++                source.in.seekg(w.offset);
++                const size_t base = destination++ * context;
++                logit_distillation::read(source.in, tokens + base, size_t(context)*4);
++                logit_distillation::read(source.in, labels + base, size_t(context)*4);
++                uint64_t offset = source.in.tellg();
++                for (int32_t j = 0; j < context; ++j) {
++                    require(tokens[base+j] >= 0 && uint32_t(tokens[base+j]) < info.vocab &&
++                            labels[base+j] >= -1 && labels[base+j] < int64_t(info.vocab), "invalid source token");
++                    if (labels[base+j] < 0) continue;
++                    // Encode source and original byte offset as offset*N+source.
++                    // The native row decoder still reads the original file.
++                    require(offset < UINT64_MAX/n, "source offset overflow");
++                    offsets[base+j] = offset*n + s;
++                    offset += info.row_bytes();
++                }
++            }
++        }
++        info.windows = total;
++        info.train_windows = train_count;
++        split = train_count;
++        ggml_opt_dataset_set_aux(result, offsets.data(), size_t(info.context)*sizeof(uint64_t));
++        return result;
++    }
++
++    void attach(ggml_opt_dataset_t dataset, int64_t split, const llama_vocab * vocab) {
++        logit_distillation::require(info.vocab == uint32_t(llama_vocab_n_tokens(vocab)) &&
++            info.tokenizer == logit_distillation::vocab_hash(vocab), "mixed tokenizer mismatch");
++        logit_distillation::require(uint64_t(split) == info.train_windows &&
++            uint64_t(ggml_opt_dataset_ndata(dataset)) == info.windows, "mixed partition mismatch");
++        ggml_opt_dataset_set_aux(dataset, offsets.data(), size_t(info.context)*sizeof(uint64_t));
++    }
++
++    static void fetch(void * userdata, uint64_t encoded, int32_t * ids, float * logp) {
++        auto & self = *static_cast<mixed_cache *>(userdata);
++        const size_t n = self.sources.size();
++        self.sources[encoded % n]->row(encoded / n, ids, logp);
++    }
++};
+--- a/examples/qlora_training/test-logit-distillation.cpp
++++ b/examples/qlora_training/test-logit-distillation.cpp
+@@ -1,4 +1,4 @@
+-#include "logit-distillation.h"
++#include "mixed-cache.h"
+ #include "ggml-cpu.h"
+ #include "ggml-cpp.h"
+ #include "ggml-backend.h"
+@@ -293,6 +293,141 @@
+     }
+ }
+ 
++static std::pair<double, size_t> tiled_distillation_check(bool tiled, bool backward = true, bool nested = false) {
++    constexpr int64_t rows = 513, vocab = 1024, dim = 32;
++    ggml_backend_ptr backend(ggml_backend_cpu_init());
++    ggml_backend_t devices[] = {backend.get()};
++    auto * sched = ggml_backend_sched_new(devices, nullptr, 1, 8192, false, false);
++    ggml_context_ptr data(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
++    auto * input = ggml_new_tensor_2d(data.get(), GGML_TYPE_F32, dim, rows);
++    auto * weight = ggml_new_tensor_2d(data.get(), GGML_TYPE_Q4_0, dim, vocab);
++    ggml_set_name(weight, "tiled_head.weight");
++    ggml_set_param(weight);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(data.get(), backend.get()));
++    std::vector<float> x(dim*rows), w(dim*vocab);
++    for (size_t j = 0; j < x.size(); ++j) x[j] = .1f*std::sin(float(j)*.13f);
++    for (size_t j = 0; j < w.size(); ++j) w[j] = .1f*std::cos(float(j)*.07f);
++    std::vector<uint8_t> packed(ggml_nbytes(weight));
++    ggml_quantize_chunk(GGML_TYPE_Q4_0, w.data(), packed.data(), 0, vocab, dim, nullptr);
++    ggml_backend_tensor_set(weight, packed.data(), 0, packed.size());
++    ggml_backend_tensor_set(input, x.data(), 0, x.size()*sizeof(float));
++    ggml_context_ptr compute(ggml_init({32*1024*1024, nullptr, true}));
++    auto * graph = ggml_new_graph_custom(compute.get(), 8192, true);
++    ggml_tensor * output = nullptr;
++    for (int64_t start = 0; start < rows; start += tiled ? 256 : rows) {
++        const int64_t count = std::min<int64_t>(tiled ? 256 : rows, rows - start);
++        auto * view = ggml_view_2d(compute.get(), input, dim, count, input->nb[1], start*input->nb[1]);
++        view->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
++        auto * inner = nested ? ggml_view_2d(compute.get(), view, dim, count, view->nb[1], 0) : view;
++        if (nested) inner->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
++        auto * logits = ggml_tanh(compute.get(), ggml_mul_mat(compute.get(), weight, inner));
++        logits->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
++        if (nested) {
++            logits = ggml_scale(compute.get(), logits, 0.5f);
++            logits->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
++            logits = ggml_scale(compute.get(), logits, 2.0f);
++        }
++        output = output ? ggml_concat(compute.get(), output, logits, 1) : logits;
++    }
++    ggml_build_forward_expand(graph, output);
++    auto params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_DISTILLATION);
++    params.optimizer = GGML_OPT_OPTIMIZER_TYPE_QLION_QAT;
++    params.activation_recompute = true;
++    params.distillation_top_k = 3;
++    auto * opt = ggml_opt_init(params);
++    ggml_opt_qat_register_param(opt, weight);
++    ggml_opt_prepare_alloc(opt, compute.get(), graph, input, output);
++    ggml_opt_alloc(opt, backward);
++    std::vector<int32_t> ids(3*rows), targets(rows);
++    std::vector<float> logp(4*rows), weights(rows);
++    for (int64_t row = 0; row < rows; ++row) {
++        for (int k = 0; k < 3; ++k) ids[3*row + k] = (row + k)%vocab;
++        for (int k = 0; k < 4; ++k) logp[4*row + k] = std::log(k == 3 ? .4f : .2f);
++        weights[row] = row%7 == 0 ? 0.0f : 1.0f + .25f*(row%3);
++        targets[row] = weights[row] > 0 ? row%vocab : -1;
++    }
++    const auto set = [](ggml_tensor * tensor, const auto & values) {
++        ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(values[0]));
++    };
++    set(ggml_opt_distillation_ids(opt), ids);
++    set(ggml_opt_distillation_logp(opt), logp);
++    set(ggml_opt_sparse_weights(opt), weights);
++    set(ggml_opt_sparse_targets(opt), targets);
++    auto * result = ggml_opt_result_init();
++    ggml_opt_eval(opt, result);
++    double loss = 0;
++    ggml_opt_result_loss(result, &loss, nullptr);
++    const size_t bytes = ggml_backend_sched_get_buffer_size(sched, backend.get());
++    if (backward) check(ggml_opt_recompute_regions(opt) == (tiled ? 3 : 1)*(nested ? 2 : 1), "head replay regions changed");
++    ggml_opt_result_free(result);
++    ggml_opt_free(opt);
++    ggml_backend_sched_free(sched);
++    return {loss, bytes};
++}
++
++static void tiled_distillation_checks() {
++    const auto full = tiled_distillation_check(false);
++    const auto tiled = tiled_distillation_check(true);
++    check(std::isfinite(tiled.first) && std::abs(full.first - tiled.first) < 1e-5, "tiled KL normalization changed with masks or a partial tile");
++    check(tiled.second < full.second, "tiled head did not reduce workspace");
++    const auto nested = tiled_distillation_check(true, true, true);
++    check(std::abs(tiled.first - nested.first) < 1e-7, "nested replay changed KL loss");
++    const auto validation = tiled_distillation_check(true, false);
++    check(std::abs(full.first - validation.first) < 1e-5, "tiled validation changed KL normalization");
++    check(validation.second <= tiled.second, "validation retained backward workspace");
++}
++
++static void mixed_cache_checks() {
++    const auto root = std::filesystem::temp_directory_path() /
++        ("qlion-mixed-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    std::filesystem::create_directory(root);
++    nlohmann::json manifest = {{"format", "lumen-mixed-cache-v1"}, {"caches", nlohmann::json::array()}};
++    const float logits[] = {4, 3, 2, -20, -21, -22, -23, -24};
++    for (int source = 0; source < 2; ++source) {
++        logit_distillation::header h;
++        h.context = 2; h.vocab = 8; h.top_k = 3;
++        h.windows = source == 0 ? 3 : 2;
++        h.train_windows = h.windows - 1;
++        const auto path = root / (std::to_string(source) + ".dat");
++        std::ofstream file(path, std::ios::binary);
++        h.save(file);
++        for (uint64_t window = 0; window < h.windows; ++window) {
++            const int32_t tokens[] = {int32_t(source*3 + window), 1};
++            const int32_t labels[] = {1, -1};
++            logit_distillation::write(file, tokens, sizeof(tokens));
++            logit_distillation::write(file, labels, sizeof(labels));
++            logit_distillation::encode_row(file, logits, h);
++        }
++        manifest["caches"].push_back({{"path", path.string()}, {"windows", h.windows}, {"train_windows", h.train_windows}});
++    }
++    const auto path = root / "mixed.json";
++    { std::ofstream file(path); file << manifest; }
++    for (int limit : {0, 1}) {
++        mixed_cache cache(path.string());
++        int64_t split = 0;
++        auto * dataset = cache.dataset(2, split, limit);
++        check(split == (limit ? 1 : 3), "mixed training partition changed");
++        check(ggml_opt_dataset_ndata(dataset) == (limit ? 2 : 5), "mixed window limit changed");
++        const int32_t expected[] = {0, 3, 1, 2, 4};
++        auto * tokens = static_cast<int32_t *>(ggml_opt_dataset_data(dataset)->data);
++        const int32_t limited[] = {0, 2};
++        for (int64_t i = 0; i < ggml_opt_dataset_ndata(dataset); ++i) {
++            check(tokens[2*i] == (limit ? limited[i] : expected[i]), "mixed interleaving changed packed tokens");
++        }
++        // dataset() also exposes the original row offsets for limited partitions.
++        std::vector<uint64_t> offsets(2*ggml_opt_dataset_ndata(dataset));
++        ggml_opt_dataset_get_batch_host_aux(dataset, offsets.data(), offsets.size()*sizeof(uint64_t), 0);
++        for (size_t i = 0; i < offsets.size(); i += 2) {
++            int32_t ids[3];
++            float logp[4];
++            mixed_cache::fetch(&cache, offsets[i], ids, logp);
++            check(ids[0] == 0 && ids[1] == 1 && ids[2] == 2 && offsets[i + 1] == 0, "mixed teacher offsets changed");
++        }
++        ggml_opt_dataset_free(dataset);
++    }
++    std::filesystem::remove_all(root);
++}
++
+ static void cache_checks() {
+     logit_distillation::header h;
+     h.context = 2; h.vocab = 8; h.top_k = 3; h.windows = 1; h.train_windows = 1;
+@@ -648,6 +783,68 @@
+     }
+ }
+ 
++static void tensor_parallel_sum(ggml_backend_dev_t first, ggml_backend_dev_t second) {
++    ggml_backend_dev_t devices[] = {first, second};
++    for (int axis : {0, 1}) {
++        int axes[] = {axis, axis};
++        auto * dev = ggml_backend_meta_device(devices, 2, test_split_state, axes);
++        auto * backend = ggml_backend_dev_init(dev, nullptr);
++        auto * buft = ggml_backend_dev_buffer_type(dev);
++        auto * data = ggml_init({1024*1024, nullptr, true});
++        auto * compute = ggml_init({1024*1024, nullptr, true});
++        auto * input = ggml_new_tensor_2d(data, GGML_TYPE_F32, 32, 16);
++        auto * other = ggml_new_tensor_2d(data, GGML_TYPE_F32, 32, 16);
++        ggml_set_name(input, "left");
++        ggml_set_name(other, "right");
++        auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(data, buft);
++        check(buffer != nullptr, "meta sum input allocation failed");
++        std::vector<float> values(ggml_nelements(input));
++        float expected = 0;
++        for (size_t i = 0; i < values.size(); ++i) {
++            values[i] = float(int(i % 7) - 3);
++            expected += values[i]*2;
++        }
++        ggml_backend_tensor_set(input, values.data(), 0, values.size()*sizeof(float));
++        ggml_tensor metadata_copy = *input;
++        std::vector<float> copied(values.size());
++        ggml_backend_tensor_get(&metadata_copy, copied.data(), 0, ggml_nbytes(input));
++        check(copied == values, "meta copied model metadata read differs from reference");
++        std::fill(copied.begin(), copied.end(), -13.0f);
++        ggml_backend_tensor_set(other, copied.data(), 0, ggml_nbytes(other));
++        metadata_copy = *other;
++        ggml_backend_tensor_get(&metadata_copy, copied.data(), 0, ggml_nbytes(other));
++        for (float value : copied) check(value == -13.0f, "meta metadata copy read the wrong model tensor");
++        auto * scaled = ggml_scale(compute, input, 2.0f);
++        check(ggml_backend_buft_get_alloc_size(buft, scaled) == ggml_nbytes(scaled)/2,
++                "meta workspace must use local split size");
++        auto * sum = ggml_scale(compute, ggml_sum(compute, scaled), 1.0f);
++        auto * transposed = ggml_transpose(compute, scaled);
++        auto * graph = ggml_new_graph(compute);
++        ggml_build_forward_expand(graph, sum);
++        ggml_build_forward_expand(graph, transposed);
++        auto * allocator = ggml_gallocr_new(buft);
++        check(ggml_gallocr_alloc_graph(allocator, graph), "meta sum graph allocation failed");
++        check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "meta sum compute failed");
++        float actual = 0;
++        ggml_backend_tensor_get(sum, &actual, 0, sizeof(actual));
++        check(actual == expected, "meta scalar sum differs from reference");
++        std::vector<float> transposed_storage(values.size());
++        ggml_backend_tensor_get(transposed, transposed_storage.data(), 0, ggml_nbytes(transposed));
++        for (size_t i = 0; i < values.size(); ++i) {
++            check(transposed_storage[i] == values[i]*2, "meta permuted storage read differs from reference");
++        }
++        std::vector<uint8_t> part(67);
++        ggml_backend_tensor_get(transposed, part.data(), 13, part.size());
++        check(std::memcmp(part.data(), reinterpret_cast<const uint8_t *>(transposed_storage.data()) + 13, part.size()) == 0,
++                "meta partial permuted read differs from full read");
++        ggml_gallocr_free(allocator);
++        ggml_backend_buffer_free(buffer);
++        ggml_backend_free(backend);
++        ggml_free(compute);
++        ggml_free(data);
++    }
++}
++
+ static void tensor_parallel_backward(ggml_backend_dev_t first, ggml_backend_dev_t second) {
+     ggml_backend_dev_t devices[] = {first, second};
+     const int mirrored = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+@@ -711,7 +908,7 @@
+     }
+ }
+ 
+-static std::vector<float> attention_backward(bool parallel) {
++static std::vector<float> attention_backward(bool parallel, bool q_only = false) {
+     auto * cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+     ggml_backend_dev_t devices[] = {cpu, cpu};
+     static int axes[] = {2, 2};
+@@ -736,14 +933,25 @@
+     }
+     auto * forward = ggml_flash_attn_ext(compute, inputs[0], inputs[1], inputs[2], nullptr, 0.125f, 0, 0);
+     auto * back = ggml_flash_attn_ext_back(compute, forward, inputs[3]);
++    if (q_only) {
++        back->ne[0] = ggml_nelements(inputs[0]);
++        back->nb[1] = back->nb[2] = back->nb[3] = back->ne[0]*sizeof(float);
++        const int flags = GGML_FLASH_ATTN_BACK_GRAD_VALID | GGML_FLASH_ATTN_BACK_GRAD_Q;
++        std::memcpy(back->op_params + 5, &flags, sizeof(flags));
++        if (parallel) {
++            check(ggml_backend_buft_get_alloc_size(buft, back) == ggml_nbytes(back)/2,
++                    "meta Q-only backward reserved unused K/V gradient segments");
++        }
++    }
+     auto * graph = ggml_new_graph(compute);
+-    ggml_tensor * views[3];
++    std::vector<ggml_tensor *> views;
+     size_t offset = 0;
+-    for (int i = 0; i < 3; ++i) {
++    for (int i = 0; i < (q_only ? 1 : 3); ++i) {
+         auto * input = inputs[i];
+-        views[i] = ggml_view_4d(compute, back, input->ne[0], input->ne[1], input->ne[2], 1,
++        auto * view = ggml_view_4d(compute, back, input->ne[0], input->ne[1], input->ne[2], 1,
+                 input->ne[0]*4, input->ne[0]*input->ne[1]*4, ggml_nelements(input)*4, offset);
+-        ggml_build_forward_expand(graph, views[i]);
++        views.push_back(view);
++        ggml_build_forward_expand(graph, view);
+         offset += GGML_PAD(ggml_nelements(input)*4, GGML_MEM_ALIGN);
+     }
+     auto * allocator = ggml_gallocr_new(buft);
+@@ -763,7 +971,7 @@
+     return result;
+ }
+ 
+-static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool last_only, ggml_backend_t backend) {
++static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool last_only, ggml_backend_t backend, bool q_only = false, bool host = false) {
+     llm_graph_result result(8192);
+     llama_adapter_loras loras;
+     llm_graph_params params = {};
+@@ -781,7 +989,7 @@
+     params.cparams.causal_attn = true;
+     params.ubatch.n_tokens = 1024;
+     params.training = true;
+-    params.full_sequence = tile < 1024;
++    params.full_sequence = true;
+     params.loras = &loras;
+     params.res = &result;
+     llm_graph_context builder(params);
+@@ -796,16 +1004,35 @@
+     ggml_backend_buffer_ptr input_buffer(ggml_backend_alloc_ctx_tensors(data.get(), backend));
+     check(input_buffer != nullptr, "full-context input allocation failed");
+     ggml_set_param(inputs[0]);
+-    ggml_set_param(inputs[1]);
+-    ggml_set_param(inputs[2]);
++    if (!q_only) {
++        ggml_set_param(inputs[1]);
++        ggml_set_param(inputs[2]);
++    }
+     auto * output = builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 0);
++    if (tile == 1024 && flash && !last_only && !q_only && !host) {
++        builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 1);
++        std::set<const ggml_tensor *> masks;
++        int attention_nodes = 0;
++        for (int i = 0; i < ggml_graph_n_nodes(result.get_gf()); ++i) {
++            const auto * node = ggml_graph_node(result.get_gf(), i);
++            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
++                masks.insert(node->src[3]);
++                ++attention_nodes;
++            }
++        }
++        check(attention_nodes == 8 && masks.size() == 4, "training layers must share fixed mask tiles");
++    }
+     int64_t largest_query = 0;
+     for (int i = 0; i < ggml_graph_n_nodes(result.get_gf()); ++i) {
+         const auto * node = ggml_graph_node(result.get_gf(), i);
+         if (node->op == GGML_OP_FLASH_ATTN_EXT) largest_query = std::max(largest_query, node->src[0]->ne[1]);
+         if (node->op == GGML_OP_SOFT_MAX) largest_query = std::max(largest_query, node->ne[1]);
+     }
+-    check(largest_query == tile, "attention query tile does not match the requested ubatch");
++    check(largest_query == LLM_TRAINING_TILE_SIZE, "attention did not use the fixed training tile");
++    if (host) {
++        output = ggml_cont(ctx, output);
++        output->flags |= GGML_TENSOR_FLAG_HOST;
++    }
+     auto * last = ggml_view_1d(ctx, output, 64, 1023*output->nb[1]);
+     auto * loss = ggml_sum(ctx, last_only ? last : ggml_sqr(ctx, output));
+     ggml_set_loss(loss);
+@@ -813,11 +1040,28 @@
+     ggml_build_forward_expand(graph, loss);
+     ggml_set_fused_backward(ctx, true);
+     ggml_build_backward_expand(ctx, graph, nullptr);
++    if (flash && q_only) {
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            const auto * node = ggml_graph_node(graph, i);
++            if (node->op == GGML_OP_FLASH_ATTN_BACK) {
++                check(ggml_nbytes(node) == ggml_nelements(node->src[0])*sizeof(float), "Q-only backward reserved unused full-context K/V gradients");
++                auto * vulkan = ggml_backend_dev_by_name("Vulkan0");
++                if (vulkan) check(!ggml_backend_dev_supports_op(vulkan, node), "Vulkan accepted compact gradients without selective writes");
++            }
++        }
++    }
+     ggml_backend_ptr cpu(ggml_backend_cpu_init());
+     ggml_backend_t backends[] = {backend, cpu.get()};
+     const bool on_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+     auto * sched = ggml_backend_sched_new(backends, nullptr, on_cpu ? 1 : 2, 8192, false, true);
++    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++        auto * node = ggml_graph_node(graph, i);
++        if (!(node->flags & GGML_TENSOR_FLAG_HOST) && !ggml_is_view(node) && ggml_backend_supports_op(backend, node)) {
++            ggml_backend_sched_set_tensor_backend(sched, node, backend);
++        }
++    }
+     check(ggml_backend_sched_alloc_graph(sched, graph), "full-context graph allocation failed");
++    if (host) check(ggml_backend_dev_type(ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched, output))) == GGML_BACKEND_DEVICE_TYPE_CPU, "host boundary stayed on GPU");
+     for (int i = 0; i < 3; ++i) {
+         std::vector<float> values(ggml_nelements(inputs[i]));
+         for (size_t j = 0; j < values.size(); ++j) values[j] = .2f*std::sin(float(j + i*17)*.07f);
+@@ -836,7 +1080,7 @@
+     check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "full-context backward failed");
+     std::vector<float> gradients(4*32*1024);
+     size_t offset = 0;
+-    for (int i = 0; i < 3; ++i) {
++    for (int i = 0; i < (q_only ? 1 : 3); ++i) {
+         auto * grad = ggml_graph_get_grad(graph, inputs[i]);
+         check(grad != nullptr, "Q/K/V gradient is disconnected");
+         ggml_backend_tensor_get(grad, gradients.data() + offset, 0, ggml_nelements(inputs[i])*sizeof(float));
+@@ -849,25 +1093,46 @@
+ static void full_context_checks(ggml_backend_t backend) {
+     for (bool flash : {false, true}) for (bool last_only : {false, true}) {
+         const auto reference = full_context_backward(1024, flash, last_only, backend);
+-        const auto tiled = full_context_backward(512, flash, last_only, backend);
+-        for (int qkv = 0; qkv < 3; ++qkv) {
+-            double prefix_norm = 0, error = 0, norm = 0;
+-            const size_t begin = qkv == 0 ? 0 : (qkv + 1)*32*1024;
+-            const size_t count = qkv == 0 ? 2*32*1024 : 32*1024;
+-            for (size_t i = begin; i < begin + count; ++i) {
+-                check(std::isfinite(tiled[i]), "non-finite full-context gradient");
+-                error += std::pow(double(tiled[i]) - reference[i], 2);
++        const auto host = full_context_backward(1024, flash, last_only, backend, false, true);
++        double host_error = 0, host_norm = 0;
++        for (size_t i = 0; i < reference.size(); ++i) {
++            host_error += std::pow(double(reference[i]) - host[i], 2);
++            host_norm += double(reference[i])*reference[i];
++        }
++        check(std::sqrt(host_error/std::max(host_norm, 1e-30)) < 1e-5, "RAM offload changed full-context gradients");
++        if (flash) {
++            const auto q_only = full_context_backward(768, flash, last_only, backend, true);
++            double error = 0, norm = 0;
++            for (size_t i = 0; i < 2*32*1024; ++i) {
++                error += std::pow(double(reference[i]) - q_only[i], 2);
+                 norm += double(reference[i])*reference[i];
+-                if (i - begin < 32*512) prefix_norm += double(tiled[i])*tiled[i];
+-            }
+-            if (qkv > 0) check(prefix_norm > 1e-12, "loss did not reach the first K/V tile");
+-            const double relative = std::sqrt(error/std::max(norm, 1e-30));
+-            std::printf("full-context gradient: backend=%s flash=%d last_only=%d qkv=%d relative_l2=%.9g prefix_l2=%.9g\n",
+-                    ggml_backend_name(backend), flash, last_only, qkv, relative, std::sqrt(prefix_norm));
+-            check(relative < 1e-5, "ub512/1024 full-context gradients differ");
+-        }
+-    }
+-    std::printf("full-context: ctx1024 ub512/1024 K/V gradients and last-token-to-prefix backward passed on %s\n", ggml_backend_name(backend));
++            }
++            check(std::sqrt(error/std::max(norm, 1e-30)) < 1e-5, "compact Q-only backward changed Q gradients");
++        }
++        for (uint32_t tile : {768u, 512u, 256u}) {
++            const auto host_tiled = full_context_backward(tile, flash, last_only, backend, false, true);
++            check(std::memcmp(host.data(), host_tiled.data(), host.size()*sizeof(float)) == 0, "ubatch changed RAM-offloaded gradient bits");
++            const auto tiled = full_context_backward(tile, flash, last_only, backend);
++            check(std::memcmp(reference.data(), tiled.data(), reference.size()*sizeof(float)) == 0, "ubatch changed full-context gradient bits");
++            for (int qkv = 0; qkv < 3; ++qkv) {
++                double prefix_norm = 0, error = 0, norm = 0;
++                const size_t begin = qkv == 0 ? 0 : (qkv + 1)*32*1024;
++                const size_t count = qkv == 0 ? 2*32*1024 : 32*1024;
++                for (size_t i = begin; i < begin + count; ++i) {
++                    check(std::isfinite(tiled[i]), "non-finite full-context gradient");
++                    error += std::pow(double(tiled[i]) - reference[i], 2);
++                    norm += double(reference[i])*reference[i];
++                    if (i - begin < 32*512) prefix_norm += double(tiled[i])*tiled[i];
++                }
++                if (qkv > 0) check(prefix_norm > 1e-12, "loss did not reach the first K/V tile");
++                const double relative = std::sqrt(error/std::max(norm, 1e-30));
++                std::printf("full-context gradient: backend=%s flash=%d last_only=%d qkv=%d relative_l2=%.9g prefix_l2=%.9g\n",
++                        ggml_backend_name(backend), flash, last_only, qkv, relative, std::sqrt(prefix_norm));
++                check(relative == 0, "full-context gradients differ");
++            }
++        }
++    }
++    std::printf("full-context: ctx1024 ub256/512/768/1024 bit-exact K/V gradients and last-token-to-prefix backward passed on %s\n", ggml_backend_name(backend));
+ }
+ 
+ static void compact_encoding_checks(ggml_backend_t backend = nullptr) {
+@@ -971,6 +1236,8 @@
+         std::puts("compact encoding: CPU IDs, FP16 logp, tails, ties and non-finite checks passed");
+         encoder_checks();
+         cache_checks();
++        mixed_cache_checks();
++        tiled_distillation_checks();
+         frozen_q41_moe_gradient();
+         auto * cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+         auto * paired_cpu = ggml_backend_dev_init(cpu, nullptr);
+@@ -978,6 +1245,7 @@
+         paired_forward_checks(paired_cpu);
+         ggml_backend_free(paired_cpu);
+         tensor_parallel_backward(cpu, cpu);
++        tensor_parallel_sum(cpu, cpu);
+         tensor_parallel_accumulate(cpu, cpu);
+         tensor_parallel_copy(cpu, cpu);
+         tensor_parallel_partial_write(cpu, cpu);
+@@ -1002,6 +1270,7 @@
+             const char * allreduce = std::getenv("GGML_CUDA_ALLREDUCE");
+             if (allreduce && std::strcmp(allreduce, "none") == 0) tensor_parallel_backward(first, second);
+             tensor_parallel_accumulate(first, second);
++            tensor_parallel_sum(first, second);
+             tensor_parallel_copy(first, second);
+             tensor_parallel_partial_write(first, second);
+             ggml_backend_dev_t devices[] = {first, second};
+@@ -1010,10 +1279,12 @@
+             paired_forward_checks(paired_meta);
+             ggml_backend_free(paired_meta);
+         }
+-        const auto serial = attention_backward(false);
+-        const auto parallel = attention_backward(true);
+-        for (size_t i = 0; i < serial.size(); ++i) {
+-            check(std::abs(serial[i] - parallel[i]) < 2e-5, "tensor parallel attention gradient differs from reference");
++        for (bool q_only : {false, true}) {
++            const auto serial = attention_backward(false, q_only);
++            const auto parallel = attention_backward(true, q_only);
++            for (size_t i = 0; i < serial.size(); ++i) {
++                check(std::abs(serial[i] - parallel[i]) < 2e-5, "tensor parallel attention gradient differs from reference");
++            }
+         }
+         std::puts("distillation: KL reference, finite-difference gradients, masks, temperatures and cache checks passed");
+         return 0;
+--- a/examples/qlora_training/test_qlion_integration.py
++++ b/examples/qlora_training/test_qlion_integration.py
+@@ -27,7 +27,7 @@
+     for name, tensor in a.items():
+         assert tensor.tensor_type == b[name].tensor_type, name
+         assert np.array_equal(tensor.shape, b[name].shape), name
+-        assert np.array_equal(tensor.data, b[name].data), name
++        assert np.array_equal(tensor.data.view(np.uint8), b[name].data.view(np.uint8)), name
+     return len(a)
+ 
+ 
+@@ -77,7 +77,9 @@
+     parser.add_argument("--output-dir", type=Path, required=True)
+     parser.add_argument("--gpu-layers", default="0")
+     parser.add_argument("--gpu-index", type=int, default=0, help="physical GPU index for NVML device-memory sampling")
+-    parser.add_argument("--full-context-only", action="store_true", help="compare ctx1024 ub512/1024 gradients and optimizer trajectories")
++    parser.add_argument("--full-context-only", action="store_true", help="require bit-exact ctx1024 training across ub256/512/768/1024")
++    parser.add_argument("--full-context-recompute", action="store_true", help="exercise layer and head activation recomputation")
++    parser.add_argument("--cpu-gradients", action="store_true", help="store native gradient sums and accumulation buffers in RAM")
+     parser.add_argument("--full-context-learning-rate", type=float, default=1e-6, help="learning rate for the full-context trajectory comparison")
+     args = parser.parse_args()
+     args.output_dir.mkdir(parents=True, exist_ok=True)
+@@ -198,37 +200,51 @@
+                 cosine = dot / np.sqrt(norm*other_norm) if norm > 0 and other_norm > 0 else float(norm == other_norm)
+                 ratio = float(np.sqrt(other_norm / norm)) if norm > 0 else (1.0 if other_norm == 0 else float("inf"))
+                 metrics[prefix] = {"relative_l2": relative, "max_abs": maximum, "cosine": float(cosine), "norm_ratio": ratio}
+-                if first_step:
+-                    assert relative < 0.02, (prefix, metrics[prefix])
+-                else:
+-                    # Quantized updates can cross code/routing boundaries; also check loss and weights below.
+-                    assert cosine > 0.99 and 0.95 < ratio < 1.05, (prefix, metrics[prefix])
++                assert relative == 0 and maximum == 0, (prefix, metrics[prefix])
+                 if prefix == "qat.m.":
+                     assert norm > 0, "missing momentum"
++            compare_models(left, right)
+             return metrics
+ 
+         for model_name, model in models.items():
+             for optimizer in ("qlion", "qlion2"):
+                 runs = []
+-                for tile in (1024, 512):
++                for tile in (1024, 768, 512, 256):
+                     name = f"full-context-{model_name}-{optimizer}-ub{tile}"
+                     device = ["--device", "CUDA0", "--split-mode", "none"] if args.gpu_layers != "0" else []
+                     extra = ["--optimizer", optimizer, "-c", "1024", "-b", "1024",
+                         "-ub", str(tile), "--qat-targets", ".attn_q.weight,.attn_k.weight,.attn_v.weight,.attn_output.weight", "-fa", "on",
+-                        "--learning-rate", str(args.full_context_learning_rate), "--qat-adapter-only", "--qat-static-graph", "on", *device]
++                        "--learning-rate", str(args.full_context_learning_rate), "--qat-adapter-only", "--qat-static-graph", "on",
++                        "--activation-recompute", "on" if args.full_context_recompute else "off", *device]
++                    if args.cpu_gradients:
++                        extra.extend(["--qat-grad-accumulator", "cpu"])
+                     _, first_adapter, _ = train(name + "-first", model, extra, data=data)
+                     _, adapter, log = train(name, model, extra, data=data, epochs=16)
+                     losses = [float(x) for x in re.findall(r"epoch:.*?loss=([0-9.e+-]+)", log)]
++                    if args.cpu_gradients:
++                        offloads = re.findall(r"RAM F32 gradient reduction for (\d+)/", log)
++                        assert offloads and all(int(count) > 0 for count in offloads), "RAM gradient reduction was not exercised"
+                     steps = [int(x) for x in re.findall(r"step: step=(\d+)", log)]
+                     assert len(losses) == 16 and np.isfinite(losses).all(), "missing/invalid loss trajectory"
+                     assert len(steps) == 16 and steps == list(range(1, len(steps) + 1)), "optimizer step count changed"
+-                    assert "reusing forward/backward/optimizer graph" in log, "full-context graph was not reused"
++                    if args.full_context_recompute:
++                        assert "activation recompute:" in log, "activation recomputation was not exercised"
++                    else:
++                        assert "reusing forward/backward/optimizer graph" in log, "full-context graph was not reused"
+                     shapes = re.findall(r"full_context_graph: max_projection_tokens=(\d+) max_query_tokens=(\d+)", log)
+-                    assert shapes and all(int(p) == tile and int(q) == tile for p, q in shapes), "requested ubatch was silently reduced"
++                    assert shapes and all(int(p) == 512 and int(q) == 256 for p, q in shapes), "training did not use fixed arithmetic tiles"
+                     runs.append((adapter, losses, steps, first_adapter))
+-                reference, tiled = runs
++                reference = runs[0]
++                for tiled in runs[1:]:
++                    assert reference[1] == tiled[1], "ubatch changed the loss trajectory"
++                    assert reference[2] == tiled[2], "ubatch changed optimizer cadence"
++                    compare_models(reference[0], tiled[0])
++                    compare_models(reference[3], tiled[3])
++                    compare_models(Path(str(reference[0]) + ".qat-state.gguf"), Path(str(tiled[0]) + ".qat-state.gguf"))
++                    compare_models(Path(str(reference[3]) + ".qat-state.gguf"), Path(str(tiled[3]) + ".qat-state.gguf"))
++                tiled = runs[-1]
+                 assert reference[2] == tiled[2], "ubatch changed optimizer cadence"
+-                np.testing.assert_allclose(reference[1], tiled[1], rtol=0.002, atol=0.002)
++                assert reference[1] == tiled[1], "ubatch changed the loss trajectory"
+                 metrics = compare_state(Path(str(reference[0]) + ".qat-state.gguf"), Path(str(tiled[0]) + ".qat-state.gguf"))
+                 first_metrics = compare_state(Path(str(reference[3]) + ".qat-state.gguf"), Path(str(tiled[3]) + ".qat-state.gguf"), first_step=True)
+                 _, a = tensor_map(reference[0])
+@@ -246,12 +262,12 @@
+                     weight_norm += float(np.sum(x*x))
+                     packed_equal = packed_equal and np.array_equal(tensor.data, other.data)
+                 relative = float(np.sqrt(weight_error / max(weight_norm, 1e-30)))
+-                assert relative < 0.005, (model_name, optimizer, relative)
++                assert packed_equal and relative == 0, (model_name, optimizer, relative)
+                 report["full_context"][model_name + "-" + optimizer] = {
+                     "optimizer_steps": len(reference[2]), "learning_rate": args.full_context_learning_rate,
+                     "reference_loss": reference[1], "tiled_loss": tiled[1],
+                     "first_step_state": first_metrics, "state": metrics, "weight_relative_l2": relative,
+-                    "packed_weights_equal": bool(packed_equal),
++                    "packed_weights_equal": bool(packed_equal), "bit_exact_ubatches": [1024, 768, 512, 256],
+                 }
+                 (args.output_dir / "report.json").write_text(json.dumps(report, indent=2))
+         print(json.dumps(report["full_context"], indent=2))
+--- a/examples/qlora_training/README.md
++++ b/examples/qlora_training/README.md
+@@ -35,7 +35,9 @@
+ 
+ Both trainers enable `--preserve-thinking` by default. For chat templates that support preserved reasoning, prior assistant reasoning remains in the training context for every model architecture. Use `--no-preserve-thinking` to disable it.
+ 
+-The finetune progress bar reports `loss` and `acc` for the latest graph evaluation, without cumulative averaging or EMA. Single-sequence Gemma4/Lumen native QLion evaluates a complete window; other paths evaluate physical microbatches. Loss includes the training objective weights and is normalized for gradient accumulation. Accuracy is the percentage of correct supervised tokens in that evaluation; it is `nan` when no accuracy measurement is available. Epoch and validation summaries remain aggregated. The WebUI applies the selected EMA directly to these samples. For older binaries that log native EMA values, it recovers samples before applying the selected EMA. Recovery from rounded logs is approximate.
++The finetune progress bar reports `loss` and `acc` for the latest graph evaluation, without cumulative averaging or EMA. Single-sequence Gemma4/Lumen native QLion and QLion2 training uses fixed 512-token projection tiles and 256-token query/FFN/head tiles inside one differentiable window graph, including when `-ub == -b`. This keeps the arithmetic graph and gradient reduction order independent of `-ub`. The requested `-ub` must be at least `min(256, context)` and is logged separately from the fixed tile size; smaller values fail explicitly. Partial final tiles are supported, and the context need not be divisible by the requested ubatch. Shared K/V remains connected, and the optimizer advances once per window or accumulated group of windows. Bit equality applies to changes of ubatch on the same backend with the same thread count and other training settings; it does not imply equality across hardware, backends, or older variable-tile checkpoints. FlashAttention converts differentiable K/V to F16 once before splitting queries, so query tiles share the conversion instead of each reserving a full-window copy; gradients remain F32. Mask tiles are shared across layers to reuse their device copies. Full-window K/V, attention masks and layer boundaries remain allocated; use activation recomputation to retain layer boundaries and replay attention, FFN and head activations. Routed FFN tiles use nested replay boundaries to release their intermediate activations before the next tile. Training disables pipeline buffer copies. GPU layer boundaries are copied to RAM in F32 through differentiable `CONT` nodes; backward uses separate reload views so the scheduler can release the forward GPU copies. With `--qat-grad-accumulator cpu`, dense tile gradients are reduced incrementally on their compute backend in the original F32 order, then the result is copied to RAM before the native update or Q8_0 window accumulation. Only the reduced gradient crosses to RAM. This bounds live gradient storage instead of retaining a full parameter gradient for every tile. Other architectures and parallel training retain the truncated KV backward path. Quantized normalization parameters receive gradients through temporary F32 dequantization. The default native trainer uses F32 KV caches.
++
++The native trainer also accepts the existing `lumen-mixed-cache-v1` manifest as both `--train-file` and `--distill-cache`. It interleaves the original packed source windows, keeps their train/validation boundaries, and reads teacher rows from their original files. No tokenization or copied logit cache is needed. With activation recomputation, distillation consumes head logits, softcapping, predictions and KL loss per fixed tile, then replays head tiles for backward instead of retaining context-by-vocabulary tensors. Loss tiles use the full-window denominator, including masks and partial final tiles. Add `--full-context-recompute` to the integration check to cover recomputation.
+ 
+ Joint snapshot validation counts correct top-1 predictions over supervised tokens, excluding prompt and padding positions. This accuracy compares predictions with dataset labels, while distillation KL compares predictions with the teacher distribution.
+ 
+@@ -43,7 +45,7 @@
+ 
+ Both trainers accept `--chat-template-file template.jinja`. The file overrides the template used by every dataset worker. QLion keeps the input GGUF metadata and original chat template when it saves checkpoints and the final model.
+ 
+-QLion requires `-b == -c` and `-b` divisible by `-ub`. When `-ub < -b`, gradients are accumulated in Q8_0 and one optimizer update is applied per packed context. This adds 8.5 bits per trainable weight instead of the 32 bits required by an F32 accumulator. Small nonquantized tensors such as normalization weights remain in their model format and are currently frozen.
++QLion requires `-b == -c`. Outside the single-sequence Gemma4/Lumen full-context path described above, `-b` must be divisible by `-ub`; when `-ub < -b`, gradients are accumulated in Q8_0 and one optimizer update is applied per packed context. This adds 8.5 bits per trainable weight instead of the 32 bits required by an F32 accumulator. Small nonquantized tensors such as normalization weights remain in their model format and are currently frozen.
+ 
+ Without microbatching, raw persistent state is 17.25 bits per weight for MXFP4 and 17.50 bits per weight for Q4_0. Q8_0 gradient accumulation raises these totals to 25.75 and 26.00 bits per weight. These figures exclude model metadata, activations, and backend workspaces. The CPU, CUDA, and Vulkan paths share the same Q8_0 accumulation contract. The V100 CUDA and Vulkan correctness tests cover MXFP4 and Q4_0 state updates, routed MoE dX, and routed MoE optimizer updates. A100 execution has not been measured in this repository environment.
+ 
+@@ -83,7 +85,7 @@
+ 
+ Use a CUDA build and append `--gpu-layers 99 --gpu-index 0` for a single-GPU run. The physical NVML index must identify the GPU used by the trainer. GPU runs record the device identity and sample whole-device VRAM every 10 ms using the installed NVML library; this includes background allocations and can miss shorter peaks. CPU/GPU timing fields are separate, and correctness success does not imply the performance ratio goals passed.
+ 
+-It checks dense/MoE training, merge byte equality, core-loader inference, lazy overlays, repacking, K/V momentum, frozen weights, graph reuse and fallback, and dense/fused/compact microbatch trajectories. Reports include exact commands, step statistics, effective supervised tokens/s, and peak process RSS. A CPU run does not validate GPU throughput or peak VRAM. The small MoE fixture uses four experts with two selected and a shared dense FFN; its generation recipe is in `QLion2-test/build_gemma4_moe_smoke.py`. Add `--full-context-only` to compare ctx1024/ub512 and ub1024 loss trajectories, packed projection weights, Q8 momentum, Q4 residual and LR state over 16 updates for both optimizers and fixtures. The default test LR is `1e-6`; `--full-context-learning-rate` overrides it. First-update states require relative L2 error below 2%; trajectory states require cosine above 0.99 and norm ratios within 5%, with separate loss and final-weight bounds. These are regression checks, not a long-training equivalence guarantee. `test-logit-distillation --full-context` checks untiled/tiled attention gradients and last-token-to-prefix K/V gradients without a model; `--full-context-cuda` runs this check on CUDA0.
++It checks dense/MoE training, merge byte equality, core-loader inference, lazy overlays, repacking, K/V momentum, frozen weights, graph reuse and fallback, and dense/fused/compact microbatch trajectories. Reports include exact commands, step statistics, effective supervised tokens/s, and peak process RSS. A CPU run does not validate GPU throughput or peak VRAM. The small MoE fixture uses four experts with two selected and a shared dense FFN; its generation recipe is in `QLion2-test/build_gemma4_moe_smoke.py`. Add `--full-context-only` to require byte equality of packed projection weights and all optimizer tensors at ub256/512/768/1024, with identical loss trajectories over 16 updates for both optimizers and fixtures. The default test LR is `1e-6`; `--full-context-learning-rate` overrides it. `test-logit-distillation --full-context` requires bit-exact Q/K/V gradients and checks last-token-to-prefix K/V gradients; `--full-context-cuda` runs this check on CUDA0.
+ 
+ For limited VRAM, use explicit tensor placement with `--no-op-offload` to keep other host operations on CPU. The tested ordinary `-ngl 1` configuration placed the large output layer on GPU. Frozen output weights still need activation gradients. Large contiguous non-Q4 quantized CUDA `OUT_PROD` now limits F32 conversion scratch to 64 MiB when a decoded row fits; Q4_0 keeps its existing tiled path. See the [P620 report](../../docs/superpowers/reports/2026-11-03-qlion2-p620.md) for the working hybrid 26B command, changed adapter, memory measurements, and unmet small-model time goal.
+ 
+@@ -92,8 +94,6 @@
+ Select `--optimizer qlion2` (case-insensitive) to enable 32-element adaptive LR scaling automatically. QLion2 always uses this unit; `--qat-lr-scale off`, `layer`, or `256` cannot change it. Existing QLion retains all its scale modes. QLion2 shares QLion's Q8_0 momentum, Q4_0 residual, quantized update and gradient accumulation paths.
+ 
+ QLion2 computes old-momentum RMS inside the update kernel. CPU updates use local decoded blocks; CUDA assigns one 32-element group to a warp and uses register values plus shuffle reductions. Fixed-tau updates allocate no FP32 group-statistics tensor and launch no separate statistics pass. Optional `--qat-lr-warmup N` retains the layer-RMS threshold estimate using a nine-float result and two persistent floats per tensor, without a per-group FP32 array. Q2_0 CPU updates apply separate LR scales to the two 32-element groups in each 64-element weight block. CUDA supports MXFP4, Q4_0 and Q8_0 weights; Vulkan falls back to CPU for QLion2.
+-
+-Single-sequence Gemma4/Lumen native QLion and QLion2 training preserves full-context K/V gradients when `-ub < -b`. Projections and attention queries use `-ub` token tiles inside one differentiable window graph; shared K/V remains connected and the optimizer advances once per window (or accumulated group of windows). Tile gradients are combined before the window update, rather than rounded to Q8 separately at each token boundary. Floating-point reduction order can differ, so bit equality is not guaranteed. Full-window K/V, attention masks and some activations remain allocated; this does not provide the memory footprint of truncated backpropagation. Use activation recomputation to reduce retained FFN activations. Other architectures and parallel training retain the truncated KV backward path. Quantized normalization parameters receive gradients through temporary F32 dequantization. The default native trainer uses F32 KV caches; quantized KV training is outside this validation.
+ 
+ The `cosine-warmup` scheduler increases LR with a cosine ramp for `--warmup-steps`, then holds the base LR constant. It works with both trainers and advances per optimizer update, including gradient accumulation and checkpoint resume.
+ 
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -694,6 +694,7 @@
+         GGML_TENSOR_FLAG_RECOMPUTE = 32, // ...is the output of an activation recompute region
+         GGML_TENSOR_FLAG_RECOMPUTE_INPUT = 64, // ...is the input to an activation recompute region
+         GGML_TENSOR_FLAG_STOP_GRAD = 128, // ...stops gradient propagation
++        GGML_TENSOR_FLAG_HOST = 256, // ...stores the result on the CPU backend
+     };
+ 
+     enum ggml_tri_type {
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -199,7 +199,7 @@
+     // get_alloc_size is optional, defaults to ggml_nbytes
+     if (buft->iface.get_alloc_size) {
+         size_t size = buft->iface.get_alloc_size(buft, tensor);
+-        assert(size >= ggml_nbytes(tensor));
++        assert(size >= ggml_nbytes(tensor) || ggml_backend_buft_is_meta(buft));
+ 
+         // [TAG_ALLOC_SIZE_EXPAND]
+         // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly
+@@ -1104,6 +1104,10 @@
+         GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+     }
+ 
++    if (tensor->flags & GGML_TENSOR_FLAG_HOST) {
++        return sched->n_backends - 1;
++    }
++
+     // graph input
+     if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
+@@ -1226,6 +1230,11 @@
+ }
+ 
+ // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
++static bool ggml_backend_sched_is_host_tensor(const struct ggml_tensor * tensor) {
++    return (tensor->flags & GGML_TENSOR_FLAG_HOST) ||
++        (tensor->view_src && (tensor->view_src->flags & GGML_TENSOR_FLAG_HOST));
++}
++
+ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+     // reset splits
+     sched->n_splits = 0;
+@@ -1518,6 +1527,12 @@
+                     if (src == NULL) {
+                         continue;
+                     }
++                    if (ggml_backend_sched_is_host_tensor(src) && tensor_backend_id(src) != cur_backend_id &&
++                        std::find(split->inputs, split->inputs + split->n_inputs, src) == split->inputs + split->n_inputs) {
++                        // Reload checkpoints at their first use, not at the start of the whole backward pass.
++                        need_new_split = true;
++                        break;
++                    }
+                     // check if a weight is on a different and incompatible backend
+                     // by starting a new split, the memory of the previously offloaded weights can be reused
+                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+@@ -1578,10 +1593,11 @@
+                         ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                         ggml_backend_buffer_is_host(src->buffer) &&
+                         cur_backend_id != sched->n_backends - 1;
++                    const bool stream_host = ggml_backend_sched_is_host_tensor(src);
+ 
+                     // create a copy of the input in the split's backend
+                     int split_input_id = -1;
+-                    if (stream_weight) {
++                    if (stream_weight || stream_host) {
+                         for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                             if (split->inputs[input_id] == src) {
+                                 split_input_id = input_id;
+@@ -1589,7 +1605,7 @@
+                             }
+                         }
+                     }
+-                    if (split_input_id < 0 && (stream_weight || tensor_id_copy(src_id, cur_backend_id, 0) == NULL)) {
++                    if (split_input_id < 0 && (stream_weight || stream_host || tensor_id_copy(src_id, cur_backend_id, 0) == NULL)) {
+                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                         int n_inputs = split->n_inputs++;
+                         if (n_inputs >= split->inputs_capacity) {
+@@ -1599,12 +1615,15 @@
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++                            if (ggml_backend_buft_is_meta(sched->bufts[cur_backend_id])) {
++                                ggml_set_name(tensor_copy, src->name);
++                            }
+                             if (sched->n_copies > 1) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                             }
+                             split->input_copies[c][n_inputs] = tensor_copy;
+-                            if (!stream_weight) {
++                            if (!stream_weight && !stream_host) {
+                                 tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                             }
+                             SET_CAUSE(tensor_copy, "4.cpy");
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -16220,6 +16220,11 @@
+                 (op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_Q8_KV) &&
+                 ggml_nbytes(op->src[3])/2 <= UINT32_MAX;
+         case GGML_OP_FLASH_ATTN_BACK: {
++            const int32_t grad_flags = ggml_get_op_params_i32(op, 5);
++            if ((grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) &&
++                !(grad_flags & (GGML_FLASH_ATTN_BACK_GRAD_K | GGML_FLASH_ATTN_BACK_GRAD_V | GGML_FLASH_ATTN_BACK_GRAD_SINKS))) {
++                return false;
++            }
+             if (!device->shader_atomic_float || ggml_nbytes(op) > UINT32_MAX) {
+                 return false;
+             }
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -250,6 +250,7 @@
+ 
+ struct ggml_backend_meta_buffer_type_context {
+     std::vector<ggml_backend_buffer_type_t> simple_bufts;
++    ggml_backend_buffer_ptr measure_buffer;
+ 
+     std::string name;
+ 
+@@ -312,15 +313,7 @@
+     return max_size;
+ }
+ 
+-static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+-    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+-    size_t max_alloc_size = 0;
+-    for (size_t i = 0; i < n_simple_bufts; i++) {
+-        const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
+-        max_alloc_size = std::max(max_alloc_size, alloc_size);
+-    }
+-    return max_alloc_size;
+-}
++static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);
+ 
+ static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+@@ -484,6 +477,15 @@
+     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
+     auto it = stc.simple_tensors.find(tensor);
+     if (it == stc.simple_tensors.end()) {
++        // GGUF writers copy tensor metadata while keeping the same model storage.
++        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++            for (const auto & entry : buf_ctx->stc_static.simple_tensors) {
++                if (entry.first->data == tensor->data && strcmp(entry.first->name, tensor->name) == 0 &&
++                    ggml_are_same_layout(entry.first, tensor)) {
++                    return entry.second[index];
++                }
++            }
++        }
+         return nullptr;
+     }
+     return it->second[index];
+@@ -492,12 +494,17 @@
+ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+ 
+ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+-        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
++        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync,
++        ggml_backend_buffer_t fallback = nullptr) {
+     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
+     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
+     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
+-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
++    ggml_backend_buffer_t buffer = tensor->buffer ? tensor->buffer : fallback;
++    if (!ggml_backend_buffer_is_meta(buffer)) {
++        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++    }
++    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
++    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+ 
+     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
+         if (a.axis != b.axis) {
+@@ -656,7 +663,9 @@
+                         return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                     }
+                 }
+-                GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
++                GGML_ABORT("shape mismatch for %s '%s': source='%s' axis=%d input=%lld output=[%lld,%lld,%lld,%lld]", ggml_op_name(tensor->op), tensor->name,
++                    tensor->src[0]->name, int(src_ss[0].axis), (long long) base_ne_in,
++                    (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
+             }
+             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
+             case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+@@ -685,7 +694,7 @@
+                     continue;
+                 }
+                 if (tensor->view_offs == offset) {
+-                    return ggml_backend_meta_get_split_state(stc, source, true);
++                    return ggml_backend_meta_get_split_state(stc, source, true, buffer);
+                 }
+                 offset += GGML_PAD(ggml_nelements(source)*sizeof(float), GGML_MEM_ALIGN);
+             }
+@@ -860,8 +869,9 @@
+         if (ggml_nelements(tensor) == 0) {
+             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+         }
+-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
++        if (tensor->view_src == nullptr &&
++            (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE || tensor->op == GGML_OP_NONE)) {
++            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+             if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+@@ -887,7 +897,7 @@
+                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                 continue;
+             }
+-            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
++            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true, buffer);
+             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+         }
+ 
+@@ -896,7 +906,7 @@
+             case GGML_OP_NONE: {
+                 if (tensor->view_src != nullptr) {
+                     // full-tensor view created with ggml_view_tensor, transparent for the split state
+-                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
++                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync, buffer);
+                 } else {
+                     split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                 }
+@@ -916,7 +926,7 @@
+                 if (axis_a == 0 && a->op == GGML_OP_SCALE && ggml_get_op_params_f32(a, 0) == 0.0f &&
+                         ggml_get_op_params_f32(a, 1) == 0.0f && a->src[0]->op == GGML_OP_MUL_MAT &&
+                         ggml_backend_buffer_is_meta(a->src[0]->src[0]->buffer)) {
+-                    auto state = ggml_backend_meta_get_split_state(stc, a->src[0]->src[0], true);
++                    auto state = ggml_backend_meta_get_split_state(stc, a->src[0]->src[0], true, buffer);
+                     if (state.axis == 1 && a->src[0]->src[0]->ne[1] == a->ne[0]) {
+                         state.axis = GGML_BACKEND_SPLIT_AXIS_0;
+                         GGML_ASSERT(split_states_equal(state, src_ss[0]));
+@@ -1011,7 +1021,11 @@
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+             } break;
+             case GGML_OP_SUM: {
+-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
++                if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
++                    split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
++                } else {
++                    split_state = handle_generic(src_ss, /*scalar_only =*/ true);
++                }
+             } break;
+             case GGML_OP_SUM_ROWS:
+             case GGML_OP_CUMSUM:
+@@ -1174,8 +1188,9 @@
+                         src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                         src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
+                 split_state = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 0};
++                const bool q_only = ggml_nbytes(tensor) == GGML_PAD(ggml_nelements(tensor->src[0])*sizeof(float), GGML_MEM_ALIGN);
+                 for (int i : {0, 1, 2, 5}) {
+-                    if (!tensor->src[i]) {
++                    if (!tensor->src[i] || (q_only && i != 0)) {
+                         continue;
+                     }
+                     const auto * source = tensor->src[i];
+@@ -1262,7 +1277,7 @@
+         }
+         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+             bool first_src_split_by_axis = true;
+-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
++            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+ 
+             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
+@@ -1822,7 +1837,32 @@
+ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+-    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++    if (!ggml_is_contiguous(tensor) && split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
++        if (ggml_is_contiguously_allocated(tensor) && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS &&
++                split_state.n_segments == 1 && split_state.nr[0] == 1) {
++            const int axis = split_state.axis;
++            const size_t stride = tensor->nb[axis]*tensor->ne[axis]/(axis == 0 ? ggml_blck_size(tensor->type) : 1);
++            const size_t end = offset + size;
++            for (size_t chunk = offset/stride; chunk*stride < end; ++chunk) {
++                size_t start = chunk*stride;
++                for (size_t j = 0; j < n_bufs; ++j) {
++                    const auto * local = ggml_backend_meta_buffer_simple_tensor(tensor, j);
++                    const size_t bytes = stride*split_state.ne[j]/tensor->ne[axis];
++                    const size_t first = std::max(offset, start);
++                    const size_t last = std::min(end, start + bytes);
++                    if (first < last) {
++                        ggml_backend_tensor_get(local, (char *) data + first - offset,
++                            chunk*bytes + first - start, last - first);
++                    }
++                    start += bytes;
++                }
++            }
++            return;
++        }
++        GGML_ABORT("unsupported split read: tensor=%s axis=%d shape=[%lld,%lld,%lld,%lld] strides=[%zu,%zu,%zu,%zu] offset=%zu size=%zu",
++            tensor->name, int(split_state.axis), (long long) tensor->ne[0], (long long) tensor->ne[1],
++            (long long) tensor->ne[2], (long long) tensor->ne[3], tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3], offset, size);
++    }
+ 
+     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
+@@ -2003,6 +2043,36 @@
+             ggml_backend_buffer_set_usage(buf_ctx->bufs[i].get(), usage);
+         }
+     }
++}
++
++static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
++    auto * ctx = static_cast<ggml_backend_meta_buffer_type_context *>(buft->context);
++    const size_t n = ctx->simple_bufts.size();
++    if (!ctx->measure_buffer) {
++        ggml_backend_meta_simple_tensor_container data, compute0, compute1;
++        auto * measure = new ggml_backend_meta_buffer_context(data, compute0, compute1,
++                std::vector<ggml_backend_buffer_t>(n, nullptr));
++        ctx->measure_buffer.reset(ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, measure, 0));
++        ggml_backend_buffer_set_usage(ctx->measure_buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++    }
++    auto * measure = static_cast<ggml_backend_meta_buffer_context *>(ctx->measure_buffer->context);
++    const auto split = ggml_backend_meta_get_split_state(measure->stc_static, tensor, true, ctx->measure_buffer.get());
++    size_t size = 0;
++    for (size_t i = 0; i < n; ++i) {
++        ggml_tensor local = *tensor;
++        if (split.axis >= 0 && split.axis < GGML_MAX_DIMS && ggml_is_contiguous(tensor)) {
++            const int axis = split.axis;
++            local.ne[axis] = 0;
++            for (size_t j = 0; j < split.n_segments; ++j) {
++                local.ne[axis] += split.ne[j*n + i]*split.nr[j];
++            }
++            for (int j = axis + 1; j < GGML_MAX_DIMS; ++j) {
++                local.nb[j] = tensor->nb[j]*local.ne[axis]/tensor->ne[axis];
++            }
++        }
++        size = std::max(size, ggml_backend_buft_get_alloc_size(ctx->simple_bufts[i], &local));
++    }
++    return size;
+ }
+ 
+ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1274,7 +1274,9 @@
+                            __func__, i, tensors[i]->data, (int) type, ne);
+             return false;
+         }
+-        GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
++        if ((ggml_nbytes(tensors[i]) & 0xF) != 0) {
++            return false;
++        }
+     }
+ 
+     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);

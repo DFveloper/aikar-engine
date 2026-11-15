@@ -1,4 +1,6 @@
 #include "llama-context.h"
+#include "llama-joint-validation.h"
+#include "llama-paired-forward.h"
 
 #include <cstdio>
 
@@ -388,7 +390,6 @@ llama_context::llama_context(
     cparams.moe_cache_size = params.moe_cache_size;
 
     // initialized later
-    cparams.pipeline_parallel = false;
     cparams.training = false;
 
     {
@@ -656,6 +657,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (opt_joint) opt_joint->owner->opt_joint_detach();
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     if (cpu_les) {
@@ -2939,8 +2941,8 @@ llm_graph_params llama_context::graph_params(
         /*.activation_recompute =*/ opt_params.activation_recompute,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
-        /*.full_sequence =*/ false,
-        /*.replace_weight =*/ {},
+        /*.full_sequence =*/ training && opt_full_sequence && ubatch.n_tokens == opt_params.n_ctx_train,
+        /*.replace_weight =*/ opt_weight_replace,
         /*.smooth_gelu =*/ false,
     };
 }
@@ -3016,6 +3018,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
+    }
+    // Fixed query/FFN tiles reuse the weight copy with different expert IDs.
+    if (lctx->opt_full_sequence) {
+        return false;
     }
 
     auto & st = lctx->copy_experts;
@@ -4033,6 +4039,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     cparams.fused_gdn_ar = false;
     cparams.fused_gdn_ch = false;
     cparams.auto_fgdn    = false;
+    cparams.pipeline_parallel = false;
     //
     // Context used for THIS fine-tuning run.
     //
@@ -4053,6 +4060,20 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     this->opt_params.n_ctx_train =
         train_n_ctx;
 
+    opt_full_sequence = lopt_params.train_target && ggml_opt_optimizer_is_qlion(lopt_params.optimizer_type) &&
+        (model->arch == LLM_ARCH_GEMMA4 || model->arch == LLM_ARCH_LUMEN4EXP) &&
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_seq_max() == 1 &&
+        this->n_batch() >= train_n_ctx;
+    if (opt_full_sequence) {
+        cparams.pipeline_parallel = false;
+        const uint32_t tile = std::min(LLM_TRAINING_TILE_SIZE, train_n_ctx);
+        if (this->n_ubatch() < tile) {
+            throw std::runtime_error("full-context QLion requires -ub >= " + std::to_string(tile) + " for fixed-order training");
+        }
+        LLAMA_LOG_INFO("%s: full-context backward, requested ubatch=%u, fixed projection/query tiles=%u/%u\n",
+                __func__, this->n_ubatch(), LLM_TRAINING_PROJECTION_TILE_SIZE, tile);
+    }
+
     const uint32_t n_batch =
         std::min(
             this->n_batch(),
@@ -4061,7 +4082,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
     const uint32_t n_ubatch =
         std::min(
-            this->n_ubatch(),
+            opt_full_sequence ? n_batch : this->n_ubatch(),
             n_batch
         );
 
@@ -4094,12 +4115,15 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                 // graph_reserve() uses gf_res_reserve to build the graph, so both
                 // must be large enough to hold the training forward graph.
                 // Chunked recurrent graphs add nodes in proportion to the training context.
-                const uint32_t tmp_cap = std::max<uint32_t>(4096u, 32u * model->n_tensors() + 16u * n_ubatch);
+                const uint32_t n_tiles = 1 + (n_ubatch - 1) / LLM_TRAINING_TILE_SIZE;
+                const uint32_t tile_nodes = opt_full_sequence ? 256u * model->hparams.n_layer() * n_tiles : 16u * n_ubatch;
+                const uint32_t tmp_cap = std::max<uint32_t>(4096u, 32u * model->n_tensors() + tile_nodes);
                 for (auto & res : gf_res_prev) {
                     res.reset(new llm_graph_result(tmp_cap));
                 }
                 gf_res_prev_active = nullptr;
                 gf_res_reserve.reset(new llm_graph_result(tmp_cap));
+                sched_new(2ull * tmp_cap, cparams.pipeline_parallel);
                 // split_only=true: only splits the graph, doesn't reallocate compute buffers
                 auto * gf_train = graph_reserve(n_ubatch, n_seq_max(), n_ubatch, mctx_tmp.get(), /*split_only=*/true, /*sizes=*/nullptr, /*training=*/true);
                 if (gf_train) {
@@ -4335,7 +4359,7 @@ void llama_context::opt_epoch_iter(
     }
     const uint32_t n_ctx    = (uint32_t)tokens.size();
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
-    const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
+    const uint32_t n_ubatch = opt_full_sequence ? n_batch : std::min(this->n_ubatch(), n_batch);
     const int64_t n_labels = std::count_if(
             labels_sparse.begin(), labels_sparse.end(), [](llama_token label) { return label >= 0; });
     // Compensate for cross-entropy averaging over masked and padded rows.
@@ -4415,7 +4439,7 @@ void llama_context::opt_epoch_iter(
 
         uint32_t n_outputs_all = std::max<uint32_t>(1, balloc->get_n_outputs());
 
-        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, n_sequences == 1);
+        auto mctx = opt_full_sequence ? memory->init_full() : memory->init_batch(*balloc, n_ubatch, n_sequences == 1);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
             break;
@@ -4430,7 +4454,7 @@ void llama_context::opt_epoch_iter(
         uint32_t pos_batch = 0;
         static bool timings_printed = false;  // print per-ubatch timings only for the first window
         do {
-            auto ubatch = mctx->get_ubatch();
+            auto ubatch = opt_full_sequence ? balloc->split_simple(n_batch) : mctx->get_ubatch();
             // KV streams can reorder microbatches. Map rows back to their source windows.
             std::vector<uint32_t> label_indices(ubatch.n_tokens);
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -4470,7 +4494,7 @@ void llama_context::opt_epoch_iter(
             }
             n_outputs = supervised_rows.size();
 
-            if (!mctx->apply()) {
+            if (!opt_full_sequence && !mctx->apply()) {
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
                 break;
             }
@@ -4480,7 +4504,8 @@ void llama_context::opt_epoch_iter(
             const bool measure_step = train && opt_params.train_target && ggml_opt_optimizer_is_qlion(opt_params.optimizer_type);
             if (measure_step && opt_step_started_us == 0) opt_step_started_us = ggml_time_us();
             const int64_t t0_build = ggml_time_ms();
-            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), train);
+            auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), train);
+            gparams.full_sequence = opt_full_sequence;
 
             auto * gf = res->get_gf();
             int64_t t1_alloc = t0_build;
@@ -4492,6 +4517,31 @@ void llama_context::opt_epoch_iter(
                 res->reset();
 
                 gf = model.build_graph(gparams);
+                if (opt_full_sequence) {
+                    int64_t projection_tokens = 0, query_tokens = 0;
+                    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                        const auto * node = ggml_graph_node(gf, i);
+                        if (node->op == GGML_OP_MUL_MAT && node->src[0]->buffer) {
+                            projection_tokens = std::max(projection_tokens, node->src[1]->ne[1]);
+                        } else if (node->op == GGML_OP_MUL_MAT_ID) {
+                            projection_tokens = std::max(projection_tokens, node->src[1]->ne[2]);
+                        }
+                        if (node->op == GGML_OP_FLASH_ATTN_EXT) query_tokens = std::max(query_tokens, node->src[0]->ne[1]);
+                        if (node->op == GGML_OP_SOFT_MAX && node->src[1]) query_tokens = std::max(query_tokens, node->ne[1]);
+                    }
+                    LLAMA_LOG_DEBUG("full_context_graph: max_projection_tokens=%lld max_query_tokens=%lld\n",
+                            (long long) projection_tokens, (long long) query_tokens);
+                }
+                if (!train && opt_joint && opt_joint->owner == this) opt_joint->set_head_precision(gf);
+                if (train && opt_joint && opt_joint->owner == this && opt_joint->status.active) {
+                    ggml_set_output(res->get_logits());
+                    auto * validation_graph = opt_joint->build();
+                    const auto paired = llama_pair_forward_graphs(opt_joint->pairing_context(gf, validation_graph), gf, validation_graph,
+                        opt_joint->fuse_all ? nullptr : model.output);
+                    if (!paired.pairs) throw std::runtime_error("no compatible projections for joint validation");
+                    gf = paired.graph;
+                    opt_joint->status.paired_projections = paired.pairs;
+                }
 
                 const bool target_backward = train && opt_params.train_target;
 
@@ -4505,7 +4555,7 @@ void llama_context::opt_epoch_iter(
                     4 *
                         size_gf *
                         ggml_tensor_overhead() +
-                    3 *
+                    4 *
                         ggml_graph_overhead_custom(
                             size_gf,
                             /*grads=*/ true
@@ -4587,6 +4637,9 @@ void llama_context::opt_epoch_iter(
                         max_tokens);
                 }
 
+                if (opt_full_sequence && opt_distillation_callback && opt_params.activation_recompute && !opt_joint) {
+                    res->get_logits()->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+                }
                 ggml_opt_prepare_alloc(
                     opt_ctx,
                     ctx_compute_opt,
@@ -4639,10 +4692,11 @@ void llama_context::opt_epoch_iter(
                 opt_graph_cached_step = optimizer_step;
             } else {
                 ggml_opt_alloc(opt_ctx, true);
-                if (++opt_graph_reused == 1) LLAMA_LOG_INFO("qat_graph: reusing forward/backward/optimizer graph\n");
+                if (++opt_graph_reused == 1) LLAMA_LOG_INFO("graph: reusing forward/backward/optimizer graph\n");
             }
             const int64_t t2_inputs = ggml_time_ms();
             res->set_inputs(&ubatch);
+            if (train && opt_joint && opt_joint->owner == this && opt_joint->status.active) opt_joint->set_inputs();
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 struct ggml_tensor * sparse_targets = ggml_opt_sparse_targets(opt_ctx);
@@ -4736,9 +4790,10 @@ void llama_context::opt_epoch_iter(
                 for (auto index : label_indices) opt_supervised_tokens += labels_sparse[index] >= 0;
             }
             ggml_opt_eval(opt_ctx, result);
+            if (train && opt_joint && opt_joint->owner == this && opt_joint->status.active) opt_joint->collect();
             if (measure_step && ggml_opt_step(opt_ctx) != step_before) {
                 const int64_t duration = ggml_time_us() - opt_step_started_us;
-                LLAMA_LOG_INFO("qat_step: step=%lld supervised_tokens=%llu duration_us=%lld\n", (long long) ggml_opt_step(opt_ctx),
+                LLAMA_LOG_INFO("step: step=%lld supervised_tokens=%llu duration_us=%lld\n", (long long) ggml_opt_step(opt_ctx),
                     (unsigned long long) opt_supervised_tokens, (long long) duration);
                 opt_supervised_tokens = 0;
                 opt_step_started_us = 0;
@@ -4807,11 +4862,12 @@ void llama_context::opt_epoch_iter(
             }
 
             if (callback) {
-                callback(train, opt_ctx, dataset, result, idata_in_loop + ((pos_ctx + pos_batch)/n_ubatch + 1)*active_sequences, ndata_in_loop, t_loop_start);
+                const uint32_t completed = (pos_ctx + pos_batch + ubatch.n_tokens + this->n_ubatch() - 1) / this->n_ubatch();
+                callback(train, opt_ctx, dataset, result, idata_in_loop + completed*active_sequences, ndata_in_loop, t_loop_start);
             }
 
             pos_batch += ubatch.n_tokens;
-        } while (mctx->next());
+        } while (!opt_full_sequence && mctx->next());
     }
     if (critical_stats_due) {
         fprintf(stderr,

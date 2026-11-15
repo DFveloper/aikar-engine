@@ -1,0 +1,9 @@
+{
+  "frozen_weights_unchanged": true,
+  "changed_packed_weights": 0,
+  "state_norm_squared": {
+    "qat.m.": 137.6095886036632,
+    "qat.r.": 0.0
+  },
+  "note": "The first QLion2 update initializes nonzero momentum; packed model weights and residuals are unchanged in this one-step smoke. Multi-step weight trajectories are covered by the fixture regressions."
+}

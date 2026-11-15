@@ -257,6 +257,9 @@ extern "C" {
     GGML_API void ggml_opt_result_pred(    ggml_opt_result_t result, int32_t * pred);                   // writes ndata values
     GGML_API void ggml_opt_result_accuracy(ggml_opt_result_t result, double  * accuracy, double * unc); // writes 1 value
 
+    // Get the latest physical batch, normalized for gradient accumulation.
+    GGML_API void ggml_opt_result_last(ggml_opt_result_t result, double * loss, double * accuracy);
+
     // ====== Computation ======
 
     // if not using static graphs, this function must be called prior to ggml_opt_alloc

@@ -33,9 +33,9 @@ static __global__ void out_prod_q4_0_prepare_tile(
         for (int q = 0; q < QK4_0/4; ++q) {
             const uint8_t packed0 = block->qs[2*q];
             const uint8_t packed1 = block->qs[2*q + 1];
-            row_dst[q] = __halves2half2(
-                __float2half(scale*((packed0 & 0x0f) - 8)),
-                __float2half(scale*((packed1 & 0x0f) - 8)));
+            const float lo0 = scale * ((packed0 & 0x0f) - 8);
+            const float lo1 = scale * ((packed1 & 0x0f) - 8);
+            row_dst[q] = __halves2half2(__float2half(lo0), __float2half(lo1));
             row_dst[QK4_0/4 + q] = __halves2half2(
                 __float2half(scale*((packed0 >> 4) - 8)),
                 __float2half(scale*((packed1 >> 4) - 8)));

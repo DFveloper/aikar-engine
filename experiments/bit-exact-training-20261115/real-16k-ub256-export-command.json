@@ -1,0 +1,9 @@
+[
+  "/home/user/aikar-engine/build/bin/llama-export-qlion",
+  "-m",
+  "/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/Lumen-3.8-Pulsar-base.gguf",
+  "--adapter",
+  "/tmp/aikar-bit-exact-16k/tensor-ub256.adapter.gguf",
+  "-o",
+  "/tmp/aikar-bit-exact-16k/tensor-ub256.gguf"
+]

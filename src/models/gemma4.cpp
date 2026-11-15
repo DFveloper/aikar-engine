@@ -220,6 +220,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
         const int   n_rot_l      = hparams.n_rot(il);
 
+        if (full_sequence && activation_recompute) {
+            inpL = ggml_view_2d(ctx0, inpL, inpL->ne[0], inpL->ne[1], inpL->nb[1], 0);
+            inpL->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+        }
         res->t_layer_inp[il] = inpL;
 
         // norm
@@ -297,7 +301,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cb(Kcur, "Kcur_pos", il);
 
-            if (full_sequence && hparams.kv_global_only && !hparams.is_swa(il)) {
+            if (full_sequence && !mctx && hparams.kv_global_only && !hparams.is_swa(il)) {
                 Kcur = build_kv_fake_quant(Kcur, GGML_TYPE_FP4_KV);
                 Vcur = build_kv_fake_quant(Vcur, GGML_TYPE_FP4_KV);
             }
@@ -340,7 +344,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         cb(attn_out, "attn_out", il);
 
         // feed-forward network
-        if (training && activation_recompute) {
+        if (training && activation_recompute && !full_sequence) {
             attn_out->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
         }
         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
@@ -401,7 +405,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur_moe, "ffn_moe", il);
 
             cur = ggml_add(ctx0, cur_mlp, cur_moe);
-            if (training && activation_recompute) {
+            if (training && activation_recompute && !full_sequence) {
                 cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
             }
             cb(cur, "ffn_moe_combined", il);
@@ -419,7 +423,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     nullptr,
                     LLM_FFN_GELU, LLM_FFN_PAR, il, &ffn_down_input);
             GGML_ASSERT(ffn_down_input);
-            if (training && activation_recompute) {
+            if (training && activation_recompute && !full_sequence) {
                 ffn_down_input->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
             }
             cb(cur, "ffn_out", il);
@@ -467,6 +471,14 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         if (!hparams.kv_global_only) {
             cur = build_cvec(cur, il);
+        }
+        if (full_sequence && activation_recompute) {
+            cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+            if (model.dev_layer(il) != ggml_backend_get_device(backend_cpu)) {
+                // Save exact boundaries in RAM and keep the backward edge.
+                cur = ggml_cont(ctx0, cur);
+                cur->flags |= GGML_TENSOR_FLAG_HOST;
+            }
         }
         cb(cur, "l_out", il);
 
@@ -520,12 +532,36 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             return;
         }
     }
-    cur = build_lora_mm(model.output, cur, model.output_s);
-
-    if (hparams.f_final_logit_softcapping) {
-        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-        cur = ggml_tanh(ctx0, cur);
-        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+    const auto head = [&](ggml_tensor * input) {
+        auto * logits = build_lora_mm(model.output, input, model.output_s);
+        if (hparams.f_final_logit_softcapping) {
+            logits = ggml_scale(ctx0, logits, 1.0f / hparams.f_final_logit_softcapping);
+            logits = ggml_tanh(ctx0, logits);
+            logits = ggml_scale(ctx0, logits, hparams.f_final_logit_softcapping);
+        }
+        if (full_sequence && activation_recompute) {
+            input->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+            logits->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+        }
+        return logits;
+    };
+    if (full_sequence && cur->ne[1] > LLM_TRAINING_TILE_SIZE) {
+        std::vector<ggml_tensor *> tiles;
+        for (int64_t start = 0; start < cur->ne[1]; start += LLM_TRAINING_TILE_SIZE) {
+            const int64_t count = std::min<int64_t>(LLM_TRAINING_TILE_SIZE, cur->ne[1] - start);
+            auto * input = ggml_view_2d(ctx0, cur, cur->ne[0], count, cur->nb[1], start*cur->nb[1]);
+            tiles.push_back(head(input));
+        }
+        while (tiles.size() > 1) {
+            size_t count = 0;
+            for (size_t i = 0; i < tiles.size(); i += 2) {
+                tiles[count++] = i + 1 < tiles.size() ? ggml_concat(ctx0, tiles[i], tiles[i + 1], 1) : tiles[i];
+            }
+            tiles.resize(count);
+        }
+        cur = tiles[0];
+    } else {
+        cur = head(cur);
     }
 
     cb(cur, "result_output", -1);

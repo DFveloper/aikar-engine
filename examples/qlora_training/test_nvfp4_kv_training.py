@@ -105,7 +105,7 @@ def main():
         text = log.read_text(errors="replace")
         assert "K (nvfp4)" in text and "V (nvfp4)" in text, "NVFP4 cache was bypassed"
         assert "kv_nvfp4_ste" in text, "NVFP4 STE training graph is absent"
-        losses = [float(value) for value in re.findall(r"qat_epoch:.*?loss=([0-9.eE+-]+)", text)]
+        losses = [float(value) for value in re.findall(r"(?:qat_)?epoch:.*?loss=([0-9.eE+-]+)", text)]
         assert losses and all(np.isfinite(loss) for loss in losses), "nonfinite or missing loss"
         changed = check_changes(source, output, shared)
         if args.gpu_layers:
