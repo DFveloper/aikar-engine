@@ -40,6 +40,25 @@ const {chromium} = require('../../../tools/ui/node_modules/playwright');
     assert.ok(Number(result.train.match(/^M([\d.]+)/)[1]) < 5, 'first training point was shifted');
     if (fixture === 'epoch2') assert.ok(new Set(result.valXs).size > 10, 'Val markers collapse');
     else assert.equal(result.singleValArea,false, 'one Val point must not produce an area');
+    const chartId = combined ? 'combined-accuracy-chart' : 'loss-chart';
+    const chart = page.locator(`#${chartId}`);
+    await chart.scrollIntoViewIfNeeded();
+    const coordinates = await chart.evaluate(svg => {
+     const matrix = svg.getScreenCTM();
+     return [120, 480].map(x => new DOMPoint(x, 75).matrixTransform(matrix).toJSON());
+    });
+    await page.mouse.move(coordinates[0].x, coordinates[0].y);
+    await page.mouse.down();
+    await page.mouse.move(coordinates[1].x, coordinates[1].y, {steps:10});
+    await page.mouse.up();
+    assert.ok(await chart.locator('.lower-trendline').count());
+    assert.ok(await chart.locator('.upper-trendline').count());
+    assert.ok(await chart.locator('.moving-average').count());
+    assert.match(await page.locator(`#${chartId.replace('-chart', '-range')}`).innerText(), /SMA20/);
+    await page.evaluate(() => refresh());
+    assert.equal(await chart.locator('.chart-analysis').count(), 1, 'selection must survive polling');
+    await chart.press('Escape');
+    assert.equal(await chart.locator('.chart-analysis').count(), 0);
     await page.screenshot({path:`/tmp/pulsar-recompute/ui-fixed-${fixture}-${width}-${combined?'combined':'separate'}.png`,fullPage:true});
    }
   }

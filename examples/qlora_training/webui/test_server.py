@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,8 +7,8 @@ from unittest.mock import patch
 import server
 
 
-def train(step, total=8, elapsed=2):
-    return f'train: data={step:07d}/{total:07d} loss_ema100=2.0 acc_ema100=60.0% t=00:00:{elapsed:02d} ETA=00:00:10\n'
+def train(step, total=8, elapsed=2, loss=2.0, accuracy=60.0):
+    return f'train: data={step:07d}/{total:07d} loss={loss} acc={accuracy}% t=00:00:{elapsed:02d} ETA=00:00:10\n'
 
 
 def val(step, epoch):
@@ -25,6 +26,44 @@ class MonitorTest(unittest.TestCase):
             log.write_text(text)
             with patch.object(server, 'training_process', return_value=123):
                 return server.Monitor(log, 'train', ema_n).snapshot()
+
+    def test_raw_samples_are_smoothed_without_differencing(self):
+        text = HEADER + train(1, loss=10, accuracy=20) + train(2, loss=2, accuracy=80)
+        data = self.snapshot(text, ema_n=25)
+        self.assertAlmostEqual(data['loss'], 10 + (2 - 10) * 2 / 26)
+        self.assertAlmostEqual(data['accuracy'], 20 + (80 - 20) * 2 / 26)
+        self.assertEqual(data['accuracy_scope'], 'supervised_tokens')
+
+    def test_resume_and_epoch_reset_do_not_reconstruct_samples(self):
+        text = HEADER.replace('start_step=0', 'start_step=6')
+        text += train(2, total=4, loss=10) + train(4, total=4, loss=2)
+        text += train(2, loss=3)
+        data = self.snapshot(text, ema_n=25)
+        expected = 10 + (2 - 10) * (1 - (1 - 2 / 26) ** 2)
+        expected += (3 - expected) * 2 / 26
+        self.assertAlmostEqual(data['loss'], expected)
+
+    def test_legacy_logs_are_used_as_logged(self):
+        text = (HEADER + train(1, loss=10) + train(2, loss=2)).replace('_raw=', '=')
+        data = self.snapshot(text, ema_n=25)
+        self.assertAlmostEqual(data['loss'], 10 + (2 - 10) * 2 / 26)
+
+    def test_native_ema_is_recovered_before_selected_smoothing(self):
+        native_alpha = 2 / 101
+        text = HEADER + train(1, loss=10, accuracy=20)
+        text += train(2, loss=10 + (2 - 10) * native_alpha, accuracy=20 + (80 - 20) * native_alpha)
+        text = text.replace('loss=', 'loss_ema100=').replace('acc=', 'acc_ema100=')
+        data = self.snapshot(text, ema_n=25)
+        self.assertAlmostEqual(data['loss'], 10 + (2 - 10) * 2 / 26)
+        self.assertAlmostEqual(data['accuracy'], 20 + (80 - 20) * 2 / 26)
+
+    def test_unavailable_raw_metrics_keep_progress_and_valid_json(self):
+        data = self.snapshot(HEADER + train(1, accuracy='nan') + train(2, loss='inf', accuracy='-nan'))
+        self.assertEqual(data['current'], 1)
+        self.assertIsNone(data['loss'])
+        self.assertIsNone(data['accuracy'])
+        self.assertEqual(len(data['history']), 2)
+        json.dumps(data, allow_nan=False)
 
     def test_chart_keeps_microbatch_history(self):
         data = self.snapshot(HEADER + train(1) + train(2) + train(3) + train(4))

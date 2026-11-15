@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -17,8 +18,8 @@ from urllib.parse import parse_qs, urlparse
 
 TRAIN_RE = re.compile(
     r"(?:^|\n)\s*train:.*?data=(?P<current>\d+)/(?P<total>\d+)\s+"
-    r"loss(?:_ema(?P<loss_window>\d+))?=(?P<loss>[0-9.eE+-]+).*?"
-    r"acc(?:_ema(?P<accuracy_window>\d+))?=(?P<accuracy>[0-9.eE+-]+).*?%\s+"
+    r"loss(?:(?P<raw>_raw)|_ema(?P<loss_window>\d+))?=(?P<loss>[+-]?(?:nan|inf)|[0-9.eE+-]+).*?"
+    r"acc(?:_raw|_ema(?P<accuracy_window>\d+))?=(?P<accuracy>[+-]?(?:nan|inf)|[0-9.eE+-]+).*?%\s+"
     r"t=(?P<elapsed>\d+:\d{2}:\d{2})\s+"
     r"ETA=(?P<eta>\d+:\d{2}:\d{2})"
 )
@@ -53,6 +54,11 @@ ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def duration_seconds(value: str) -> int:
     hours, minutes, seconds = (int(part) for part in value.split(":"))
     return hours * 3600 + minutes * 60 + seconds
+
+
+def finite_metric(value: str) -> float | None:
+    result = float(value)
+    return result if math.isfinite(result) else None
 
 
 def read_tail(path: Path, limit: int = 16 * 1024 * 1024) -> str:
@@ -177,38 +183,27 @@ def ema_series(records: list[dict], window: int) -> list[dict]:
         delta = 1
         if previous is not None:
             delta = max(1, record["data_step"] - previous["data_step"])
-            if not record["native_ema"] and not previous["native_ema"]:
-                # The trainer's loss is cumulative within the current epoch's
-                # local `data` counter.  `step` is a WebUI global counter and
-                # includes resume offsets, so using it here creates a false,
-                # sometimes negative sample after --*-resume.
-                local_delta = record["data_step"] - previous["data_step"]
-                if local_delta > 0 and record.get("epoch") == previous.get("epoch"):
-                    loss_sample = (
-                        record["loss"] * record["data_step"]
-                        - previous["loss"] * previous["data_step"]
-                    ) / local_delta
-                else:
-                    # A new epoch reset the trainer accumulator. Its first
-                    # reported mean is the only valid loss sample available.
-                    loss_sample = record["loss"]
-                # Legacy accuracy was rounded to 0.01% before logging. Differencing
-                # cumulative values amplifies that quantization noise, so smooth the
-                # logged value until native per-batch EMA is available.
-                accuracy_sample = record["accuracy"]
-        if record["native_ema"]:
-            loss_ema = record["loss"]
-            accuracy_ema = record["accuracy"]
-        else:
-            effective_alpha = 1.0 - (1.0 - alpha) ** delta
+        if record["native_ema"] and previous is not None:
+            for key, native_window in (("loss", record["loss_window"]), ("accuracy", record["accuracy_window"])):
+                sample, prior = record[key], previous[key]
+                if (sample is not None and prior is not None and native_window
+                        and previous.get(key + "_window") == native_window
+                        and record["epoch"] == previous["epoch"]
+                        and record["data_step"] > previous["data_step"]):
+                    decay = (1.0 - 2.0 / (native_window + 1.0)) ** delta
+                    recovered = (sample - decay * prior) / (1.0 - decay)
+                    if key == "loss":
+                        loss_sample = recovered
+                    else:
+                        accuracy_sample = recovered
+        effective_alpha = 1.0 - (1.0 - alpha) ** delta
+        if loss_sample is not None:
             loss_ema = loss_sample if loss_ema is None else loss_ema + effective_alpha * (loss_sample - loss_ema)
+        if accuracy_sample is not None:
             accuracy_sample = min(100.0, max(0.0, accuracy_sample))
-            accuracy_ema = (
-                accuracy_sample
-                if accuracy_ema is None
-                else accuracy_ema + effective_alpha * (accuracy_sample - accuracy_ema)
-            )
-        output.append({"step": record["step"], "loss": loss_ema, "accuracy": accuracy_ema})
+            accuracy_ema = accuracy_sample if accuracy_ema is None else accuracy_ema + effective_alpha * (accuracy_sample - accuracy_ema)
+        output.append({"step": record["step"], "loss": loss_ema if loss_sample is not None else None,
+                       "accuracy": accuracy_ema if accuracy_sample is not None else None})
         previous = record
     return output
 
@@ -295,6 +290,7 @@ def token_weighted_ema(records: list[dict], keys: tuple[str, ...], weight_key: s
 
 def trend_delta(series: list[dict], key: str, window: int) -> dict[str, float | int] | None:
     """Compare the latest EMA value with the value N optimizer windows earlier."""
+    series = [point for point in series if point[key] is not None]
     if len(series) < 2:
         return None
     latest = series[-1]
@@ -379,10 +375,12 @@ class Monitor:
                 current = epoch * epoch_windows + offset + local // factor
                 epoch_elapsed = duration_seconds(item["elapsed"])
                 records.append(dict(step=current + (local % factor) / factor, data_step=local, epoch=epoch,
-                                    data_per_window=factor, loss=float(item["loss"]),
-                                    accuracy=float(item["accuracy"]),
+                                    data_per_window=factor, loss=finite_metric(item["loss"]),
+                                    accuracy=finite_metric(item["accuracy"]),
                                     elapsed_seconds=elapsed_before_epoch + epoch_elapsed,
-                                    native_ema=item["loss_window"] is not None))
+                                    native_ema=item["loss_window"] is not None, raw=item["loss_window"] is None,
+                                    loss_window=int(item["loss_window"]) if item["loss_window"] else None,
+                                    accuracy_window=int(item["accuracy_window"]) if item["accuracy_window"] else None))
                 previous_local = local
                 critical_step = current
                 if not total:
@@ -411,7 +409,7 @@ class Monitor:
                 checkpoint = QLORA_CHECKPOINT_PATH_RE.search(name)
                 if checkpoint:
                     successes.add((int(checkpoint["epoch"]) - 1) * windows + int(checkpoint["step"]))
-            if any(marker in line for marker in ("checkpoint", "ckpt", "qat_epoch:", "failed to save", "cannot open")):
+            if any(marker in line for marker in ("checkpoint", "ckpt", "epoch:", "failed to save", "cannot open")):
                 events.append(line.strip()[-260:])
 
         history = ema_series(records, ema_n)
@@ -451,7 +449,7 @@ class Monitor:
             "chart_start": start_step, "chart_current": latest["step"] if latest else start_step,
             "loss": smoothed.get("loss"), "accuracy": smoothed.get("accuracy"),
             "unweighted_nll": nll_history[-1]["nll"] if nll_history else None,
-            "accuracy_scope": "supervised_token_weighted" if latest and latest["native_ema"] else "legacy_all_positions",
+            "accuracy_scope": "supervised_tokens" if latest and (latest["raw"] or latest["native_ema"]) else "legacy_all_positions",
             "ema_n": ema_n, "elapsed": format_duration(elapsed) if latest else "--:--:--",
             "eta": eta, "rate": rate, "history": downsample(history), "nll_history": downsample(nll_history),
             "validation": validation_history[-1] if validation_history else None,

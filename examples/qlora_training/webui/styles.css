@@ -67,7 +67,16 @@ h2 { margin: 2px 0 0; font-size: 18px; letter-spacing: -0.02em; }
 .metric-card > strong .trend.good { color: var(--green); }
 .metric-card > strong .trend.bad { color: var(--red); }
 .metric-card > strong .trend.neutral { color: var(--muted); }
-.chart { display: block; width: 100%; height: 150px; margin-top: 12px; overflow: visible; }
+.chart { display: block; width: 100%; height: 150px; margin-top: 12px; overflow: visible; cursor: crosshair; touch-action: pan-y; user-select: none; }
+.chart:focus-visible { outline: 1px solid var(--cyan); outline-offset: 3px; }
+.chart-analysis { pointer-events: none; }
+.selection-band { fill: rgba(184, 156, 255, 0.12); stroke: #b89cff; stroke-width: 1; }
+.lower-trendline, .upper-trendline, .moving-average { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.lower-trendline { stroke-dasharray: 3 3; }
+.upper-trendline { stroke-dasharray: 8 4; }
+.moving-average { stroke-width: 3; }
+.analysis-summary { flex-basis: 100%; color: var(--text); overflow-wrap: anywhere; }
+.chart-help { color: var(--muted); font-size: 11px; line-height: 1.6; }
 .chart .grid { stroke: var(--line-soft); stroke-width: 1; }
 .chart .area { fill: color-mix(in srgb, var(--accent) 10%, transparent); }
 .chart .line { fill: none; stroke: var(--accent); stroke-width: 2.5; vector-effect: non-scaling-stroke; }
