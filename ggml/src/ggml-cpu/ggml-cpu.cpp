@@ -5,6 +5,7 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include "ops.h"
 
 #include <cctype>
 #include <cmath>
@@ -688,6 +689,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_cpu_set_out_prod_host") == 0) {
+        return (void *) ggml_cpu_set_out_prod_host;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

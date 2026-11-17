@@ -26,6 +26,9 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 extern "C" {
 #endif
 
+typedef bool (*ggml_cpu_out_prod_host_t)(struct ggml_tensor * dst, bool accumulate);
+void ggml_cpu_set_out_prod_host(ggml_cpu_out_prod_host_t function);
+
 void ggml_compute_forward_mul_mat_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dup(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add(const struct ggml_compute_params * params, struct ggml_tensor * dst);

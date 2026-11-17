@@ -1,7 +1,6 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
-#include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "binary-ops.h"
@@ -14,12 +13,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cfloat>
 #include <climits>
 #include <cmath>
 #include <cstring>
 #include <vector>
+
+static std::atomic<ggml_cpu_out_prod_host_t> out_prod_host { nullptr };
+
+void ggml_cpu_set_out_prod_host(ggml_cpu_out_prod_host_t function) {
+    out_prod_host.store(function, std::memory_order_release);
+}
 
 void ggml_compute_forward_turboquant_pack(const ggml_compute_params * params, ggml_tensor * dst) {
     ggml_turboquant_op_params options;
@@ -5118,9 +5124,7 @@ static void ggml_compute_forward_out_prod_f32(
             ggml_is_contiguous(dst) && ne0 >= 1024 && ne1 >= 1024 && ne01 >= 32) {
         auto * success = (bool *) params->wdata;
         if (ith == 0) {
-            auto * reg = ggml_backend_reg_by_name("CUDA");
-            using host_out_prod_t = bool (*)(ggml_tensor *, bool);
-            auto fn = reg ? (host_out_prod_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_out_prod_host") : nullptr;
+            auto fn = out_prod_host.load(std::memory_order_acquire);
             *success = fn && fn(dst, accumulate);
         }
         ggml_barrier(params->threadpool);

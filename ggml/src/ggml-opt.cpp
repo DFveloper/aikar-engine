@@ -1141,6 +1141,8 @@ static ggml_tensor * ggml_opt_clone_recompute_tensor(
         const std::map<ggml_tensor *, ggml_tensor *> & replacements,
         const std::unordered_map<ggml_tensor *, int> & order, int boundary) {
     if (tensor == input) return replay_input;
+    // Keep discrete routing decisions from the forward pass.
+    if (tensor && tensor->type == GGML_TYPE_I32) return tensor;
     if (!tensor || tensor == input || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo, order, boundary)) {
         const auto found = replacements.find(tensor);
         return found == replacements.end() ? tensor : found->second;

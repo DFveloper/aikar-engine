@@ -199,6 +199,20 @@ struct ggml_backend_registry {
             __func__, ggml_backend_reg_name(reg), ggml_backend_reg_dev_count(reg));
 #endif
         backends.push_back({ reg, std::move(handle) });
+        // Keep the CPU backend usable without the backend registry.
+        using out_prod_host_t = bool (*)(ggml_tensor *, bool);
+        using set_out_prod_host_t = void (*)(out_prod_host_t);
+        out_prod_host_t out_prod_host = nullptr;
+        set_out_prod_host_t set_out_prod_host = nullptr;
+        for (const auto & entry : backends) {
+            if (auto function = ggml_backend_reg_get_proc_address(entry.reg, "ggml_backend_cuda_out_prod_host")) {
+                out_prod_host = (out_prod_host_t) function;
+            }
+            if (auto function = ggml_backend_reg_get_proc_address(entry.reg, "ggml_cpu_set_out_prod_host")) {
+                set_out_prod_host = (set_out_prod_host_t) function;
+            }
+        }
+        if (set_out_prod_host) set_out_prod_host(out_prod_host);
         for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
             register_device(ggml_backend_reg_dev_get(reg, i));
         }
