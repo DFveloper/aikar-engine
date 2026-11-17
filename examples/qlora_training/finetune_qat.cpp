@@ -670,14 +670,35 @@ struct qat_callback_context {
     bool    first_save_pending;
     const common_qlion_snapshot * adapter_base;
     const std::vector<ggml_tensor *> * adapter_tensors;
+    double update_loss = 0.0;
 };
 
 static thread_local struct qat_callback_context * g_qat_callback = nullptr;
+
+struct qat_eval_flags {
+    std::vector<std::pair<ggml_tensor *, int32_t>> saved;
+
+    explicit qat_eval_flags(llama_context * lctx) {
+        saved.reserve(llama_opt_qat_state_count(lctx));
+        for (int64_t i = 0; i < llama_opt_qat_state_count(lctx); ++i) {
+            auto * tensor = llama_opt_qat_state_param(lctx, i);
+            if (tensor->type != GGML_TYPE_Q4_0) continue;
+            saved.emplace_back(tensor, tensor->flags);
+            tensor->flags &= ~GGML_TENSOR_FLAG_PARAM;
+        }
+    }
+
+    ~qat_eval_flags() {
+        for (const auto & entry : saved) entry.first->flags = entry.second;
+    }
+};
 
 static void qat_run_periodic_eval(ggml_opt_dataset_t dataset, int64_t step) {
     auto * callback = g_qat_callback;
     if (!callback || callback->validation_end <= callback->validation_start) return;
     ggml_opt_result_reset(callback->result_eval);
+    // Use frozen Q4 kernels for validation, independent of training targets.
+    qat_eval_flags flags(callback->lctx);
     llama_opt_eval_range(callback->lctx, dataset, callback->result_eval,
         callback->validation_start, callback->validation_end, nullptr);
     double loss = 0.0;
@@ -700,6 +721,11 @@ static void qat_epoch_callback(
     ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
     if (!train || !g_qat_callback) {
         return;
+    }
+    if (g_qat_callback->params->verbose_loss) {
+        float loss;
+        ggml_backend_tensor_get(ggml_opt_loss(opt_ctx), &loss, 0, sizeof(loss));
+        g_qat_callback->update_loss += loss;
     }
     if (ibatch == ibatch_max && !g_qat_callback->params->distill_cache.empty()) {
         const double elapsed = (ggml_time_us() - t_start_us)*1e-6;
@@ -727,9 +753,10 @@ static void qat_epoch_callback(
         double loss;
         double accuracy;
         ggml_opt_result_last(result, &loss, &accuracy);
-        LOG_INF("loss: epoch=%ld window=%ld step=%ld loss=%.8f acc=%.6f%% lr=%.9g\n",
+        LOG_INF("loss: epoch=%ld window=%ld step=%ld loss=%.8f acc=%.6f%% lr=%.9g objective=update\n",
             (long) g_qat_callback->epoch, (long) ibatch, (long) step,
-            loss, 100.0 * accuracy, (double) g_qat_callback->schedule->current_lr);
+            g_qat_callback->update_loss, 100.0 * accuracy, (double) g_qat_callback->schedule->current_lr);
+        g_qat_callback->update_loss = 0.0;
     }
     const bool window_complete = ibatch > 0 && ibatch % g_qat_callback->ubatches_per_window == 0;
     const bool first_save_due = g_qat_callback->first_save_pending &&
@@ -963,7 +990,7 @@ int main(int argc, char ** argv) {
         (unsigned long long) model_info.nonquantized_bytes,
         (unsigned long long) (model_info.quantized_bytes + model_info.momentum_bytes + model_info.residual_bytes + gradient_estimate));
 
-    params.offload_input = true;
+    params.offload_input = false;
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -1262,7 +1289,7 @@ int main(int argc, char ** argv) {
     }
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval = ggml_opt_result_init();
-    const int64_t ubatches_per_window = llama_n_ctx(lctx) / llama_n_ubatch(lctx);
+    const int64_t ubatches_per_window = 1 + (llama_n_ctx(lctx) - 1) / llama_n_ubatch(lctx);
     GGML_ASSERT(ubatches_per_window > 0);
     struct qat_callback_context callback_ctx {
         lctx, mtp.ctx.get(), model, &mtp, &schedule, &params, 0, 0, ubatches_per_window,
@@ -1304,12 +1331,7 @@ int main(int argc, char ** argv) {
             qat_print_memory(lctx, model_info);
         }
         if (idata_split < ndata) {
-            double val_loss = 0.0;
-            double val_accuracy = 0.0;
-            ggml_opt_result_loss(result_eval, &val_loss, nullptr);
-            ggml_opt_result_accuracy(result_eval, &val_accuracy, nullptr);
-            LOG_INF("validation: step=%ld epoch=%d loss=%.8f acc=%.4f%%\n",
-                (long) optimizer_step, params.lr.epoch + 1, val_loss, 100.0 * val_accuracy);
+            qat_run_periodic_eval(dataset, optimizer_step);
         }
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_eval);

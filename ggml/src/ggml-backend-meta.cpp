@@ -11,11 +11,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -395,7 +397,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 // Container to hold the tensor slices per simple ggml backend buffer.
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
-    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -424,7 +426,7 @@ struct ggml_backend_meta_buffer_context {
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+    std::unordered_map<const ggml_tensor *, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache[2];
 
     int debug;
 
@@ -1318,16 +1320,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return split_state;
     };
 
-    const std::pair key = std::make_pair(tensor, assume_sync);
-    auto it = buf_ctx->split_state_cache.find(key);
-    if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
-        it = buf_ctx->split_state_cache.end();
+    auto & cache = buf_ctx->split_state_cache[assume_sync];
+    const auto * key = tensor;
+    auto it = cache.find(key);
+    if (it != cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
+        for (auto & entry : buf_ctx->split_state_cache) {
+            entry.clear();
+        }
+        it = cache.end();
     }
 
-    if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
-        memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+    if (it == cache.end()) {
+        const auto calculated = calculate_split_state();
+        it = cache.try_emplace(key).first;
+        it->second.first = calculated;
+        memcpy(it->second.second, tensor, sizeof(it->second.second));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1355,15 +1362,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (!ne_info.empty()) {
                     ne_info += ", ";
                 }
-                const ggml_backend_meta_split_state & ss = buf_ctx->split_state_cache[key].first;
+                const ggml_backend_meta_split_state & ss = cache[key].first;
                 ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
             }
             GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
-                ggml_backend_meta_split_axis_name(buf_ctx->split_state_cache[key].first.axis), ne_info.c_str());
+                ggml_backend_meta_split_axis_name(cache[key].first.axis), ne_info.c_str());
         }
     }
 
-    ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
+    ggml_backend_meta_split_state ret = buf_ctx->debug > 0 ? cache[key].first : it->second.first;
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
@@ -1548,7 +1555,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
     }
 
-    stc.simple_tensors[tensor] = simple_tensors;
+    stc.simple_tensors[tensor] = std::move(simple_tensors);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2303,12 +2310,14 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
-
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+    if (offset != 0 || !ggml_is_contiguous(tensor) || split_state.n_segments != 1 || split_state.nr[0] != 1 ||
+            (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+             (split_state.axis < GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis > GGML_BACKEND_SPLIT_AXIS_2))) {
+        for (size_t j = 0; j < n_backends; ++j) ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j));
+        ggml_backend_tensor_get(tensor, data, offset, size);
+        return;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -2827,14 +2836,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    const auto dev0 = ggml_backend_get_device(backend_ctx->backend_configs[0].backend);
+    const auto reg0 = ggml_backend_dev_backend_reg(dev0);
+    const bool parallel_cuda = n_backends == 2 && reg0 && std::strcmp(ggml_backend_reg_name(reg0), "CUDA") == 0 &&
+        ggml_backend_get_device(backend_ctx->backend_configs[1].backend) != dev0 &&
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ctx->backend_configs[1].backend)) == reg0;
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
+        std::future<ggml_status> pending;
+        if (parallel_cuda) {
+            pending = std::async(std::launch::async, [&, i] {
+                auto & bc = backend_ctx->backend_configs[1];
+                return ggml_backend_graph_compute_async(bc.backend, bc.cgraphs[i].cgraph_main);
+            });
+        }
+        ggml_status result = GGML_STATUS_SUCCESS;
+        for (size_t j = 0; j < (parallel_cuda ? 1 : n_backends); j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
+            if (status != GGML_STATUS_SUCCESS) result = status;
         }
+        if (parallel_cuda) {
+            const ggml_status status = pending.get();
+            if (status != GGML_STATUS_SUCCESS) result = status;
+        }
+        if (result != GGML_STATUS_SUCCESS) return result;
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             bool backend_allreduce_success = false;

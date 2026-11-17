@@ -1104,7 +1104,8 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src, std::map<g
 }
 
 static bool ggml_opt_tensor_depends_on(
-        ggml_tensor * tensor, ggml_tensor * input, std::map<ggml_tensor *, bool> & memo) {
+        ggml_tensor * tensor, ggml_tensor * input, std::map<ggml_tensor *, bool> & memo,
+        const std::unordered_map<ggml_tensor *, int> & order, int boundary) {
     if (!tensor) {
         return false;
     }
@@ -1116,9 +1117,14 @@ static bool ggml_opt_tensor_depends_on(
         memo[tensor] = true;
         return true;
     }
+    if (boundary >= 0) {
+        const auto position = order.find(tensor);
+        // Earlier forward nodes cannot depend on a later checkpoint boundary.
+        if (position == order.end() || position->second < boundary) return false;
+    }
     memo[tensor] = false;
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_opt_tensor_depends_on(tensor->src[i], input, memo)) {
+        if (ggml_opt_tensor_depends_on(tensor->src[i], input, memo, order, boundary)) {
             memo[tensor] = true;
             return true;
         }
@@ -1132,9 +1138,10 @@ static ggml_tensor * ggml_opt_clone_recompute_tensor(
         ggml_tensor * input,
         std::map<ggml_tensor *, bool> & dependency_memo,
         std::map<ggml_tensor *, ggml_tensor *> & clones, ggml_tensor * replay_input,
-        const std::map<ggml_tensor *, ggml_tensor *> & replacements) {
+        const std::map<ggml_tensor *, ggml_tensor *> & replacements,
+        const std::unordered_map<ggml_tensor *, int> & order, int boundary) {
     if (tensor == input) return replay_input;
-    if (!tensor || tensor == input || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
+    if (!tensor || tensor == input || !ggml_opt_tensor_depends_on(tensor, input, dependency_memo, order, boundary)) {
         const auto found = replacements.find(tensor);
         return found == replacements.end() ? tensor : found->second;
     }
@@ -1154,10 +1161,10 @@ static ggml_tensor * ggml_opt_clone_recompute_tensor(
     ggml_format_name(clone, "recompute_%s", tensor->name);
     clone->view_offs = tensor->view_offs;
     clone->view_src = ggml_opt_clone_recompute_tensor(
-            ctx, tensor->view_src, input, dependency_memo, clones, replay_input, replacements);
+            ctx, tensor->view_src, input, dependency_memo, clones, replay_input, replacements, order, boundary);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         clone->src[i] = ggml_opt_clone_recompute_tensor(
-                ctx, tensor->src[i], input, dependency_memo, clones, replay_input, replacements);
+                ctx, tensor->src[i], input, dependency_memo, clones, replay_input, replacements, order, boundary);
     }
     return clone;
 }
@@ -1180,6 +1187,17 @@ static void ggml_opt_prepare_recompute(ggml_opt_context_t opt_ctx, int n_nodes_f
     }
     GGML_ASSERT(inputs.empty() && "activation recompute input has no output boundary");
 
+    std::unordered_map<ggml_tensor *, int> order;
+    order.reserve(n_nodes_f);
+    for (int i = 0; i < n_nodes_f; ++i) order.emplace(opt_ctx->gb_grad->nodes[i], i);
+    bool topological = true;
+    for (int i = 0; i < n_nodes_f && topological; ++i) {
+        for (auto * source : opt_ctx->gb_grad->nodes[i]->src) {
+            const auto found = order.find(source);
+            // CPY can reference its destination; ignore that self edge.
+            if (found != order.end() && found->second > i) { topological = false; break; }
+        }
+    }
     std::map<ggml_tensor *, ggml_tensor *> replacements;
     // Build outer regions first; inner regions replay from the outer checkpoint.
     for (auto it = regions.rbegin(); it != regions.rend(); ++it) {
@@ -1197,7 +1215,8 @@ static void ggml_opt_prepare_recompute(ggml_opt_context_t opt_ctx, int n_nodes_f
             replacements[region.first] = replay_input;
         }
         ggml_tensor * replay = ggml_opt_clone_recompute_tensor(
-                opt_ctx->ctx_compute, region.second, region.first, dependency_memo, clones, replay_input, replacements);
+                opt_ctx->ctx_compute, region.second, region.first, dependency_memo, clones, replay_input, replacements,
+                order, topological ? order.at(region.first) : -1);
         GGML_ASSERT(replay != region.second && "activation recompute output does not depend on its input");
         for (const auto & entry : clones) replacements[entry.first] = entry.second;
         opt_ctx->recompute_regions++;

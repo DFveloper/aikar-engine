@@ -204,6 +204,15 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(dst->type  == src0->type);
 
+    if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1) &&
+            ggml_row_size(src0->type, src0->ne[0]) % sizeof(uint4) == 0 &&
+            ggml_row_size(src1->type, src1->ne[0]) % sizeof(uint4) == 0 &&
+            (reinterpret_cast<uintptr_t>(src0->data) | reinterpret_cast<uintptr_t>(src1->data) |
+             reinterpret_cast<uintptr_t>(dst->data) | src0->nb[3] | src1->nb[3] | dst->nb[3]) % alignof(uint4) == 0) {
+        concat_cuda<uint4>(src0, src1, dst, dim, stream);
+        return;
+    }
+
     if (ggml_is_quantized(src0->type)) {
         if (dim == 3) {
             GGML_ASSERT(ggml_is_contiguous(src0));

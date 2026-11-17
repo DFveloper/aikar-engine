@@ -11,3 +11,7 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_acc_qlion_qat_experts(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// Optional CPU outer-product acceleration; host quantization stays on the CPU.
+bool ggml_cuda_out_prod_host(ggml_tensor * dst, bool accumulate);
+void ggml_cuda_out_prod_host_device(int device, bool active);

@@ -105,7 +105,9 @@ class UploadTest(unittest.TestCase):
             (run / 'final.adapter.gguf').write_bytes(b'final-adapter')
             with (run / 'train-a.log').open('a') as stream:
                 stream.write('qat_adapter_checkpoint: saved final path=final.adapter.gguf\n')
-            self.assertEqual(hf_upload.completed_checkpoints(run, run / 'train-a.log'), [step, final])
+            for prefix in ('', 'qat_'):
+                (run / 'train-a.log').write_text(f'adapter_checkpoint: saved step=1000 path=step.gguf\ncheckpoint set saved at step 1000 window 1000\n{prefix}adapter_checkpoint: saved final path=final.adapter.gguf\n')
+                self.assertEqual(hf_upload.completed_checkpoints(run, run / 'train-a.log'), [step, final])
             (run / 'status.json').write_text('{"phase":"complete"}')
             self.assertEqual(hf_upload.completed_checkpoints(run), [step, final])
             current_log = run / 'train-new.log'

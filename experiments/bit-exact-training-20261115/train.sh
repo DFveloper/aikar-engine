@@ -3,7 +3,12 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-exec /home/user/aikar-engine/build/bin/llama-finetune-qlion \
+printf '{"run":"%s","launcher_pid":%s,"launcher_name":"train.sh","status":"running","microbatch":768,"context":16384,"grad_accum":6,"total_data_windows":6057}\n' "$PWD" "$$" > webui/manual-run.json
+python3 webui/server.py > webui.log 2>&1 &
+webui_pid=$!
+trap 'kill "$webui_pid" 2>/dev/null || true' EXIT
+
+/home/user/aikar-engine/build/bin/llama-finetune-qlion \
     -m Lumen-3.8-Pulsar-base.gguf \
     --train-file logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json \
     --distill-cache logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json \
@@ -16,6 +21,7 @@ exec /home/user/aikar-engine/build/bin/llama-finetune-qlion \
     --activation-recompute on --qat-grad-accumulator cpu \
     --epochs 1 \
     -lr 1e-5 -lr-min 1e-6 --lr-scheduler cosine --warmup-steps 50 \
+    --eval-initial --eval-every 4 --distill-validation-windows 6 \
     --qat-adapter-only --qat-adapter-out interleaved.adapter.gguf \
     --save-every 4 \
-    --verbose-loss "$@"
+    --verbose-loss "$@" 2>&1 | tee train.log

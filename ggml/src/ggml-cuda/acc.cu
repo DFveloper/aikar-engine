@@ -27,6 +27,21 @@ static __global__ void acc_f32(const float * x, const float * y, float * dst, co
     dst[i] = val;
 }
 
+static __global__ void acc_f32_slice(const float * y, float * dst, const int64_t ne,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const int64_t s11, const int64_t s12, const int64_t s13, const int64_t offset) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= ne) return;
+    int64_t tmp = i;
+    const int64_t i10 = tmp % ne10;
+    tmp /= ne10;
+    const int64_t i11 = tmp % ne11;
+    tmp /= ne11;
+    const int64_t i12 = tmp % ne12;
+    const int64_t i13 = tmp / ne12;
+    dst[offset + i10 + i11*s11 + i12*s12 + i13*s13] += y[i];
+}
+
 static void acc_f32_cuda(const float * x, const float * y, float * dst, const int64_t n_elements,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s1, const int64_t s2, const int64_t s3, const int64_t offset, cudaStream_t stream) {
@@ -56,6 +71,22 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s2     = dst->op_params[1] / sizeof(float);
     const int64_t s3     = dst->op_params[2] / sizeof(float);
     const int64_t offset = dst->op_params[3] / sizeof(float);
+
+    const int64_t n = ggml_nelements(src1);
+    const bool ordered = s1 >= src1->ne[0] && s2 >= s1*src1->ne[1] && s3 >= s2*src1->ne[2];
+    const bool disjoint = uintptr_t(src1_d) + ggml_nbytes(src1) <= uintptr_t(dst_d) ||
+        uintptr_t(dst_d) + ggml_nbytes(dst) <= uintptr_t(src1_d);
+    const int64_t end = offset + src1->ne[0] + (src1->ne[1] - 1)*s1 +
+        (src1->ne[2] - 1)*s2 + (src1->ne[3] - 1)*s3;
+    if (ordered && disjoint && offset >= 0 && end <= ggml_nelements(dst) &&
+            (src0_d == dst_d || n <= ggml_nelements(dst)/4)) {
+        // Keep untouched elements in place when the allocator reuses the gradient buffer.
+        if (src0_d != dst_d) CUDA_CHECK(cudaMemcpyAsync(dst_d, src0_d, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
+        const int blocks = (n + CUDA_ACC_BLOCK_SIZE - 1) / CUDA_ACC_BLOCK_SIZE;
+        acc_f32_slice<<<blocks, CUDA_ACC_BLOCK_SIZE, 0, stream>>>(src1_d, dst_d, n,
+                src1->ne[0], src1->ne[1], src1->ne[2], s1, s2, s3, offset);
+        return;
+    }
 
     acc_f32_cuda(src0_d, src1_d, dst_d, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset, stream);
 }

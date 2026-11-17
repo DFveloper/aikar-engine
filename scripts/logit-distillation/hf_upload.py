@@ -39,7 +39,7 @@ def completed_checkpoints(run, log_path=None):
                 match = re.search(r'checkpoint set saved at step (\d+) window ', line)
                 if match:
                     steps.add(int(match[1]))
-                if 'qat_adapter_checkpoint: saved final path=' in line:
+                if 'adapter_checkpoint: saved final path=' in line:
                     final = True
     models = [run / f'final.gguf.step{step}.gguf' for step in sorted(steps)]
     status = run / 'status.json'

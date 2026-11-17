@@ -4,8 +4,11 @@
 #include "cpy.cuh"
 #include "opt-step-qlion-qat.cuh"
 #include <functional>
+#include <future>
+#include <thread>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -523,7 +526,7 @@ static __device__ __forceinline__ float mxfp4_get(const block_mxfp4 & block, int
 #include <mma.h>
 
 static constexpr int MUL_MAT_ID_BACK_FUSED_M = 128;
-static constexpr int MUL_MAT_ID_BACK_FUSED_N = 64;
+static constexpr int MUL_MAT_ID_BACK_FUSED_N = 32;
 static constexpr int MUL_MAT_ID_BACK_FUSED_K = 64;
 static constexpr int MUL_MAT_ID_BACK_FUSED_WARPS = 8;
 static constexpr int MUL_MAT_ID_BACK_SCALE_WARPS = 4;
@@ -559,7 +562,10 @@ static __global__ void mul_mat_id_back_q4_0_fused(
     __shared__ int weight_exp;
     __shared__ float weight_scale;
     // The MMA input tiles and output fragments use this storage at different times.
-    __shared__ __align__(32) unsigned char workspace[tile_m*tile_n*sizeof(float)];
+    constexpr int input_bytes = (tile_m + tile_n)*tile_k*sizeof(half);
+    constexpr int output_bytes = tile_m*tile_n*sizeof(float);
+    constexpr int workspace_bytes = input_bytes > output_bytes ? input_bytes : output_bytes;
+    __shared__ __align__(32) unsigned char workspace[workspace_bytes];
     half * a = reinterpret_cast<half *>(workspace);
     half * b = a + tile_m*tile_k;
     float * c = reinterpret_cast<float *>(workspace);
@@ -577,15 +583,21 @@ static __global__ void mul_mat_id_back_q4_0_fused(
         return;
     }
 
-    if (warp == 0) {
-        float maximum = 0.0f;
-        for (int64_t row = lane; row < rows; row += WARP_SIZE) {
-            for (int block_m = 0; block_m < tile_m/QK4_0 && col_begin + block_m*QK4_0 < cols; ++block_m) {
-                const auto & block = weight[(int64_t(expert)*rows + row)*blocks_row + col_begin/QK4_0 + block_m];
-                maximum = fmaxf(maximum, 8.0f*fabsf(__half2float(block.d)));
-            }
+    __shared__ float weight_maximum[warps];
+    float maximum = 0.0f;
+    for (int64_t i = tid; i < rows*(tile_m/QK4_0); i += warps*WARP_SIZE) {
+        const int64_t row = i/(tile_m/QK4_0);
+        const int block_m = i%(tile_m/QK4_0);
+        if (col_begin + block_m*QK4_0 < cols) {
+            const auto & block = weight[(int64_t(expert)*rows + row)*blocks_row + col_begin/QK4_0 + block_m];
+            maximum = fmaxf(maximum, 8.0f*fabsf(__half2float(block.d)));
         }
-        maximum = warp_reduce_max(maximum);
+    }
+    maximum = warp_reduce_max(maximum);
+    if (lane == 0) weight_maximum[warp] = maximum;
+    __syncthreads();
+    if (warp == 0) {
+        maximum = warp_reduce_max(lane < warps ? weight_maximum[lane] : 0.0f);
         if (lane == 0) {
             weight_exp = mul_mat_id_back_scale_exp(maximum);
             weight_scale = ldexpf(1.0f, weight_exp);
@@ -593,26 +605,30 @@ static __global__ void mul_mat_id_back_q4_0_fused(
     }
     __syncthreads();
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1, acc2, acc3;
-    wmma::fill_fragment(acc0, 0.0f);
-    wmma::fill_fragment(acc1, 0.0f);
-    wmma::fill_fragment(acc2, 0.0f);
-    wmma::fill_fragment(acc3, 0.0f);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[tile_n/16];
+    #pragma unroll
+    for (int j = 0; j < tile_n/16; ++j) wmma::fill_fragment(acc[j], 0.0f);
     const int m = warp*16;
     const int n = 0;
     for (int64_t row_begin = 0; row_begin < rows; row_begin += tile_k) {
-        for (int i = tid; i < tile_m*tile_k; i += warps*WARP_SIZE) {
-            const int col = i%tile_m;
-            const int64_t row = row_begin + i/tile_m;
-            float value = 0.0f;
+        for (int i = tid; i < tile_m*tile_k/4; i += warps*WARP_SIZE) {
+            const int packed_col = i%(tile_m/4);
+            const int col = packed_col/8*QK4_0 + 2*(packed_col%8);
+            const int64_t row = row_begin + i/(tile_m/4);
+            half2 lo = __float2half2_rn(0.0f);
+            half2 hi = lo;
             if (row < rows && col_begin + col < cols) {
                 const auto & block = weight[(int64_t(expert)*rows + row)*blocks_row + (col_begin + col)/QK4_0];
-                const int quant_col = col%QK4_0;
-                const int packed = block.qs[quant_col%16];
-                const int quant = (quant_col < 16 ? packed & 15 : packed >> 4) - 8;
-                value = __half2float(block.d)*quant*weight_scale;
+                const uint16_t packed = *reinterpret_cast<const uint16_t *>(block.qs + col%QK4_0);
+                const float scale = __half2float(block.d);
+                lo = __halves2half2(__float2half(scale*((packed & 15) - 8)*weight_scale),
+                                   __float2half(scale*(((packed >> 8) & 15) - 8)*weight_scale));
+                hi = __halves2half2(__float2half(scale*(((packed >> 4) & 15) - 8)*weight_scale),
+                                   __float2half(scale*(((packed >> 12) & 15) - 8)*weight_scale));
             }
-            a[i] = __float2half(value);
+            half2 * target = reinterpret_cast<half2 *>(a + (row - row_begin)*tile_m + col);
+            target[0] = lo;
+            target[QK4_0/4] = hi;
         }
         for (int i = tid; i < tile_k*tile_n; i += warps*WARP_SIZE) {
             const int slot = i/tile_k;
@@ -627,23 +643,20 @@ static __global__ void mul_mat_id_back_q4_0_fused(
         __syncthreads();
         for (int k = 0; k < tile_k; k += 16) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> af;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf0, bf1, bf2, bf3;
             wmma::load_matrix_sync(af, a + m + k*tile_m, tile_m);
-            wmma::load_matrix_sync(bf0, b + k + n*tile_k, tile_k);
-            wmma::load_matrix_sync(bf1, b + k + (n + 16)*tile_k, tile_k);
-            wmma::load_matrix_sync(bf2, b + k + (n + 32)*tile_k, tile_k);
-            wmma::load_matrix_sync(bf3, b + k + (n + 48)*tile_k, tile_k);
-            wmma::mma_sync(acc0, af, bf0, acc0);
-            wmma::mma_sync(acc1, af, bf1, acc1);
-            wmma::mma_sync(acc2, af, bf2, acc2);
-            wmma::mma_sync(acc3, af, bf3, acc3);
+            #pragma unroll
+            for (int j = 0; j < tile_n/16; ++j) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+                wmma::load_matrix_sync(bf, b + k + (n + 16*j)*tile_k, tile_k);
+                wmma::mma_sync(acc[j], af, bf, acc[j]);
+            }
         }
         __syncthreads();
     }
-    wmma::store_matrix_sync(c + m + n*tile_m, acc0, tile_m, wmma::mem_col_major);
-    wmma::store_matrix_sync(c + m + (n + 16)*tile_m, acc1, tile_m, wmma::mem_col_major);
-    wmma::store_matrix_sync(c + m + (n + 32)*tile_m, acc2, tile_m, wmma::mem_col_major);
-    wmma::store_matrix_sync(c + m + (n + 48)*tile_m, acc3, tile_m, wmma::mem_col_major);
+    #pragma unroll
+    for (int j = 0; j < tile_n/16; ++j) {
+        wmma::store_matrix_sync(c + m + (n + 16*j)*tile_m, acc[j], tile_m, wmma::mem_col_major);
+    }
     __syncthreads();
     for (int i = tid; i < tile_m*tile_n; i += warps*WARP_SIZE) {
         const int slot = i/tile_m;
@@ -1704,4 +1717,106 @@ void ggml_cuda_mul_mat_id_back(
     CUDA_CHECK(
         cudaGetLastError()
     );
+}
+
+static std::atomic<int> out_prod_host_devices[GGML_CUDA_MAX_DEVICES];
+
+void ggml_cuda_out_prod_host_device(int device, bool active) {
+    out_prod_host_devices[device].fetch_add(active ? 1 : -1, std::memory_order_relaxed);
+}
+
+static __global__ void out_prod_host_ordered(
+        const char * a, const char * b, float * out, int64_t m, int64_t n, int64_t k,
+        size_t a_stride, size_t b_col_stride, size_t b_k_stride, bool accumulate) {
+    const int64_t col = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t row = int64_t(blockIdx.y)*4;
+    if (col >= m) return;
+    float sums[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        sums[r] = accumulate && row + r < n ? out[(row + r)*m + col] : 0.0f;
+    }
+    for (int64_t i = 0; i < k; ++i) {
+        const float x = *(const float *) (a + i*a_stride + col*sizeof(float));
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            if (row + r < n) {
+                const float y = *(const float *) (b + (row + r)*b_col_stride + i*b_k_stride);
+                sums[r] = __fmaf_rn(x, y, sums[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        if (row + r < n) out[(row + r)*m + col] = sums[r];
+    }
+}
+
+static bool ggml_cuda_out_prod_host_rows(ggml_tensor * dst, bool accumulate, int device, int64_t row, int64_t rows,
+        std::atomic<int> * ready = nullptr, std::atomic<bool> * failed = nullptr) {
+    const auto * a = dst->src[0];
+    const auto * b = dst->src[1];
+    int previous;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    void * da = nullptr;
+    void * db = nullptr;
+    void * dc = nullptr;
+    const size_t sa = ggml_nbytes(a), sb = ggml_nbytes(b), sc = rows*dst->nb[1];
+    auto * host = (char *) dst->data + row*dst->nb[1];
+    // Allocation failure leaves this host slice untouched and uses the CPU fallback.
+    bool success = cudaMalloc(&da, sa) == cudaSuccess;
+    if (success) success = cudaMalloc(&db, sb) == cudaSuccess;
+    if (success) success = cudaMalloc(&dc, sc) == cudaSuccess;
+    if (ready) {
+        // Both allocations must succeed before either slice changes the host accumulator.
+        if (!success) failed->store(true);
+        ready->fetch_add(1);
+        while (ready->load() != 2) std::this_thread::yield();
+        success = !failed->load();
+    }
+    if (success) {
+        CUDA_CHECK(cudaMemcpyAsync(da, a->data, sa, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(db, b->data, sb, cudaMemcpyHostToDevice, stream));
+        if (accumulate) CUDA_CHECK(cudaMemcpyAsync(dc, host, sc, cudaMemcpyHostToDevice, stream));
+        const dim3 blocks((dst->ne[0] + 127)/128, (rows + 3)/4);
+        out_prod_host_ordered<<<blocks, 128, 0, stream>>>((const char *) da, (const char *) db + row*b->nb[0], (float *) dc,
+            dst->ne[0], rows, a->ne[1], a->nb[1], b->nb[0], b->nb[1], accumulate);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(host, dc, sc, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        (void) cudaGetLastError();
+    }
+    if (dc) CUDA_CHECK(cudaFree(dc));
+    if (db) CUDA_CHECK(cudaFree(db));
+    if (da) CUDA_CHECK(cudaFree(da));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaSetDevice(previous));
+    return success;
+}
+
+bool ggml_cuda_out_prod_host(ggml_tensor * dst, bool accumulate) {
+    const auto * a = dst->src[0];
+    const auto * b = dst->src[1];
+    if (dst->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+            !ggml_is_matrix(a) || !ggml_is_matrix(b) || !ggml_is_matrix(dst) ||
+            !ggml_is_contiguous(dst) || a->nb[0] != sizeof(float)) return false;
+    int devices[2], count = 0;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES && count < 2; ++d) {
+        if (out_prod_host_devices[d].load(std::memory_order_relaxed) > 0) devices[count++] = d;
+    }
+    if (count == 0) return false;
+    if (count == 1) return ggml_cuda_out_prod_host_rows(dst, accumulate, devices[0], 0, dst->ne[1]);
+    const int64_t half = dst->ne[1]/2;
+    std::atomic<int> ready{0};
+    std::atomic<bool> failed{false};
+    auto first = std::async(std::launch::async, [=, &ready, &failed] {
+        return ggml_cuda_out_prod_host_rows(dst, accumulate, devices[0], 0, half, &ready, &failed);
+    });
+    const bool second = ggml_cuda_out_prod_host_rows(dst, accumulate, devices[1], half, dst->ne[1] - half, &ready, &failed);
+    const bool first_ok = first.get();
+    return first_ok && second;
 }

@@ -195,9 +195,13 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = ne12;
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // Use the per-expert token count when wide tiles waste most columns.
+            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+                    (cc == GGML_CUDA_CC_VOLTA && src0->type == GGML_TYPE_Q4_0)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+                if (cc == GGML_CUDA_CC_VOLTA && src0->type == GGML_TYPE_Q4_0 && !fallback && ncols_opt > 16 && ncols_opt <= 24) {
+                    ncols_opt = 32;
+                }
             }
         }
 

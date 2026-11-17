@@ -2,6 +2,10 @@
 #include "convert.cuh"
 #include "turbo-quant.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <mma.h>
+#endif
+
 template<ggml_type type>
 static __device__ __forceinline__ float fattn_back_load(const char * row, const int64_t i) {
     if constexpr (type == GGML_TYPE_F32) {
@@ -171,6 +175,150 @@ static __global__ void flash_attn_back_softmax_grad(
     }
 }
 
+template<int DK, int DV>
+static __global__ void flash_attn_back_fused_rows(
+        const half * q, const half * k, const half * v, const half * d,
+        const half * mask, const float * sinks, half * probabilities, half * ds,
+        int M, int N, int HQ, int q_per_kv, int ldk, int ldv,
+        uint64_t k_nb2, uint64_t v_nb2, uint64_t m_nb1, uint64_t m_nb2,
+        int mask_heads, int causal, float scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    constexpr int queries = 16;
+    constexpr int threads = 256;
+    const int warp = threadIdx.x/WARP_SIZE;
+    const int iqh = blockIdx.y;
+    const int ikh = iqh/q_per_kv;
+    const int query_begin = queries*blockIdx.x;
+    const half * pk = (const half *) ((const char *) k + ikh*k_nb2);
+    const half * pv = (const half *) ((const char *) v + ikh*v_nb2);
+    const half * pq = q + (size_t) DK*(query_begin + N*iqh);
+    const half * pd = d + (size_t) DV*(iqh + HQ*query_begin);
+    const half * pm = mask ? (const half *) ((const char *) mask + (iqh%mask_heads)*m_nb2) : nullptr;
+    half * pp = probabilities + (size_t) M*(query_begin + N*iqh);
+    half * pds = ds + (size_t) M*(query_begin + N*iqh);
+    extern __shared__ float shared[];
+    float * matrix = shared + threads;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+    for (int key = 16*warp; key < M; key += 16*(threads/WARP_SIZE)) {
+        wmma::fill_fragment(c, 0.0f);
+        for (int h = 0; h < DK; h += 16) {
+            wmma::load_matrix_sync(a, pk + key*ldk + h, ldk);
+            wmma::load_matrix_sync(b, pq + h, DK);
+            wmma::mma_sync(c, a, b, c);
+        }
+        wmma::store_matrix_sync(matrix + key, c, M, wmma::mem_col_major);
+    }
+    __syncthreads();
+
+    // One warp handles a row while retaining the reference 256-lane sum order.
+    for (int j = warp; j < queries; j += threads/WARP_SIZE) {
+        const int lane = threadIdx.x%WARP_SIZE;
+        const int iq = query_begin + j;
+        const int end = causal ? min(M, M - N + iq + 1) : M;
+        const half * row_mask = pm ? (const half *) ((const char *) pm + iq*m_nb1) : nullptr;
+        float local_max = -INFINITY;
+        for (int key = lane; key < end; key += WARP_SIZE) {
+            const float mv = row_mask ? __half2float(row_mask[key]) : 0.0f;
+            const float value = mv == -INFINITY ? -INFINITY : matrix[key + M*j]*scale + mv;
+            matrix[key + M*j] = value;
+            local_max = fmaxf(local_max, value);
+        }
+        if (lane == 0 && sinks) {
+            local_max = fmaxf(local_max, sinks[iqh]);
+        }
+        const float maximum = warp_reduce_max(local_max);
+        float local_sum[8] = {};
+        if (maximum != -INFINITY) {
+#pragma unroll
+            for (int group = 0; group < 8; ++group) {
+                for (int key = lane + group*WARP_SIZE; key < end; key += threads) {
+                    const float value = expf(matrix[key + M*j] - maximum);
+                    matrix[key + M*j] = value;
+                    local_sum[group] += value;
+                }
+            }
+            if (lane == 0 && sinks) {
+                local_sum[0] += expf(sinks[iqh] - maximum);
+            }
+        }
+        float partial = 0.0f;
+#pragma unroll
+        for (int group = 0; group < 8; ++group) {
+            const float value = warp_reduce_sum(local_sum[group]);
+            if (lane == group) {
+                partial = value;
+            }
+        }
+        const float sum = warp_reduce_sum(partial);
+        const float inv_sum = sum != 0.0f ? 1.0f/sum : 0.0f;
+        for (int key = lane; key < M; key += WARP_SIZE) {
+            const float probability = key < end && maximum != -INFINITY ? matrix[key + M*j]*inv_sum : 0.0f;
+            pp[key + M*j] = __float2half(probability);
+        }
+    }
+    __syncthreads();
+
+    for (int key = 16*warp; key < M; key += 16*(threads/WARP_SIZE)) {
+        wmma::fill_fragment(c, 0.0f);
+        for (int h = 0; h < DV; h += 16) {
+            wmma::load_matrix_sync(a, pv + key*ldv + h, ldv);
+            wmma::load_matrix_sync(b, pd + h, DV*HQ);
+            wmma::mma_sync(c, a, b, c);
+        }
+        wmma::store_matrix_sync(matrix + key, c, M, wmma::mem_col_major);
+    }
+    __syncthreads();
+
+    for (int j = warp; j < queries; j += threads/WARP_SIZE) {
+        const int lane = threadIdx.x%WARP_SIZE;
+        float local_mean[8] = {};
+#pragma unroll
+        for (int group = 0; group < 8; ++group) {
+            for (int key = lane + group*WARP_SIZE; key < M; key += threads) {
+                local_mean[group] += __half2float(pp[key + M*j])*matrix[key + M*j];
+            }
+        }
+        float partial = 0.0f;
+#pragma unroll
+        for (int group = 0; group < 8; ++group) {
+            const float value = warp_reduce_sum(local_mean[group]);
+            if (lane == group) {
+                partial = value;
+            }
+        }
+        const float mean = warp_reduce_sum(partial);
+        for (int key = lane; key < M; key += WARP_SIZE) {
+            const float probability = __half2float(pp[key + M*j]);
+            pds[key + M*j] = __float2half(probability*(matrix[key + M*j] - mean)*scale);
+        }
+    }
+
+#else
+    GGML_UNUSED(q); GGML_UNUSED(k); GGML_UNUSED(v); GGML_UNUSED(d);
+    GGML_UNUSED(mask); GGML_UNUSED(sinks); GGML_UNUSED(probabilities); GGML_UNUSED(ds);
+    GGML_UNUSED(M); GGML_UNUSED(N); GGML_UNUSED(HQ); GGML_UNUSED(q_per_kv);
+    GGML_UNUSED(ldk); GGML_UNUSED(ldv); GGML_UNUSED(k_nb2); GGML_UNUSED(v_nb2);
+    GGML_UNUSED(m_nb1); GGML_UNUSED(m_nb2); GGML_UNUSED(mask_heads); GGML_UNUSED(causal); GGML_UNUSED(scale);
+    NO_DEVICE_CODE;
+#endif
+}
+
+static __global__ void flash_attn_back_q_pointers(
+        const half * k, const half * ds, float * dq,
+        const half ** keys, const half ** gradients, float ** outputs,
+        int HQ, int q_per_kv, int DK, int M, int N, uint64_t k_nb2) {
+    const int head = blockIdx.x*blockDim.x + threadIdx.x;
+    if (head < HQ) {
+        keys[head] = (const half *) ((const char *) k + (head/q_per_kv)*k_nb2);
+        gradients[head] = ds + (size_t) M*N*head;
+        outputs[head] = dq + (size_t) DK*N*head;
+    }
+}
+
 static bool use_volta_f16_fattn_back(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -294,7 +442,13 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int DK = q->ne[0];
     const int DV = v->ne[0];
     const int N  = q->ne[1];
-    const int M  = k->ne[1];
+    const int full_M = k->ne[1];
+    const int begin_hint = ggml_get_op_params_i32(dst, 6);
+    const int count_hint = ggml_get_op_params_i32(dst, 7);
+    const bool bounded = !std::is_same_v<T, float> && begin_hint >= 0 && begin_hint%256 == 0 &&
+        count_hint > 0 && count_hint <= full_M && begin_hint <= full_M - count_hint;
+    const int key_begin = bounded ? begin_hint : 0;
+    const int M = bounded ? count_hint : full_M;
     const int HQ = q->ne[2];
     const int HK = k->ne[2];
     const int B  = q->ne[3];
@@ -309,8 +463,19 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
     ggml_cuda_pool_alloc<T> d_data(ctx.pool(), ggml_nelements(d));
     ggml_cuda_pool_alloc<T> k_data(ctx.pool(), fp32 ? ggml_nelements(k) : 0);
     ggml_cuda_pool_alloc<T> v_data(ctx.pool(), fp32 ? ggml_nelements(v) : 0);
-    ggml_cuda_pool_alloc<float> matrix_f32(ctx.pool(), (size_t) M*N);
-    ggml_cuda_pool_alloc<T> matrix_p(ctx.pool(), (size_t) M*N);
+    const bool need_sinks = !(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) ||
+        (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS);
+    const bool fused_rows = !fp32 && bounded && B == 1 && M <= 1280 && M%16 == 0 && N%16 == 0 &&
+        DK == 256 && DV == 256 && (need_q || need_k) && !(sinks && need_sinks) &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA;
+    const size_t matrix_count = (size_t) M*N;
+    ggml_cuda_pool_alloc<float> matrix_f32(ctx.pool(), fused_rows ? 0 : matrix_count);
+    ggml_cuda_pool_alloc<T> matrix_p(ctx.pool(), matrix_count*(fused_rows ? HQ : 1));
+    ggml_cuda_pool_alloc<T> matrix_ds(ctx.pool(), fused_rows ? matrix_count*HQ : 0);
+    ggml_cuda_pool_alloc<const half *> q_keys(ctx.pool(), fused_rows && need_q ? HQ : 0);
+    ggml_cuda_pool_alloc<const half *> q_gradients(ctx.pool(), fused_rows && need_q ? HQ : 0);
+    ggml_cuda_pool_alloc<float *> q_outputs(ctx.pool(), fused_rows && need_q ? HQ : 0);
+    ggml_cuda_pool_alloc<T> matrix_q(ctx.pool(), bounded && need_q && !fused_rows ? (size_t) full_M*N : 0);
     ggml_cuda_pool_alloc<float> sink_probabilities(ctx.pool(), sinks ? N : 0);
 
     cudaStream_t stream = ctx.stream();
@@ -336,14 +501,45 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
     float * grad_s = sinks && (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS)) ?
         (float *) ((char *) dst->data + offs_s) : nullptr;
 
+    if (bounded) {
+        if (grad_k) CUDA_CHECK(cudaMemsetAsync(grad_k, 0, ggml_nelements(k)*sizeof(float), stream));
+        if (grad_v) CUDA_CHECK(cudaMemsetAsync(grad_v, 0, ggml_nelements(v)*sizeof(float), stream));
+    }
+    if constexpr (!std::is_same_v<T, float>) {
+        if (fused_rows) {
+            const int shared_bytes = (threads + 16*M)*sizeof(float);
+            const half * pk = (const half *) k->data + key_begin*ldk;
+            const half * pv = (const half *) v->data + key_begin*ldv;
+            const half * pm = mask ? (const half *) mask->data + key_begin : nullptr;
+            const dim3 blocks(N/16, HQ);
+            CUDA_CHECK(cudaFuncSetAttribute(flash_attn_back_fused_rows<256, 256>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+            flash_attn_back_fused_rows<256, 256><<<blocks, threads, shared_bytes, stream>>>(
+                q_data.ptr, pk, pv, d_data.ptr, pm, sinks ? (const float *) sinks->data : nullptr,
+                matrix_p.ptr, matrix_ds.ptr, M, N, HQ, q_per_kv, ldk, ldv, k->nb[2], v->nb[2],
+                mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->ne[2] : 1,
+                ggml_flash_attn_ext_get_causal(dst) ? 1 : 0, scale);
+            CUDA_CHECK(cudaGetLastError());
+            if (need_q) {
+                flash_attn_back_q_pointers<<<(HQ + 31)/32, 32, 0, stream>>>(
+                    pk, matrix_ds.ptr, grad_q, q_keys.ptr, q_gradients.ptr, q_outputs.ptr,
+                    HQ, q_per_kv, DK, M, N, k->nb[2]);
+                CUDA_CHECK(cudaGetLastError());
+                CUBLAS_CHECK(cublasGemmBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    DK, N, M, &alpha, (const void * const *) q_keys.ptr, data_type, ldk,
+                    (const void * const *) q_gradients.ptr, data_type, M,
+                    &beta_zero, (void * const *) q_outputs.ptr, CUDA_R_32F, DK,
+                    HQ, CUBLAS_COMPUTE_32F, algorithm));
+            }
+        }
+    }
     for (int ib = 0; ib < B; ++ib) {
         for (int ikh = 0; ikh < HK; ++ikh) {
             const T * pk = fp32 ? k_data.ptr + (size_t) DK*M*(ikh + HK*ib) :
-                (const T *) ((const char *) k->data + ikh*k->nb[2] + ib*k->nb[3]);
+                (const T *) ((const char *) k->data + ikh*k->nb[2] + ib*k->nb[3] + key_begin*k->nb[1]);
             const T * pv = fp32 ? v_data.ptr + (size_t) DV*M*(ikh + HK*ib) :
-                (const T *) ((const char *) v->data + ikh*v->nb[2] + ib*v->nb[3]);
-            float * pgk = grad_k ? grad_k + (size_t) DK*M*(ikh + HK*ib) : nullptr;
-            float * pgv = grad_v ? grad_v + (size_t) DV*M*(ikh + HK*ib) : nullptr;
+                (const T *) ((const char *) v->data + ikh*v->nb[2] + ib*v->nb[3] + key_begin*v->nb[1]);
+            float * pgk = grad_k ? grad_k + (size_t) DK*(full_M*(ikh + HK*ib) + key_begin) : nullptr;
+            float * pgv = grad_v ? grad_v + (size_t) DV*(full_M*(ikh + HK*ib) + key_begin) : nullptr;
 
             for (int ih = 0; ih < q_per_kv; ++ih) {
                 const int iqh = ikh*q_per_kv + ih;
@@ -351,43 +547,46 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
                 const T * pd = d_data.ptr + (size_t) DV*(iqh + HQ*N*ib);
                 float * pgq = grad_q + (size_t) DK*N*(iqh + HQ*ib);
                 const half * pm = mask ? (const half *) ((const char *) mask->data +
-                    (iqh % mask->ne[2])*mask->nb[2] + (ib % mask->ne[3])*mask->nb[3]) : nullptr;
+                    (iqh % mask->ne[2])*mask->nb[2] + (ib % mask->ne[3])*mask->nb[3] + key_begin*sizeof(half)) : nullptr;
 
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                    M, N, DK, &alpha,
-                    pk, data_type, ldk, pq, data_type, DK,
-                    &beta_zero, matrix_f32.ptr, CUDA_R_32F, M,
-                    CUBLAS_COMPUTE_32F, algorithm));
+                T * probabilities = matrix_p.ptr + (fused_rows ? matrix_count*iqh : 0);
+                T * ds = fused_rows ? matrix_ds.ptr + matrix_count*iqh : probabilities;
+                if (!fused_rows) {
+                    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        M, N, DK, &alpha,
+                        pk, data_type, ldk, pq, data_type, DK,
+                        &beta_zero, matrix_f32.ptr, CUDA_R_32F, M,
+                        CUBLAS_COMPUTE_32F, algorithm));
 
-                if (M <= 8192) {
-                    flash_attn_back_softmax<T, true><<<N, threads, (threads + M)*sizeof(float), stream>>>(
-                        matrix_f32.ptr, matrix_p.ptr, pm,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        sinks ? sink_probabilities.ptr : nullptr, iqh,
-                        M, N, mask ? mask->nb[1] : 0,
-                        ggml_flash_attn_ext_get_causal(dst) ? 1 : 0, scale);
-                } else {
-                    flash_attn_back_softmax<T><<<N, threads, threads*sizeof(float), stream>>>(
-                        matrix_f32.ptr, matrix_p.ptr, pm,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        sinks ? sink_probabilities.ptr : nullptr, iqh,
-                        M, N, mask ? mask->nb[1] : 0,
-                        ggml_flash_attn_ext_get_causal(dst) ? 1 : 0, scale);
+                    if (M <= 8192) {
+                        flash_attn_back_softmax<T, true><<<N, threads, (threads + M)*sizeof(float), stream>>>(
+                            matrix_f32.ptr, matrix_p.ptr, pm,
+                            sinks ? (const float *) sinks->data : nullptr,
+                            sinks ? sink_probabilities.ptr : nullptr, iqh,
+                            M, N, mask ? mask->nb[1] : 0,
+                            ggml_flash_attn_ext_get_causal(dst) ? 1 : 0, scale);
+                    } else {
+                        flash_attn_back_softmax<T><<<N, threads, threads*sizeof(float), stream>>>(
+                            matrix_f32.ptr, matrix_p.ptr, pm,
+                            sinks ? (const float *) sinks->data : nullptr,
+                            sinks ? sink_probabilities.ptr : nullptr, iqh,
+                            M, N, mask ? mask->nb[1] : 0,
+                            ggml_flash_attn_ext_get_causal(dst) ? 1 : 0, scale);
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+
                 }
-                CUDA_CHECK(cudaGetLastError());
 
                 if (need_v) {
                     const float * beta = ih == 0 ? &beta_zero : &beta_one;
                     CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
                         DV, M, N, &alpha,
-                        pd, data_type, DV*HQ, matrix_p.ptr, data_type, M,
+                        pd, data_type, DV*HQ, probabilities, data_type, M,
                         beta, pgv, CUDA_R_32F, DV,
                         CUBLAS_COMPUTE_32F, algorithm));
                 }
 
-                const bool need_sinks = !(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) ||
-                    (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS);
-                if (need_q || need_k || need_sinks) {
+                if (!fused_rows && (need_q || need_k || need_sinks)) {
                     CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                         M, N, DV, &alpha,
                         pv, data_type, ldv, pd, data_type, DV*HQ,
@@ -396,13 +595,13 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
 
                     if (M <= 16*threads) {
                         flash_attn_back_softmax_grad<T, 16><<<N, threads, threads*sizeof(float), stream>>>(
-                            matrix_f32.ptr, matrix_p.ptr,
+                            matrix_f32.ptr, ds,
                             sinks ? sink_probabilities.ptr : nullptr,
                             sinks && need_sinks ? grad_s : nullptr,
                             iqh, M, N, scale);
                     } else {
                         flash_attn_back_softmax_grad<T><<<N, threads, threads*sizeof(float), stream>>>(
-                            matrix_f32.ptr, matrix_p.ptr,
+                            matrix_f32.ptr, ds,
                             sinks ? sink_probabilities.ptr : nullptr,
                             sinks && need_sinks ? grad_s : nullptr,
                             iqh, M, N, scale);
@@ -410,10 +609,18 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
                     CUDA_CHECK(cudaGetLastError());
                 }
 
-                if (need_q) {
+                if (need_q && !fused_rows) {
+                    const T * q_probabilities = ds;
+                    if (bounded) {
+                        // Keep the original GEMM reduction length and zero the masked keys.
+                        CUDA_CHECK(cudaMemsetAsync(matrix_q.ptr, 0, (size_t) full_M*N*sizeof(T), stream));
+                        CUDA_CHECK(cudaMemcpy2DAsync(matrix_q.ptr + key_begin, full_M*sizeof(T),
+                            ds, M*sizeof(T), M*sizeof(T), N, cudaMemcpyDeviceToDevice, stream));
+                        q_probabilities = matrix_q.ptr;
+                    }
                     CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                        DK, N, M, &alpha,
-                        pk, data_type, ldk, matrix_p.ptr, data_type, M,
+                        DK, N, full_M, &alpha,
+                        pk - key_begin*ldk, data_type, ldk, q_probabilities, data_type, full_M,
                         &beta_zero, pgq, CUDA_R_32F, DK,
                         CUBLAS_COMPUTE_32F, algorithm));
                 }
@@ -422,7 +629,7 @@ static void launch_gemm_fattn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
                     const float * beta = ih == 0 ? &beta_zero : &beta_one;
                     CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
                         DK, M, N, &alpha,
-                        pq, data_type, DK, matrix_p.ptr, data_type, M,
+                        pq, data_type, DK, ds, data_type, M,
                         beta, pgk, CUDA_R_32F, DK,
                         CUBLAS_COMPUTE_32F, algorithm));
                 }
@@ -601,6 +808,17 @@ static void launch_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
     const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
     cudaStream_t stream = ctx.stream();
+    const bool gemm_f16 = use_volta_f16_fattn_back(ctx, dst);
+    const bool gemm_f32 = use_pascal_f32_fattn_back(ctx, dst);
+    if (gemm_f16 || gemm_f32) {
+        // GEMMs overwrite Q/K/V; only the sink gradient uses atomic accumulation.
+        if (sinks && (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS))) {
+            CUDA_CHECK(cudaMemsetAsync((char *) dst->data + offs_s, 0, ggml_nbytes(dst) - offs_s, stream));
+        }
+        if (gemm_f16) launch_gemm_fattn_back<half>(ctx, dst);
+        else launch_gemm_fattn_back<float>(ctx, dst);
+        return;
+    }
     if (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID)) {
         CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
     } else {
@@ -616,16 +834,6 @@ static void launch_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor 
         if (sinks && (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS)) {
             CUDA_CHECK(cudaMemsetAsync((char *) dst->data + offs_s, 0, ggml_nbytes(dst) - offs_s, stream));
         }
-    }
-
-    if (use_volta_f16_fattn_back(ctx, dst)) {
-        launch_gemm_fattn_back<half>(ctx, dst);
-        return;
-    }
-
-    if (use_pascal_f32_fattn_back(ctx, dst)) {
-        launch_gemm_fattn_back<float>(ctx, dst);
-        return;
     }
 
     const int threads = 128;

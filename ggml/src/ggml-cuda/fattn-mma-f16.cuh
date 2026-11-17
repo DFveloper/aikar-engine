@@ -110,6 +110,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 1, false);
+
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2, 32, 128, 128, 128, 1, false);
 
@@ -646,6 +648,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+#ifdef VOLTA_MMA_AVAILABLE
+    if constexpr (DKQ == 256 && DV == 256 && !use_sparse && nstages == 0) {
+        if (mask_h && slope > 0.0f) {
+            bool visible = false;
+            const int tid = threadIdx.y*warp_size + threadIdx.x;
+            for (int i = tid; i < ncols1*nbatch_fa; i += nwarps*warp_size) {
+                const int j = jt*ncols1 + i/nbatch_fa;
+                const int k = i%nbatch_fa;
+                if (j < int(ne01.z) && (!oob_check || k < k_VKQ_sup)) {
+                    visible |= __half2float(mask_h[j*stride_mask + k_VKQ_0 + k]) != -INFINITY;
+                }
+            }
+            if (!__syncthreads_or(visible)) {
+                return;
+            }
+        }
+    }
+#endif
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)

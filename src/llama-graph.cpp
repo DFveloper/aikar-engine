@@ -509,13 +509,34 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
     }
 }
 
+static bool has_contiguous_positions(const llama_ubatch & ubatch) {
+    if (!ubatch.pos) return false;
+    for (int64_t i = 1; i < ubatch.n_tokens; ++i) {
+        if (int64_t(ubatch.pos[i]) != int64_t(ubatch.pos[0]) + i) return false;
+    }
+    return true;
+}
+
 void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     const int64_t n_kv     = self_kq_mask->ne[0];
     const int64_t n_tokens = ubatch->n_tokens;
+    const bool contiguous_causal = n_tokens > 0 && cparams.causal_attn && !hparams.use_alibi &&
+        has_contiguous_positions(*ubatch) &&
+        std::all_of(ubatch->seq_id, ubatch->seq_id + n_tokens,
+            [&](const llama_seq_id * ids) { return ids[0] == ubatch->seq_id[0][0]; });
 
     const auto fill_mask = [&](auto * data, int64_t ne, int n_swa, llama_swa_type swa_type) {
         using T = std::remove_reference_t<decltype(*data)>;
         std::fill(data, data + ne, llama_cast<T>(-INFINITY));
+
+        if (contiguous_causal && n_swa >= 0 && (swa_type == LLAMA_SWA_TYPE_NONE || swa_type == LLAMA_SWA_TYPE_STANDARD)) {
+            for (int64_t row = 0; row < n_tokens; ++row) {
+                const int64_t begin = swa_type == LLAMA_SWA_TYPE_NONE ? 0 : std::max<int64_t>(0, row - n_swa + 1);
+                std::fill(data + row*n_kv + begin, data + row*n_kv + row + 1, llama_cast<T>(0.0f));
+            }
+            if (debug) print_mask(data, n_tokens, n_kv, n_swa, swa_type);
+            return;
+        }
 
         for (int i1 = 0; i1 < n_tokens; ++i1) {
             const llama_seq_id s1 = ubatch->seq_id[i1][0];
@@ -578,6 +599,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_no_cache::can_reuse(const llm_graph_params & params) {
+    if (cropped_swa && !has_contiguous_positions(params.ubatch)) return false;
     if (bool(mctx) != bool(params.full_sequence && params.mctx)) return false;
     if (mctx) mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
     return self_kq_mask->ne[0] == GGML_PAD(params.ubatch.n_tokens, 256) &&
@@ -3214,10 +3236,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     }
     if (full_sequence && q->ne[2] > tile) {
         GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && kq_b == nullptr && turboquant_parameters == nullptr);
+        const bool crop_swa = training && cparams.flash_attn && !v_mla && cparams.causal_attn &&
+            hparams.is_swa(il) && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD && hparams.n_swa > 0 &&
+            k->ne[2] == q->ne[2] && v->ne[2] == q->ne[2] && has_contiguous_positions(ubatch);
         std::vector<ggml_tensor *> tiles;
         for (int64_t start = 0; start < q->ne[2]; start += tile) {
             const int64_t count = std::min<int64_t>(tile, q->ne[2] - start);
             auto * query = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], count, q->nb[1], q->nb[2], start*q->nb[2]);
+            const int64_t kv_begin = crop_swa ? std::max<int64_t>(0, start - hparams.n_swa + 1)/256*256 : 0;
+            const int64_t kv_end = crop_swa ? std::min<int64_t>(k->ne[2], GGML_PAD(start + count, 256)) : k->ne[2];
+            const int64_t kv_count = kv_end - kv_begin;
             auto & mask = training_mask_tiles[{kq_mask, {start, count}}];
             if (!mask) {
                 // Reuse mask views across layers so the scheduler shares their device copies.
@@ -3225,7 +3253,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                         kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], start*kq_mask->nb[1]);
             }
             // Each query tile reads the same differentiable K/V tensors.
-            tiles.push_back(build_attn_mha(query, k, v, nullptr, mask, sinks, v_mla, n_kv_max, kq_scale, il));
+            auto * output = build_attn_mha(query, k, v, nullptr, mask, sinks, v_mla, n_kv_max, kq_scale, il);
+            if (crop_swa) {
+                auto * attention = output->src[0];
+                GGML_ASSERT(attention->op == GGML_OP_FLASH_ATTN_EXT);
+                // Keep forward unchanged. CUDA backward can skip masked keys in this range.
+                const int32_t begin = kv_begin;
+                const int32_t count = kv_count;
+                memcpy(attention->op_params + 6, &begin, sizeof(begin));
+                memcpy(attention->op_params + 7, &count, sizeof(count));
+            }
+            tiles.push_back(output);
         }
         return concat_tiles(ctx0, std::move(tiles), 1);
     }
@@ -3431,6 +3469,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
+    inp->cropped_swa = full_sequence && training && has_contiguous_positions(ubatch);
 
     if (full_sequence && mctx) {
         inp->mctx = static_cast<const llama_kv_cache_iswa_context *>(mctx);
@@ -3583,9 +3622,10 @@ ggml_tensor * llm_graph_context::build_kv_fake_quant(ggml_tensor * cur, ggml_typ
     auto * quantized = ggml_cast(ctx0, cur, type);
     ggml_set_name(quantized, "kv_fp4_packed");
     auto * restored = ggml_cast(ctx0, quantized, GGML_TYPE_F32);
-    auto * stop = ggml_cpy_no_grad(ctx0, restored, ggml_dup_tensor(ctx0, restored));
+    // CAST uses CPY; stop gradients without a second F32 copy.
+    restored->op_params[0] = 1;
     auto * master_stop = ggml_cpy_no_grad(ctx0, cur, ggml_dup_tensor(ctx0, cur));
-    auto * result = ggml_add(ctx0, cur, ggml_sub(ctx0, stop, master_stop));
+    auto * result = ggml_add(ctx0, cur, ggml_sub(ctx0, restored, master_stop));
     ggml_set_name(result, "kv_fp4_ste");
     return result;
 }

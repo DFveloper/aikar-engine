@@ -16,7 +16,123 @@ static void check(bool ok, const char * message) {
     if (!ok) throw std::runtime_error(message);
 }
 
+static void no_cache_mask_checks() {
+    constexpr int rows = 17, columns = 32;
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool causal : {false, true}) for (bool alibi : {false, true}) {
+            for (bool irregular : {false, true}) for (bool multiple : {false, true}) {
+                for (auto swa : {LLAMA_SWA_TYPE_NONE, LLAMA_SWA_TYPE_STANDARD, LLAMA_SWA_TYPE_CHUNKED, LLAMA_SWA_TYPE_SYMMETRIC}) {
+                    llama_hparams hparams = {};
+                    hparams.use_alibi = alibi;
+                    hparams.swa_type = swa;
+                    hparams.n_swa = 3;
+                    llama_cparams cparams = {};
+                    cparams.causal_attn = causal;
+                    llm_graph_input_attn_no_cache input(hparams, cparams);
+                    ggml_context_ptr ctx(ggml_init({4*ggml_tensor_overhead(), nullptr, true}));
+                    input.self_kq_mask = ggml_new_tensor_2d(ctx.get(), type, columns, rows);
+                    input.self_kq_mask_swa = ggml_new_tensor_2d(ctx.get(), type, columns, rows);
+                    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+                    std::vector<llama_pos> positions(rows);
+                    std::vector<llama_seq_id> sequences(rows);
+                    std::vector<llama_seq_id *> ids(rows);
+                    for (int i = 0; i < rows; ++i) {
+                        positions[i] = 7 + i*(irregular ? 2 : 1);
+                        sequences[i] = multiple ? i%2 : 0;
+                        ids[i] = &sequences[i];
+                    }
+                    llama_ubatch batch = {};
+                    batch.n_tokens = rows;
+                    batch.pos = positions.data();
+                    batch.seq_id = ids.data();
+                    input.set_input(&batch);
+                    for (bool sliding : {false, true}) {
+                        auto * tensor = sliding && swa != LLAMA_SWA_TYPE_NONE ? input.self_kq_mask_swa : input.self_kq_mask;
+                        std::vector<float> values(rows*columns);
+                        if (type == GGML_TYPE_F16) {
+                            std::vector<ggml_fp16_t> packed(values.size());
+                            ggml_backend_tensor_get(tensor, packed.data(), 0, ggml_nbytes(tensor));
+                            ggml_fp16_to_fp32_row(packed.data(), values.data(), values.size());
+                        } else {
+                            ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+                        }
+                        for (int q = 0; q < rows; ++q) for (int k = 0; k < columns; ++k) {
+                            float expected = -INFINITY;
+                            if (k < rows && sequences[k] == sequences[q] && (!causal || positions[k] <= positions[q]) &&
+                                (!sliding || !llama_hparams::is_masked_swa(hparams.n_swa, swa, positions[k], positions[q]))) {
+                                expected = alibi ? -std::abs(positions[k] - positions[q]) : 0.0f;
+                            }
+                            check(values[q*columns + k] == expected, "no-cache attention mask differs from position reference");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::puts("attention masks: contiguous, irregular, sequence, ALiBi and SWA checks passed");
+}
+
 struct paired_result { std::vector<float> train, validation, gradient; };
+
+static std::vector<float> fake_quant_gradient(ggml_backend_t backend, bool reference) {
+    llm_graph_result result(1024);
+    llm_graph_params params = {};
+    params.hparams.n_layer_all = 1;
+    params.hparams.n_embd = 64;
+    params.hparams.n_head_arr[0] = 2;
+    params.hparams.n_head_kv_arr[0] = 1;
+    params.hparams.n_embd_head_k_full = 32;
+    params.hparams.n_embd_head_v_full = 32;
+    params.res = &result;
+    llm_graph_context builder(params);
+    auto * ctx = result.get_ctx();
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 8);
+    auto * upstream = ggml_dup_tensor(ctx, input);
+    ggml_set_param(input);
+    ggml_tensor * output;
+    if (reference) {
+        auto * packed = ggml_cast(ctx, input, GGML_TYPE_FP4_KV);
+        auto * restored = ggml_cast(ctx, packed, GGML_TYPE_F32);
+        auto * stopped = ggml_cpy_no_grad(ctx, restored, ggml_dup_tensor(ctx, restored));
+        auto * master = ggml_cpy_no_grad(ctx, input, ggml_dup_tensor(ctx, input));
+        output = ggml_add(ctx, input, ggml_sub(ctx, stopped, master));
+    } else {
+        output = builder.build_kv_fake_quant(input, GGML_TYPE_FP4_KV);
+    }
+    ggml_set_output(output);
+    auto * loss = ggml_sum(ctx, ggml_mul(ctx, output, upstream));
+    ggml_set_loss(loss);
+    auto * graph = ggml_new_graph_custom(ctx, 1024, true);
+    ggml_build_forward_expand(graph, loss);
+    ggml_build_backward_expand(ctx, graph, nullptr);
+    ggml_backend_ptr cpu(ggml_backend_cpu_init());
+    ggml_backend_t backends[] = {backend, cpu.get()};
+    const bool on_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    auto * sched = ggml_backend_sched_new(backends, nullptr, on_cpu ? 1 : 2, 1024, false, true);
+    check(ggml_backend_sched_alloc_graph(sched, graph), "FP4 STE allocation failed");
+    std::vector<float> values(2048), expected(2048);
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = std::sin(float(i)*.17f)*7.0f;
+        expected[i] = float(int(i%19) - 9)/19;
+    }
+    ggml_backend_tensor_set(input, values.data(), 0, values.size()*sizeof(float));
+    ggml_backend_tensor_set(upstream, expected.data(), 0, expected.size()*sizeof(float));
+    ggml_graph_reset(graph);
+    check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "FP4 STE compute failed");
+    std::vector<float> actual(values.size()*2);
+    ggml_backend_tensor_get(output, actual.data(), 0, values.size()*sizeof(float));
+    ggml_backend_tensor_get(ggml_graph_get_grad(graph, input), actual.data() + values.size(), 0, values.size()*sizeof(float));
+    check(std::memcmp(actual.data() + values.size(), expected.data(), expected.size()*sizeof(float)) == 0, "FP4 STE lost its identity gradient");
+    ggml_backend_sched_free(sched);
+    return actual;
+}
+
+static void fake_quant_checks(ggml_backend_t backend) {
+    const auto reference = fake_quant_gradient(backend, true);
+    const auto candidate = fake_quant_gradient(backend, false);
+    check(reference.size() == candidate.size() && std::memcmp(reference.data(), candidate.data(), reference.size()*sizeof(float)) == 0, "FP4 stop-gradient copy removal changed values or gradients");
+    std::printf("FP4 STE: copy removal preserves exact values and identity gradients on %s\n", ggml_backend_name(backend));
+}
 
 static paired_result paired_forward(ggml_backend_t backend, bool paired, bool routed, bool broadcast, bool zero_copy = false, bool crop = false) {
     ggml_context_ptr ctx(ggml_init({ 32*1024*1024, nullptr, true }));
@@ -783,6 +899,158 @@ static void tensor_parallel_partial_write(ggml_backend_dev_t first, ggml_backend
     }
 }
 
+static void tensor_parallel_async(ggml_backend_dev_t first, ggml_backend_dev_t second) {
+    const char * mode = std::getenv("GGML_CUDA_ALLREDUCE");
+    if (mode && std::strcmp(mode, "none") == 0) return;
+    ggml_backend_ptr first_backend(ggml_backend_dev_init(first, nullptr));
+    ggml_backend_ptr second_backend(ggml_backend_dev_init(second, nullptr));
+    ggml_backend_t backends[] = {first_backend.get(), second_backend.get()};
+    auto * reg = ggml_backend_dev_backend_reg(first);
+    auto init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
+    auto reduce = (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
+    auto destroy = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
+    check(init && reduce && destroy, "CUDA collective interface is missing");
+    void * comm = init(backends, 2);
+    check(comm != nullptr, "CUDA collective initialization failed");
+    for (int64_t count : {1024, 1048576, 1032, 9437184, 1024}) {
+        ggml_context_ptr contexts[2];
+        ggml_backend_buffer_ptr buffers[2];
+        ggml_tensor * tensors[2];
+        ggml_cgraph * graphs[2];
+        std::vector<float> values(count);
+        for (int j = 0; j < 2; ++j) {
+            contexts[j].reset(ggml_init({1024*1024, nullptr, true}));
+            tensors[j] = ggml_new_tensor_1d(contexts[j].get(), GGML_TYPE_F32, count);
+            tensors[j]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            auto * scaled = ggml_scale_inplace(contexts[j].get(), tensors[j], 0.5f);
+            graphs[j] = ggml_new_graph(contexts[j].get());
+            ggml_build_forward_expand(graphs[j], scaled);
+            buffers[j].reset(ggml_backend_alloc_ctx_tensors(contexts[j].get(), backends[j]));
+            check(buffers[j] != nullptr, "CUDA collective allocation failed");
+            std::fill(values.begin(), values.end(), float(j + 1));
+            ggml_backend_tensor_set(tensors[j], values.data(), 0, ggml_nbytes(tensors[j]));
+        }
+        if (mode && std::strcmp(mode, "internal") == 0) {
+            const char * threshold_env = std::getenv("GGML_CUDA_AR_BF16_THRESHOLD");
+            const size_t threshold = threshold_env ? std::strtoull(threshold_env, nullptr, 10) : 1;
+            const bool bf16 = threshold > 0 && count*sizeof(float) >= threshold;
+            std::vector<float> expected(count, 0.0f);
+            for (int active : {1, 2}) {
+                std::fill(expected.begin(), expected.end(), 0.0f);
+                for (int j = 0; j < 2; ++j) {
+                    tensors[j]->flags = j < active ? GGML_TENSOR_FLAG_COMPUTE : 0;
+                    for (int64_t k = 0; k < count; ++k) {
+                        values[k] = std::sin(float(k%7919)*0.013f + j)*7.0f;
+                        if (j < active) expected[k] += bf16 ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(values[k])) : values[k];
+                    }
+                    ggml_backend_tensor_set(tensors[j], values.data(), 0, ggml_nbytes(tensors[j]));
+                }
+                check(reduce(comm, tensors), "CUDA collective reference submission failed");
+                for (int j = 0; j < 2; ++j) {
+                    ggml_backend_synchronize(backends[j]);
+                    ggml_backend_tensor_get(tensors[j], values.data(), 0, ggml_nbytes(tensors[j]));
+                    check(std::memcmp(values.data(), expected.data(), count*sizeof(float)) == 0, "CUDA collective differs from exact rounded-input reference");
+                }
+            }
+            for (int j = 0; j < 2; ++j) {
+                tensors[j]->flags = GGML_TENSOR_FLAG_COMPUTE;
+                std::fill(values.begin(), values.end(), float(j + 1));
+                ggml_backend_tensor_set(tensors[j], values.data(), 0, ggml_nbytes(tensors[j]));
+            }
+        }
+        // Queue enough reductions to reuse event slots without a host synchronization.
+        for (int i = 0; i < 16; ++i) {
+            check(reduce(comm, tensors), "CUDA collective submission failed");
+            for (int j = 0; j < 2; ++j) check(ggml_backend_graph_compute_async(backends[j], graphs[j]) == GGML_STATUS_SUCCESS, "CUDA collective scale failed");
+        }
+        for (int j = 0; j < 2; ++j) {
+            ggml_backend_synchronize(backends[j]);
+            ggml_backend_tensor_get(tensors[j], values.data(), 0, ggml_nbytes(tensors[j]));
+            for (float value : values) check(value == 1.5f, "queued CUDA collective changed a value");
+        }
+    }
+    destroy(comm);
+    std::puts("CUDA collective: queued mixed-size reductions and event reuse passed");
+}
+
+static void tensor_parallel_host_copy(ggml_backend_dev_t first, ggml_backend_dev_t second) {
+    ggml_backend_dev_t devices[] = {first, second};
+    for (int axis : {0, 1, 2}) {
+        auto split = [](const ggml_tensor * tensor, void * userdata) {
+            const int axis = *static_cast<int *>(userdata);
+            ggml_backend_meta_split_state state = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
+            state.ne[0] = state.ne[1] = tensor->ne[axis]/2;
+            return state;
+        };
+        ggml_backend_ptr meta(ggml_backend_dev_init(ggml_backend_meta_device(devices, 2, split, &axis), nullptr));
+        ggml_backend_ptr cpu(ggml_backend_cpu_init());
+        ggml_context_ptr data(ggml_init({1024*1024, nullptr, true}));
+        ggml_context_ptr compute(ggml_init({1024*1024, nullptr, true}));
+        auto * input = ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, 32, 16, 4);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(data.get(), meta.get()));
+        std::vector<float> values(ggml_nelements(input));
+        for (size_t i = 0; i < values.size(); ++i) values[i] = float(int(i%31) - 15);
+        ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+        auto * scaled = ggml_scale(compute.get(), input, 2.0f);
+        auto * host = ggml_cont(compute.get(), scaled);
+        host->flags |= GGML_TENSOR_FLAG_HOST;
+        auto * graph = ggml_new_graph(compute.get());
+        ggml_build_forward_expand(graph, host);
+        ggml_backend_t backends[] = {meta.get(), cpu.get()};
+        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true);
+        ggml_backend_sched_set_tensor_backend(sched, scaled, meta.get());
+        check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "Meta host copy failed");
+        std::vector<float> actual(values.size());
+        ggml_backend_tensor_get(host, actual.data(), 0, ggml_nbytes(host));
+        for (size_t i = 0; i < values.size(); ++i) check(actual[i] == 2*values[i], "Meta host copy changed a shard");
+        ggml_backend_sched_free(sched);
+    }
+}
+
+static void host_gradient_dependency(ggml_backend_dev_t device) {
+    ggml_backend_ptr gpu(ggml_backend_dev_init(device, nullptr));
+    ggml_backend_ptr cpu(ggml_backend_cpu_init());
+    ggml_backend_cpu_set_n_threads(cpu.get(), 2);
+    ggml_context_ptr host_data(ggml_init({1024*1024, nullptr, true}));
+    ggml_context_ptr gpu_data(ggml_init({1024*1024, nullptr, true}));
+    ggml_context_ptr compute(ggml_init({1024*1024, nullptr, true}));
+    auto * a = ggml_new_tensor_2d(host_data.get(), GGML_TYPE_F32, 32, 128);
+    auto * b = ggml_new_tensor_2d(host_data.get(), GGML_TYPE_F32, 16, 128);
+    auto * acc = ggml_new_tensor_2d(host_data.get(), GGML_TYPE_F32, 32, 16);
+    auto * input = ggml_new_tensor_2d(gpu_data.get(), GGML_TYPE_F32, 32, 16);
+    ggml_backend_buffer_ptr host_buffer(ggml_backend_alloc_ctx_tensors(host_data.get(), cpu.get()));
+    ggml_backend_buffer_ptr gpu_buffer(ggml_backend_alloc_ctx_tensors(gpu_data.get(), gpu.get()));
+    auto * product = ggml_out_prod(compute.get(), a, b);
+    auto * gradient = ggml_add_inplace(compute.get(), acc, product);
+    auto * independent = ggml_scale(compute.get(), input, 2.0f);
+    auto * output = ggml_add(compute.get(), independent, gradient);
+    auto * graph = ggml_new_graph(compute.get());
+    ggml_build_forward_expand(graph, gradient);
+    ggml_build_forward_expand(graph, independent);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_t backends[] = {gpu.get(), cpu.get()};
+    auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true);
+    ggml_backend_sched_set_tensor_backend(sched, product, cpu.get());
+    ggml_backend_sched_set_tensor_backend(sched, gradient, cpu.get());
+    ggml_backend_sched_set_tensor_backend(sched, independent, gpu.get());
+    ggml_backend_sched_set_tensor_backend(sched, output, gpu.get());
+    check(ggml_backend_sched_alloc_graph(sched, graph), "host gradient allocation failed");
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        for (auto * tensor : {a, b, acc, input}) {
+            const float value = tensor == a ? float(iteration + 1) : tensor == b ? .25f : tensor == acc ? 1.0f : float(iteration);
+            std::vector<float> values(ggml_nelements(tensor), value);
+            ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+        }
+        check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "host gradient execution failed");
+        std::vector<float> actual(ggml_nelements(output));
+        ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+        const float expected = 32.0f*(iteration + 1) + 1.0f + 2.0f*iteration;
+        for (float value : actual) check(value == expected, "GPU consumed an incomplete host gradient");
+    }
+    ggml_backend_sched_free(sched);
+    std::puts("host gradient: repeated in-place accumulation and GPU dependency checks passed");
+}
+
 static void tensor_parallel_sum(ggml_backend_dev_t first, ggml_backend_dev_t second) {
     ggml_backend_dev_t devices[] = {first, second};
     for (int axis : {0, 1}) {
@@ -971,11 +1239,11 @@ static std::vector<float> attention_backward(bool parallel, bool q_only = false)
     return result;
 }
 
-static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool last_only, ggml_backend_t backend, bool q_only = false, bool host = false) {
+static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool last_only, ggml_backend_t backend, bool q_only = false, bool host = false, bool swa = false, bool crop = false) {
     llm_graph_result result(8192);
     llama_adapter_loras loras;
     llm_graph_params params = {};
-    params.hparams.n_layer_all = 1;
+    params.hparams.n_layer_all = 2;
     params.hparams.n_embd = 64;
     params.hparams.n_head_arr[0] = 2;
     params.hparams.n_head_kv_arr[0] = 1;
@@ -988,6 +1256,14 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool 
     params.cparams.op_offload = true;
     params.cparams.causal_attn = true;
     params.ubatch.n_tokens = 1024;
+    std::vector<llama_pos> positions(1024);
+    for (int i = 0; i < 1024; ++i) positions[i] = i;
+    if (swa) {
+        params.hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        params.hparams.n_swa = 128;
+        params.hparams.is_swa_impl[0] = 1;
+        if (crop) params.ubatch.pos = positions.data();
+    }
     params.training = true;
     params.full_sequence = true;
     params.loras = &loras;
@@ -1009,7 +1285,7 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool 
         ggml_set_param(inputs[2]);
     }
     auto * output = builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 0);
-    if (tile == 1024 && flash && !last_only && !q_only && !host) {
+    if (tile == 1024 && flash && !last_only && !q_only && !host && !swa) {
         builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 1);
         std::set<const ggml_tensor *> masks;
         int attention_nodes = 0;
@@ -1023,12 +1299,21 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool 
         check(attention_nodes == 8 && masks.size() == 4, "training layers must share fixed mask tiles");
     }
     int64_t largest_query = 0;
+    int64_t largest_kv = 0;
+    int32_t largest_backward_kv = 0;
     for (int i = 0; i < ggml_graph_n_nodes(result.get_gf()); ++i) {
         const auto * node = ggml_graph_node(result.get_gf(), i);
-        if (node->op == GGML_OP_FLASH_ATTN_EXT) largest_query = std::max(largest_query, node->src[0]->ne[1]);
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            largest_query = std::max(largest_query, node->src[0]->ne[1]);
+            largest_kv = std::max(largest_kv, node->src[1]->ne[1]);
+            int32_t backward_kv;
+            std::memcpy(&backward_kv, node->op_params + 7, sizeof(backward_kv));
+            largest_backward_kv = std::max(largest_backward_kv, backward_kv);
+        }
         if (node->op == GGML_OP_SOFT_MAX) largest_query = std::max(largest_query, node->ne[1]);
     }
     check(largest_query == LLM_TRAINING_TILE_SIZE, "attention did not use the fixed training tile");
+    if (swa && crop) check(largest_kv == 1024 && largest_backward_kv > 0 && largest_backward_kv <= 512, "SWA backward range is missing or changes forward");
     if (host) {
         output = ggml_cont(ctx, output);
         output->flags |= GGML_TENSOR_FLAG_HOST;
@@ -1068,7 +1353,7 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool 
         ggml_backend_tensor_set(inputs[i], values.data(), 0, values.size()*sizeof(float));
     }
     std::vector<float> mask(1024*1024);
-    for (int q = 0; q < 1024; ++q) for (int k = 0; k < 1024; ++k) mask[q*1024 + k] = k > q ? -INFINITY : 0.0f;
+    for (int q = 0; q < 1024; ++q) for (int k = 0; k < 1024; ++k) mask[q*1024 + k] = k > q || (swa && q - k >= 128) ? -INFINITY : 0.0f;
     if (flash) {
         std::vector<ggml_fp16_t> half(mask.size());
         ggml_fp32_to_fp16_row(mask.data(), half.data(), mask.size());
@@ -1091,6 +1376,19 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool 
 }
 
 static void full_context_checks(ggml_backend_t backend) {
+    for (bool last_only : {false, true}) {
+        const auto reference = full_context_backward(1024, true, last_only, backend, false, false, true, false);
+        const auto cropped = full_context_backward(1024, true, last_only, backend, false, false, true, true);
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < reference.size(); ++i) {
+            check(std::isfinite(cropped[i]), "non-finite cropped SWA gradient");
+            error += std::pow(double(cropped[i]) - reference[i], 2);
+            norm += double(reference[i])*reference[i];
+        }
+        const double relative = std::sqrt(error/std::max(norm, 1e-30));
+        std::printf("cropped SWA: last_only=%d gradient_relative_l2=%.9g\n", last_only, relative);
+        check(relative < 1e-5, "cropped SWA changed full-context gradients");
+    }
     for (bool flash : {false, true}) for (bool last_only : {false, true}) {
         const auto reference = full_context_backward(1024, flash, last_only, backend);
         const auto host = full_context_backward(1024, flash, last_only, backend, false, true);
@@ -1196,8 +1494,102 @@ static void compact_encoding_checks(ggml_backend_t backend = nullptr) {
     }
 }
 
+static void swa_fused_backward_checks(ggml_backend_t backend) {
+    constexpr int dim = 256, keys = 1536, queries = 32, heads = 4, kv_heads = 2;
+    for (bool q_only : {false, true}) for (bool masked : {false, true}) for (bool with_sink : {false, true}) {
+        ggml_context_ptr ctx(ggml_init({1024*1024, nullptr, true}));
+        auto * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, queries, heads);
+        auto * k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, dim, keys, kv_heads);
+        auto * v = ggml_dup_tensor(ctx.get(), k);
+        auto * d = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, heads, queries);
+        auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, keys, queries);
+        auto * sink = with_sink ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, heads) : nullptr;
+        auto * forward = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.0f/16, 0, 0);
+        ggml_flash_attn_ext_set_causal(forward, true);
+        ggml_flash_attn_ext_add_sinks(forward, sink);
+        auto * reference = ggml_flash_attn_ext_back(ctx.get(), forward, d);
+        auto * fused = ggml_flash_attn_ext_back(ctx.get(), forward, d);
+        const int range_begin = keys - 1280, range_count = 1280;
+        std::memcpy(fused->op_params + 6, &range_begin, sizeof(range_begin));
+        std::memcpy(fused->op_params + 7, &range_count, sizeof(range_count));
+        const int flags = GGML_FLASH_ATTN_BACK_GRAD_VALID | GGML_FLASH_ATTN_BACK_GRAD_Q |
+            (q_only ? 0 : GGML_FLASH_ATTN_BACK_GRAD_K | GGML_FLASH_ATTN_BACK_GRAD_V);
+        for (auto * tensor : {reference, fused}) {
+            std::memcpy(tensor->op_params + 5, &flags, sizeof(flags));
+            tensor->ne[0] = ggml_nelements(q) + (q_only ? 0 : ggml_nelements(k) + ggml_nelements(v));
+            tensor->nb[1] = tensor->nb[2] = tensor->nb[3] = tensor->ne[0]*sizeof(float);
+        }
+        auto * graph = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(graph, reference);
+        ggml_build_forward_expand(graph, fused);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        check(buffer != nullptr, "SWA fused backward allocation failed");
+        std::mt19937 random(19);
+        std::uniform_real_distribution<float> distribution(-0.5f, 0.5f);
+        for (auto * tensor : {q, k, v, d, sink}) {
+            if (!tensor) continue;
+            std::vector<float> values(ggml_nelements(tensor));
+            for (auto & value : values) value = distribution(random);
+            if (tensor->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> packed(values.size());
+                ggml_fp32_to_fp16_row(values.data(), packed.data(), values.size());
+                ggml_backend_tensor_set(tensor, packed.data(), 0, ggml_nbytes(tensor));
+            } else {
+                ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+            }
+        }
+        std::vector<float> values(keys*queries, -INFINITY);
+        for (int j = 0; j < queries; ++j) for (int i = 0; i < keys; ++i) {
+            const int position = keys - queries + j;
+            if (!masked && i <= position && i > position - 1024) values[j*keys + i] = distribution(random)*0.25f;
+        }
+        std::vector<ggml_fp16_t> packed(values.size());
+        ggml_fp32_to_fp16_row(values.data(), packed.data(), values.size());
+        ggml_backend_tensor_set(mask, packed.data(), 0, ggml_nbytes(mask));
+        check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "SWA fused backward compute failed");
+        std::vector<float> expected(ggml_nelements(reference)), actual(expected.size());
+        ggml_backend_tensor_get(reference, expected.data(), 0, ggml_nbytes(reference));
+        ggml_backend_tensor_get(fused, actual.data(), 0, ggml_nbytes(fused));
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            check(std::isfinite(actual[i]), "SWA fused backward produced non-finite gradient");
+            error += double(actual[i] - expected[i])*(actual[i] - expected[i]);
+            norm += double(expected[i])*expected[i];
+        }
+        const double relative = std::sqrt(error/std::max(norm, 1e-30));
+        std::printf("SWA fused backward: q_only=%d masked=%d sink=%d relative_l2=%.9g\n", q_only, masked, with_sink, relative);
+        check(relative < 1e-4, "SWA fused backward differs from reference");
+    }
+}
+
 int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--swa-fused-cuda") == 0) {
+            ggml_backend_load_all();
+            auto * device = ggml_backend_dev_by_name("CUDA0");
+            check(device != nullptr, "SWA fused backward regression requires CUDA0");
+            ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+            check(backend != nullptr, "cannot initialize SWA fused backend");
+            swa_fused_backward_checks(backend.get());
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--host-gradient") == 0) {
+            ggml_backend_load_all();
+            auto * device = ggml_backend_dev_by_name("CUDA0");
+            check(device != nullptr, "host gradient regression requires CUDA");
+            host_gradient_dependency(device);
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--async-cuda") == 0) {
+            ggml_backend_load_all();
+            auto * first = ggml_backend_dev_by_name("CUDA0");
+            auto * second = ggml_backend_dev_by_name("CUDA1");
+            check(first && second, "async regression requires two CUDA devices");
+            tensor_parallel_async(first, second);
+            tensor_parallel_host_copy(first, second);
+            host_gradient_dependency(first);
+            return 0;
+        }
         if (argc == 2 && (std::strcmp(argv[1], "--full-context") == 0 || std::strcmp(argv[1], "--full-context-cuda") == 0)) {
             ggml_backend_ptr backend;
             if (std::strcmp(argv[1], "--full-context-cuda") == 0) {
@@ -1237,10 +1629,12 @@ int main(int argc, char ** argv) {
         encoder_checks();
         cache_checks();
         mixed_cache_checks();
+        no_cache_mask_checks();
         tiled_distillation_checks();
         frozen_q41_moe_gradient();
         auto * cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
         auto * paired_cpu = ggml_backend_dev_init(cpu, nullptr);
+        fake_quant_checks(paired_cpu);
         full_context_checks(paired_cpu);
         paired_forward_checks(paired_cpu);
         ggml_backend_free(paired_cpu);
@@ -1257,6 +1651,7 @@ int main(int argc, char ** argv) {
             for (auto * device : {first, second}) {
                 auto * backend = ggml_backend_dev_init(device, nullptr);
                 check(backend != nullptr, "cannot initialize CUDA KL backend");
+                fake_quant_checks(backend);
                 full_context_checks(backend);
                 compact_encoding_checks(backend);
                 paired_forward_checks(backend);
@@ -1269,6 +1664,9 @@ int main(int argc, char ** argv) {
             // The internal collective can round inputs to BF16; this reference checks F32 peer reduction.
             const char * allreduce = std::getenv("GGML_CUDA_ALLREDUCE");
             if (allreduce && std::strcmp(allreduce, "none") == 0) tensor_parallel_backward(first, second);
+            tensor_parallel_async(first, second);
+            tensor_parallel_host_copy(first, second);
+            host_gradient_dependency(first);
             tensor_parallel_accumulate(first, second);
             tensor_parallel_sum(first, second);
             tensor_parallel_copy(first, second);

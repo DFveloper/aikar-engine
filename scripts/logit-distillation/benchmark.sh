@@ -45,6 +45,6 @@ common=(--train-file "$DATA" --distill-cache "$BENCH_DIR/teacher.dat"
     --epochs 1 -lr "$LR" --save-every 0 --eval-every 0 --shuffle-dataset \
     --verbose-loss --qat-out "$BENCH_TEMP/final.gguf" > "$BENCH_DIR/train.log" 2>&1
 rg 'distill_throughput' "$BENCH_DIR/extract.log"
-rg 'qat_throughput|validation:|qat_memory:' "$BENCH_DIR/train.log"
+rg '(qat_)?throughput:|validation:|(qat_)?memory:' "$BENCH_DIR/train.log"
 cat "$BENCH_DIR/extract.time" "$BENCH_DIR/train.time"
 echo "Logs: $BENCH_DIR"

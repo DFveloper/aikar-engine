@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "binary-ops.h"
@@ -1607,7 +1608,7 @@ static void ggml_compute_forward_acc_f32(
     size_t offset  = ((int32_t *) dst->op_params)[3];
     bool   inplace = (bool) ((int32_t *) dst->op_params)[4];
 
-    if (!inplace) {
+    if (!inplace && dst->data != src0->data) {
         if (params->ith == 0) {
             // memcpy needs to be synchronized across threads to avoid race conditions.
             // => do it in INIT phase
@@ -5112,6 +5113,23 @@ static void ggml_compute_forward_out_prod_f32(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+#if defined(__AVX2__) && defined(__FMA__)
+    if (!params->use_ref && params->wsize >= sizeof(bool) && ggml_is_matrix(src0) && ggml_is_matrix(src1) &&
+            ggml_is_contiguous(dst) && ne0 >= 1024 && ne1 >= 1024 && ne01 >= 32) {
+        auto * success = (bool *) params->wdata;
+        if (ith == 0) {
+            auto * reg = ggml_backend_reg_by_name("CUDA");
+            using host_out_prod_t = bool (*)(ggml_tensor *, bool);
+            auto fn = reg ? (host_out_prod_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_out_prod_host") : nullptr;
+            *success = fn && fn(dst, accumulate);
+        }
+        ggml_barrier(params->threadpool);
+        const bool accelerated = *success;
+        ggml_barrier(params->threadpool);
+        if (accelerated) return;
+    }
+#endif
+
     if (!accumulate && ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
     }
@@ -5161,6 +5179,44 @@ static void ggml_compute_forward_out_prod_f32(
         }
         return;
     }
+
+#if defined(GGML_SIMD)
+    if (ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) && ne0 % GGML_F32_STEP == 0) {
+        // Keep two output rows in registers and share each input vector.
+        for (int64_t row = ir0; row < ir1; row += 2) {
+            const int rows = MIN(int64_t(2), ir1 - row);
+            for (int64_t col = 0; col < ne0; col += GGML_F32_STEP) {
+                GGML_F32_VEC sums[2][GGML_F32_ARR];
+                for (int r = 0; r < rows; ++r) {
+                    const float * out = (const float *) ((const char *) dst->data + (row + r)*nb1) + col;
+                    for (int v = 0; v < GGML_F32_ARR; ++v) {
+                        sums[r][v] = GGML_F32_VEC_LOAD(out + v*GGML_F32_EPR);
+                    }
+                }
+                for (int64_t k = 0; k < ne01; ++k) {
+                    const float * a = (const float *) ((const char *) src0->data + k*nb01) + col;
+                    GGML_F32_VEC scale[2];
+                    for (int r = 0; r < rows; ++r) {
+                        scale[r] = GGML_F32_VEC_SET1(*(const float *) ((const char *) src1->data + (row + r)*nb10 + k*nb11));
+                    }
+                    for (int v = 0; v < GGML_F32_ARR; ++v) {
+                        const GGML_F32_VEC x = GGML_F32_VEC_LOAD(a + v*GGML_F32_EPR);
+                        for (int r = 0; r < rows; ++r) {
+                            sums[r][v] = GGML_F32_VEC_FMA(sums[r][v], x, scale[r]);
+                        }
+                    }
+                }
+                for (int r = 0; r < rows; ++r) {
+                    float * out = (float *) ((char *) dst->data + (row + r)*nb1) + col;
+                    for (int v = 0; v < GGML_F32_ARR; ++v) {
+                        GGML_F32_VEC_STORE(out + v*GGML_F32_EPR, sums[r][v]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     for (int64_t bir = ir0; bir < ir1; bir += blck_1) {
         const int64_t bir1 = MIN(bir + blck_1, ir1);
