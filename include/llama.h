@@ -417,6 +417,8 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        bool type_k_explicit;
+        bool type_v_explicit;
         enum ggml_type type_k_swa; // data type for sliding-window K cache, GGML_TYPE_COUNT = type_k [EXPERIMENTAL]
         enum ggml_type type_v_swa; // data type for sliding-window V cache, GGML_TYPE_COUNT = type_v [EXPERIMENTAL]
 

@@ -16,7 +16,7 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
         if (hparams.n_layer_all != 30) {
             throw std::runtime_error("Lumen4Exp Global sharing requires 30 layers");
         }
-        for (int il : {11, 17, 23}) { hparams.kvsharer_map[il] = 6; }
+        hparams.kvsharer_map[23] = 18;
     }
 
     if (hparams.kv_global_only && n_kv_shared_layers >= hparams.n_layer_all) {

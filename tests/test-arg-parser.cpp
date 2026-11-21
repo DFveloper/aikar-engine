@@ -351,6 +351,17 @@ static void test(void) {
 
     printf("test-arg-parser: test valid usage\n\n");
 
+    {
+        const auto defaults = common_context_params_to_llama(common_params{});
+        assert(!defaults.type_k_explicit && !defaults.type_v_explicit);
+        common_params kv_params;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "f16", "-ctv", "f16"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        const auto explicit_types = common_context_params_to_llama(kv_params);
+        assert(explicit_types.type_k == GGML_TYPE_F16 && explicit_types.type_v == GGML_TYPE_F16);
+        assert(explicit_types.type_k_explicit && explicit_types.type_v_explicit);
+    }
+
     for (const std::string & block_size : {"1", "16", "32", "64", "128"}) {
         common_params paged_params;
         argv = {"binary_name", "-m", "model.gguf", "--kv-paged", "--kv-block-size", block_size, "--kv-blocks", "4096", "--prefill-chunk-size", "64"};
@@ -478,6 +489,8 @@ static void test(void) {
         assert(cparams.type_v == GGML_TYPE_F16);
         assert(cparams.type_k_swa == GGML_TYPE_Q8_0);
         assert(cparams.type_v_swa == GGML_TYPE_Q8_0);
+        assert(cparams.type_k_explicit);
+        assert(cparams.type_v_explicit);
     }
 
     {
@@ -487,6 +500,8 @@ static void test(void) {
         const llama_context_params cparams = common_context_params_to_llama(kv_params);
         assert(cparams.type_k == GGML_TYPE_Q8_0);
         assert(cparams.type_v == GGML_TYPE_Q8_0);
+        assert(cparams.type_k_explicit);
+        assert(cparams.type_v_explicit);
         assert(cparams.type_k_swa == GGML_TYPE_Q8_0);
         assert(cparams.type_v_swa == GGML_TYPE_Q8_0);
     }

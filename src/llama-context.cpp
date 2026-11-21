@@ -5502,6 +5502,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_k_explicit             =*/ false,
+        /*.type_v_explicit             =*/ false,
         /*.type_k_swa                  =*/ GGML_TYPE_COUNT,
         /*.type_v_swa                  =*/ GGML_TYPE_COUNT,
         /*.cpu_les_prefetch_mib        =*/ 16,
@@ -5559,6 +5561,15 @@ llama_context * llama_init_from_model(
     }
     if (params.type_v_swa == GGML_TYPE_COUNT) {
         params.type_v_swa = params.type_v;
+    }
+
+    if (model->hparams.kv_global_only && !params.kv_turboquant_bits) {
+        if (!params.type_k_explicit && params.type_k == GGML_TYPE_F16) {
+            params.type_k = GGML_TYPE_FP4_KV;
+        }
+        if (!params.type_v_explicit && params.type_v == GGML_TYPE_F16) {
+            params.type_v = GGML_TYPE_FP4_KV;
+        }
     }
 
     if (!params.kv_hadamard_separate) {

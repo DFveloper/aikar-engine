@@ -32,7 +32,7 @@ def convert(source, output, shared_layers=19, context_length=1048576):
         raise ValueError("context length must be at least the positive original context length and fit uint32")
     count = int(reader.fields["gemma4.block_count"].contents())
     pattern = reader.fields["gemma4.attention.sliding_window_pattern"].contents()
-    if len(pattern) != count or not 0 <= shared_layers < count:
+    if count != 30 or len(pattern) != count or not 0 <= shared_layers < count:
         raise ValueError("invalid layer pattern or sharing count")
     if not any(not pattern[i] for i in range(count - shared_layers)):
         raise ValueError("sharing requires an independent global layer")
@@ -40,7 +40,7 @@ def convert(source, output, shared_layers=19, context_length=1048576):
     legacy_nvfp4 = version is None or version.contents() < 3
     names = {tensor.name for tensor in reader.tensors}
     for i in range(count):
-        if pattern[i] or i < count - shared_layers:
+        if i != 23:
             prefix = f"blk.{i}.attn_"
             if prefix + "k_norm.weight" not in names or not (
                 prefix + "k.weight" in names or prefix + "qkv.weight" in names

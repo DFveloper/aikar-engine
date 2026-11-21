@@ -90,6 +90,14 @@ class TestLumen4Exp(unittest.TestCase):
             converter.convert(source, self.root / "lumen.gguf")
 
     def test_shared_global_weights_optional(self):
+        self.check_missing_global_weights(23, False)
+
+    def test_independent_global_weights_required(self):
+        for layer in (11, 17, 29):
+            with self.subTest(layer=layer):
+                self.check_missing_global_weights(layer, True)
+
+    def check_missing_global_weights(self, layer, rejected):
         source = self.root / "gemma.gguf"
         make_source(source)
         reader = gguf.GGUFReader(source)
@@ -99,13 +107,17 @@ class TestLumen4Exp(unittest.TestCase):
                 writer.add_key_value(key, field.contents(), field.types[0],
                                      field.types[-1] if field.types[0] == gguf.GGUFValueType.ARRAY else None)
         for tensor in reader.tensors:
-            if tensor.name != "blk.17.attn_k.weight":
+            if tensor.name != f"blk.{layer}.attn_k.weight":
                 writer.add_tensor(tensor.name, tensor.data, raw_dtype=tensor.tensor_type)
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file()
         writer.close()
-        converter.convert(self.root / "missing.gguf", self.root / "lumen.gguf")
+        if rejected:
+            with self.assertRaisesRegex(ValueError, f"independent KV weights for layer {layer}"):
+                converter.convert(self.root / "missing.gguf", self.root / "lumen.gguf")
+        else:
+            converter.convert(self.root / "missing.gguf", self.root / "lumen.gguf")
 
     def test_yarn_context_extension(self):
         for original, target in ((None, 1048576), (32768, 1048576), (None, 262144)):

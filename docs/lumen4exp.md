@@ -14,7 +14,7 @@ Conversion also configures YaRN for a 1,048,576-token (1M) context by default. I
 
 The model loads these YaRN settings without runtime RoPE flags. Use `-c 1048576` to allocate the full context at inference. The metadata marks the extension as not finetuned: conversion alone does not validate 1M-context quality. Distillation or long-context training and evaluation are still required.
 
-The default `lumen4exp.attention.shared_kv_layers` is 19, interpreted as the trailing 19 transformer layers. Only global attention layers in this range reuse KV. For the 30-layer model, layer 5 is the only global KV owner; global layers 11, 17, 23 and 29 all reuse layer 5. All indices are zero-based. Every SWA layer retains its own KV projections and cache. `--shared-layers 0` disables sharing. The temporary independent-layer-17 override has been removed.
+For the 30-layer model, only global layer 23 reuses layer 17's KV by default. Global layers 5, 11, 17 and 29 keep independent KV. All indices are zero-based. Every SWA layer retains its own KV projections and cache. The runtime uses this fixed default instead of the converter's legacy `lumen4exp.attention.shared_kv_layers` value. `KVSHARER_MAP` can override the sharing map.
 
 A source checkpoint must contain independent K projection and K normalization weights for all SWA layers. The converter rejects checkpoints whose original sharing removed these weights. Merge sharded GGUFs before conversion. Existing output files are never overwritten.
 
@@ -31,7 +31,11 @@ value       = E2M1_value * block_scale
 
 The number of independent global cache layers comes from model metadata and sharing rules; it is not fixed at two. A 512-channel head row occupies `8 * 36 = 288` bytes. With two KV heads, each independent global layer uses about 1.073 GiB at 1,000,000 tokens. In the earlier two-layer test configuration, two independent global layers and two KV heads require `1000000 * 2 * 2 * 2 * 288 = 2304000000` bytes (2.146 GiB). At the aligned 1,000,192 cells, the global cache uses 2,197.69 MiB. SWA keeps its configured cache types and adds 900 MiB in the four-slot test configuration. Appending rows does not change existing groups or require full-cache requantization.
 
-The default is selected automatically for `lumen4exp`; no cache-type flags or checkpoint conversion are needed. Runtime type 150 is separate from GGUF NVFP4 weight type 40. Existing NVFP4 weight codecs and conversion remain compatible. Old saved KV states are rejected by their different cache type.
+The default is selected automatically for `lumen4exp`; no cache-type flags or checkpoint conversion are needed. Explicit `-ctk`/`-ctv` or `-ctgk`/`-ctgv` values override the global K/V defaults independently, including explicit `f16`. Runtime type 150 is separate from GGUF NVFP4 weight type 40. Existing NVFP4 weight codecs and conversion remain compatible. Old saved KV states are rejected by their different cache type.
+
+Global inference Flash Attention uses a packed one-bit mask for every supported KV type when ALiBi and TurboQuant are disabled. CPU attention reads the bits directly. CUDA keeps the direct packed-mask path for fused FP4 V-from-K attention and expands other masks to temporary F16 storage before invoking its existing attention kernels.
+
+C API callers selecting F16 explicitly set `llama_context_params.type_k_explicit` or `type_v_explicit` to preserve that choice instead of the model default. Other explicitly selected cache types are preserved directly.
 
 CPU cache writes, dequantization and direct Flash Attention support this format. CUDA supports packed cache writes and GPU dequantization before F16 Flash Attention, including on V100; no native FP4 tensor-core instructions are required. FP4 cache rows span the KV heads so tensor parallelism can split the head channels while sharing token indices. Unsupported backends keep the packed cache on CPU. Small-model FP4 KV inference passed on two V100s. Real-model validation is pending after a repeated PCIe/NVLink device failure; see the V100 guide for kernel logs. E4M3 scales have finite range: extremely small values can underflow, and very large values can saturate; there is no master scale to extend that range.
 

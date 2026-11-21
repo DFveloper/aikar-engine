@@ -10311,6 +10311,52 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_packed_mask : public test_flash_attn_ext {
+    const bool all_masked;
+    test_flash_attn_packed_mask(ggml_type type_k, ggml_type type_v, int nb, bool all_masked) :
+        test_flash_attn_ext(128, 128, 2, {2, 2}, 512, nb, true, true, 0, 30,
+            GGML_PREC_F32, type_k, type_v), all_masked(all_masked) {}
+
+    std::string vars() override { return test_flash_attn_ext::vars() + ",packed_mask=1,all_masked=" + std::to_string(all_masked); }
+    bool run_whole_graph() override { return true; }
+    double err(const float * reference, const float * actual, size_t count) override {
+        std::vector<float> packed, dense;
+        for (size_t row = 0; row < count; row += 2*hsv) {
+            packed.insert(packed.end(), actual + row, actual + row + hsv);
+            dense.insert(dense.end(), actual + row + hsv, actual + row + 2*hsv);
+        }
+        return std::max(nmse(reference, actual, count), nmse(dense.data(), packed.data(), packed.size()));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * reference = test_flash_attn_ext::build_graph(ctx);
+        auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, (kv + 31)/32, nb, 1, 2);
+        ggml_set_name(mask, "packed_mask");
+        auto * packed = ggml_flash_attn_ext(ctx, reference->src[0], reference->src[1], reference->src[2],
+            mask, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(packed, reference->src[4]);
+        ggml_prec_set_acc(packed, GGML_PREC_F32);
+        return ggml_concat(ctx, packed, reference, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        auto * dense = ggml_get_tensor(ctx, "m");
+        auto * packed = ggml_get_tensor(ctx, "packed_mask");
+        std::vector<ggml_fp16_t> values(ggml_nelements(dense));
+        std::vector<uint32_t> words(ggml_nelements(packed), UINT32_MAX);
+        for (int64_t row = 0; row < ggml_nelements(dense)/kv; ++row) {
+            for (int64_t token = 0; token < kv; ++token) {
+                const bool keep = !all_masked && token <= kv/2 + row%nb && (token + row)%5 != 0;
+                values[row*kv + token] = ggml_fp32_to_fp16(keep ? 0.0f : -INFINITY);
+                if (keep) words[row*packed->ne[0] + token/32] &= ~(uint32_t(1) << (token%32));
+            }
+        }
+        ggml_backend_tensor_set(dense, values.data(), 0, ggml_nbytes(dense));
+        ggml_backend_tensor_set(packed, words.data(), 0, ggml_nbytes(packed));
+    }
+};
+
 struct test_flash_attn_mask_tiles : public test_flash_attn_ext {
     const int pattern;
 
@@ -15183,6 +15229,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 512, 1,
             true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, type));
 
+    }
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0,
+            GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_KV,
+            GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_FP4_KV,
+            GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (int nb : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_packed_mask(type, type, nb, false));
+            test_cases.emplace_back(new test_flash_attn_packed_mask(type, GGML_TYPE_F16, nb, true));
+        }
     }
 
     for (int nb : {1, 5, 16, 64}) {
