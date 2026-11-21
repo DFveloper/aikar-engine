@@ -189,7 +189,7 @@ class GGUFReader:
                 raise ValueError('Invalid alignment: must be a non-zero power of two')
         padding = offs % self.alignment
         if padding != 0:
-            offs += self.alignment - padding
+            offs += int(self.alignment - padding)
         self.data_offset = offs
         self._build_tensors(offs, tensors_fields)
 
@@ -354,7 +354,9 @@ class GGUFReader:
             nvfp4_scaled = ggml_type == GGMLQuantizationType.NVFP4 and version_field is not None and version_field.contents() >= 3
             if nvfp4_scaled:
                 n_bytes += 4 * (n_elems // int(dims[0]))
-            data_offs = int(start_offs + offset_tensor[0])
+            data_offs = start_offs + int(offset_tensor[0])
+            if data_offs + n_bytes > self.data.nbytes:
+                raise ValueError(f'Tensor {tensor_name} data exceeds file size {self.data.nbytes}')
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:
                 item_count = n_elems

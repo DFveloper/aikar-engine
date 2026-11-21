@@ -15,6 +15,7 @@ class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(
             const llama_model & model,
+                         bool   no_alloc,
                     ggml_type   type_k_base,
                     ggml_type   type_v_base,
                     ggml_type   type_k_swa,
@@ -26,7 +27,6 @@ public:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
-                     uint32_t   n_pad,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
@@ -37,6 +37,7 @@ public:
 
     llama_kv_cache_iswa(
             const llama_model & model,
+                         bool   no_alloc,
             const llama_hparams & hparams,
                     ggml_type   type_k_base,
                     ggml_type   type_v_base,
@@ -49,7 +50,6 @@ public:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
-                     uint32_t   n_pad,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,

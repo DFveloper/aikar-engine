@@ -58,7 +58,7 @@ endfunction()
 
 # Determines which FlashAttention vector kernel template instances to compile, returns them in OUT_SRCS.
 function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
-    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 q8_kv bf16 f16 mxfp4 turbo3_0 turbo4_0)
+    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 q8_kv bf16 f16 f8_e4m3 mxfp4 turbo3_0 turbo4_0)
 
     string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
     string(STRIP   "${FA_QUANTS}" FA_QUANTS)

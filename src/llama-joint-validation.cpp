@@ -209,7 +209,7 @@ bool llama_context::opt_joint_attach(llama_context * other, bool fuse_all) {
         throw std::runtime_error("joint validation requires compatible single-sequence Gemma contexts");
     }
     other->synchronize();
-    other->sched_new(other->gf_res_reserve->get_max_nodes(), false);
+    other->sched_new({(size_t) other->gf_res_reserve->get_max_nodes(), false, other->cparams.op_offload});
     opt_joint = std::make_shared<llama_opt_joint_validation>(this, other);
     opt_joint->fuse_all = fuse_all;
     other->opt_joint = opt_joint;

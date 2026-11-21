@@ -13,6 +13,7 @@
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
+                     bool   no_alloc,
                 ggml_type   type_k_base,
                 ggml_type   type_v_base,
                 ggml_type   type_k_swa,
@@ -24,7 +25,6 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
-                 uint32_t   n_pad,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
@@ -32,12 +32,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                   int32_t   turboquant_bits,
                   int32_t   turboquant_bits_swa,
                  uint64_t   turboquant_seed) :
-    llama_kv_cache_iswa(model, model.hparams, type_k_base, type_v_base, type_k_swa, type_v_swa, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, turboquant_bits, turboquant_bits_swa, turboquant_seed) {
+    llama_kv_cache_iswa(model, no_alloc, model.hparams, type_k_base, type_v_base, type_k_swa, type_v_swa, v_trans, offload, swa_full, unified,
+            kv_size, n_seq_max, n_ubatch, mem_other, filter, reuse, share, turboquant_bits, turboquant_bits_swa, turboquant_seed) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
+                     bool   no_alloc,
         const llama_hparams & hparams,
                 ggml_type   type_k_base,
                 ggml_type   type_v_base,
@@ -50,7 +51,6 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
-                 uint32_t   n_pad,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
@@ -106,8 +106,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         (type_k_base == GGML_TYPE_Q8_0 || type_k_base == GGML_TYPE_Q8_KV || type_k_base == GGML_TYPE_F16);
 
     kv_base = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k_base, type_v_base,
-            v_trans, offload, unified, size_base, n_seq_max, n_pad,
+            model, no_alloc, hparams, type_k_base, type_v_base,
+            v_trans, offload, unified, size_base, n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, "", lazy_base, turboquant_bits, turboquant_seed);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
@@ -116,8 +116,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         (type_k_swa == GGML_TYPE_Q8_0 || type_k_swa == GGML_TYPE_Q8_KV || type_k_swa == GGML_TYPE_F16);
 
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k_swa, type_v_swa,
-            v_trans, offload, unified, size_swa, n_seq_max, n_pad,
+            model, no_alloc, hparams, type_k_swa, type_v_swa,
+            v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, "", lazy_swa, turboquant_bits_swa, turboquant_seed);
 }
 
