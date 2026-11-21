@@ -1,0 +1,19 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1897,1 +1897,1 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+-    const uint32_t tile = LLM_TRAINING_PROJECTION_TILE_SIZE;
++    const uint32_t tile = std::getenv("GGML_TRAIN_MOE_PRESERVE_MM") ? LLM_TRAINING_TILE_SIZE : LLM_TRAINING_PROJECTION_TILE_SIZE;
+@@ -2436,4 +2436,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+-    if (full_sequence && n_tokens > LLM_TRAINING_TILE_SIZE) {
++    static const int64_t moe_tile = [] {
++        const char * value = std::getenv("GGML_TRAIN_MOE_TILE");
++        const long parsed = value ? std::strtol(value, nullptr, 10) : LLM_TRAINING_TILE_SIZE;
++        return parsed == 512 || parsed == 1024 ? int64_t(parsed) : int64_t(LLM_TRAINING_TILE_SIZE);
++    }();
++    if (full_sequence && n_tokens > moe_tile) {
+         std::vector<ggml_tensor *> tiles;
+-        for (int64_t start = 0; start < n_tokens; start += LLM_TRAINING_TILE_SIZE) {
+-            const int64_t count = std::min<int64_t>(LLM_TRAINING_TILE_SIZE, n_tokens - start);
++        for (int64_t start = 0; start < n_tokens; start += moe_tile) {
++            const int64_t count = std::min<int64_t>(moe_tile, n_tokens - start);

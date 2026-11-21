@@ -1,0 +1,180 @@
+{
+  "target_hours": 60,
+  "train_windows": 6057,
+  "validation_windows": 73,
+  "production_args_changed": false,
+  "runs": {
+    "baseline": {
+      "train_seconds": 182.53,
+      "training_loss": 4.36751747,
+      "validation_loss": 4.4167881,
+      "exit_code": 0,
+      "wall_seconds": 304.4033013320295,
+      "kernel_trace": false,
+      "training_only_projection_hours": 307.106725
+    },
+    "optimized": {
+      "train_seconds": 163.393,
+      "training_loss": 4.38803101,
+      "validation_loss": 4.41197586,
+      "exit_code": 0,
+      "wall_seconds": 301.73829867196037,
+      "kernel_trace": true,
+      "training_only_projection_hours": 274.9087225
+    }
+  },
+  "training_speedup": 1.117122520548616,
+  "required_seconds_per_window_without_validation_or_saves": 35.661218424962854,
+  "weights": {},
+  "state": {
+    "qat.m.000000": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.5106693100748884,
+      "cosine": 0.9137764123604301
+    },
+    "qat.r.000000": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000000": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000001": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.17336636111517686,
+      "cosine": 0.985450447678856
+    },
+    "qat.r.000001": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000001": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000002": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.6469718319567213,
+      "cosine": 0.9671741068591642
+    },
+    "qat.r.000002": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000002": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000003": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.09950038731892655,
+      "cosine": 0.995598394208422
+    },
+    "qat.r.000003": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000003": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000004": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.46830129231630424,
+      "cosine": 0.9722369856092317
+    },
+    "qat.r.000004": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000004": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000005": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.06298868874436997,
+      "cosine": 0.9980299399241988
+    },
+    "qat.r.000005": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000005": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000006": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.33690139365989524,
+      "cosine": 0.9798818833879656
+    },
+    "qat.r.000006": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000006": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000007": {
+      "bytes_equal": false,
+      "finite": true,
+      "relative_l2": 0.033531363112727454,
+      "cosine": 0.9994888348546384
+    },
+    "qat.r.000007": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000007": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    }
+  },
+  "source_sha256": {
+    "src/llama-graph.cpp": "3a1439e78ddb347b4c216fe0d8ce41075838b5a35c09e56b428e3542fbc11ecf",
+    "ggml/src/ggml.c": "f93273c46c490a0e906824a5a7096042185b7d415b85ac46a1ddfeaecde97e07",
+    "ggml/src/ggml-cuda/fattn-back.cu": "b66e712d3f0e8b162c336bc9dfbf887123172dbd2046e7eff380cff20e44f310"
+  }
+}

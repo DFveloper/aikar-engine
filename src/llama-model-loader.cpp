@@ -1473,7 +1473,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx), qlion != nullptr);
             if (qlion) qlion->patch_mapping(mapping->addr(), mapping->size());
-            mmaps_used.emplace_back(mapping->size(), 0);
+            mmaps_used.emplace_back();
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
@@ -1723,6 +1723,7 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    std::vector<no_init<uint8_t>> staging_buf;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1738,7 +1739,9 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        // Stage copied weights without faulting a second copy into the mapping.
+        const bool from_mapping = lazy.has(cur) || (use_mmap && (cur->data == nullptr ||
+                cur->data == (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs));
 
         if (!from_mapping && qlion && qlion->has(cur->name)) {
             std::vector<unsigned char> assembled(n_size);
@@ -1781,9 +1784,7 @@ bool llama_model_loader::load_all_data(
                     lmlock->grow_to(weight->offs + n_size);
                 }
 
-                auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                mmaps_used[weight->idx].emplace_back(weight->offs, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1853,8 +1854,9 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    // scoped to one tensor so only one staging buffer is alive at a time
-                    std::vector<no_init<uint8_t>> read_buf(n_size);
+                    std::vector<no_init<uint8_t>> tensor_buf;
+                    auto & read_buf = use_mmap ? staging_buf : tensor_buf;
+                    read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
@@ -1896,12 +1898,17 @@ bool llama_model_loader::load_all_data(
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
-                const auto & mmap_used = mmaps_used.at(idx);
+                auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
-                mapping->unmap_fragment(0, mmap_used.first);
-                if (mmap_used.second != 0) {
-                    mapping->unmap_fragment(mmap_used.second, mapping->size());
+                std::sort(mmap_used.begin(), mmap_used.end());
+                size_t last = 0;
+                for (const auto & range : mmap_used) {
+                    if (range.first > last) {
+                        mapping->unmap_fragment(last, range.first);
+                    }
+                    last = std::max(last, range.second);
                 }
+                mapping->unmap_fragment(last, mapping->size());
             }
         }
         if (progress_callback) {

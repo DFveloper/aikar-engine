@@ -1,0 +1,20 @@
+{
+  "full": 13.5084275,
+  "crop": 1.7550409999999999,
+  "q": {
+    "bytes_equal": false,
+    "rel_l2": 2.655065998169448e-07,
+    "max_abs": 1.4901161193847656e-08
+  },
+  "k": {
+    "bytes_equal": true,
+    "rel_l2": 0.0,
+    "max_abs": 0.0
+  },
+  "v": {
+    "bytes_equal": true,
+    "rel_l2": 0.0,
+    "max_abs": 0.0
+  },
+  "speedup": 7.696929872293582
+}

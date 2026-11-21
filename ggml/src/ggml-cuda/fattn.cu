@@ -6,6 +6,146 @@
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct fattn_v_from_k_layout {
+    int64_t nbq[4], nbk[4], nbv[4], nbm[4];
+    int64_t queries, heads, kv_heads, tokens, mask_heads, mask_streams;
+    int prefix, chunks, packed_mask;
+    float scale, max_bias, softcap;
+};
+
+static __device__ float fattn_fp4_kv_value(const char * row, int d) {
+    const auto & block = ((const block_nvfp4 *) row)[d/QK_NVFP4];
+    const int sub = d % QK_NVFP4 / QK_NVFP4_SUB;
+    const int j = d % QK_NVFP4_SUB;
+    const uint8_t packed = block.qs[sub*(QK_NVFP4_SUB/2) + j % (QK_NVFP4_SUB/2)];
+    const int code = j < QK_NVFP4_SUB/2 ? packed & 15 : packed >> 4;
+    return __fmul_rn(ggml_cuda_ue4m3_to_fp32(block.d[sub]), kvalues_mxfp4[code]);
+}
+
+static __global__ void flash_attn_v_from_k(
+        const char * q, const char * k, const char * v, const char * mask,
+        const float * sinks, const float * scales, float * dst, fattn_v_from_k_layout p) {
+    constexpr int dim = 512;
+    constexpr int lanes = ggml_cuda_get_physical_warp_size();
+    constexpr int values = dim/lanes;
+    const int lane = threadIdx.x;
+    const int64_t task = blockIdx.x;
+    const int64_t head = task % p.heads;
+    const int64_t query = task/p.heads % p.queries;
+    const int64_t stream = task/(p.heads*p.queries);
+    const int64_t kv_head = head/(p.heads/p.kv_heads);
+    q += query*p.nbq[1] + head*p.nbq[2] + stream*p.nbq[3];
+    k += kv_head*p.nbk[2] + stream*p.nbk[3];
+    v += kv_head*p.nbv[2] + stream*p.nbv[3];
+    if (mask) mask += query*p.nbm[1] + (head % p.mask_heads)*p.nbm[2] + (stream % p.mask_streams)*p.nbm[3];
+    const uint32_t heads_log2 = 1u << uint32_t(floorf(log2f(float(p.heads))));
+    const float slope = p.max_bias == 0 ? 1.0f : head < heads_log2 ?
+            powf(powf(2.0f, -p.max_bias/heads_log2), head + 1) :
+            powf(powf(2.0f, -p.max_bias/(2*heads_log2)), 2*(head - heads_log2) + 1);
+    float query_values[values], norm[values], accum[values] = {};
+#pragma unroll
+    for (int i = 0; i < values; ++i) {
+        const int d = lane + i*lanes;
+        query_values[i] = __half2float(__float2half_rn(((const float *) q)[d]));
+        norm[i] = scales[d];
+    }
+    float maximum = -INFINITY, sum = 0;
+    const int64_t chunk_size = (p.tokens + p.chunks - 1)/p.chunks;
+    const int64_t end = min(p.tokens, (blockIdx.y + 1)*chunk_size);
+    for (int64_t token = blockIdx.y*chunk_size; token < end; ++token) {
+        const float bias = !mask ? 0 : p.packed_mask ?
+                ((((const uint32_t *) mask)[token/32] >> (token % 32)) & 1 ? -INFINITY : 0) :
+                slope*__half2float(*(const half *) (mask + token*p.nbm[0]));
+        if (bias == -INFINITY) continue;
+        const char * key = k + token*p.nbk[1];
+        const char * value = v + token*p.nbv[1];
+        float key_values[values];
+        float score = 0;
+#pragma unroll
+        for (int i = 0; i < values; ++i) {
+            key_values[i] = fattn_fp4_kv_value(key, lane + i*lanes);
+            score += __half2float(__float2half_rn(key_values[i]))*query_values[i];
+        }
+        score = warp_reduce_sum(score)*p.scale;
+        if (p.softcap != 0) score = p.softcap*tanhf(score/p.softcap);
+        score += bias;
+        const float next_max = fmaxf(maximum, score);
+        const float alpha = expf(maximum - next_max), weight = expf(score - next_max);
+#pragma unroll
+        for (int i = 0; i < values; ++i) {
+            const int d = lane + i*lanes;
+            const float reconstructed = d < p.prefix ? fattn_fp4_kv_value(value, d) : __fdiv_rn(key_values[i], norm[i]);
+            accum[i] = accum[i]*alpha + weight*__half2float(__float2half_rn(reconstructed));
+        }
+        sum = sum*alpha + weight;
+        maximum = next_max;
+    }
+    if (sinks && blockIdx.y == 0) {
+        const float next_max = fmaxf(maximum, sinks[head]);
+        const float alpha = expf(maximum - next_max);
+#pragma unroll
+        for (int i = 0; i < values; ++i) accum[i] *= alpha;
+        sum = sum*alpha + expf(sinks[head] - next_max);
+        maximum = next_max;
+    }
+    float * output = dst + task*(p.chunks == 1 ? dim : p.chunks*(dim + 2)) + blockIdx.y*(dim + 2);
+#pragma unroll
+    for (int i = 0; i < values; ++i) {
+        output[lane + i*lanes] = p.chunks == 1 ? (sum == 0 ? 0 : accum[i]/sum) : accum[i];
+    }
+    if (p.chunks > 1 && lane == 0) { output[dim] = maximum; output[dim + 1] = sum; }
+}
+
+static __global__ void flash_attn_v_from_k_reduce(const float * partials, float * dst, int chunks) {
+    constexpr int dim = 512;
+    constexpr int lanes = ggml_cuda_get_physical_warp_size();
+    const float * input = partials + int64_t(blockIdx.x)*chunks*(dim + 2);
+    float maximum = -INFINITY, sum = 0, accum[dim/lanes] = {};
+    for (int c = 0; c < chunks; ++c) {
+        const float * part = input + c*(dim + 2);
+        if (part[dim + 1] == 0) continue;
+        const float next_max = fmaxf(maximum, part[dim]);
+        const float alpha = expf(maximum - next_max), weight = expf(part[dim] - next_max);
+#pragma unroll
+        for (int i = 0; i < dim/lanes; ++i) accum[i] = accum[i]*alpha + part[threadIdx.x + i*lanes]*weight;
+        sum = sum*alpha + part[dim + 1]*weight;
+        maximum = next_max;
+    }
+#pragma unroll
+    for (int i = 0; i < dim/lanes; ++i) dst[int64_t(blockIdx.x)*dim + threadIdx.x + i*lanes] = sum == 0 ? 0 : accum[i]/sum;
+}
+
+static void ggml_cuda_flash_attn_v_from_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const auto * q = dst->src[0];
+    const auto * k = dst->src[1];
+    const auto * v = dst->src[2];
+    const auto * mask = dst->src[3];
+    fattn_v_from_k_layout p = {};
+    for (int i = 0; i < 4; ++i) {
+        p.nbq[i] = q->nb[i]; p.nbk[i] = k->nb[i]; p.nbv[i] = v->nb[i];
+        if (mask) p.nbm[i] = mask->nb[i];
+    }
+    p.queries = q->ne[1]; p.heads = q->ne[2]; p.kv_heads = k->ne[2]; p.tokens = k->ne[1];
+    p.mask_heads = mask ? mask->ne[2] : 1; p.mask_streams = mask ? mask->ne[3] : 1;
+    p.prefix = v->ne[0];
+    p.packed_mask = mask && mask->type == GGML_TYPE_I32;
+    p.chunks = q->ne[1] == 1 ? std::min<int64_t>(32, (p.tokens + 255)/256) : 1;
+    memcpy(&p.scale, dst->op_params, sizeof(float));
+    memcpy(&p.max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&p.softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int64_t tasks = q->ne[1]*q->ne[2]*q->ne[3];
+    ggml_cuda_pool_alloc<float> partials(ctx.pool());
+    if (p.chunks > 1) partials.alloc(tasks*p.chunks*(512 + 2));
+    flash_attn_v_from_k<<<dim3(tasks, p.chunks), WARP_SIZE, 0, ctx.stream()>>>(
+            (const char *) q->data, (const char *) k->data, (const char *) v->data, mask ? (const char *) mask->data : nullptr,
+            dst->src[4] ? (const float *) dst->src[4]->data : nullptr, (const float *) dst->src[5]->data,
+            p.chunks > 1 ? partials.get() : (float *) dst->data, p);
+    if (p.chunks > 1) flash_attn_v_from_k_reduce<<<tasks, WARP_SIZE, 0, ctx.stream()>>>(partials.get(), (float *) dst->data, p.chunks);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
@@ -837,6 +977,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (dst->src[5]) return ggml_nbytes(dst);
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -873,6 +1014,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (dst->src[5]) { ggml_cuda_flash_attn_v_from_k(ctx, dst); return; }
+#endif
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
     switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
@@ -890,5 +1034,16 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (dst->src[5]) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        return false;
+#else
+        return dst->src[0]->type == GGML_TYPE_F32 && dst->src[0]->nb[0] == sizeof(float) &&
+            dst->src[1]->type == GGML_TYPE_FP4_KV && dst->src[2]->type == GGML_TYPE_FP4_KV &&
+            dst->src[1]->ne[0] == 512 && dst->ne[0] == 512 && dst->src[2]->ne[0] < 512 &&
+            dst->src[1]->ne[3] == dst->src[0]->ne[3] && dst->src[2]->ne[3] == dst->src[0]->ne[3] &&
+            dst->src[5]->type == GGML_TYPE_F32 && ggml_is_contiguous(dst->src[5]) && ggml_nelements(dst->src[5]) == 512;
+#endif
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

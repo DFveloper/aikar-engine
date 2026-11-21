@@ -1,0 +1,76 @@
+{
+  "scope": "Additional profiling and CUDA optimization after accepted recompute cutoff build",
+  "production_args_changed": false,
+  "moe_scale_scan": {
+    "up": {
+      "before_ms": 3.19384,
+      "after_ms": 2.9704949999999997,
+      "speedup": 1.0751878053994368,
+      "elements": 5767168,
+      "bit_exact": true
+    },
+    "down": {
+      "before_ms": 4.863665,
+      "after_ms": 4.52395,
+      "speedup": 1.0750925629151515,
+      "elements": 720896,
+      "bit_exact": true
+    }
+  },
+  "concat_vector_copy": {
+    "before_ms": 0.192225,
+    "after_ms": 0.082675,
+    "speedup": 2.3250680374962203,
+    "elements": 6291456,
+    "bit_exact": true,
+    "shape_a": [
+      256,
+      512,
+      32
+    ],
+    "shape_b": [
+      256,
+      256,
+      32
+    ],
+    "dim": 1
+  },
+  "checks": {
+    "moe_backend_cases": 2,
+    "concat_backend_cases": 187,
+    "async_cuda_unit": "passed",
+    "whitespace": "passed"
+  },
+  "profiler_limitations": "kernel-profile-before exited 139 without CUDA events; unsupported driver warning. Do not use it for performance conclusions. Earlier valid trace used for kernel ranking.",
+  "previous_accepted_train_seconds": 208.394,
+  "moe_only_train_seconds": 207.744,
+  "remaining_hotspots": [
+    "FlashAttention D256/D512",
+    "Q4 routed matrix multiplication",
+    "host graph preparation and ordered CPU-gradient transfer"
+  ],
+  "target_hours": 60,
+  "required_seconds_per_window": 35.661218424962854,
+  "actual_model": {
+    "state_tensors": 24,
+    "changed": [],
+    "state_bytes_equal": true,
+    "train_seconds_before": 298.7,
+    "train_seconds_after": 204.765,
+    "speedup": 1.4587453910580421,
+    "training_losses_equal": true,
+    "validation_losses_equal": true,
+    "production_args_changed": false,
+    "required_seconds_per_window": 35.661218424962854
+  },
+  "additional_time_reduction_percent": 1.741412900563366,
+  "production": {
+    "trainer_pid": 1637626,
+    "started_utc": "2026-11-16T00:59:01.594381+00:00",
+    "args_match": true,
+    "original_script": "/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/train.sh",
+    "running_training_evaluation": true
+  },
+  "state_comparison": "Full tensor byte strings including dtype and shape",
+  "source_hashes": "kernel-final-source-hashes.json"
+}

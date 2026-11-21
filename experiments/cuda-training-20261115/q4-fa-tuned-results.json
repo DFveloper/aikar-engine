@@ -1,0 +1,54 @@
+{
+  "256": {
+    "before_ms": 6.368847499999999,
+    "after_ms": 1.2960180000000001,
+    "speedup": 4.914165929794184,
+    "bytes_equal": true,
+    "elements": 1048576,
+    "finite_elements": 1048576
+  },
+  "dense": {
+    "before_ms": 6.3717310000000005,
+    "after_ms": 5.5289405,
+    "speedup": 1.1524325501422923,
+    "bytes_equal": true,
+    "elements": 1048576,
+    "finite_elements": 1048576
+  },
+  "short": {
+    "before_ms": 1.648844,
+    "after_ms": 0.551416,
+    "speedup": 2.990199776575217,
+    "bytes_equal": true,
+    "elements": 1048576,
+    "finite_elements": 1048576
+  },
+  "masked": {
+    "before_ms": 0.45442150000000003,
+    "after_ms": 0.1022985,
+    "speedup": 4.442113031960391,
+    "bytes_equal": true,
+    "elements": 1048576,
+    "finite_elements": 0
+  },
+  "fp4": {
+    "before_ms": 10.6224955,
+    "after_ms": 10.647110000000001,
+    "speedup": 0.9976881519961753,
+    "bytes_equal": true,
+    "elements": 2097152,
+    "finite_elements": 2097152
+  },
+  "q4-up": {
+    "before_ms": 0.797085,
+    "after_ms": 0.79644,
+    "speedup": 1.0008098538496308,
+    "bytes_equal": true
+  },
+  "q4-down": {
+    "before_ms": 1.00052,
+    "after_ms": 1.0086300000000001,
+    "speedup": 0.9919593904603273,
+    "bytes_equal": true
+  }
+}

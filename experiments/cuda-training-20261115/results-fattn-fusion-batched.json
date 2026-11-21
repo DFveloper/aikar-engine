@@ -1,0 +1,19 @@
+{
+  "state_tensors": 24,
+  "changed": [
+    "qat.m.000000",
+    "qat.m.000001",
+    "qat.m.000002",
+    "qat.m.000003",
+    "qat.m.000004",
+    "qat.m.000005"
+  ],
+  "state_bytes_equal": false,
+  "train_seconds_before": 298.7,
+  "train_seconds_after": 172.66,
+  "speedup": 1.7299895748870613,
+  "training_losses_equal": true,
+  "validation_losses_equal": true,
+  "production_args_changed": false,
+  "required_seconds_per_window": 35.661218424962854
+}

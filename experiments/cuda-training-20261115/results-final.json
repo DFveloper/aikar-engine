@@ -1,0 +1,263 @@
+{
+  "target_hours": 60,
+  "train_windows": 6057,
+  "validation_windows": 73,
+  "production_args_changed": false,
+  "runs": {
+    "baseline": {
+      "train_seconds": 182.53,
+      "training_loss": 4.36751747,
+      "validation_loss": 4.4167881,
+      "exit_code": 0,
+      "wall_seconds": 304.4033013320295,
+      "kernel_trace": false,
+      "training_only_projection_hours": 307.106725
+    },
+    "final": {
+      "train_seconds": 172.011,
+      "training_loss": 4.36751747,
+      "validation_loss": 4.4167881,
+      "exit_code": 0,
+      "wall_seconds": 292.14924247202,
+      "kernel_trace": false,
+      "training_only_projection_hours": 289.4085075
+    }
+  },
+  "training_speedup": 1.061153065792304,
+  "required_seconds_per_window_without_validation_or_saves": 35.661218424962854,
+  "weights": {},
+  "state": {
+    "qat.m.000000": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000000": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000000": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000001": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000001": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000001": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000002": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000002": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000002": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000003": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000003": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000003": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000004": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000004": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000004": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000005": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000005": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000005": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000006": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000006": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000006": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.m.000007": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.r.000007": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    },
+    "qat.lr.000007": {
+      "bytes_equal": true,
+      "finite": true,
+      "relative_l2": 0.0,
+      "cosine": 1.0
+    }
+  },
+  "source_sha256": {
+    "ggml/src/ggml-cuda/acc.cu": "32a0f9d8bf4c2a933f1e67aef485ff0bbf0e31c12a289d020115469fe2693704",
+    "ggml/src/ggml-cuda/fattn-back.cu": "a2fc942e20fbeb4e1849db087660425be0a6c3649e8128228524534d76d0853f",
+    "tests/test-backend-ops.cpp": "e18f6d190f7e5b1d486f3c623643ac6fc85c40a3df6ba8932040de30199b4eda",
+    "examples/qlora_training/test-logit-distillation.cpp": "15c72d809a2b5f4fd79b4edd655d8e43b5201f9efa28ff1abb4c50d7bbf147ed"
+  },
+  "kernel_trace": false,
+  "timing_caveat": "Baseline used Nsight instrumentation, final did not; one window per run. Raw elapsed differences are not a controlled steady-state speedup.",
+  "state_tensors_compared": 24,
+  "state_all_bytes_equal": true,
+  "production_restart": {
+    "launcher_pid": 267532,
+    "cwd": "/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar",
+    "launch_command": [
+      "/bin/bash",
+      "/mnt/openwebui/AIKAR/Lumen-3.8-Pulsar/train.sh"
+    ],
+    "started_utc": "2026-11-15T13:49:40.149404+00:00",
+    "production_args_changed": false,
+    "log": "/tmp/aikar-production-restart.log",
+    "trainer_pid": 267535,
+    "command": [
+      "/home/user/aikar-engine/build/bin/llama-finetune-qlion",
+      "-m",
+      "Lumen-3.8-Pulsar-base.gguf",
+      "--train-file",
+      "logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json",
+      "--distill-cache",
+      "logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json",
+      "-dev",
+      "CUDA0,CUDA1",
+      "-sm",
+      "tensor",
+      "-ts",
+      "1,1",
+      "-ngl",
+      "999",
+      "--fit",
+      "off",
+      "-fa",
+      "on",
+      "-c",
+      "16384",
+      "-b",
+      "16384",
+      "-ub",
+      "768",
+      "--grad-accum",
+      "6",
+      "-t",
+      "18",
+      "-tb",
+      "18",
+      "-dthr",
+      "18",
+      "--optimizer",
+      "qlion2",
+      "--quant-type",
+      "q4_0,q8_0",
+      "--qat-targets",
+      "blk.11.attn_q.weight,blk.11.attn_output.weight,blk.17.attn_q.weight,blk.17.attn_output.weight,blk.23.attn_q.weight,blk.23.attn_output.weight,blk.29.attn_q.weight,blk.29.attn_output.weight",
+      "--activation-recompute",
+      "on",
+      "--qat-grad-accumulator",
+      "cpu",
+      "--epochs",
+      "1",
+      "-lr",
+      "1e-5",
+      "-lr-min",
+      "1e-6",
+      "--lr-scheduler",
+      "cosine",
+      "--warmup-steps",
+      "50",
+      "--qat-adapter-only",
+      "--qat-adapter-out",
+      "interleaved.adapter.gguf",
+      "--save-every",
+      "4",
+      "--verbose-loss"
+    ],
+    "args_match": true,
+    "first_window_observed": true,
+    "first_window_progress": "train: [        ] data=0000022/0133254 loss=4.36751747 acc=4.585979% t=00:03:40 ETA=371:08:24",
+    "first_window_rounded_seconds": 220,
+    "first_window_reported_eta_hours": 371.14
+  }
+}

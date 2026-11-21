@@ -1,0 +1,219 @@
+diff --git a/examples/qlora_training/test-logit-distillation.cpp b/examples/qlora_training/test-logit-distillation.cpp
+index e96044e90..9a144afb6 100644
+--- a/examples/qlora_training/test-logit-distillation.cpp
++++ b/examples/qlora_training/test-logit-distillation.cpp
+@@ -600,7 +600,7 @@ static ggml_backend_meta_split_state test_split_state(const ggml_tensor * tensor
+     if (std::strcmp(tensor->name, "left") == 0) axis = axes[0];
+     if (std::strcmp(tensor->name, "right") == 0) axis = axes[1];
+     if (std::strcmp(tensor->name, "q") == 0 || std::strcmp(tensor->name, "k") == 0 || std::strcmp(tensor->name, "v") == 0) axis = 2;
+-    if (std::strcmp(tensor->name, "upstream") == 0) axis = 1;
++    if (std::strcmp(tensor->name, "upstream") == 0 || std::strncmp(tensor->name, "full_context_", 13) == 0) axis = 1;
+     ggml_backend_meta_split_state state = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
+     if (axis >= 0 && axis < GGML_MAX_DIMS) {
+         state.ne[0] = tensor->ne[axis]/2;
+@@ -971,22 +971,26 @@ static std::vector<float> attention_backward(bool parallel, bool q_only = false)
+     return result;
+ }
+ 
+-static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool last_only, ggml_backend_t backend, bool q_only = false, bool host = false) {
++static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool last_only, ggml_backend_t backend, bool q_only = false, bool host = false, bool swa = false, bool prune = true, bool parallel = false) {
++    const int64_t dim = parallel ? 512 : 32;
+     llm_graph_result result(8192);
+     llama_adapter_loras loras;
+     llm_graph_params params = {};
+-    params.hparams.n_layer_all = 1;
++    params.hparams.n_layer_all = 2;
+     params.hparams.n_embd = 64;
+     params.hparams.n_head_arr[0] = 2;
+     params.hparams.n_head_kv_arr[0] = 1;
+-    params.hparams.n_embd_head_k_full = 32;
+-    params.hparams.n_embd_head_v_full = 32;
++    params.hparams.n_embd_head_k_full = dim;
++    params.hparams.n_embd_head_v_full = dim;
+     params.cparams.n_ctx = 1024;
+     params.cparams.n_ubatch = tile;
+     params.cparams.flash_attn = flash;
+     params.cparams.offload_kqv = true;
+     params.cparams.op_offload = true;
+-    params.cparams.causal_attn = true;
++    params.cparams.causal_attn = prune;
++    params.hparams.n_swa = swa ? 256 : 0;
++    params.hparams.swa_type = swa ? LLAMA_SWA_TYPE_STANDARD : LLAMA_SWA_TYPE_NONE;
++    params.hparams.is_swa_impl[0] = swa;
+     params.ubatch.n_tokens = 1024;
+     params.training = true;
+     params.full_sequence = true;
+@@ -996,11 +1000,12 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool
+     auto * ctx = result.get_ctx();
+     ggml_context_ptr data(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
+     ggml_tensor * inputs[] = {
+-        ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, 32, 2, 1024),
+-        ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, 32, 1, 1024),
+-        ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, 32, 1, 1024),
++        ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, dim, parallel ? 16 : 2, 1024),
++        ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, dim, parallel ? 2 : 1, 1024),
++        ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, dim, parallel ? 2 : 1, 1024),
+         ggml_new_tensor_2d(data.get(), flash ? GGML_TYPE_F16 : GGML_TYPE_F32, 1024, 1024),
+     };
++    for (int i = 0; i < 3; ++i) ggml_format_name(inputs[i], "full_context_%d", i);
+     ggml_backend_buffer_ptr input_buffer(ggml_backend_alloc_ctx_tensors(data.get(), backend));
+     check(input_buffer != nullptr, "full-context input allocation failed");
+     ggml_set_param(inputs[0]);
+@@ -1008,9 +1013,9 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool
+         ggml_set_param(inputs[1]);
+         ggml_set_param(inputs[2]);
+     }
+-    auto * output = builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 0);
++    auto * output = builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, 1.0f/std::sqrt(float(dim)), 0);
+     if (tile == 1024 && flash && !last_only && !q_only && !host) {
+-        builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 1);
++        builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, 1.0f/std::sqrt(float(dim)), 1);
+         std::set<const ggml_tensor *> masks;
+         int attention_nodes = 0;
+         for (int i = 0; i < ggml_graph_n_nodes(result.get_gf()); ++i) {
+@@ -1039,7 +1044,7 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool
+     auto * graph = ggml_new_graph_custom(ctx, 8192, true);
+     ggml_build_forward_expand(graph, loss);
+     ggml_set_fused_backward(ctx, true);
+-    ggml_build_backward_expand(ctx, graph, nullptr);
++    if (!parallel) ggml_build_backward_expand(ctx, graph, nullptr);
+     if (flash && q_only) {
+         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+             const auto * node = ggml_graph_node(graph, i);
+@@ -1068,7 +1073,7 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool
+         ggml_backend_tensor_set(inputs[i], values.data(), 0, values.size()*sizeof(float));
+     }
+     std::vector<float> mask(1024*1024);
+-    for (int q = 0; q < 1024; ++q) for (int k = 0; k < 1024; ++k) mask[q*1024 + k] = k > q ? -INFINITY : 0.0f;
++    for (int q = 0; q < 1024; ++q) for (int k = 0; k < 1024; ++k) mask[q*1024 + k] = k > q || (swa && q - k >= 256) ? -INFINITY : 0.0f;
+     if (flash) {
+         std::vector<ggml_fp16_t> half(mask.size());
+         ggml_fp32_to_fp16_row(mask.data(), half.data(), mask.size());
+@@ -1078,19 +1083,36 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool
+     }
+     ggml_graph_reset(graph);
+     check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "full-context backward failed");
+-    std::vector<float> gradients(4*32*1024);
++    std::vector<float> gradients(parallel ? 0 : 4*32*1024);
+     size_t offset = 0;
+-    for (int i = 0; i < (q_only ? 1 : 3); ++i) {
++    for (int i = 0; !parallel && i < (q_only ? 1 : 3); ++i) {
+         auto * grad = ggml_graph_get_grad(graph, inputs[i]);
+         check(grad != nullptr, "Q/K/V gradient is disconnected");
+         ggml_backend_tensor_get(grad, gradients.data() + offset, 0, ggml_nelements(inputs[i])*sizeof(float));
+         offset += ggml_nelements(inputs[i]);
+     }
++    const size_t gradient_count = gradients.size();
++    gradients.resize(gradient_count + ggml_nelements(output));
++    ggml_backend_tensor_get(output, gradients.data() + gradient_count, 0, ggml_nelements(output)*sizeof(float));
+     ggml_backend_sched_free(sched);
+     return gradients;
+ }
+ 
+-static void full_context_checks(ggml_backend_t backend) {
++static void full_context_checks(ggml_backend_t backend, bool parallel = false) {
++    for (bool swa : {false, true}) for (bool q_only : {false, true}) {
++        const auto reference = full_context_backward(768, true, false, backend, q_only, false, swa, false, parallel);
++        const auto pruned = full_context_backward(768, true, false, backend, q_only, false, swa, true, parallel);
++        double error = 0, norm = 0;
++        for (size_t i = 0; i < reference.size(); ++i) {
++            check(std::isfinite(pruned[i]), "pruned attention gradient is non-finite");
++            error += std::pow(double(reference[i]) - pruned[i], 2);
++            norm += double(reference[i])*reference[i];
++        }
++        const double relative = std::sqrt(error/std::max(norm, 1e-30));
++        std::printf("pruned attention: backend=%s swa=%d q_only=%d relative_l2=%.9g\n", ggml_backend_name(backend), swa, q_only, relative);
++        check(relative < 1e-5, "masked K/V pruning changed attention gradients");
++    }
++    if (parallel) return;
+     for (bool flash : {false, true}) for (bool last_only : {false, true}) {
+         const auto reference = full_context_backward(1024, flash, last_only, backend);
+         const auto host = full_context_backward(1024, flash, last_only, backend, false, true);
+@@ -1212,6 +1234,17 @@ int main(int argc, char ** argv) {
+             full_context_checks(backend.get());
+             return 0;
+         }
++        if (argc == 2 && (std::strcmp(argv[1], "--full-context-meta") == 0 || std::strcmp(argv[1], "--full-context-meta-cuda") == 0)) {
++            auto * cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
++            ggml_backend_load_all();
++            const bool cuda = std::strcmp(argv[1], "--full-context-meta-cuda") == 0;
++            ggml_backend_dev_t devices[] = {cuda ? ggml_backend_dev_by_name("CUDA0") : cpu, cuda ? ggml_backend_dev_by_name("CUDA1") : cpu};
++            check(devices[0] && devices[1], "full-context regression requires two devices");
++            int axes[] = {1, 1};
++            ggml_backend_ptr backend(ggml_backend_dev_init(ggml_backend_meta_device(devices, 2, test_split_state, axes), nullptr));
++            full_context_checks(backend.get(), true);
++            return 0;
++        }
+         llama_hparams hparams;
+         hparams.n_layer_all = 30;
+         hparams.n_layer_kv_from_start = 11;
+@@ -1277,6 +1310,7 @@ int main(int argc, char ** argv) {
+             int axes[] = {0, 0};
+             auto * paired_meta = ggml_backend_dev_init(ggml_backend_meta_device(devices, 2, test_split_state, axes), nullptr);
+             paired_forward_checks(paired_meta);
++            full_context_checks(paired_meta, true);
+             ggml_backend_free(paired_meta);
+         }
+         for (bool q_only : {false, true}) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 014c285f7..d641c5847 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -7761,7 +7761,7 @@ static void ggml_acc_or_set(
+         }
+         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
+     } else {
+-        struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
++        struct ggml_tensor * a_zero = ggml_scale(ctx, src->type == tensor->type ? src : ggml_cast(ctx, src, tensor->type), 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
+     }
+     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
+@@ -8263,9 +8263,9 @@ static void ggml_compute_backward(
+                 size_t nb2 = tensor->nb[2];
+                 size_t nb3 = tensor->nb[3];
+ 
+-                if (cgraph->grads[isrc0] && src0->type != cgraph->grads[isrc0]->type) {
+-                    // gradient is typically F32, but src0 could be other type
+-                    size_t ng = ggml_element_size(cgraph->grads[isrc0]);
++                if (src0->type != grad->type) {
++                    // Scale view strides to the gradient element size, including the first contribution.
++                    size_t ng = ggml_element_size(grad);
+                     size_t n0 = ggml_element_size(src0);
+                     GGML_ASSERT(offset % n0 == 0);
+                     GGML_ASSERT(nb1 % n0 == 0);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ed2e4d562..c73163318 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3218,14 +3218,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         for (int64_t start = 0; start < q->ne[2]; start += tile) {
+             const int64_t count = std::min<int64_t>(tile, q->ne[2] - start);
+             auto * query = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], count, q->nb[1], q->nb[2], start*q->nb[2]);
++            int64_t key_start = 0;
++            int64_t key_count = k->ne[2];
++            if (cparams.causal_attn && k->ne[2] == q->ne[2] && kq_mask->ne[0] == k->ne[2]) {
++                if (hparams.is_swa(il) && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD && hparams.n_swa > 0) {
++                    key_start = std::max<int64_t>(0, start - hparams.n_swa + 1);
++                    key_start -= key_start % tile;
++                }
++                key_count = std::min<int64_t>(k->ne[2] - key_start, GGML_PAD(start + count - key_start, tile));
++            }
++            auto * keys = ggml_view_3d(ctx0, k, k->ne[0], k->ne[1], key_count, k->nb[1], k->nb[2], key_start*k->nb[2]);
++            auto * values = ggml_view_3d(ctx0, v, v->ne[0], v->ne[1], key_count, v->nb[1], v->nb[2], key_start*v->nb[2]);
+             auto & mask = training_mask_tiles[{kq_mask, {start, count}}];
+             if (!mask) {
+                 // Reuse mask views across layers so the scheduler shares their device copies.
+-                mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], count, kq_mask->ne[2], kq_mask->ne[3],
+-                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], start*kq_mask->nb[1]);
++                mask = ggml_view_4d(ctx0, kq_mask, key_count, count, kq_mask->ne[2], kq_mask->ne[3],
++                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], start*kq_mask->nb[1] + key_start*kq_mask->nb[0]);
++                if (!ggml_is_contiguous(mask)) mask = ggml_cont(ctx0, mask);
+             }
+-            // Each query tile reads the same differentiable K/V tensors.
+-            tiles.push_back(build_attn_mha(query, k, v, nullptr, mask, sinks, v_mla, n_kv_max, kq_scale, il));
++            // Masked keys contribute zero; keep the retained K/V views differentiable.
++            tiles.push_back(build_attn_mha(query, keys, values, nullptr, mask, sinks, v_mla,
++                    std::min(n_kv_max, key_count), kq_scale, il));
+         }
+         return concat_tiles(ctx0, std::move(tiles), 1);
+     }

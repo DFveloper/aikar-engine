@@ -1,0 +1,9 @@
+{
+  "checkpoint": "production-step11.gguf",
+  "optimizer_step": 11,
+  "scheduler_step": 11,
+  "window": 66,
+  "grad_accum": 6,
+  "merged_adapter_tensors": 5,
+  "merged_adapter_tensors_byte_equal": true
+}

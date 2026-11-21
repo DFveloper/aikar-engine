@@ -1,0 +1,1816 @@
+#include "out-prod.cuh"
+#include "convert.cuh"
+#include "moe-route.cuh"
+#include "cpy.cuh"
+#include "opt-step-qlion-qat.cuh"
+#include <functional>
+#include <future>
+#include <thread>
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+static constexpr size_t OUT_PROD_WORKSPACE_MAX = 64ull*1024*1024;
+
+static __global__ void out_prod_q4_0_prepare_tile(
+        const char * src0, half * dst0, int64_t ne00,
+        const char * src1, half * dst1, int64_t ne10,
+        int64_t row_begin, int64_t n_rows, size_t nb01, size_t nb10, size_t nb11) {
+    const int64_t block_index = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t blocks = (ne00/QK4_0)*n_rows;
+    const int64_t elements = ne10*n_rows;
+    const int64_t work = block_index;
+
+    if (work < blocks) {
+        const int64_t row = work/(ne00/QK4_0);
+        const int64_t block_col = work%(ne00/QK4_0);
+        const block_q4_0 * block = (const block_q4_0 *) (src0 + (row_begin + row)*nb01) + block_col;
+        const float scale = __half2float(block->d);
+        half2 * row_dst = reinterpret_cast<half2 *>(dst0 + row*ne00 + block_col*QK4_0);
+
+#pragma unroll
+        for (int q = 0; q < QK4_0/4; ++q) {
+            const uint8_t packed0 = block->qs[2*q];
+            const uint8_t packed1 = block->qs[2*q + 1];
+            const float lo0 = scale * ((packed0 & 0x0f) - 8);
+            const float lo1 = scale * ((packed1 & 0x0f) - 8);
+            row_dst[q] = __halves2half2(__float2half(lo0), __float2half(lo1));
+            row_dst[QK4_0/4 + q] = __halves2half2(
+                __float2half(scale*((packed0 >> 4) - 8)),
+                __float2half(scale*((packed1 >> 4) - 8)));
+        }
+    }
+
+    if (work < elements) {
+        const int64_t row = work/ne10;
+        const int64_t col = work%ne10;
+        *(dst1 + row*ne10 + col) = __float2half(*(const float *) (src1 + col*nb10 + (row_begin + row)*nb11));
+    }
+}
+
+static void ggml_cuda_out_prod_q4_0_tiled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const size_t elements_per_row = ne00 + ne10;
+    const int64_t rows_per_tile = std::max<int64_t>(1, std::min<int64_t>(ne01,
+        OUT_PROD_WORKSPACE_MAX/(sizeof(half)*elements_per_row)));
+    const size_t workspace_elements = rows_per_tile*elements_per_row;
+    ggml_cuda_pool_alloc<half> workspace(ctx.pool(), workspace_elements);
+    half * src0_f16 = workspace.ptr;
+    half * src1_f16 = workspace.ptr + rows_per_tile*ne00;
+
+    cudaStream_t stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    const int64_t dps2 = ne2/ne02;
+    const int64_t dps3 = ne3/ne03;
+    const int threads = 256;
+    const float alpha = 1.0f;
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            const char * src0_batch = (const char *) src0->data + (i2/dps2)*nb02 + (i3/dps3)*nb03;
+            const char * src1_batch = (const char *) src1->data + i2*nb12 + i3*nb13;
+            float * dst_batch = (float *) ((char *) dst->data + i2*nb2 + i3*nb3);
+
+            for (int64_t row_begin = 0; row_begin < ne01; row_begin += rows_per_tile) {
+                const int64_t n_rows = std::min<int64_t>(rows_per_tile, ne01 - row_begin);
+                const int64_t n0 = (ne00/QK4_0)*n_rows;
+                const int64_t n1 = ne10*n_rows;
+                const int64_t n = std::max(n0, n1);
+                out_prod_q4_0_prepare_tile<<<(n + threads - 1)/threads, threads, 0, stream>>>(
+                    src0_batch, src0_f16, ne00, src1_batch, src1_f16, ne10,
+                    row_begin, n_rows, nb01, nb10, nb11);
+                CUDA_CHECK(cudaGetLastError());
+
+                const float tile_beta = row_begin == 0 ? beta : 1.0f;
+                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    ne00, ne10, n_rows,
+                    &alpha, src0_f16, CUDA_R_16F, ne00,
+                            src1_f16, CUDA_R_16F, ne10,
+                    &tile_beta, dst_batch, CUDA_R_32F, ne0,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+        }
+    }
+}
+
+static void ggml_cuda_out_prod_quantized_tiled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t rows_per_tile = std::min<int64_t>(ne01, OUT_PROD_WORKSPACE_MAX/sizeof(float)/ne00);
+    GGML_ASSERT(rows_per_tile > 0 && ggml_is_contiguous(src0));
+    ggml_cuda_pool_alloc<float> workspace(ctx.pool(), rows_per_tile*ne00);
+    const auto to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+    GGML_ASSERT(to_fp32);
+    const auto stream = ctx.stream();
+    const auto handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const bool transposed = ggml_is_transposed(src1);
+    const auto operation = transposed ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const int64_t ldb = (transposed ? nb10 : nb11)/sizeof(float);
+    GGML_ASSERT((transposed ? nb11 : nb10) == sizeof(float));
+    const float alpha = 1.0f;
+    const int64_t dps2 = ne2/ne02;
+    const int64_t dps3 = ne3/ne03;
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            const char * a = (const char *) src0->data + (i2/dps2)*nb02 + (i3/dps3)*nb03;
+            const char * b = (const char *) src1->data + i2*nb12 + i3*nb13;
+            float * output = (float *) ((char *) dst->data + i2*nb2 + i3*nb3);
+            for (int64_t row = 0; row < ne01; row += rows_per_tile) {
+                const int64_t count = std::min(rows_per_tile, ne01 - row);
+                to_fp32(a + row*nb01, workspace.ptr, count*ne00, stream);
+                const float tile_beta = row == 0 ? beta : 1.0f;
+                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, operation,
+                    ne00, ne10, count, &alpha, workspace.ptr, ne00,
+                    (const float *) (b + row*nb11), ldb, &tile_beta, output, nb1/sizeof(float)));
+            }
+        }
+    }
+}
+
+static __global__ void k_compute_out_prod_ptrs(
+        const float * src0_d, const float * src1_d, float * dst_d,
+        const float ** ptrs_a, const float ** ptrs_b, float ** ptrs_c,
+        const int64_t ne2, const int64_t ne3,
+        const int64_t dps2, const int64_t dps3,
+        const size_t s02, const size_t s03,
+        const size_t s12, const size_t s13,
+        const size_t s2,  const size_t s3) {
+    const int64_t i2 = blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t i3 = blockIdx.y*blockDim.y + threadIdx.y;
+
+    if (i2 >= ne2 || i3 >= ne3) {
+        return;
+    }
+
+    const int64_t idx = i3*ne2 + i2;
+
+    ptrs_a[idx] = src0_d + (i3/dps3)*s03 + (i2/dps2)*s02;
+    ptrs_b[idx] = src1_d +  i3      *s13 +  i2      *s12;
+    ptrs_c[idx] = dst_d  +  i3      *s3  +  i2      *s2;
+}
+
+void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float beta) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || ggml_is_quantized(src0->type));
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    GGML_ASSERT(ne01 == ne11);
+    GGML_ASSERT(ne0 == ne00);
+    GGML_ASSERT(ne1 == ne10);
+
+    GGML_ASSERT(ne2 % src0->ne[2] == 0);
+    GGML_ASSERT(ne3 % src0->ne[3] == 0);
+
+    GGML_ASSERT(ne2 == src1->ne[2]);
+    GGML_ASSERT(ne3 == src1->ne[3]);
+
+    cudaStream_t   stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+
+    if (src0->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_out_prod_q4_0_tiled(ctx, dst, beta);
+        return;
+    }
+
+    const int64_t max_workspace_elements = OUT_PROD_WORKSPACE_MAX/sizeof(float);
+    if (ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && ne00 > 0 &&
+            ne00 <= max_workspace_elements && ggml_nelements(src0) > max_workspace_elements) {
+        ggml_cuda_out_prod_quantized_tiled(ctx, dst, beta);
+        return;
+    }
+
+    // If src0 is quantized, dequantize to a temp F32 buffer on GPU
+    ggml_cuda_pool_alloc<float> src0_f32_alloc;
+    const float * src0_d;
+    int64_t       lda;
+
+    if (src0->type != GGML_TYPE_F32) {
+        const int64_t n_elements = ggml_nelements(src0);
+        src0_f32_alloc.alloc(ctx.pool(), n_elements);
+
+        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+        to_fp32(src0->data, src0_f32_alloc.ptr, n_elements, stream);
+
+        src0_d = src0_f32_alloc.ptr;
+        lda    = ne00; // dequantized data is contiguous: stride = ne00
+    } else {
+        src0_d = (const float *) src0->data;
+        lda    = nb01 / sizeof(float);
+    }
+
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float       *)  dst->data;
+
+    const float alpha = 1.0f;
+
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const int64_t ldc = nb1  / sizeof(float);
+
+    const bool src1_T = ggml_is_transposed(src1);
+    const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const int64_t           ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
+    GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
+
+    // data strides in dimensions 2/3 (for dequantized src0, use element-based strides)
+    const size_t s02 = (src0->type != GGML_TYPE_F32) ? (ne00 * ne01)        : (nb02 / sizeof(float));
+    const size_t s03 = (src0->type != GGML_TYPE_F32) ? (ne00 * ne01 * ne02) : (nb03 / sizeof(float));
+    const size_t s12 = nb12 / sizeof(float);
+    const size_t s13 = nb13 / sizeof(float);
+    const size_t s2  = nb2  / sizeof(float);
+    const size_t s3  = nb3  / sizeof(float);
+
+    // dps == dst per src0, used for group query attention
+    const int64_t dps2 = ne2 / ne02;
+    const int64_t dps3 = ne3 / ne03;
+
+    if (dps2 == 1 && ne2 > 1) {
+        // src0 has uniform stride s02 along dim 2; batch the inner loop with a strided GEMM
+        GGML_ASSERT(ne2 <= std::numeric_limits<int>::max());
+        const int batch_count = (int) ne2;
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            CUBLAS_CHECK(
+                cublasSgemmStridedBatched(handle, CUBLAS_OP_N, src1_cublas_op,
+                        ne0, ne1, ne01,
+                        &alpha, src0_d + (i3/dps3)*s03, lda, s02,
+                                src1_d +  i3     *s13, ldb, s12,
+                        &beta,  dst_d  +  i3     *s3,  ldc, s2,
+                        batch_count));
+        }
+    } else if (ne2 > 1 || ne3 > 1) {
+        // dps2 > 1 (src0 broadcast along dim 2 with non-uniform stride) or multiple GEMMs
+        // along dim 3: compute per-GEMM pointers on the device and use a single batched GEMM.
+        GGML_ASSERT(ne3 > 0);
+        GGML_ASSERT(ne2 <= (int64_t) std::numeric_limits<int>::max() / ne3);
+        const int batch_count = (int) (ne2 * ne3);
+
+        ggml_cuda_pool_alloc<const float *> ptrs_a(ctx.pool(), batch_count);
+        ggml_cuda_pool_alloc<const float *> ptrs_b(ctx.pool(), batch_count);
+        ggml_cuda_pool_alloc<      float *> ptrs_c(ctx.pool(), batch_count);
+
+        const dim3 block_dims(16, 16);
+        const dim3 grid_dims((ne2 + block_dims.x - 1)/block_dims.x, (ne3 + block_dims.y - 1)/block_dims.y);
+        k_compute_out_prod_ptrs<<<grid_dims, block_dims, 0, stream>>>(
+            src0_d, src1_d, dst_d,
+            ptrs_a.get(), ptrs_b.get(), ptrs_c.get(),
+            ne2, ne3, dps2, dps3, s02, s03, s12, s13, s2, s3);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUBLAS_CHECK(
+            cublasSgemmBatched(handle, CUBLAS_OP_N, src1_cublas_op,
+                    ne0, ne1, ne01,
+                    &alpha, ptrs_a.get(), lda,
+                            ptrs_b.get(), ldb,
+                    &beta,  ptrs_c.get(), ldc,
+                    batch_count));
+    } else {
+        // ne2 == 1 && ne3 == 1: single GEMM
+        CUBLAS_CHECK(
+            cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
+                    ne0, ne1, ne01,
+                    &alpha, src0_d, lda,
+                            src1_d, ldb,
+                    &beta,  dst_d,  ldc));
+    }
+}
+
+// ggml_cuda_out_prod_id
+//
+// Scattered outer-product for the MUL_MAT_ID backward pass (gradient w.r.t. expert weights).
+//
+//   src0 = a   [cols, n_expert_used, n_tokens]  F32  — token activations
+//   src1 = b   [rows, n_expert_used, n_tokens]  F32  — upstream gradient
+//   src2 = ids [n_expert_used, n_tokens]        I32  — expert dispatch indices
+//   dst        [cols, rows, n_expert, 1]         F32  — gradient w.r.t. expert weight matrices
+//
+//   dst[:, :, e] += sum_{(i,t): ids[i,t]==e} a[:, i, t] ⊗ b[:, i, t]
+//
+// Algorithm:
+//   For each expert e: gather the token columns where ids[i,t]==e into contiguous
+//   GPU buffers, then use cublasSgemm (beta=1) to accumulate the outer product.
+//   ids may be CPU-resident (common in backward graphs where they are leaf tensors).
+static __global__ void out_prod_id_gather(
+        const float * a, const float * b, float * gathered_a, float * gathered_b,
+        const int64_t * routes, int64_t count, int64_t cols, int64_t rows, int64_t tokens,
+        int64_t a_stride_exp, int64_t a_stride_tok, int64_t b_stride_exp, int64_t b_stride_tok) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count * (cols + rows)) {
+        return;
+    }
+    const int64_t slot = i / (cols + rows);
+    const int64_t col = i % (cols + rows);
+    const int64_t used = routes[slot] / tokens;
+    const int64_t token = routes[slot] % tokens;
+    if (col < cols) {
+        gathered_a[slot * cols + col] = a[used * a_stride_exp + token * a_stride_tok + col];
+    } else {
+        gathered_b[slot * rows + col - cols] = b[used * b_stride_exp + token * b_stride_tok + col - cols];
+    }
+}
+
+static void out_prod_id_each(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const std::function<float *(int64_t)> & destination,
+        const std::function<void(int64_t, float *)> & complete, bool clear) {
+    const ggml_tensor * src0 = dst->src[0]; // a   [cols, n_exp_used, n_tokens]
+    const ggml_tensor * src1 = dst->src[1]; // b   [rows, n_exp_used, n_tokens]
+    const ggml_tensor * ids  = dst->src[2]; // ids [n_exp_used, n_tokens]  i32
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int64_t cols       = src0->ne[0];
+    const int64_t n_exp_used = ids->ne[0];
+    const int64_t n_tokens   = src0->ne[2];
+    const int64_t rows       = src1->ne[0];
+    const int64_t n_expert   = dst->ne[2];
+
+    cudaStream_t   stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+
+    // Read ids to host — ids may be CPU-resident (backward graph leaf) or GPU-resident
+    const size_t ids_nbytes = ggml_nbytes(ids);
+    std::vector<char> ids_host(ids_nbytes);
+    if (ids->buffer && !ggml_backend_buffer_is_host(ids->buffer)) {
+        // GPU-resident: copy to host and synchronize so we can inspect the values
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ids_nbytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        memcpy(ids_host.data(), ids->data, ids_nbytes);
+    }
+
+    // Build per-expert token list: expert_tokens[e] = list of flat indices (iexp*n_tokens+itok)
+    // whose dispatch id equals e.
+    std::vector<std::vector<int64_t>> expert_tokens(n_expert);
+    for (int64_t itok = 0; itok < n_tokens; ++itok) {
+        for (int64_t iexp = 0; iexp < n_exp_used; ++iexp) {
+            const int32_t eid = *(const int32_t *)(ids_host.data()
+                + itok * ids->nb[1] + iexp * ids->nb[0]);
+            GGML_ASSERT(eid >= 0 && eid < (int32_t)n_expert);
+            expert_tokens[eid].push_back(iexp * n_tokens + itok);
+        }
+    }
+
+    std::vector<int64_t> routes;
+    std::vector<int64_t> offsets(n_expert + 1, 0);
+    for (int64_t e = 0; e < n_expert; ++e) {
+        routes.insert(routes.end(), expert_tokens[e].begin(), expert_tokens[e].end());
+        offsets[e + 1] = routes.size();
+    }
+    ggml_cuda_pool_alloc<int64_t> device_routes(ctx.pool());
+    if (!routes.empty()) {
+        device_routes.alloc(routes.size());
+        CUDA_CHECK(cudaMemcpyAsync(device_routes.ptr, routes.data(), routes.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    // Strides (in elements, not bytes)
+    const int64_t a_stride_exp = src0->nb[1] / sizeof(float); // cols
+    const int64_t a_stride_tok = src0->nb[2] / sizeof(float); // cols * n_exp_used
+    const int64_t b_stride_exp = src1->nb[1] / sizeof(float); // rows
+    const int64_t b_stride_tok = src1->nb[2] / sizeof(float); // rows * n_exp_used
+
+    const float alpha_one = 1.0f;
+    const float beta_acc  = 1.0f; // accumulate — dst is already zeroed above
+
+    const float * a_base = (const float *) src0->data;
+    const float * b_base = (const float *) src1->data;
+
+
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const auto & toks = expert_tokens[e];
+        float * output = destination(e);
+        if (!output) continue;
+        if (clear) CUDA_CHECK(cudaMemsetAsync(output, 0, cols*rows*sizeof(float), stream));
+        if (toks.empty()) {
+            complete(e, output);
+            continue;
+        }
+
+        const int64_t ntoks_e = (int64_t) toks.size();
+
+        // Allocate contiguous gather buffers on GPU: a_e [cols, ntoks_e], b_e [rows, ntoks_e]
+        ggml_cuda_pool_alloc<float> a_gathered(ctx.pool(), cols * ntoks_e);
+        ggml_cuda_pool_alloc<float> b_gathered(ctx.pool(), rows * ntoks_e);
+
+        GGML_ASSERT(cols > 0 && rows > 0 && cols <= INT64_MAX - rows);
+        GGML_ASSERT(ntoks_e <= INT64_MAX / (cols + rows));
+        const int64_t work = ntoks_e * (cols + rows);
+        GGML_ASSERT(work <= INT64_MAX - 255 && (work + 255) / 256 <= INT32_MAX);
+        out_prod_id_gather<<<(work + 255) / 256, 256, 0, stream>>>(
+            a_base, b_base, a_gathered.ptr, b_gathered.ptr, device_routes.ptr + offsets[e],
+            ntoks_e, cols, rows, n_tokens, src0->ne[1] == 1 ? 0 : a_stride_exp, a_stride_tok,
+            b_stride_exp, b_stride_tok);
+        CUDA_CHECK(cudaGetLastError());
+
+        // dst[:, :, e] += a_gathered @ b_gathered^T
+        // cuBLAS column-major: A=[cols, ntoks_e] lda=cols, B=[rows, ntoks_e] ldb=rows
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+            (int)cols, (int)rows, (int)ntoks_e,
+            &alpha_one, a_gathered.ptr,         (int)cols,
+                        b_gathered.ptr,         (int)rows,
+            &beta_acc, output, (int)cols));
+        complete(e, output);
+    }
+}
+
+void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    out_prod_id_each(ctx, dst, [dst](int64_t expert) {
+        return (float *) ((char *) dst->data + expert*dst->nb[2]);
+    }, [](int64_t, float *) {}, false);
+}
+
+void ggml_cuda_acc_qlion_qat_experts(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    auto * accumulator = dst->src[0];
+    auto * state_ids = dst->src[1];
+    auto * state_count = dst->src[3];
+    auto * activations = dst->src[8];
+    auto * gradient = dst->src[6];
+    auto * ids = dst->src[7];
+    const bool reset = ggml_get_op_params_i32(dst, 0) != 0;
+    if (reset) CUDA_CHECK(cudaMemsetAsync(accumulator->data, 0, ggml_nbytes(accumulator), ctx.stream()));
+    const int64_t experts = ggml_get_op_params_i32(dst, 3);
+    const int64_t cols = activations->ne[0];
+    const int64_t rows = gradient->ne[0];
+    const int64_t capacity = accumulator->ne[1];
+    int32_t count = 0;
+    std::vector<int32_t> active(capacity);
+    if (!reset) {
+        CUDA_CHECK(cudaMemcpyAsync(&count, state_count->data, sizeof(count), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(active.data(), state_ids->data, capacity*sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    }
+    GGML_ASSERT(count >= 0 && count <= capacity);
+    std::vector<char> route_data(ggml_nbytes(ids));
+    CUDA_CHECK(cudaMemcpyAsync(route_data.data(), ids->data, route_data.size(), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    for (int64_t used = 0; used < ids->ne[0]; ++used) {
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            int32_t expert;
+            memcpy(&expert, route_data.data() + used*ids->nb[0] + token*ids->nb[1], sizeof(expert));
+            GGML_ASSERT(expert >= 0 && expert < experts);
+            if (std::find(active.begin(), active.begin() + count, expert) == active.begin() + count) {
+                GGML_ASSERT(count < capacity);
+                active[count++] = expert;
+            }
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(state_ids->data, active.data(), count*sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(state_count->data, &count, sizeof(count), cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), cols*rows);
+    ggml_cuda_pool_alloc<block_q8_0> quantized(ctx.pool(), cols*rows/32);
+    ggml_tensor product = {};
+    product.type = GGML_TYPE_F32;
+    product.ne[0] = cols; product.ne[1] = rows; product.ne[2] = experts; product.ne[3] = 1;
+    product.nb[0] = sizeof(float); product.nb[1] = cols*sizeof(float);
+    product.nb[2] = cols*rows*sizeof(float); product.nb[3] = product.nb[2]*experts;
+    product.src[0] = activations; product.src[1] = gradient; product.src[2] = ids;
+    out_prod_id_each(ctx, &product, [&](int64_t expert) -> float * {
+        return std::find(active.begin(), active.begin() + count, expert) == active.begin() + count ? nullptr : scratch.ptr;
+    }, [&](int64_t expert, float * data) {
+        const auto slot = std::find(active.begin(), active.begin() + count, expert) - active.begin();
+        ggml_tensor f32 = product;
+        f32.ne[2] = 1; f32.nb[3] = f32.nb[2]; f32.data = data;
+        ggml_tensor q8 = f32;
+        q8.type = GGML_TYPE_Q8_0; q8.data = quantized.ptr;
+        q8.nb[0] = sizeof(block_q8_0); q8.nb[1] = ggml_row_size(GGML_TYPE_Q8_0, cols);
+        q8.nb[2] = rows*q8.nb[1]; q8.nb[3] = q8.nb[2];
+        ggml_cuda_cpy(ctx, &f32, &q8);
+        ggml_tensor target = *accumulator;
+        target.ne[1] = 1; target.nb[2] = target.nb[1]; target.nb[3] = target.nb[2];
+        target.data = (char *) accumulator->data + slot*accumulator->nb[1];
+        ggml_tensor add = target;
+        add.src[0] = &target; add.src[1] = &q8;
+        ggml_set_op_params_i32(&add, 0, reset);
+        ggml_cuda_acc_qlion_qat(ctx, &add);
+    }, true);
+}
+
+static __device__ __forceinline__ float q4_0_get(const block_q4_0 & block, int lane) {
+    const uint8_t packed = block.qs[lane & 15];
+    const int q = lane < 16 ? packed & 0x0f : packed >> 4;
+    return __half2float(block.d) * (q - 8);
+}
+
+static __device__ __forceinline__ float mxfp4_get(const block_mxfp4 & block, int lane) {
+    const uint8_t packed = block.qs[lane & 15];
+    const int q = lane < 16 ? packed & 0x0f : packed >> 4;
+    return ggml_cuda_e8m0_to_fp32(block.e) * 0.5f * kvalues_mxfp4[q];
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <mma.h>
+
+static constexpr int MUL_MAT_ID_BACK_FUSED_M = 128;
+static constexpr int MUL_MAT_ID_BACK_FUSED_N = 32;
+static constexpr int MUL_MAT_ID_BACK_FUSED_K = 64;
+static constexpr int MUL_MAT_ID_BACK_FUSED_WARPS = 8;
+static constexpr int MUL_MAT_ID_BACK_SCALE_WARPS = 4;
+
+// Normalize each operand by a power of two before the FP16 tile conversion.
+static __device__ __forceinline__ int mul_mat_id_back_scale_exp(float maximum) {
+    return maximum > 0.0f && isfinite(maximum) ? max(-126, min(126, 10 - ilogbf(maximum))) : 0;
+}
+
+static __global__ void mul_mat_id_back_q4_0_fused(
+        const block_q4_0 * weight, const float * grad, const int32_t * routes,
+        const int32_t * expert_offsets, const int32_t * experts, const int32_t * offsets, const int32_t * exponents,
+        float * dst, int64_t cols, int64_t rows, int64_t n_used,
+        int64_t grad_s0, int64_t grad_s1, int64_t grad_s2) {
+#ifdef VOLTA_MMA_AVAILABLE
+    namespace wmma = nvcuda::wmma;
+    const int expert = experts[blockIdx.y];
+    if (expert < 0) return;
+    constexpr int tile_m = MUL_MAT_ID_BACK_FUSED_M;
+    constexpr int tile_n = MUL_MAT_ID_BACK_FUSED_N;
+    constexpr int tile_k = MUL_MAT_ID_BACK_FUSED_K;
+    constexpr int warps = MUL_MAT_ID_BACK_FUSED_WARPS;
+    const int tid = threadIdx.x;
+    const int warp = tid/WARP_SIZE;
+    const int lane = tid%WARP_SIZE;
+    const int64_t col_begin = int64_t(blockIdx.x)*tile_m;
+    const int64_t blocks_row = cols/QK4_0;
+    const int begin = offsets[blockIdx.y];
+    const int end = expert_offsets[expert + 1];
+    __shared__ int selected[tile_n];
+    __shared__ int grad_exp[tile_n];
+    __shared__ float grad_scale[tile_n];
+    __shared__ int weight_exp;
+    __shared__ float weight_scale;
+    // The MMA input tiles and output fragments use this storage at different times.
+    constexpr int input_bytes = (tile_m + tile_n)*tile_k*sizeof(half);
+    constexpr int output_bytes = tile_m*tile_n*sizeof(float);
+    constexpr int workspace_bytes = input_bytes > output_bytes ? input_bytes : output_bytes;
+    __shared__ __align__(32) unsigned char workspace[workspace_bytes];
+    half * a = reinterpret_cast<half *>(workspace);
+    half * b = a + tile_m*tile_k;
+    float * c = reinterpret_cast<float *>(workspace);
+    if (tid < tile_n) {
+        selected[tid] = begin + tid < end ? routes[begin + tid] : -1;
+        grad_exp[tid] = selected[tid] >= 0 ? exponents[selected[tid]] : INT_MIN;
+        grad_scale[tid] = grad_exp[tid] == INT_MIN ? 0.0f : ldexpf(1.0f, grad_exp[tid]);
+    }
+    const bool nonzero = tid < tile_n && grad_exp[tid] != INT_MIN;
+    if (!__syncthreads_or(nonzero)) {
+        for (int i = tid; i < tile_m*tile_n; i += warps*WARP_SIZE) {
+            const int route = selected[i/tile_m];
+            if (route >= 0 && col_begin + i%tile_m < cols) dst[col_begin + i%tile_m + cols*int64_t(route)] = 0.0f;
+        }
+        return;
+    }
+
+    __shared__ float weight_maximum[warps];
+    float maximum = 0.0f;
+    for (int64_t i = tid; i < rows*(tile_m/QK4_0); i += warps*WARP_SIZE) {
+        const int64_t row = i/(tile_m/QK4_0);
+        const int block_m = i%(tile_m/QK4_0);
+        if (col_begin + block_m*QK4_0 < cols) {
+            const auto & block = weight[(int64_t(expert)*rows + row)*blocks_row + col_begin/QK4_0 + block_m];
+            maximum = fmaxf(maximum, 8.0f*fabsf(__half2float(block.d)));
+        }
+    }
+    maximum = warp_reduce_max(maximum);
+    if (lane == 0) weight_maximum[warp] = maximum;
+    __syncthreads();
+    if (warp == 0) {
+        maximum = warp_reduce_max(lane < warps ? weight_maximum[lane] : 0.0f);
+        if (lane == 0) {
+            weight_exp = mul_mat_id_back_scale_exp(maximum);
+            weight_scale = ldexpf(1.0f, weight_exp);
+        }
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[tile_n/16];
+    #pragma unroll
+    for (int j = 0; j < tile_n/16; ++j) wmma::fill_fragment(acc[j], 0.0f);
+    const int m = warp*16;
+    const int n = 0;
+    for (int64_t row_begin = 0; row_begin < rows; row_begin += tile_k) {
+        for (int i = tid; i < tile_m*tile_k; i += warps*WARP_SIZE) {
+            const int col = i%tile_m;
+            const int64_t row = row_begin + i/tile_m;
+            float value = 0.0f;
+            if (row < rows && col_begin + col < cols) {
+                const auto & block = weight[(int64_t(expert)*rows + row)*blocks_row + (col_begin + col)/QK4_0];
+                const int quant_col = col%QK4_0;
+                const int packed = block.qs[quant_col%16];
+                const int quant = (quant_col < 16 ? packed & 15 : packed >> 4) - 8;
+                value = __half2float(block.d)*quant*weight_scale;
+            }
+            a[i] = __float2half(value);
+        }
+        for (int i = tid; i < tile_k*tile_n; i += warps*WARP_SIZE) {
+            const int slot = i/tile_k;
+            const int64_t row = row_begin + i%tile_k;
+            const int route = selected[slot];
+            float value = 0.0f;
+            if (route >= 0 && row < rows) {
+                value = grad[row*grad_s0 + (route%n_used)*grad_s1 + (route/n_used)*grad_s2]*grad_scale[slot];
+            }
+            b[i] = __float2half(value);
+        }
+        __syncthreads();
+        for (int k = 0; k < tile_k; k += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> af;
+            wmma::load_matrix_sync(af, a + m + k*tile_m, tile_m);
+            #pragma unroll
+            for (int j = 0; j < tile_n/16; ++j) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+                wmma::load_matrix_sync(bf, b + k + (n + 16*j)*tile_k, tile_k);
+                wmma::mma_sync(acc[j], af, bf, acc[j]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int j = 0; j < tile_n/16; ++j) {
+        wmma::store_matrix_sync(c + m + (n + 16*j)*tile_m, acc[j], tile_m, wmma::mem_col_major);
+    }
+    __syncthreads();
+    for (int i = tid; i < tile_m*tile_n; i += warps*WARP_SIZE) {
+        const int slot = i/tile_m;
+        const int route = selected[slot];
+        if (route >= 0 && col_begin + i%tile_m < cols) {
+            dst[col_begin + i%tile_m + cols*int64_t(route)] = grad_exp[slot] == INT_MIN ? 0.0f : ldexpf(c[i], -weight_exp - grad_exp[slot]);
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+#endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void mul_mat_id_back_count_scale(
+        const float * grad, const int32_t * ids, int32_t * counts, int32_t * exponents,
+        int64_t rows, int64_t n_expert, int64_t n_used, int64_t total_routes,
+        int64_t grad_s0, int64_t grad_s1, int64_t grad_s2, int64_t ids_s0, int64_t ids_s1) {
+    const int warp = threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x%WARP_SIZE;
+    const int64_t route = int64_t(blockIdx.x)*MUL_MAT_ID_BACK_SCALE_WARPS + warp;
+    if (route >= total_routes) return;
+    const int used = route%n_used;
+    const int token = route/n_used;
+    const int expert = ids[used*ids_s0 + token*ids_s1];
+    if (lane == 0 && expert >= 0 && expert < n_expert) atomicAdd(counts + expert, 1);
+    float maximum = 0.0f;
+    for (int64_t row = lane; row < rows; row += WARP_SIZE) {
+        const float value = grad[row*grad_s0 + used*grad_s1 + token*grad_s2];
+        maximum = fmaxf(maximum, isnan(value) ? INFINITY : fabsf(value));
+    }
+    maximum = warp_reduce_max(maximum);
+    if (lane == 0) exponents[route] = maximum == 0.0f ? INT_MIN : mul_mat_id_back_scale_exp(maximum);
+}
+
+static __global__ void mul_mat_id_back_prefix_tiles(
+        const int32_t * counts, int32_t * expert_offsets, int32_t * experts, int32_t * offsets,
+        int64_t n_expert, int64_t n_tiles, int64_t cap) {
+    // sum(ceil(routes_per_expert/cap)) <= n_expert + ceil(total_routes/cap).
+    int32_t sum = 0;
+    int64_t tile = 0;
+    expert_offsets[0] = 0;
+    for (int64_t expert = 0; expert < n_expert; ++expert) {
+        const int32_t end = sum + counts[expert];
+        expert_offsets[expert + 1] = end;
+        for (int64_t begin = sum; begin < end; begin += cap) {
+            experts[tile] = expert;
+            offsets[tile++] = begin;
+        }
+        sum = end;
+    }
+    for (; tile < n_tiles; ++tile) {
+        experts[tile] = -1;
+        offsets[tile] = 0;
+    }
+}
+#endif
+
+static constexpr int MUL_MAT_ID_BACK_CAP =
+    256;
+
+static constexpr int MUL_MAT_ID_BACK_BATCH =
+    8;
+
+static constexpr int MUL_MAT_ID_BACK_WARPS =
+    4;
+
+
+// ============================================================
+// Dequantize a batch of experts.
+//
+// Each warp handles one quant block = 32 columns.
+// ============================================================
+
+template<ggml_type weight_type>
+static __global__ void mul_mat_id_back_dequant_batch(
+        const void * __restrict__ weight_data,
+        float * __restrict__ weight_f32,
+        int64_t cols,
+        int64_t rows,
+        int64_t n_blocks_row,
+        int64_t expert_base,
+        int64_t batch_count) {
+
+    const int warp =
+        threadIdx.x >> 5;
+
+    const int lane =
+        threadIdx.x & 31;
+
+    const int64_t task =
+        (int64_t) blockIdx.x *
+            MUL_MAT_ID_BACK_WARPS +
+        warp;
+
+    const int64_t n_blocks_expert =
+        n_blocks_row * rows;
+
+    const int64_t total_tasks =
+        batch_count *
+        n_blocks_expert;
+
+    if (task >= total_tasks) {
+        return;
+    }
+
+    const int64_t batch_expert =
+        task / n_blocks_expert;
+
+    const int64_t local =
+        task -
+        batch_expert *
+            n_blocks_expert;
+
+    const int64_t block =
+        local % n_blocks_row;
+
+    const int64_t row =
+        local / n_blocks_row;
+
+    const int64_t expert =
+        expert_base +
+        batch_expert;
+
+    const int64_t global_ib =
+        block +
+        n_blocks_row *
+            (
+                row +
+                rows * expert
+            );
+
+    float value;
+    if constexpr (weight_type == GGML_TYPE_MXFP4) {
+        value = mxfp4_get(((const block_mxfp4 *) weight_data)[global_ib], lane);
+    } else if constexpr (weight_type == GGML_TYPE_Q4_1) {
+        const block_q4_1 & block = ((const block_q4_1 *) weight_data)[global_ib];
+        const int quant = lane < 16 ? block.qs[lane] & 15 : block.qs[lane - 16] >> 4;
+        const float2 scale = __half22float2(block.dm);
+        value = scale.x*quant + scale.y;
+    } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
+        const block_q8_0 & block = ((const block_q8_0 *) weight_data)[global_ib];
+        value = __half2float(block.d) * block.qs[lane];
+    } else {
+        value = q4_0_get(((const block_q4_0 *) weight_data)[global_ib], lane);
+    }
+
+    const int64_t col =
+        block * 32 +
+        lane;
+
+    weight_f32[
+        batch_expert *
+            cols * rows +
+        col +
+        cols * row
+    ] = value;
+}
+
+
+// ============================================================
+// Gather routed gradient columns.
+//
+// G_e = [rows, CAP]
+// ============================================================
+
+static __global__ void mul_mat_id_back_gather_grad(
+        const float * __restrict__ grad,
+        const int32_t * __restrict__ expert_offsets,
+        const int32_t * __restrict__ routes,
+        float * __restrict__ grad_gathered,
+        int64_t rows,
+        int64_t n_used,
+        int64_t grad_s0,
+        int64_t grad_s1,
+        int64_t grad_s2,
+        int64_t expert_base,
+        int64_t batch_count,
+        int64_t cap) {
+
+    const int64_t pair =
+        blockIdx.x;
+
+    const int64_t batch_expert =
+        pair / cap;
+
+    const int64_t slot =
+        pair % cap;
+
+    if (batch_expert >=
+        batch_count) {
+        return;
+    }
+
+    const int64_t expert =
+        expert_base +
+        batch_expert;
+
+    __shared__ int32_t s_valid;
+    __shared__ int32_t s_used;
+    __shared__ int32_t s_token;
+
+    if (threadIdx.x == 0) {
+
+        const int32_t begin =
+            expert_offsets[expert];
+
+        const int32_t end =
+            expert_offsets[expert + 1];
+
+        const int64_t route_pos =
+            (int64_t) begin +
+            slot;
+
+        if (route_pos < end) {
+
+            const int32_t route =
+                routes[route_pos];
+
+            s_valid =
+                1;
+
+            s_used =
+                route % n_used;
+
+            s_token =
+                route / n_used;
+
+        } else {
+
+            s_valid =
+                0;
+
+            s_used =
+                0;
+
+            s_token =
+                0;
+        }
+    }
+
+    __syncthreads();
+
+    for (int64_t row =
+             threadIdx.x;
+         row < rows;
+         row += blockDim.x) {
+
+        float value =
+            0.0f;
+
+        if (s_valid) {
+            value =
+                grad[
+                    row      * grad_s0 +
+                    s_used   * grad_s1 +
+                    s_token  * grad_s2
+                ];
+        }
+
+        grad_gathered[
+            batch_expert *
+                rows * cap +
+            row +
+            rows * slot
+        ] = value;
+    }
+}
+
+
+// ============================================================
+// Scatter GEMM output back into dst route layout.
+//
+// C_e = [cols, CAP]
+// dst = [cols, n_used, n_tokens]
+// ============================================================
+
+static __global__ void mul_mat_id_back_scatter(
+        const float * __restrict__ gemm_out,
+        const int32_t * __restrict__ expert_offsets,
+        const int32_t * __restrict__ routes,
+        float * __restrict__ dst,
+        int64_t cols,
+        int64_t expert_base,
+        int64_t batch_count,
+        int64_t cap) {
+
+    const int64_t pair =
+        blockIdx.x;
+
+    const int64_t batch_expert =
+        pair / cap;
+
+    const int64_t slot =
+        pair % cap;
+
+    if (batch_expert >=
+        batch_count) {
+        return;
+    }
+
+    const int64_t expert =
+        expert_base +
+        batch_expert;
+
+    __shared__ int32_t s_route;
+    __shared__ int32_t s_valid;
+
+    if (threadIdx.x == 0) {
+
+        const int32_t begin =
+            expert_offsets[expert];
+
+        const int32_t end =
+            expert_offsets[expert + 1];
+
+        const int64_t route_pos =
+            (int64_t) begin +
+            slot;
+
+        if (route_pos < end) {
+            s_valid =
+                1;
+
+            s_route =
+                routes[route_pos];
+
+        } else {
+            s_valid =
+                0;
+
+            s_route =
+                0;
+        }
+    }
+
+    __syncthreads();
+
+    if (!s_valid) {
+        return;
+    }
+
+    for (int64_t col =
+             threadIdx.x;
+         col < cols;
+         col += blockDim.x) {
+
+        dst[
+            col +
+            cols *
+                (int64_t) s_route
+        ] =
+            gemm_out[
+                batch_expert *
+                    cols * cap +
+                col +
+                cols * slot
+            ];
+    }
+}
+
+
+// ============================================================
+// Exact overflow fallback.
+//
+// Only routes whose local rank >= CAP do the expensive row loop.
+// All normal routes return immediately.
+// ============================================================
+
+template<ggml_type weight_type>
+static __global__ void mul_mat_id_back_overflow(
+        const void * __restrict__ weight_data,
+        const float * __restrict__ grad,
+        const int32_t * __restrict__ ids,
+        const int32_t * __restrict__ route_rank,
+        float * __restrict__ dst,
+        int64_t n_blocks,
+        int64_t n_rows,
+        int64_t n_expert,
+        int64_t n_used,
+        int64_t n_tokens,
+        int64_t grad_s0,
+        int64_t grad_s1,
+        int64_t grad_s2,
+        int64_t ids_s0,
+        int64_t ids_s1,
+        int64_t cap) {
+
+    const int warp =
+        threadIdx.x >> 5;
+
+    const int lane =
+        threadIdx.x & 31;
+
+    const int64_t task =
+        (int64_t) blockIdx.x *
+            MUL_MAT_ID_BACK_WARPS +
+        warp;
+
+    const int64_t total_routes =
+        n_used * n_tokens;
+
+    const int64_t total_tasks =
+        n_blocks *
+        total_routes;
+
+    if (task >= total_tasks) {
+        return;
+    }
+
+    const int64_t block =
+        task % n_blocks;
+
+    const int64_t route =
+        task / n_blocks;
+
+    //
+    // Common case: handled by GEMM.
+    //
+    if (route_rank[route] < cap) {
+        return;
+    }
+
+    const int64_t used =
+        route % n_used;
+
+    const int64_t token =
+        route / n_used;
+
+    const int32_t expert =
+        ids[
+            used  * ids_s0 +
+            token * ids_s1
+        ];
+
+    if (expert < 0 ||
+        expert >= n_expert) {
+        return;
+    }
+
+    float sum =
+        0.0f;
+
+    for (int64_t row = 0;
+         row < n_rows;
+         ++row) {
+
+        const int64_t ib =
+            block +
+            n_blocks *
+                (
+                    row +
+                    n_rows *
+                        expert
+                );
+
+        float value;
+        if constexpr (weight_type == GGML_TYPE_MXFP4) {
+            value = mxfp4_get(((const block_mxfp4 *) weight_data)[ib], lane);
+        } else if constexpr (weight_type == GGML_TYPE_Q4_1) {
+            const block_q4_1 & block = ((const block_q4_1 *) weight_data)[ib];
+            const int quant = lane < 16 ? block.qs[lane] & 15 : block.qs[lane - 16] >> 4;
+            const float2 scale = __half22float2(block.dm);
+            value = scale.x*quant + scale.y;
+        } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
+            const block_q8_0 & block = ((const block_q8_0 *) weight_data)[ib];
+            value = __half2float(block.d) * block.qs[lane];
+        } else {
+            value = q4_0_get(((const block_q4_0 *) weight_data)[ib], lane);
+        }
+
+        sum =
+            fmaf(
+                value,
+                grad[
+                    row   * grad_s0 +
+                    used  * grad_s1 +
+                    token * grad_s2
+                ],
+                sum
+            );
+    }
+
+    dst[
+        block * 32 +
+        lane +
+        n_blocks * 32 *
+            route
+    ] = sum;
+}
+
+
+// ============================================================
+// Batched W @ G
+// ============================================================
+
+static inline void mul_mat_id_back_gemm_batched(
+        cublasHandle_t handle,
+        int cols,
+        int cap,
+        int rows,
+        const float * weight,
+        const float * grad,
+        float * dst,
+        int batch_count) {
+
+    const float alpha =
+        1.0f;
+
+    const float beta =
+        0.0f;
+
+    CUBLAS_CHECK(
+        cublasSgemmStridedBatched(
+            handle,
+
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+
+            cols,
+            cap,
+            rows,
+
+            &alpha,
+
+            weight,
+            cols,
+            (long long) cols *
+                rows,
+
+            grad,
+            rows,
+            (long long) rows *
+                cap,
+
+            &beta,
+
+            dst,
+            cols,
+            (long long) cols *
+                cap,
+
+            batch_count
+        )
+    );
+}
+
+
+// ============================================================
+// New grouped MUL_MAT_ID_BACK launcher
+// ============================================================
+
+void ggml_cuda_mul_mat_id_back(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * weight =
+        dst->src[0];
+
+    const ggml_tensor * grad =
+        dst->src[1];
+
+    const ggml_tensor * ids =
+        dst->src[2];
+
+    GGML_ASSERT(
+        weight->type ==
+            GGML_TYPE_MXFP4 ||
+        weight->type ==
+            GGML_TYPE_Q4_0 ||
+        weight->type == GGML_TYPE_Q4_1 ||
+        weight->type == GGML_TYPE_Q8_0
+    );
+
+    GGML_ASSERT(
+        grad->type ==
+            GGML_TYPE_F32 &&
+        ids->type ==
+            GGML_TYPE_I32 &&
+        dst->type ==
+            GGML_TYPE_F32
+    );
+
+    GGML_ASSERT(
+        ggml_is_contiguous(weight) &&
+        ggml_is_contiguous(dst)
+    );
+
+    GGML_ASSERT(
+        grad->nb[0] %
+            sizeof(float) == 0
+    );
+
+    GGML_ASSERT(
+        grad->nb[1] %
+            sizeof(float) == 0
+    );
+
+    GGML_ASSERT(
+        grad->nb[2] %
+            sizeof(float) == 0
+    );
+
+    GGML_ASSERT(
+        ids->nb[0] %
+            sizeof(int32_t) == 0
+    );
+
+    GGML_ASSERT(
+        ids->nb[1] %
+            sizeof(int32_t) == 0
+    );
+
+    const int64_t cols =
+        weight->ne[0];
+
+    const int64_t rows =
+        weight->ne[1];
+
+    const int64_t n_expert =
+        weight->ne[2];
+
+    const int64_t n_used =
+        grad->ne[1];
+
+    const int64_t n_tokens =
+        grad->ne[2];
+
+    const int64_t total_routes =
+        n_used *
+        n_tokens;
+
+    const int64_t n_blocks_row =
+        cols / 32;
+
+    GGML_ASSERT(
+        cols % 32 == 0
+    );
+
+    GGML_ASSERT(
+        dst->ne[0] ==
+            cols
+    );
+
+    GGML_ASSERT(
+        dst->ne[1] ==
+            n_used
+    );
+
+    GGML_ASSERT(
+        dst->ne[2] ==
+            n_tokens
+    );
+
+    const int64_t grad_s0 =
+        grad->nb[0] /
+        sizeof(float);
+
+    const int64_t grad_s1 =
+        grad->nb[1] /
+        sizeof(float);
+
+    const int64_t grad_s2 =
+        grad->nb[2] /
+        sizeof(float);
+
+    const int64_t ids_s0 =
+        ids->nb[0] /
+        sizeof(int32_t);
+
+    const int64_t ids_s1 =
+        ids->nb[1] /
+        sizeof(int32_t);
+
+    cudaStream_t stream =
+        ctx.stream();
+
+    cublasHandle_t handle =
+        ctx.cublas_handle();
+
+    CUBLAS_CHECK(
+        cublasSetStream(
+            handle,
+            stream
+        )
+    );
+
+    //
+    // Route metadata.
+    //
+    ggml_cuda_pool_alloc<int32_t>
+        expert_offsets(
+            ctx.pool(),
+            n_expert + 1
+        );
+
+    ggml_cuda_pool_alloc<int32_t>
+        cursor(
+            ctx.pool(),
+            n_expert
+        );
+
+    ggml_cuda_pool_alloc<int32_t>
+        routes(
+            ctx.pool(),
+            total_routes
+        );
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool disable_fusion = std::getenv("GGML_CUDA_DISABLE_FUSION") &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_FUSION"));
+    constexpr int64_t tile_n = MUL_MAT_ID_BACK_FUSED_N;
+    const int64_t n_tiles = n_expert + (total_routes + tile_n - 1)/tile_n;
+    if (!disable_fusion && weight->type == GGML_TYPE_Q4_0 && n_tokens >= 128 && n_expert >= 16 &&
+            ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA && n_tiles <= 65535) {
+        ggml_cuda_pool_alloc<int32_t> experts(ctx.pool(), n_tiles);
+        ggml_cuda_pool_alloc<int32_t> offsets(ctx.pool(), n_tiles);
+        ggml_cuda_pool_alloc<int32_t> exponents(ctx.pool(), total_routes);
+        CUDA_CHECK(cudaMemsetAsync(cursor.ptr, 0, n_expert*sizeof(int32_t), stream));
+        mul_mat_id_back_count_scale<<<(total_routes + MUL_MAT_ID_BACK_SCALE_WARPS - 1)/MUL_MAT_ID_BACK_SCALE_WARPS, MUL_MAT_ID_BACK_SCALE_WARPS*WARP_SIZE, 0, stream>>>(
+                static_cast<const float *>(grad->data), static_cast<const int32_t *>(ids->data),
+                cursor.ptr, exponents.ptr, rows, n_expert, n_used, total_routes,
+                grad_s0, grad_s1, grad_s2, ids_s0, ids_s1);
+        CUDA_CHECK(cudaGetLastError());
+        mul_mat_id_back_prefix_tiles<<<1, 1, 0, stream>>>(
+                cursor.ptr, expert_offsets.ptr, experts.ptr, offsets.ptr, n_expert, n_tiles, tile_n);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_moe_route_scatter<<<n_expert, ggml_cuda_moe_route_threads, 0, stream>>>(
+                static_cast<const int32_t *>(ids->data), expert_offsets.ptr, routes.ptr, nullptr,
+                total_routes, n_used, ids_s0, ids_s1);
+        CUDA_CHECK(cudaGetLastError());
+        mul_mat_id_back_q4_0_fused<<<dim3((cols + MUL_MAT_ID_BACK_FUSED_M - 1)/MUL_MAT_ID_BACK_FUSED_M, n_tiles), MUL_MAT_ID_BACK_FUSED_WARPS*WARP_SIZE, 0, stream>>>(
+                static_cast<const block_q4_0 *>(weight->data), static_cast<const float *>(grad->data),
+                routes.ptr, expert_offsets.ptr, experts.ptr, offsets.ptr, exponents.ptr,
+                static_cast<float *>(dst->data), cols, rows, n_used, grad_s0, grad_s1, grad_s2);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
+
+    ggml_cuda_pool_alloc<int32_t>
+        route_rank(
+            ctx.pool(),
+            total_routes
+        );
+
+    ggml_cuda_moe_build_routes(
+        stream,
+
+        (const int32_t *)
+            ids->data,
+
+        expert_offsets.ptr,
+        cursor.ptr,
+        routes.ptr,
+        route_rank.ptr,
+
+        n_expert,
+        n_used,
+        n_tokens,
+
+        ids_s0,
+        ids_s1
+    );
+
+    // An expert has at most one route per token. Duplicate routes use the overflow path.
+    const int64_t cap = std::min<int64_t>(MUL_MAT_ID_BACK_CAP, std::max<int64_t>(32, n_tokens));
+
+    constexpr int64_t expert_batch =
+        MUL_MAT_ID_BACK_BATCH;
+
+    //
+    // ~138 MiB for 2816x1408,
+    // batch=8, cap=128.
+    //
+    ggml_cuda_pool_alloc<float>
+        weight_f32(
+            ctx.pool(),
+            expert_batch *
+                cols * rows
+        );
+
+    ggml_cuda_pool_alloc<float>
+        grad_gathered(
+            ctx.pool(),
+            expert_batch *
+                rows * cap
+        );
+
+    ggml_cuda_pool_alloc<float>
+        gemm_out(
+            ctx.pool(),
+            expert_batch *
+                cols * cap
+        );
+
+    constexpr int dequant_threads =
+        MUL_MAT_ID_BACK_WARPS *
+        32;
+
+    constexpr int gather_threads =
+        256;
+
+    for (int64_t expert_base = 0;
+         expert_base < n_expert;
+         expert_base += expert_batch) {
+
+        const int batch_count =
+            (int) std::min<int64_t>(
+                expert_batch,
+                n_expert -
+                    expert_base
+            );
+
+        //
+        // 1. Dequantize W_e.
+        //
+        const int64_t dequant_tasks =
+            (int64_t) batch_count *
+            n_blocks_row *
+            rows;
+
+        const int64_t dequant_blocks =
+            (
+                dequant_tasks +
+                MUL_MAT_ID_BACK_WARPS -
+                1
+            ) /
+            MUL_MAT_ID_BACK_WARPS;
+
+        if (weight->type ==
+            GGML_TYPE_MXFP4) {
+
+            mul_mat_id_back_dequant_batch<GGML_TYPE_MXFP4>
+                <<<dequant_blocks,
+                   dequant_threads,
+                   0,
+                   stream>>>(
+                    weight->data,
+                    weight_f32.ptr,
+                    cols,
+                    rows,
+                    n_blocks_row,
+                    expert_base,
+                    batch_count
+                );
+
+        } else if (weight->type == GGML_TYPE_Q4_1) {
+            mul_mat_id_back_dequant_batch<GGML_TYPE_Q4_1>
+                <<<dequant_blocks, dequant_threads, 0, stream>>>(
+                    weight->data, weight_f32.ptr, cols, rows, n_blocks_row, expert_base, batch_count);
+        } else if (weight->type == GGML_TYPE_Q8_0) {
+            mul_mat_id_back_dequant_batch<GGML_TYPE_Q8_0>
+                <<<dequant_blocks, dequant_threads, 0, stream>>>(
+                    weight->data, weight_f32.ptr, cols, rows, n_blocks_row, expert_base, batch_count);
+        } else {
+
+            mul_mat_id_back_dequant_batch<GGML_TYPE_Q4_0>
+                <<<dequant_blocks,
+                   dequant_threads,
+                   0,
+                   stream>>>(
+                    weight->data,
+                    weight_f32.ptr,
+                    cols,
+                    rows,
+                    n_blocks_row,
+                    expert_base,
+                    batch_count
+                );
+        }
+
+        CUDA_CHECK(
+            cudaGetLastError()
+        );
+
+        //
+        // 2. Gather G_e.
+        //
+        mul_mat_id_back_gather_grad
+            <<<batch_count * cap,
+               gather_threads,
+               0,
+               stream>>>(
+                (const float *)
+                    grad->data,
+
+                expert_offsets.ptr,
+                routes.ptr,
+
+                grad_gathered.ptr,
+
+                rows,
+                n_used,
+
+                grad_s0,
+                grad_s1,
+                grad_s2,
+
+                expert_base,
+                batch_count,
+                cap
+            );
+
+        CUDA_CHECK(
+            cudaGetLastError()
+        );
+
+        //
+        // 3. W_e @ G_e.
+        //
+        mul_mat_id_back_gemm_batched(
+            handle,
+
+            (int) cols,
+            (int) cap,
+            (int) rows,
+
+            weight_f32.ptr,
+            grad_gathered.ptr,
+            gemm_out.ptr,
+
+            batch_count
+        );
+
+        //
+        // 4. Scatter back to routes.
+        //
+        mul_mat_id_back_scatter
+            <<<batch_count * cap,
+               gather_threads,
+               0,
+               stream>>>(
+                gemm_out.ptr,
+
+                expert_offsets.ptr,
+                routes.ptr,
+
+                (float *)
+                    dst->data,
+
+                cols,
+
+                expert_base,
+                batch_count,
+                cap
+            );
+
+        CUDA_CHECK(
+            cudaGetLastError()
+        );
+    }
+
+    //
+    // Rare >CAP routes.
+    //
+    const int64_t overflow_tasks =
+        total_routes *
+        n_blocks_row;
+
+    const int64_t overflow_blocks =
+        (
+            overflow_tasks +
+            MUL_MAT_ID_BACK_WARPS -
+            1
+        ) /
+        MUL_MAT_ID_BACK_WARPS;
+
+    if (weight->type ==
+        GGML_TYPE_MXFP4) {
+
+        mul_mat_id_back_overflow<GGML_TYPE_MXFP4>
+            <<<overflow_blocks,
+               MUL_MAT_ID_BACK_WARPS * 32,
+               0,
+               stream>>>(
+                weight->data,
+
+                (const float *)
+                    grad->data,
+
+                (const int32_t *)
+                    ids->data,
+
+                route_rank.ptr,
+
+                (float *)
+                    dst->data,
+
+                n_blocks_row,
+                rows,
+                n_expert,
+                n_used,
+                n_tokens,
+
+                grad_s0,
+                grad_s1,
+                grad_s2,
+
+                ids_s0,
+                ids_s1,
+
+                cap
+            );
+
+    } else if (weight->type == GGML_TYPE_Q4_1) {
+        mul_mat_id_back_overflow<GGML_TYPE_Q4_1>
+            <<<overflow_blocks, MUL_MAT_ID_BACK_WARPS * 32, 0, stream>>>(
+                weight->data, (const float *) grad->data, (const int32_t *) ids->data,
+                route_rank.ptr, (float *) dst->data,
+                n_blocks_row, rows, n_expert, n_used, n_tokens,
+                grad_s0, grad_s1, grad_s2, ids_s0, ids_s1, cap);
+    } else if (weight->type == GGML_TYPE_Q8_0) {
+        mul_mat_id_back_overflow<GGML_TYPE_Q8_0>
+            <<<overflow_blocks, MUL_MAT_ID_BACK_WARPS * 32, 0, stream>>>(
+                weight->data, (const float *) grad->data, (const int32_t *) ids->data,
+                route_rank.ptr, (float *) dst->data,
+                n_blocks_row, rows, n_expert, n_used, n_tokens,
+                grad_s0, grad_s1, grad_s2, ids_s0, ids_s1, cap);
+    } else {
+
+        mul_mat_id_back_overflow<GGML_TYPE_Q4_0>
+            <<<overflow_blocks,
+               MUL_MAT_ID_BACK_WARPS * 32,
+               0,
+               stream>>>(
+                weight->data,
+
+                (const float *)
+                    grad->data,
+
+                (const int32_t *)
+                    ids->data,
+
+                route_rank.ptr,
+
+                (float *)
+                    dst->data,
+
+                n_blocks_row,
+                rows,
+                n_expert,
+                n_used,
+                n_tokens,
+
+                grad_s0,
+                grad_s1,
+                grad_s2,
+
+                ids_s0,
+                ids_s1,
+
+                cap
+            );
+    }
+
+    CUDA_CHECK(
+        cudaGetLastError()
+    );
+}
+
+static std::atomic<int> out_prod_host_devices[GGML_CUDA_MAX_DEVICES];
+
+void ggml_cuda_out_prod_host_device(int device, bool active) {
+    out_prod_host_devices[device].fetch_add(active ? 1 : -1, std::memory_order_relaxed);
+}
+
+static __global__ void out_prod_host_ordered(
+        const char * a, const char * b, float * out, int64_t m, int64_t n, int64_t k,
+        size_t a_stride, size_t b_col_stride, size_t b_k_stride, bool accumulate) {
+    const int64_t col = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t row = int64_t(blockIdx.y)*4;
+    if (col >= m) return;
+    float sums[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        sums[r] = accumulate && row + r < n ? out[(row + r)*m + col] : 0.0f;
+    }
+    for (int64_t i = 0; i < k; ++i) {
+        const float x = *(const float *) (a + i*a_stride + col*sizeof(float));
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            if (row + r < n) {
+                const float y = *(const float *) (b + (row + r)*b_col_stride + i*b_k_stride);
+                sums[r] = __fmaf_rn(x, y, sums[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        if (row + r < n) out[(row + r)*m + col] = sums[r];
+    }
+}
+
+static bool ggml_cuda_out_prod_host_rows(ggml_tensor * dst, bool accumulate, int device, int64_t row, int64_t rows,
+        std::atomic<int> * ready = nullptr, std::atomic<bool> * failed = nullptr) {
+    const auto * a = dst->src[0];
+    const auto * b = dst->src[1];
+    int previous;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    void * da = nullptr;
+    void * db = nullptr;
+    void * dc = nullptr;
+    const size_t sa = ggml_nbytes(a), sb = ggml_nbytes(b), sc = rows*dst->nb[1];
+    auto * host = (char *) dst->data + row*dst->nb[1];
+    // Allocation failure leaves this host slice untouched and uses the CPU fallback.
+    bool success = cudaMalloc(&da, sa) == cudaSuccess;
+    if (success) success = cudaMalloc(&db, sb) == cudaSuccess;
+    if (success) success = cudaMalloc(&dc, sc) == cudaSuccess;
+    if (ready) {
+        // Both allocations must succeed before either slice changes the host accumulator.
+        if (!success) failed->store(true);
+        ready->fetch_add(1);
+        while (ready->load() != 2) std::this_thread::yield();
+        success = !failed->load();
+    }
+    if (success) {
+        CUDA_CHECK(cudaMemcpyAsync(da, a->data, sa, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(db, b->data, sb, cudaMemcpyHostToDevice, stream));
+        if (accumulate) CUDA_CHECK(cudaMemcpyAsync(dc, host, sc, cudaMemcpyHostToDevice, stream));
+        const dim3 blocks((dst->ne[0] + 127)/128, (rows + 3)/4);
+        out_prod_host_ordered<<<blocks, 128, 0, stream>>>((const char *) da, (const char *) db + row*b->nb[0], (float *) dc,
+            dst->ne[0], rows, a->ne[1], a->nb[1], b->nb[0], b->nb[1], accumulate);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(host, dc, sc, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        (void) cudaGetLastError();
+    }
+    if (dc) CUDA_CHECK(cudaFree(dc));
+    if (db) CUDA_CHECK(cudaFree(db));
+    if (da) CUDA_CHECK(cudaFree(da));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaSetDevice(previous));
+    return success;
+}
+
+bool ggml_cuda_out_prod_host(ggml_tensor * dst, bool accumulate) {
+    const auto * a = dst->src[0];
+    const auto * b = dst->src[1];
+    if (dst->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+            !ggml_is_matrix(a) || !ggml_is_matrix(b) || !ggml_is_matrix(dst) ||
+            !ggml_is_contiguous(dst) || a->nb[0] != sizeof(float)) return false;
+    int devices[2], count = 0;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES && count < 2; ++d) {
+        if (out_prod_host_devices[d].load(std::memory_order_relaxed) > 0) devices[count++] = d;
+    }
+    if (count == 0) return false;
+    if (count == 1) return ggml_cuda_out_prod_host_rows(dst, accumulate, devices[0], 0, dst->ne[1]);
+    const int64_t half = dst->ne[1]/2;
+    std::atomic<int> ready{0};
+    std::atomic<bool> failed{false};
+    auto first = std::async(std::launch::async, [=, &ready, &failed] {
+        return ggml_cuda_out_prod_host_rows(dst, accumulate, devices[0], 0, half, &ready, &failed);
+    });
+    const bool second = ggml_cuda_out_prod_host_rows(dst, accumulate, devices[1], half, dst->ne[1] - half, &ready, &failed);
+    const bool first_ok = first.get();
+    return first_ok && second;
+}

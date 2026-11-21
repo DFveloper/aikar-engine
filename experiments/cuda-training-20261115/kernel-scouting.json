@@ -1,0 +1,81 @@
+{
+  "source": "/tmp/aikar-training-async-parallel.sqlite",
+  "scope": "Earlier valid trace; kernel ranking only, not a current end-to-end measurement",
+  "kernels": [
+    {
+      "calls": 8320,
+      "gpu_seconds": 27.034159369,
+      "kernel": "void flash_attn_ext_f16<(int)256, (int)256, (int)32, (int)2, (bool)0, (bool)0, (bool)0, (bool)0>(const char *, const char *, const char *, const char *, const char *, const int *, float *, float2 *, float, float, float, float, unsigned int, float, int, uint3, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)"
+    },
+    {
+      "calls": 4864,
+      "gpu_seconds": 24.299998558,
+      "kernel": "mul_mat_id_back_q4_0_fused(const block_q4_0 *, const float *, const int *, const int *, const int *, const int *, const int *, float *, long, long, long, long, long, long)"
+    },
+    {
+      "calls": 25088,
+      "gpu_seconds": 23.261201366,
+      "kernel": "void mul_mat_q<(ggml_type)2, (int)24, (bool)0, (ggml_prec)30>(const char *, const int *, const int *, const int *, float *, float *, const float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)"
+    },
+    {
+      "calls": 25600,
+      "gpu_seconds": 13.954630316,
+      "kernel": "void mul_mat_q<(ggml_type)2, (int)128, (bool)0, (ggml_prec)30>(const char *, const int *, const int *, const int *, float *, float *, const float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)"
+    },
+    {
+      "calls": 1792,
+      "gpu_seconds": 9.681080511,
+      "kernel": "void flash_attn_ext_f16<(int)512, (int)512, (int)8, (int)8, (bool)0, (bool)0, (bool)0, (bool)0>(const char *, const char *, const char *, const char *, const char *, const int *, float *, float2 *, float, float, float, float, unsigned int, float, int, uint3, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)"
+    },
+    {
+      "calls": 57480,
+      "gpu_seconds": 7.480301595,
+      "kernel": "void concat_cont<unsigned int, (int)1>(const T1 *, const T1 *, T1 *, long, long, long, long, long, long)"
+    },
+    {
+      "calls": 2436,
+      "gpu_seconds": 6.065121489,
+      "kernel": "void k_get_rows_back_float<float, float>(const T1 *, const int *, T2 *, long, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)"
+    },
+    {
+      "calls": 10366,
+      "gpu_seconds": 4.689029285,
+      "kernel": "out_prod_q4_0_prepare_tile(const char *, __half *, long, const char *, __half *, long, long, long, unsigned long, unsigned long, unsigned long)"
+    },
+    {
+      "calls": 38912,
+      "gpu_seconds": 3.744439429,
+      "kernel": "volta_s884gemm_fp16_128x256_ldg8_tn"
+    },
+    {
+      "calls": 19456,
+      "gpu_seconds": 3.43821691,
+      "kernel": "void flash_attn_back_softmax<__half, (bool)0>(const float *, T1 *, const __half *, const float *, float *, long, long, long, unsigned long, int, float)"
+    },
+    {
+      "calls": 15360,
+      "gpu_seconds": 3.026509186,
+      "kernel": "volta_s884gemm_fp16_64x128_ldg8_nn"
+    },
+    {
+      "calls": 40342,
+      "gpu_seconds": 2.883679797,
+      "kernel": "void k_bin_bcast<&op_mul, float, float, float, const float *>(const T2 *, const T3 *, T4 *, unsigned int, unsigned int, unsigned int, uint3, uint3, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, T5...)"
+    },
+    {
+      "calls": 19456,
+      "gpu_seconds": 2.807070936,
+      "kernel": "void flash_attn_back_softmax_grad<__half, (int)0>(const float *, T1 *, const float *, float *, long, long, long, float)"
+    },
+    {
+      "calls": 30720,
+      "gpu_seconds": 2.618584094,
+      "kernel": "volta_s884gemm_fp16_64x128_ldg8_nt"
+    },
+    {
+      "calls": 77512,
+      "gpu_seconds": 2.145307598,
+      "kernel": "void k_bin_bcast<&op_add, float, float, float, const float *>(const T2 *, const T3 *, T4 *, unsigned int, unsigned int, unsigned int, uint3, uint3, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, T5...)"
+    }
+  ]
+}

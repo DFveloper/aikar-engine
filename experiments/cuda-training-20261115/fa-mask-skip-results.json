@@ -1,0 +1,18 @@
+{
+  "256": {
+    "before_ms": 6.368847499999999,
+    "after_ms": 3.0448145,
+    "speedup": 2.091702959244315,
+    "bit_exact": true,
+    "finite": true,
+    "elements": 1048576
+  },
+  "512": {
+    "before_ms": 10.6403725,
+    "after_ms": 15.0196145,
+    "speedup": 0.7084317976336876,
+    "bit_exact": true,
+    "finite": true,
+    "elements": 2097152
+  }
+}

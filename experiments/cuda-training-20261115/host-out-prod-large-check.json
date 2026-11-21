@@ -1,0 +1,14 @@
+[
+  {
+    "name": "zero",
+    "bytes_equal": true,
+    "finite": true,
+    "bytes": 92274688
+  },
+  {
+    "name": "accumulate",
+    "bytes_equal": true,
+    "finite": true,
+    "bytes": 92274688
+  }
+]

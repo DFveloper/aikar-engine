@@ -1,0 +1,42 @@
+[
+  {
+    "k": 32,
+    "accumulate": false,
+    "bytes_equal": true,
+    "finite": true,
+    "times": [
+      "iter=0 ms=19.87593\niter=1 ms=0.79800\niter=2 ms=0.75895\niter=3 ms=0.74998\niter=4 ms=0.75620\n",
+      "iter=0 ms=262.37300\niter=1 ms=2.63914\niter=2 ms=2.51787\niter=3 ms=2.48360\niter=4 ms=2.48770\n"
+    ]
+  },
+  {
+    "k": 33,
+    "accumulate": true,
+    "bytes_equal": true,
+    "finite": true,
+    "times": [
+      "iter=0 ms=13.27712\niter=1 ms=0.45770\niter=2 ms=0.45634\niter=3 ms=0.44223\niter=4 ms=0.45402\n",
+      "iter=0 ms=234.24511\niter=1 ms=3.37229\niter=2 ms=3.22018\niter=3 ms=3.22470\niter=4 ms=3.23266\n"
+    ]
+  },
+  {
+    "k": 127,
+    "accumulate": true,
+    "bytes_equal": true,
+    "finite": true,
+    "times": [
+      "iter=0 ms=17.17809\niter=1 ms=1.69321\niter=2 ms=1.67581\niter=3 ms=1.67086\niter=4 ms=1.67274\n",
+      "iter=0 ms=241.02980\niter=1 ms=6.23314\niter=2 ms=6.05879\niter=3 ms=6.05831\niter=4 ms=6.05106\n"
+    ]
+  },
+  {
+    "k": 512,
+    "accumulate": false,
+    "bytes_equal": true,
+    "finite": true,
+    "times": [
+      "iter=0 ms=30.00569\niter=1 ms=15.31917\niter=2 ms=15.16231\niter=3 ms=15.33998\niter=4 ms=15.36970\n",
+      "iter=0 ms=259.85546\niter=1 ms=18.19042\niter=2 ms=17.87715\niter=3 ms=17.78466\niter=4 ms=17.81373\n"
+    ]
+  }
+]

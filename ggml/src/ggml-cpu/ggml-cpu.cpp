@@ -427,6 +427,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[4]) {
+        return src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32 &&
+            src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) &&
+            (!src0->buffer || !ggml_backend_cpu_is_extra_buffer_type(src0->buffer->buft));
+    }
+
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
     }

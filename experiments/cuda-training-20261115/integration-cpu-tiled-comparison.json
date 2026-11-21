@@ -1,0 +1,7 @@
+{
+  "warmup_optimizer_steps": 2,
+  "time_goal_ratio_moe_to_dense": 1.1,
+  "peak_rss_goal_ratio_moe_to_dense": 1.1,
+  "peak_device_vram_goal_ratio_moe_to_dense": 1.1,
+  "note": "Goals are recorded before measurement; CPU results do not validate P620 goals."
+}

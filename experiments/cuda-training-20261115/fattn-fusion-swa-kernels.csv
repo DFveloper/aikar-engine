@@ -1,0 +1,8 @@
+Generating SQLite file /tmp/aikar-fattn-fusion-swa-profile.sqlite from /tmp/aikar-fattn-fusion-swa-profile.nsys-rep
+Processing [/tmp/aikar-fattn-fusion-swa-profile.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+63.1,3113893,16,194618.3,194562.5,191938,197442,1617.0,volta_s884gemm_fp16_64x128_ldg8_nn
+25.9,1276782,1,1276782.0,1276782.0,1276782,1276782,0.0,"void flash_attn_back_fused_rows<(int)256, (int)256>(const __half *, const __half *, const __half *, const __half *, const __half *, const float *, __half *, __half *, int, int, int, int, int, int, unsigned long, unsigned long, unsigned long, unsigned long, int, int, float)"
+10.5,519525,32,16235.2,16112.0,15008,20992,1105.9,volta_s884gemm_fp16_64x64_ldg8_nt
+0.6,28544,2,14272.0,14272.0,11872,16672,3394.1,"void convert_unary_cont_vec4<float, __half>(const void *, T2 *, long)"
+

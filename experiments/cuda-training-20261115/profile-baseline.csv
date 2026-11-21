@@ -1,0 +1,10 @@
+Generating SQLite file /tmp/aikar-training-baseline.sqlite from /tmp/aikar-training-baseline.nsys-rep
+Processing [/tmp/aikar-training-baseline.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+SKIPPED: /tmp/aikar-training-baseline.sqlite does not contain CUDA kernel data.
+
+Processing [/tmp/aikar-training-baseline.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+SKIPPED: /tmp/aikar-training-baseline.sqlite does not contain GPU memory data.
+
+Processing [/tmp/aikar-training-baseline.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_api_sum.py]... 
+SKIPPED: /tmp/aikar-training-baseline.sqlite does not contain CUDA trace data.
+

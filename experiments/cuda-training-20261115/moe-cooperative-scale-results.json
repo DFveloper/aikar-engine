@@ -1,0 +1,16 @@
+{
+  "up": {
+    "before_ms": 3.19384,
+    "after_ms": 2.9704949999999997,
+    "speedup": 1.0751878053994368,
+    "elements": 5767168,
+    "bit_exact": true
+  },
+  "down": {
+    "before_ms": 4.863665,
+    "after_ms": 4.52395,
+    "speedup": 1.0750925629151515,
+    "elements": 720896,
+    "bit_exact": true
+  }
+}

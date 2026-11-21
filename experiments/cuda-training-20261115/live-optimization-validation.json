@@ -1,0 +1,105 @@
+{
+  "status": "deployed_from_best_first_window_completed",
+  "production_trainer_pid": 2703254,
+  "production_restarted": true,
+  "power_limit_watts": [
+    150,
+    150
+  ],
+  "candidate_directory": "/home/user/aikar-engine/experiments/cuda-training-20261115/live-candidate-bin",
+  "changes": [
+    "Reuse first/end contributing row bounds across columns in CUDA GET_ROWS_BACK; sum order unchanged",
+    "Hash split-state cache with separate assume_sync keys; metadata invalidation still clears both caches"
+  ],
+  "get_rows_back_shape": {
+    "columns": 2816,
+    "destination_rows": 16384,
+    "gradient_rows": 16384,
+    "output_floats": 46137344
+  },
+  "p620_exclusive": {
+    "before": {
+      "steady_median_ms": 17045.2161,
+      "samples_ms": [
+        17076.9206,
+        17050.7145,
+        17045.2161,
+        17028.7981
+      ],
+      "byte_different": 0
+    },
+    "after": {
+      "steady_median_ms": 34.6538,
+      "samples_ms": [
+        37.9822,
+        34.6756,
+        34.6535,
+        34.6538
+      ],
+      "byte_different": 0
+    }
+  },
+  "v100_shared_with_live_training": {
+    "before": {
+      "steady_median_ms": 2985.5055,
+      "samples_ms": [
+        2863.166,
+        2949.2278,
+        3100.6205,
+        2985.5055
+      ],
+      "byte_different": 0
+    },
+    "after": {
+      "steady_median_ms": 8.6815,
+      "samples_ms": [
+        13.2524,
+        8.6712,
+        8.6815,
+        8.7031
+      ],
+      "byte_different": 0
+    },
+    "limitation": "Concurrent production makes these isolated shape timings unsuitable for estimating end-to-end training speedup."
+  },
+  "split_state_cache_microbenchmark": {
+    "before_median_ms": 428.802,
+    "after_median_ms": 398.262,
+    "lookup_speedup": 1.076683188453832
+  },
+  "validation": {
+    "cpu_backend_cases": 13,
+    "cuda_backend_cases": {
+      "CUDA0": 11,
+      "CUDA1": 11,
+      "CUDA2": 11
+    },
+    "full_cpu_training_unit_suite": "passed",
+    "full_two_v100_training_unit_suite": "passed",
+    "compute_sanitizer_memcheck_errors": 0,
+    "mutable_indices_same_graph": "passed byte-exact",
+    "dense_and_moe_training": {
+      "dense": {
+        "state_and_adapter_tensors": 85,
+        "changed": [],
+        "losses_equal": true,
+        "loss_count": 16
+      },
+      "moe": {
+        "state_and_adapter_tensors": 85,
+        "changed": [],
+        "losses_equal": true,
+        "loss_count": 16
+      }
+    },
+    "diff_whitespace": "passed"
+  },
+  "production_end_to_end_speedup_verified": false,
+  "deployment_constraint": "Applied through train.sh LD_LIBRARY_PATH and merged best-step136 model. Optimizer, schedule and dataset reset as documented for from-best; original K5-only state is incompatible with the eight Q/O targets.",
+  "source_sha256": {
+    "ggml/src/ggml-backend-meta.cpp": "d323922a3e92d93b7e879ba254fb140e78749fbdd925c60c164460624bab46c3",
+    "ggml/src/ggml-cuda/getrows.cu": "431efb8e4a611d58a542fd2851e54a2211fd785b4262776d97c39ae39a793c1f",
+    "tests/test-backend-ops.cpp": "24dd50f50738121a36ddf05bb15a87854be9801493bef72bc92a2a7cd7d66030"
+  },
+  "production_restart_record": "/home/user/aikar-engine/experiments/cuda-training-20261115/production-from-best.json"
+}

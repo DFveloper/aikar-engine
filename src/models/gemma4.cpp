@@ -1,4 +1,6 @@
 #include "models.h"
+#include <cstdlib>
+#include <sstream>
 #include "llama-impl.h"
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
@@ -6,8 +8,16 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
 
     hparams.kv_global_only = arch == LLM_ARCH_LUMEN4EXP;
-    uint32_t n_kv_shared_layers = hparams.kv_global_only ? 19 : 0;
-    ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+    uint32_t n_kv_shared_layers = 0;
+    if (!hparams.kv_global_only) {
+        ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+    }
+    if (hparams.kv_global_only) {
+        if (hparams.n_layer_all != 30) {
+            throw std::runtime_error("Lumen4Exp Global sharing requires 30 layers");
+        }
+        for (int il : {11, 17, 23}) { hparams.kvsharer_map[il] = 6; }
+    }
 
     if (hparams.kv_global_only && n_kv_shared_layers >= hparams.n_layer_all) {
         throw std::runtime_error("shared KV layers must be smaller than the layer count");
@@ -23,6 +33,35 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
                 LLAMA_LOG_INFO("%s: global layer %u KV source %d\n", __func__, il, source);
             }
         }
+    }
+    if (const char * spec = std::getenv("KVSHARER_MAP")) {
+        std::istringstream input(spec);
+        std::string pair;
+        while (std::getline(input, pair, ',')) {
+            int dst, src;
+            char extra;
+            if (std::sscanf(pair.c_str(), "%d:%d%c", &dst, &src, &extra) != 2 ||
+                src < 0 || dst <= src || dst >= hparams.n_layer_kv_from_start ||
+                hparams.is_swa(dst) != hparams.is_swa(src)) {
+                throw std::runtime_error("invalid KVSHARER_MAP; require earlier source of same attention type");
+            }
+            hparams.kvsharer_map[dst] = src + 1;
+        }
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            int src = il;
+            while (hparams.kvsharer_map[src]) { src = hparams.kvsharer_map[src] - 1; }
+            if (src != int(il)) {
+                hparams.kvsharer_map[il] = src + 1;
+                LLAMA_LOG_INFO("KVSharer: %u -> %d\n", il, src);
+            }
+        }
+    }
+    if (hparams.kv_global_only) {
+        if (hparams.n_embd_head_k_full != 512 || hparams.n_embd_head_v_full != 512) {
+            throw std::runtime_error("Lumen4Exp requires 512-dimensional Global K/V heads");
+        }
+        hparams.n_rot_full = 128;
+        LLAMA_LOG_INFO("Lumen4Exp: Global RoPE=128/512, V cache=128, V tail=K tail/K norm scale\n");
     }
     hparams.f_attention_scale     = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
 
@@ -171,6 +210,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         llm_graph_context(params),
         model(model),
         n_embd_per_layer(model.hparams.n_embd_per_layer) {
+    if (hparams.kv_global_only) {
+        for (const auto & layer : model.layers) { kv_reconstruction_scales.push_back(layer.attn_k_norm); }
+    }
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -264,7 +307,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         }
 
         // self-attention
-        if (hparams.has_kv(il)) {
+        if (hparams.has_kv(il) && !hparams.kvsharer_map[il]) {
             ggml_tensor * Kcur;
             ggml_tensor * Vcur;
             if (qkv_fused) {
@@ -301,6 +344,13 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cb(Kcur, "Kcur_pos", il);
 
+            if (hparams.kv_global_only && !hparams.is_swa(il)) {
+                if (model.layers[il].wv || model.layers[il].wqkv) {
+                    throw std::runtime_error("Lumen4Exp K/V reconstruction requires tied K/V projection");
+                }
+                Vcur = ggml_cont(ctx0, ggml_view_3d(ctx0, Vcur, n_rot_l, n_head_kv, n_tokens,
+                        Vcur->nb[1], Vcur->nb[2], 0));
+            }
             if (full_sequence && !mctx && hparams.kv_global_only && !hparams.is_swa(il)) {
                 Kcur = build_kv_fake_quant(Kcur, GGML_TYPE_FP4_KV);
                 Vcur = build_kv_fake_quant(Vcur, GGML_TYPE_FP4_KV);
@@ -315,8 +365,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
-            const int source_layer = hparams.kv_global_only ? hparams.kv_source(il) :
+            int source_layer = hparams.kvsharer_map[il] ? hparams.kvsharer_map[il] - 1 : hparams.kv_global_only ? hparams.kv_source(il) :
                 hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+            if (hparams.kvsharer_map[source_layer]) { source_layer = hparams.kvsharer_map[source_layer] - 1; }
             ggml_tensor * shared_k = full_sequence ? sequence_k.at(source_layer) : nullptr;
             ggml_tensor * shared_v = full_sequence ? sequence_v.at(source_layer) : nullptr;
             cur = build_attn(inp_attn,

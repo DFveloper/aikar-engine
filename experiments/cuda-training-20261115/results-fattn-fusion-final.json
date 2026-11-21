@@ -1,0 +1,24 @@
+{
+  "state_tensors": 24,
+  "changed": [
+    "qat.m.000000",
+    "qat.m.000001",
+    "qat.m.000002",
+    "qat.m.000003",
+    "qat.m.000004",
+    "qat.m.000005"
+  ],
+  "state_bytes_equal": false,
+  "train_seconds_before": 298.7,
+  "train_seconds_after": 172.087,
+  "speedup": 1.7357499404371046,
+  "training_losses_equal": true,
+  "validation_losses_equal": true,
+  "production_args_changed": false,
+  "required_seconds_per_window": 35.661218424962854,
+  "floating_point_drift_authorized": true,
+  "gradient_validation_passed": true,
+  "final_state_equals_validated_broad_prototype": true,
+  "immediate_baseline_seconds": 175.499,
+  "immediate_reduction_percent": 1.9441706220548305
+}

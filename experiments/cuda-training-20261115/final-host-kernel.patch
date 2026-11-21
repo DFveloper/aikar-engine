@@ -1,0 +1,591 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index daa80d8ce..5eeb4513d 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -11,6 +11,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <future>
+ #include <map>
+ #include <memory>
+ #include <set>
+@@ -2303,12 +2304,14 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+ 
+ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+-    GGML_ASSERT(offset == 0);
+-    GGML_ASSERT(ggml_is_contiguous(tensor));
+-
+     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+-    GGML_ASSERT(split_state.n_segments == 1);
+-    GGML_ASSERT(split_state.nr[0]      == 1);
++    if (offset != 0 || !ggml_is_contiguous(tensor) || split_state.n_segments != 1 || split_state.nr[0] != 1 ||
++            (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
++             (split_state.axis < GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis > GGML_BACKEND_SPLIT_AXIS_2))) {
++        for (size_t j = 0; j < n_backends; ++j) ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j));
++        ggml_backend_tensor_get(tensor, data, offset, size);
++        return;
++    }
+ 
+     switch (split_state.axis) {
+         case GGML_BACKEND_SPLIT_AXIS_0:
+@@ -2827,14 +2830,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     };
+ 
+ 
++    const auto dev0 = ggml_backend_get_device(backend_ctx->backend_configs[0].backend);
++    const auto reg0 = ggml_backend_dev_backend_reg(dev0);
++    const bool parallel_cuda = n_backends == 2 && reg0 && std::strcmp(ggml_backend_reg_name(reg0), "CUDA") == 0 &&
++        ggml_backend_get_device(backend_ctx->backend_configs[1].backend) != dev0 &&
++        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ctx->backend_configs[1].backend)) == reg0;
++
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+-        for (size_t j = 0; j < n_backends; j++) {
++        std::future<ggml_status> pending;
++        if (parallel_cuda) {
++            pending = std::async(std::launch::async, [&, i] {
++                auto & bc = backend_ctx->backend_configs[1];
++                return ggml_backend_graph_compute_async(bc.backend, bc.cgraphs[i].cgraph_main);
++            });
++        }
++        ggml_status result = GGML_STATUS_SUCCESS;
++        for (size_t j = 0; j < (parallel_cuda ? 1 : n_backends); j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+-            if (status != GGML_STATUS_SUCCESS) {
+-                return status;
+-            }
++            if (status != GGML_STATUS_SUCCESS) result = status;
++        }
++        if (parallel_cuda) {
++            const ggml_status status = pending.get();
++            if (status != GGML_STATUS_SUCCESS) result = status;
+         }
++        if (result != GGML_STATUS_SUCCESS) return result;
+ 
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+             bool backend_allreduce_success = false;
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 2b552ec64..9eff5cfcf 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1952,6 +1952,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++        if (ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_META &&
++                input_backend->iface.get_tensor_async && ggml_backend_buffer_is_host(input_cpy->buffer)) {
++            ggml_backend_synchronize(split_backend);
++            // Queue all shards before waiting, so one GPU does not wait for the other's host copy.
++            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
++            ggml_backend_synchronize(input_backend);
++            return;
++        }
+         ggml_backend_synchronize(input_backend);
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index fc7df18bf..ccded5689 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -1,6 +1,7 @@
+ #include "ops.h"
+ 
+ #include "ggml-cpu.h"
++#include "ggml-backend.h"
+ #include "ggml-impl.h"
+ #include "ggml-quants.h"
+ #include "binary-ops.h"
+@@ -5112,6 +5113,23 @@ static void ggml_compute_forward_out_prod_f32(
+     // nb01 >= nb00 - src0 is not transposed
+     //   compute by src0 rows
+ 
++#if defined(__AVX2__) && defined(__FMA__)
++    if (!params->use_ref && params->wsize >= sizeof(bool) && ggml_is_matrix(src0) && ggml_is_matrix(src1) &&
++            ggml_is_contiguous(dst) && ne0 >= 1024 && ne1 >= 1024 && ne01 >= 32) {
++        auto * success = (bool *) params->wdata;
++        if (ith == 0) {
++            auto * reg = ggml_backend_reg_by_name("CUDA");
++            using host_out_prod_t = bool (*)(ggml_tensor *, bool);
++            auto fn = reg ? (host_out_prod_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_out_prod_host") : nullptr;
++            *success = fn && fn(dst, accumulate);
++        }
++        ggml_barrier(params->threadpool);
++        const bool accelerated = *success;
++        ggml_barrier(params->threadpool);
++        if (accelerated) return;
++    }
++#endif
++
+     if (!accumulate && ith == 0) {
+         ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
+     }
+@@ -5162,6 +5180,44 @@ static void ggml_compute_forward_out_prod_f32(
+         return;
+     }
+ 
++#if defined(GGML_SIMD)
++    if (ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) && ne0 % GGML_F32_STEP == 0) {
++        // Keep two output rows in registers and share each input vector.
++        for (int64_t row = ir0; row < ir1; row += 2) {
++            const int rows = MIN(int64_t(2), ir1 - row);
++            for (int64_t col = 0; col < ne0; col += GGML_F32_STEP) {
++                GGML_F32_VEC sums[2][GGML_F32_ARR];
++                for (int r = 0; r < rows; ++r) {
++                    const float * out = (const float *) ((const char *) dst->data + (row + r)*nb1) + col;
++                    for (int v = 0; v < GGML_F32_ARR; ++v) {
++                        sums[r][v] = GGML_F32_VEC_LOAD(out + v*GGML_F32_EPR);
++                    }
++                }
++                for (int64_t k = 0; k < ne01; ++k) {
++                    const float * a = (const float *) ((const char *) src0->data + k*nb01) + col;
++                    GGML_F32_VEC scale[2];
++                    for (int r = 0; r < rows; ++r) {
++                        scale[r] = GGML_F32_VEC_SET1(*(const float *) ((const char *) src1->data + (row + r)*nb10 + k*nb11));
++                    }
++                    for (int v = 0; v < GGML_F32_ARR; ++v) {
++                        const GGML_F32_VEC x = GGML_F32_VEC_LOAD(a + v*GGML_F32_EPR);
++                        for (int r = 0; r < rows; ++r) {
++                            sums[r][v] = GGML_F32_VEC_FMA(sums[r][v], x, scale[r]);
++                        }
++                    }
++                }
++                for (int r = 0; r < rows; ++r) {
++                    float * out = (float *) ((char *) dst->data + (row + r)*nb1) + col;
++                    for (int v = 0; v < GGML_F32_ARR; ++v) {
++                        GGML_F32_VEC_STORE(out + v*GGML_F32_EPR, sums[r][v]);
++                    }
++                }
++            }
++        }
++        return;
++    }
++#endif
++
+     for (int64_t bir = ir0; bir < ir1; bir += blck_1) {
+         const int64_t bir1 = MIN(bir + blck_1, ir1);
+         for (int64_t bi01 = 0; bi01 < ne01; bi01 += blck_0) {
+diff --git a/ggml/src/ggml-cuda/acc.cu b/ggml/src/ggml-cuda/acc.cu
+index e084607c0..c2738697e 100644
+--- a/ggml/src/ggml-cuda/acc.cu
++++ b/ggml/src/ggml-cuda/acc.cu
+@@ -27,6 +27,21 @@ static __global__ void acc_f32(const float * x, const float * y, float * dst, co
+     dst[i] = val;
+ }
+ 
++static __global__ void acc_f32_slice(const float * y, float * dst, const int64_t ne,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t s11, const int64_t s12, const int64_t s13, const int64_t offset) {
++    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++    if (i >= ne) return;
++    int64_t tmp = i;
++    const int64_t i10 = tmp % ne10;
++    tmp /= ne10;
++    const int64_t i11 = tmp % ne11;
++    tmp /= ne11;
++    const int64_t i12 = tmp % ne12;
++    const int64_t i13 = tmp / ne12;
++    dst[offset + i10 + i11*s11 + i12*s12 + i13*s13] += y[i];
++}
++
+ static void acc_f32_cuda(const float * x, const float * y, float * dst, const int64_t n_elements,
+         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+         const int64_t s1, const int64_t s2, const int64_t s3, const int64_t offset, cudaStream_t stream) {
+@@ -57,5 +72,21 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t s3     = dst->op_params[2] / sizeof(float);
+     const int64_t offset = dst->op_params[3] / sizeof(float);
+ 
++    const int64_t n = ggml_nelements(src1);
++    const bool ordered = s1 >= src1->ne[0] && s2 >= s1*src1->ne[1] && s3 >= s2*src1->ne[2];
++    const bool disjoint = uintptr_t(src1_d) + ggml_nbytes(src1) <= uintptr_t(dst_d) ||
++        uintptr_t(dst_d) + ggml_nbytes(dst) <= uintptr_t(src1_d);
++    const int64_t end = offset + src1->ne[0] + (src1->ne[1] - 1)*s1 +
++        (src1->ne[2] - 1)*s2 + (src1->ne[3] - 1)*s3;
++    if (ordered && disjoint && offset >= 0 && end <= ggml_nelements(dst) &&
++            (src0_d == dst_d || n <= ggml_nelements(dst)/4)) {
++        // Keep untouched elements in place when the allocator reuses the gradient buffer.
++        if (src0_d != dst_d) CUDA_CHECK(cudaMemcpyAsync(dst_d, src0_d, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
++        const int blocks = (n + CUDA_ACC_BLOCK_SIZE - 1) / CUDA_ACC_BLOCK_SIZE;
++        acc_f32_slice<<<blocks, CUDA_ACC_BLOCK_SIZE, 0, stream>>>(src1_d, dst_d, n,
++                src1->ne[0], src1->ne[1], src1->ne[2], s1, s2, s3, offset);
++        return;
++    }
++
+     acc_f32_cuda(src0_d, src1_d, dst_d, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset, stream);
+ }
+diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
+index 39b23bed7..341c2be1d 100644
+--- a/ggml/src/ggml-cuda/allreduce.cu
++++ b/ggml/src/ggml-cuda/allreduce.cu
+@@ -225,12 +225,7 @@ static __global__ void ggml_cuda_ar_add_kernel(
+ // Pipeline structure
+ // ---------------------------------------------------------------------------
+ 
+-// Number of slots in the event / arrival ring.  Two slots is sufficient:
+-// lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
+-// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
+-// from AR N-2 by the time we get to AR N.  acquire_slot's
+-// cudaEventSynchronize on ev.ker for both devices makes that consumption
+-// explicit before we overwrite host_buf[slot] for the new AR.
++// Wait for both devices to release a slot before either device reuses it.
+ static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
+ 
+ // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
+@@ -361,7 +356,7 @@ struct ggml_cuda_ar_slot_info {
+     int token;
+ };
+ 
+-static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
++static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends) {
+     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
+     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
+     p->call_count++;
+@@ -369,7 +364,11 @@ static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline *
+     if (pool_lapped) {
+         for (int i = 0; i < p->n_devices; ++i) {
+             ggml_cuda_set_device(p->devices[i]);
+-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
++            auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
++            for (int peer = 0; peer < p->n_devices; ++peer) {
++                CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), p->ev_pool[peer][slot].ker, 0));
++                CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].ker, 0));
++            }
+         }
+     }
+ 
+@@ -611,7 +610,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
+     const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
+     GGML_ASSERT(chunk_bytes > 0);
+ 
+-    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
++    const int slot = ggml_cuda_ar_acquire_slot(p, backends).slot;
+     const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
+     GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
+ 
+@@ -701,7 +700,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
+ 
+         // Record dev_tmp-released on the compute stream so the next copy_impl
+         // can wait for the kernel to finish before overwriting dev_tmp.  Also
+-        // record AR-done as ev.ker for acquire_slot's pool-wraparound sync.
++        // record AR-done as ev.ker for slot reuse on either stream.
+         CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
+         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
+     }
+@@ -896,14 +895,13 @@ bool ggml_cuda_ar_allreduce(
+         // cross-stream event handshake that the copy-engine path needs, and
+         // skips the cross-stream scheduling overhead that was hurting the
+         // small-tensor (tg) latency on the AR-stream variant.  Only ev.ker is
+-        // still recorded at end-of-AR for acquire_slot's pool-wraparound check.
++        // recorded after each chunk to protect ring-slot reuse.
+         for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
+             const size_t remaining_elems = (size_t) (ne - chunk_start);
+             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
+             const size_t chunk_dst_bytes  = chunk_elems * input_type_size;
+ 
+-            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+-            const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
++            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p, backends);
+ 
+             for (int i = 0; i < n; ++i) {
+                 const int peer = 1 - i;  // valid for n == 2 only
+@@ -947,9 +945,7 @@ bool ggml_cuda_ar_allreduce(
+ #undef LAUNCH_AR_KERNEL
+                 CUDA_CHECK(cudaGetLastError());
+ 
+-                if (last_chunk) {
+-                    CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+-                }
++                CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/fattn-back.cu b/ggml/src/ggml-cuda/fattn-back.cu
+index 09b00575b..26821b6b6 100644
+--- a/ggml/src/ggml-cuda/fattn-back.cu
++++ b/ggml/src/ggml-cuda/fattn-back.cu
+@@ -601,6 +601,17 @@ static void launch_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor
+     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+     const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+     cudaStream_t stream = ctx.stream();
++    const bool gemm_f16 = use_volta_f16_fattn_back(ctx, dst);
++    const bool gemm_f32 = use_pascal_f32_fattn_back(ctx, dst);
++    if (gemm_f16 || gemm_f32) {
++        // GEMMs overwrite Q/K/V; only the sink gradient uses atomic accumulation.
++        if (sinks && (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS))) {
++            CUDA_CHECK(cudaMemsetAsync((char *) dst->data + offs_s, 0, ggml_nbytes(dst) - offs_s, stream));
++        }
++        if (gemm_f16) launch_gemm_fattn_back<half>(ctx, dst);
++        else launch_gemm_fattn_back<float>(ctx, dst);
++        return;
++    }
+     if (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID)) {
+         CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+     } else {
+@@ -618,16 +629,6 @@ static void launch_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor
+         }
+     }
+ 
+-    if (use_volta_f16_fattn_back(ctx, dst)) {
+-        launch_gemm_fattn_back<half>(ctx, dst);
+-        return;
+-    }
+-
+-    if (use_pascal_f32_fattn_back(ctx, dst)) {
+-        launch_gemm_fattn_back<float>(ctx, dst);
+-        return;
+-    }
+-
+     const int threads = 128;
+     const int blocks = q->ne[1]*q->ne[2]*q->ne[3];
+     flash_attn_back_kernel<type_K, type_V><<<blocks, threads, threads*sizeof(float), stream>>>(
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 04811125c..2176cc6cb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2765,6 +2765,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
+ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
++    ggml_cuda_out_prod_host_device(cuda_ctx->device, false);
+     delete cuda_ctx;
+     delete backend;
+ }
+@@ -6824,6 +6825,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_cuda_out_prod_host") == 0) {
++        return (void *) ggml_cuda_out_prod_host;
++    }
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_cuda_comm_init;
+     }
+@@ -6933,6 +6937,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+         /* .context = */ ctx,
+     };
+ 
++    ggml_cuda_out_prod_host_device(device, true);
+     return cuda_backend;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 2b6bc328a..4442b2ba9 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -195,8 +195,9 @@ void ggml_cuda_mul_mat_q(
+             ncols_opt = ne12;
+ 
+             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
++            // Use the per-expert token count when wide tiles waste most columns.
++            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
++                    (cc == GGML_CUDA_CC_VOLTA && src0->type == GGML_TYPE_Q4_0)) {
+                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+             }
+         }
+diff --git a/ggml/src/ggml-cuda/out-prod.cu b/ggml/src/ggml-cuda/out-prod.cu
+index 0f8a371ba..ef0974c99 100644
+--- a/ggml/src/ggml-cuda/out-prod.cu
++++ b/ggml/src/ggml-cuda/out-prod.cu
+@@ -4,8 +4,11 @@
+ #include "cpy.cuh"
+ #include "opt-step-qlion-qat.cuh"
+ #include <functional>
++#include <future>
++#include <thread>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+@@ -523,7 +526,7 @@ static __device__ __forceinline__ float mxfp4_get(const block_mxfp4 & block, int
+ #include <mma.h>
+ 
+ static constexpr int MUL_MAT_ID_BACK_FUSED_M = 128;
+-static constexpr int MUL_MAT_ID_BACK_FUSED_N = 64;
++static constexpr int MUL_MAT_ID_BACK_FUSED_N = 32;
+ static constexpr int MUL_MAT_ID_BACK_FUSED_K = 64;
+ static constexpr int MUL_MAT_ID_BACK_FUSED_WARPS = 8;
+ static constexpr int MUL_MAT_ID_BACK_SCALE_WARPS = 4;
+@@ -559,7 +562,10 @@ static __global__ void mul_mat_id_back_q4_0_fused(
+     __shared__ int weight_exp;
+     __shared__ float weight_scale;
+     // The MMA input tiles and output fragments use this storage at different times.
+-    __shared__ __align__(32) unsigned char workspace[tile_m*tile_n*sizeof(float)];
++    constexpr int input_bytes = (tile_m + tile_n)*tile_k*sizeof(half);
++    constexpr int output_bytes = tile_m*tile_n*sizeof(float);
++    constexpr int workspace_bytes = input_bytes > output_bytes ? input_bytes : output_bytes;
++    __shared__ __align__(32) unsigned char workspace[workspace_bytes];
+     half * a = reinterpret_cast<half *>(workspace);
+     half * b = a + tile_m*tile_k;
+     float * c = reinterpret_cast<float *>(workspace);
+@@ -593,11 +599,9 @@ static __global__ void mul_mat_id_back_q4_0_fused(
+     }
+     __syncthreads();
+ 
+-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1, acc2, acc3;
+-    wmma::fill_fragment(acc0, 0.0f);
+-    wmma::fill_fragment(acc1, 0.0f);
+-    wmma::fill_fragment(acc2, 0.0f);
+-    wmma::fill_fragment(acc3, 0.0f);
++    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[tile_n/16];
++    #pragma unroll
++    for (int j = 0; j < tile_n/16; ++j) wmma::fill_fragment(acc[j], 0.0f);
+     const int m = warp*16;
+     const int n = 0;
+     for (int64_t row_begin = 0; row_begin < rows; row_begin += tile_k) {
+@@ -627,23 +631,20 @@ static __global__ void mul_mat_id_back_q4_0_fused(
+         __syncthreads();
+         for (int k = 0; k < tile_k; k += 16) {
+             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> af;
+-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf0, bf1, bf2, bf3;
+             wmma::load_matrix_sync(af, a + m + k*tile_m, tile_m);
+-            wmma::load_matrix_sync(bf0, b + k + n*tile_k, tile_k);
+-            wmma::load_matrix_sync(bf1, b + k + (n + 16)*tile_k, tile_k);
+-            wmma::load_matrix_sync(bf2, b + k + (n + 32)*tile_k, tile_k);
+-            wmma::load_matrix_sync(bf3, b + k + (n + 48)*tile_k, tile_k);
+-            wmma::mma_sync(acc0, af, bf0, acc0);
+-            wmma::mma_sync(acc1, af, bf1, acc1);
+-            wmma::mma_sync(acc2, af, bf2, acc2);
+-            wmma::mma_sync(acc3, af, bf3, acc3);
++            #pragma unroll
++            for (int j = 0; j < tile_n/16; ++j) {
++                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
++                wmma::load_matrix_sync(bf, b + k + (n + 16*j)*tile_k, tile_k);
++                wmma::mma_sync(acc[j], af, bf, acc[j]);
++            }
+         }
+         __syncthreads();
+     }
+-    wmma::store_matrix_sync(c + m + n*tile_m, acc0, tile_m, wmma::mem_col_major);
+-    wmma::store_matrix_sync(c + m + (n + 16)*tile_m, acc1, tile_m, wmma::mem_col_major);
+-    wmma::store_matrix_sync(c + m + (n + 32)*tile_m, acc2, tile_m, wmma::mem_col_major);
+-    wmma::store_matrix_sync(c + m + (n + 48)*tile_m, acc3, tile_m, wmma::mem_col_major);
++    #pragma unroll
++    for (int j = 0; j < tile_n/16; ++j) {
++        wmma::store_matrix_sync(c + m + (n + 16*j)*tile_m, acc[j], tile_m, wmma::mem_col_major);
++    }
+     __syncthreads();
+     for (int i = tid; i < tile_m*tile_n; i += warps*WARP_SIZE) {
+         const int slot = i/tile_m;
+@@ -1705,3 +1706,105 @@ void ggml_cuda_mul_mat_id_back(
+         cudaGetLastError()
+     );
+ }
++
++static std::atomic<int> out_prod_host_devices[GGML_CUDA_MAX_DEVICES];
++
++void ggml_cuda_out_prod_host_device(int device, bool active) {
++    out_prod_host_devices[device].fetch_add(active ? 1 : -1, std::memory_order_relaxed);
++}
++
++static __global__ void out_prod_host_ordered(
++        const char * a, const char * b, float * out, int64_t m, int64_t n, int64_t k,
++        size_t a_stride, size_t b_col_stride, size_t b_k_stride, bool accumulate) {
++    const int64_t col = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    const int64_t row = int64_t(blockIdx.y)*4;
++    if (col >= m) return;
++    float sums[4];
++#pragma unroll
++    for (int r = 0; r < 4; ++r) {
++        sums[r] = accumulate && row + r < n ? out[(row + r)*m + col] : 0.0f;
++    }
++    for (int64_t i = 0; i < k; ++i) {
++        const float x = *(const float *) (a + i*a_stride + col*sizeof(float));
++#pragma unroll
++        for (int r = 0; r < 4; ++r) {
++            if (row + r < n) {
++                const float y = *(const float *) (b + (row + r)*b_col_stride + i*b_k_stride);
++                sums[r] = __fmaf_rn(x, y, sums[r]);
++            }
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < 4; ++r) {
++        if (row + r < n) out[(row + r)*m + col] = sums[r];
++    }
++}
++
++static bool ggml_cuda_out_prod_host_rows(ggml_tensor * dst, bool accumulate, int device, int64_t row, int64_t rows,
++        std::atomic<int> * ready = nullptr, std::atomic<bool> * failed = nullptr) {
++    const auto * a = dst->src[0];
++    const auto * b = dst->src[1];
++    int previous;
++    CUDA_CHECK(cudaGetDevice(&previous));
++    CUDA_CHECK(cudaSetDevice(device));
++    cudaStream_t stream;
++    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++    void * da = nullptr;
++    void * db = nullptr;
++    void * dc = nullptr;
++    const size_t sa = ggml_nbytes(a), sb = ggml_nbytes(b), sc = rows*dst->nb[1];
++    auto * host = (char *) dst->data + row*dst->nb[1];
++    // Allocation failure leaves this host slice untouched and uses the CPU fallback.
++    bool success = cudaMalloc(&da, sa) == cudaSuccess;
++    if (success) success = cudaMalloc(&db, sb) == cudaSuccess;
++    if (success) success = cudaMalloc(&dc, sc) == cudaSuccess;
++    if (ready) {
++        // Both allocations must succeed before either slice changes the host accumulator.
++        if (!success) failed->store(true);
++        ready->fetch_add(1);
++        while (ready->load() != 2) std::this_thread::yield();
++        success = !failed->load();
++    }
++    if (success) {
++        CUDA_CHECK(cudaMemcpyAsync(da, a->data, sa, cudaMemcpyHostToDevice, stream));
++        CUDA_CHECK(cudaMemcpyAsync(db, b->data, sb, cudaMemcpyHostToDevice, stream));
++        if (accumulate) CUDA_CHECK(cudaMemcpyAsync(dc, host, sc, cudaMemcpyHostToDevice, stream));
++        const dim3 blocks((dst->ne[0] + 127)/128, (rows + 3)/4);
++        out_prod_host_ordered<<<blocks, 128, 0, stream>>>((const char *) da, (const char *) db + row*b->nb[0], (float *) dc,
++            dst->ne[0], rows, a->ne[1], a->nb[1], b->nb[0], b->nb[1], accumulate);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaMemcpyAsync(host, dc, sc, cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++    } else {
++        (void) cudaGetLastError();
++    }
++    if (dc) CUDA_CHECK(cudaFree(dc));
++    if (db) CUDA_CHECK(cudaFree(db));
++    if (da) CUDA_CHECK(cudaFree(da));
++    CUDA_CHECK(cudaStreamDestroy(stream));
++    CUDA_CHECK(cudaSetDevice(previous));
++    return success;
++}
++
++bool ggml_cuda_out_prod_host(ggml_tensor * dst, bool accumulate) {
++    const auto * a = dst->src[0];
++    const auto * b = dst->src[1];
++    if (dst->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
++            !ggml_is_matrix(a) || !ggml_is_matrix(b) || !ggml_is_matrix(dst) ||
++            !ggml_is_contiguous(dst) || a->nb[0] != sizeof(float)) return false;
++    int devices[2], count = 0;
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES && count < 2; ++d) {
++        if (out_prod_host_devices[d].load(std::memory_order_relaxed) > 0) devices[count++] = d;
++    }
++    if (count == 0) return false;
++    if (count == 1) return ggml_cuda_out_prod_host_rows(dst, accumulate, devices[0], 0, dst->ne[1]);
++    const int64_t half = dst->ne[1]/2;
++    std::atomic<int> ready{0};
++    std::atomic<bool> failed{false};
++    auto first = std::async(std::launch::async, [=, &ready, &failed] {
++        return ggml_cuda_out_prod_host_rows(dst, accumulate, devices[0], 0, half, &ready, &failed);
++    });
++    const bool second = ggml_cuda_out_prod_host_rows(dst, accumulate, devices[1], half, dst->ne[1] - half, &ready, &failed);
++    const bool first_ok = first.get();
++    return first_ok && second;
++}
+diff --git a/ggml/src/ggml-cuda/out-prod.cuh b/ggml/src/ggml-cuda/out-prod.cuh
+index 208d561d2..9237bd544 100644
+--- a/ggml/src/ggml-cuda/out-prod.cuh
++++ b/ggml/src/ggml-cuda/out-prod.cuh
+@@ -11,3 +11,7 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_acc_qlion_qat_experts(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// Optional CPU outer-product acceleration; host quantization stays on the CPU.
++bool ggml_cuda_out_prod_host(ggml_tensor * dst, bool accumulate);
++void ggml_cuda_out_prod_host_device(int device, bool active);

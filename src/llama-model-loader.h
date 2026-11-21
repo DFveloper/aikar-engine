@@ -138,7 +138,7 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
-    std::vector<std::pair<size_t, size_t>> mmaps_used;
+    std::vector<llama_mmap::ranges> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {

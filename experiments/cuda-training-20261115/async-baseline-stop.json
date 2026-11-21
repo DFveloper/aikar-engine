@@ -1,0 +1,5 @@
+{
+  "trainer_pid": 267535,
+  "stopped_utc": "2026-11-15T14:02:38.337849+00:00",
+  "reason": "Apply and validate asynchronous training changes; user authorized pre-checkpoint restart"
+}

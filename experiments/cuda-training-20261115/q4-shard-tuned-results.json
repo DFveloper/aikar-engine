@@ -1,0 +1,26 @@
+{
+  "up-shard": {
+    "before": 0.71712,
+    "tuned": 0.709165,
+    "bytes_equal": true,
+    "speedup": 1.0112174176672564
+  },
+  "up-fused-shard": {
+    "before": 1.15651,
+    "tuned": 1.149515,
+    "bytes_equal": true,
+    "speedup": 1.0060851750520872
+  },
+  "down-shard": {
+    "before": 0.54064,
+    "tuned": 0.54417,
+    "bytes_equal": true,
+    "speedup": 0.993513056581583
+  },
+  "up-fused": {
+    "before": 1.40556,
+    "tuned": 1.39846,
+    "bytes_equal": true,
+    "speedup": 1.0050770132860432
+  }
+}

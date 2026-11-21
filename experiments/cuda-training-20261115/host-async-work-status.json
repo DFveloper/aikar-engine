@@ -1,0 +1,18 @@
+{
+  "production_stopped_for_validation": true,
+  "accepted_cpu_register_two_window_seconds": 287.016,
+  "accepted_cpu_register_state_equal": 24,
+  "baseline_two_window_seconds": 298.7,
+  "profile_runner_pid": 1228063,
+  "profile_trainer_pid": 1228113,
+  "profile_source_snapshot": "/tmp/aikar-host-async-all-branches.cpp",
+  "unbuilt_change": "Parameter-gradient-only host classification in ggml-backend.cpp",
+  "tiny_dense_baseline_repeat_equal": true,
+  "tiny_dense_all_branch_reordering_changed_state_tensors": 13,
+  "tiny_dense_all_branch_weights_and_220_losses_equal": true,
+  "next": "Finish actual profile; build narrow classification and rerun dense accumulation comparison before acceptance/restart.",
+  "scheduler_experiment_accepted": false,
+  "scheduler_reason": "No throughput gain; repeated dense accumulation changed optimizer state. Source reverted to accepted eight-line host-copy change.",
+  "profile_checkpoint_valid": false,
+  "profile_checkpoint_reason": "Nsight process stuck after temporary storage quota; incomplete optimizer state removed."
+}

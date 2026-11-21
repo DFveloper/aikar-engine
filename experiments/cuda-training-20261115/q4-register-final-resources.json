@@ -1,0 +1,27 @@
+[
+  {
+    "arch": "sm_70",
+    "kernel": "_Z26mul_mat_id_back_q4_0_fusedPK10block_q4_0PKfPKiS5_S5_S5_S5_Pfllllll",
+    "resources": "REG:81 STACK:0 SHARED:20928 LOCAL:0 CONSTANT[2]:64 CONSTANT[0]:464 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  },
+  {
+    "arch": "sm_70",
+    "kernel": "_Z9mul_mat_qIL9ggml_type2ELi32ELb1EL9ggml_prec30EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_",
+    "resources": "REG:169 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:524 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  },
+  {
+    "arch": "sm_70",
+    "kernel": "_Z9mul_mat_qIL9ggml_type2ELi32ELb0EL9ggml_prec30EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_",
+    "resources": "REG:121 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:524 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  },
+  {
+    "arch": "sm_70",
+    "kernel": "_Z9mul_mat_qIL9ggml_type2ELi24ELb1EL9ggml_prec30EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_",
+    "resources": "REG:24 STACK:40 SHARED:0 LOCAL:0 CONSTANT[0]:524 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  },
+  {
+    "arch": "sm_70",
+    "kernel": "_Z9mul_mat_qIL9ggml_type2ELi24ELb0EL9ggml_prec30EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_",
+    "resources": "REG:112 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:524 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  }
+]

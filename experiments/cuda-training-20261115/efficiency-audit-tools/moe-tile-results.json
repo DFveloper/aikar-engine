@@ -1,0 +1,416 @@
+{
+  "target_seconds_per_window": 35.661218424962854,
+  "validated_seconds_per_window": 55.333333333333336,
+  "accepted": [],
+  "comparisons": {
+    "candidate-moe-512": {
+      "candidate-deployment-profile": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 218.1529869629885
+        },
+        "losses": [
+          "1.62849301"
+        ],
+        "window_losses": [
+          "2.60183626",
+          "1.62849301"
+        ],
+        "train_elapsed_seconds": 118,
+        "train_seconds_per_window": 59.0,
+        "phase_ms": [
+          {
+            "build": 27,
+            "alloc": 6744,
+            "inputs": 313,
+            "eval": 60720,
+            "total": 67804
+          },
+          {
+            "build": 25,
+            "alloc": 4008,
+            "inputs": 151,
+            "eval": 39485,
+            "total": 43669
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.026,
+          "alloc": 5.376,
+          "inputs": 0.232,
+          "eval": 50.1025,
+          "total": 55.7365
+        },
+        "peak_device_mib": {
+          "0": 14698,
+          "1": 15306
+        },
+        "workspace_bytes": 12604047360
+      },
+      "candidate-moe-512": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 213.79724378394894
+        },
+        "losses": [
+          "1.63272089"
+        ],
+        "window_losses": [
+          "2.60183626",
+          "1.63272089"
+        ],
+        "train_elapsed_seconds": 109,
+        "train_seconds_per_window": 54.5,
+        "phase_ms": [
+          {
+            "build": 16,
+            "alloc": 5736,
+            "inputs": 326,
+            "eval": 57496,
+            "total": 63574
+          },
+          {
+            "build": 18,
+            "alloc": 2526,
+            "inputs": 215,
+            "eval": 36596,
+            "total": 39355
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.017,
+          "alloc": 4.131,
+          "inputs": 0.2705,
+          "eval": 47.046,
+          "total": 51.4645
+        },
+        "peak_device_mib": {
+          "0": 14892,
+          "1": 15516
+        },
+        "workspace_bytes": 12615819264
+      },
+      "losses_equal": false,
+      "window_losses_equal": false,
+      "state_tensors_compared": 24,
+      "changed_tensors": [
+        ".qat-state.gguf:qat.m.000000",
+        ".qat-state.gguf:qat.m.000001",
+        ".qat-state.gguf:qat.m.000002",
+        ".qat-state.gguf:qat.m.000003",
+        ".qat-state.gguf:qat.m.000004",
+        ".qat-state.gguf:qat.m.000005",
+        ".qat-state.gguf:qat.m.000006",
+        ".qat-state.gguf:qat.m.000007"
+      ]
+    },
+    "candidate-moe-1024": {
+      "candidate-deployment-profile": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 218.1529869629885
+        },
+        "losses": [
+          "1.62849301"
+        ],
+        "window_losses": [
+          "2.60183626",
+          "1.62849301"
+        ],
+        "train_elapsed_seconds": 118,
+        "train_seconds_per_window": 59.0,
+        "phase_ms": [
+          {
+            "build": 27,
+            "alloc": 6744,
+            "inputs": 313,
+            "eval": 60720,
+            "total": 67804
+          },
+          {
+            "build": 25,
+            "alloc": 4008,
+            "inputs": 151,
+            "eval": 39485,
+            "total": 43669
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.026,
+          "alloc": 5.376,
+          "inputs": 0.232,
+          "eval": 50.1025,
+          "total": 55.7365
+        },
+        "peak_device_mib": {
+          "0": 14698,
+          "1": 15306
+        },
+        "workspace_bytes": 12604047360
+      },
+      "candidate-moe-1024": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 206.07031656900654
+        },
+        "losses": [
+          "1.62568724"
+        ],
+        "window_losses": [
+          "2.59544474",
+          "1.62568724"
+        ],
+        "train_elapsed_seconds": 107,
+        "train_seconds_per_window": 53.5,
+        "phase_ms": [
+          {
+            "build": 15,
+            "alloc": 4763,
+            "inputs": 495,
+            "eval": 56118,
+            "total": 61391
+          },
+          {
+            "build": 15,
+            "alloc": 1987,
+            "inputs": 156,
+            "eval": 37111,
+            "total": 39269
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.015,
+          "alloc": 3.375,
+          "inputs": 0.3255,
+          "eval": 46.6145,
+          "total": 50.33
+        },
+        "peak_device_mib": {
+          "0": 15192,
+          "1": 15822
+        },
+        "workspace_bytes": 12859449344
+      },
+      "losses_equal": false,
+      "window_losses_equal": false,
+      "state_tensors_compared": 24,
+      "changed_tensors": [
+        ".qat-state.gguf:qat.m.000000",
+        ".qat-state.gguf:qat.m.000001",
+        ".qat-state.gguf:qat.m.000002",
+        ".qat-state.gguf:qat.m.000003",
+        ".qat-state.gguf:qat.m.000004",
+        ".qat-state.gguf:qat.m.000005",
+        ".qat-state.gguf:qat.m.000006",
+        ".qat-state.gguf:qat.m.000007"
+      ]
+    },
+    "candidate-moe-preserve-1024": {
+      "candidate-deployment-profile": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 218.1529869629885
+        },
+        "losses": [
+          "1.62849301"
+        ],
+        "window_losses": [
+          "2.60183626",
+          "1.62849301"
+        ],
+        "train_elapsed_seconds": 118,
+        "train_seconds_per_window": 59.0,
+        "phase_ms": [
+          {
+            "build": 27,
+            "alloc": 6744,
+            "inputs": 313,
+            "eval": 60720,
+            "total": 67804
+          },
+          {
+            "build": 25,
+            "alloc": 4008,
+            "inputs": 151,
+            "eval": 39485,
+            "total": 43669
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.026,
+          "alloc": 5.376,
+          "inputs": 0.232,
+          "eval": 50.1025,
+          "total": 55.7365
+        },
+        "peak_device_mib": {
+          "0": 14698,
+          "1": 15306
+        },
+        "workspace_bytes": 12604047360
+      },
+      "candidate-moe-preserve-1024": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 213.32369027804816
+        },
+        "losses": [
+          "1.62568724"
+        ],
+        "window_losses": [
+          "2.59544474",
+          "1.62568724"
+        ],
+        "train_elapsed_seconds": 113,
+        "train_seconds_per_window": 56.5,
+        "phase_ms": [
+          {
+            "build": 18,
+            "alloc": 4956,
+            "inputs": 318,
+            "eval": 59672,
+            "total": 64964
+          },
+          {
+            "build": 16,
+            "alloc": 2317,
+            "inputs": 151,
+            "eval": 39600,
+            "total": 42084
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.017,
+          "alloc": 3.6365,
+          "inputs": 0.2345,
+          "eval": 49.636,
+          "total": 53.524
+        },
+        "peak_device_mib": {
+          "0": 14928,
+          "1": 15536
+        },
+        "workspace_bytes": 12859658240
+      },
+      "losses_equal": false,
+      "window_losses_equal": false,
+      "state_tensors_compared": 24,
+      "changed_tensors": [
+        ".qat-state.gguf:qat.m.000000",
+        ".qat-state.gguf:qat.m.000001",
+        ".qat-state.gguf:qat.m.000002",
+        ".qat-state.gguf:qat.m.000003",
+        ".qat-state.gguf:qat.m.000004",
+        ".qat-state.gguf:qat.m.000005",
+        ".qat-state.gguf:qat.m.000006",
+        ".qat-state.gguf:qat.m.000007"
+      ]
+    },
+    "candidate-moe-512-acc-absent": {
+      "candidate-deployment-profile": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 218.1529869629885
+        },
+        "losses": [
+          "1.62849301"
+        ],
+        "window_losses": [
+          "2.60183626",
+          "1.62849301"
+        ],
+        "train_elapsed_seconds": 118,
+        "train_seconds_per_window": 59.0,
+        "phase_ms": [
+          {
+            "build": 27,
+            "alloc": 6744,
+            "inputs": 313,
+            "eval": 60720,
+            "total": 67804
+          },
+          {
+            "build": 25,
+            "alloc": 4008,
+            "inputs": 151,
+            "eval": 39485,
+            "total": 43669
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.026,
+          "alloc": 5.376,
+          "inputs": 0.232,
+          "eval": 50.1025,
+          "total": 55.7365
+        },
+        "peak_device_mib": {
+          "0": 14698,
+          "1": 15306
+        },
+        "workspace_bytes": 12604047360
+      },
+      "candidate-moe-512-acc-absent": {
+        "status": {
+          "exit_code": 0,
+          "wall_seconds": 212.90943797503132
+        },
+        "losses": [
+          "1.63272089"
+        ],
+        "window_losses": [
+          "2.60183626",
+          "1.63272089"
+        ],
+        "train_elapsed_seconds": 114,
+        "train_seconds_per_window": 57.0,
+        "phase_ms": [
+          {
+            "build": 16,
+            "alloc": 5043,
+            "inputs": 326,
+            "eval": 59996,
+            "total": 65381
+          },
+          {
+            "build": 16,
+            "alloc": 2325,
+            "inputs": 150,
+            "eval": 40012,
+            "total": 42503
+          }
+        ],
+        "phase_mean_seconds": {
+          "build": 0.016,
+          "alloc": 3.684,
+          "inputs": 0.238,
+          "eval": 50.004,
+          "total": 53.942
+        },
+        "peak_device_mib": {
+          "0": 14862,
+          "1": 15470
+        },
+        "workspace_bytes": 12767338496
+      },
+      "losses_equal": false,
+      "window_losses_equal": false,
+      "state_tensors_compared": 24,
+      "changed_tensors": [
+        ".qat-state.gguf:qat.m.000000",
+        ".qat-state.gguf:qat.m.000001",
+        ".qat-state.gguf:qat.m.000002",
+        ".qat-state.gguf:qat.m.000003",
+        ".qat-state.gguf:qat.m.000004",
+        ".qat-state.gguf:qat.m.000005",
+        ".qat-state.gguf:qat.m.000006",
+        ".qat-state.gguf:qat.m.000007"
+      ]
+    }
+  },
+  "notes": [
+    "The two-window baseline comparison was profiled; candidate timings are diagnostic, not sustained speedups.",
+    "candidate-moe-512-noacc-isolated set ACC=0, which still enables ACC by variable presence. Exclude it as an ACC ablation.",
+    "candidate-moe-512-noacc failed during an accidentally overlapping launch; exclude it from performance and numerical conclusions."
+  ]
+}

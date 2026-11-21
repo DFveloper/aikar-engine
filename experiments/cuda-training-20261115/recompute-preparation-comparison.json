@@ -1,0 +1,15 @@
+{
+  "original_prepare_seconds": 23.186673,
+  "optimized_prepare_seconds": 0.202176,
+  "original_second_prepare_seconds": 21.4976,
+  "optimized_second_prepare_seconds": 0.163439,
+  "original_first_graph_allocation_ms": 30189,
+  "optimized_first_graph_allocation_ms": 7033,
+  "original_first_window_seconds": 150,
+  "optimized_first_window_seconds": 127,
+  "replay_regions": 2014,
+  "replay_nodes": 153243,
+  "probe_memo_entries_without_cutoff": 108395970,
+  "source": "Actual model logs host-kernel-dual.log and recompute-fixed.log; prepare-only topology probe recompute-probe.log",
+  "guard": "Require forward graph ordering excluding CPY destination self references; otherwise use original dependency traversal"
+}

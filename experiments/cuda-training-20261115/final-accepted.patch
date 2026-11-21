@@ -1,0 +1,544 @@
+diff --git a/examples/qlora_training/test-logit-distillation.cpp b/examples/qlora_training/test-logit-distillation.cpp
+index e96044e90..fc6f99352 100644
+--- a/examples/qlora_training/test-logit-distillation.cpp
++++ b/examples/qlora_training/test-logit-distillation.cpp
+@@ -783,6 +783,86 @@ static void tensor_parallel_partial_write(ggml_backend_dev_t first, ggml_backend
+     }
+ }
+ 
++static void tensor_parallel_async(ggml_backend_dev_t first, ggml_backend_dev_t second) {
++    const char * mode = std::getenv("GGML_CUDA_ALLREDUCE");
++    if (mode && std::strcmp(mode, "none") == 0) return;
++    ggml_backend_ptr first_backend(ggml_backend_dev_init(first, nullptr));
++    ggml_backend_ptr second_backend(ggml_backend_dev_init(second, nullptr));
++    ggml_backend_t backends[] = {first_backend.get(), second_backend.get()};
++    auto * reg = ggml_backend_dev_backend_reg(first);
++    auto init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
++    auto reduce = (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
++    auto destroy = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
++    check(init && reduce && destroy, "CUDA collective interface is missing");
++    void * comm = init(backends, 2);
++    check(comm != nullptr, "CUDA collective initialization failed");
++    for (int64_t count : {1024, 1048576, 1032, 9437184, 1024}) {
++        ggml_context_ptr contexts[2];
++        ggml_backend_buffer_ptr buffers[2];
++        ggml_tensor * tensors[2];
++        ggml_cgraph * graphs[2];
++        std::vector<float> values(count);
++        for (int j = 0; j < 2; ++j) {
++            contexts[j].reset(ggml_init({1024*1024, nullptr, true}));
++            tensors[j] = ggml_new_tensor_1d(contexts[j].get(), GGML_TYPE_F32, count);
++            tensors[j]->flags |= GGML_TENSOR_FLAG_COMPUTE;
++            auto * scaled = ggml_scale_inplace(contexts[j].get(), tensors[j], 0.5f);
++            graphs[j] = ggml_new_graph(contexts[j].get());
++            ggml_build_forward_expand(graphs[j], scaled);
++            buffers[j].reset(ggml_backend_alloc_ctx_tensors(contexts[j].get(), backends[j]));
++            check(buffers[j] != nullptr, "CUDA collective allocation failed");
++            std::fill(values.begin(), values.end(), float(j + 1));
++            ggml_backend_tensor_set(tensors[j], values.data(), 0, ggml_nbytes(tensors[j]));
++        }
++        // Queue enough reductions to reuse event slots without a host synchronization.
++        for (int i = 0; i < 16; ++i) {
++            check(reduce(comm, tensors), "CUDA collective submission failed");
++            for (int j = 0; j < 2; ++j) check(ggml_backend_graph_compute_async(backends[j], graphs[j]) == GGML_STATUS_SUCCESS, "CUDA collective scale failed");
++        }
++        for (int j = 0; j < 2; ++j) {
++            ggml_backend_synchronize(backends[j]);
++            ggml_backend_tensor_get(tensors[j], values.data(), 0, ggml_nbytes(tensors[j]));
++            for (float value : values) check(value == 1.5f, "queued CUDA collective changed a value");
++        }
++    }
++    destroy(comm);
++    std::puts("CUDA collective: queued mixed-size reductions and event reuse passed");
++}
++
++static void tensor_parallel_host_copy(ggml_backend_dev_t first, ggml_backend_dev_t second) {
++    ggml_backend_dev_t devices[] = {first, second};
++    for (int axis : {0, 1, 2}) {
++        auto split = [](const ggml_tensor * tensor, void * userdata) {
++            const int axis = *static_cast<int *>(userdata);
++            ggml_backend_meta_split_state state = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
++            state.ne[0] = state.ne[1] = tensor->ne[axis]/2;
++            return state;
++        };
++        ggml_backend_ptr meta(ggml_backend_dev_init(ggml_backend_meta_device(devices, 2, split, &axis), nullptr));
++        ggml_backend_ptr cpu(ggml_backend_cpu_init());
++        ggml_context_ptr data(ggml_init({1024*1024, nullptr, true}));
++        ggml_context_ptr compute(ggml_init({1024*1024, nullptr, true}));
++        auto * input = ggml_new_tensor_3d(data.get(), GGML_TYPE_F32, 32, 16, 4);
++        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(data.get(), meta.get()));
++        std::vector<float> values(ggml_nelements(input));
++        for (size_t i = 0; i < values.size(); ++i) values[i] = float(int(i%31) - 15);
++        ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
++        auto * scaled = ggml_scale(compute.get(), input, 2.0f);
++        auto * host = ggml_cont(compute.get(), scaled);
++        host->flags |= GGML_TENSOR_FLAG_HOST;
++        auto * graph = ggml_new_graph(compute.get());
++        ggml_build_forward_expand(graph, host);
++        ggml_backend_t backends[] = {meta.get(), cpu.get()};
++        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true);
++        ggml_backend_sched_set_tensor_backend(sched, scaled, meta.get());
++        check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "Meta host copy failed");
++        std::vector<float> actual(values.size());
++        ggml_backend_tensor_get(host, actual.data(), 0, ggml_nbytes(host));
++        for (size_t i = 0; i < values.size(); ++i) check(actual[i] == 2*values[i], "Meta host copy changed a shard");
++        ggml_backend_sched_free(sched);
++    }
++}
++
+ static void tensor_parallel_sum(ggml_backend_dev_t first, ggml_backend_dev_t second) {
+     ggml_backend_dev_t devices[] = {first, second};
+     for (int axis : {0, 1}) {
+@@ -975,7 +1055,7 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool
+     llm_graph_result result(8192);
+     llama_adapter_loras loras;
+     llm_graph_params params = {};
+-    params.hparams.n_layer_all = 1;
++    params.hparams.n_layer_all = 2;
+     params.hparams.n_embd = 64;
+     params.hparams.n_head_arr[0] = 2;
+     params.hparams.n_head_kv_arr[0] = 1;
+@@ -1198,6 +1278,15 @@ static void compact_encoding_checks(ggml_backend_t backend = nullptr) {
+ 
+ int main(int argc, char ** argv) {
+     try {
++        if (argc == 2 && std::strcmp(argv[1], "--async-cuda") == 0) {
++            ggml_backend_load_all();
++            auto * first = ggml_backend_dev_by_name("CUDA0");
++            auto * second = ggml_backend_dev_by_name("CUDA1");
++            check(first && second, "async regression requires two CUDA devices");
++            tensor_parallel_async(first, second);
++            tensor_parallel_host_copy(first, second);
++            return 0;
++        }
+         if (argc == 2 && (std::strcmp(argv[1], "--full-context") == 0 || std::strcmp(argv[1], "--full-context-cuda") == 0)) {
+             ggml_backend_ptr backend;
+             if (std::strcmp(argv[1], "--full-context-cuda") == 0) {
+@@ -1269,6 +1358,8 @@ int main(int argc, char ** argv) {
+             // The internal collective can round inputs to BF16; this reference checks F32 peer reduction.
+             const char * allreduce = std::getenv("GGML_CUDA_ALLREDUCE");
+             if (allreduce && std::strcmp(allreduce, "none") == 0) tensor_parallel_backward(first, second);
++            tensor_parallel_async(first, second);
++            tensor_parallel_host_copy(first, second);
+             tensor_parallel_accumulate(first, second);
+             tensor_parallel_sum(first, second);
+             tensor_parallel_copy(first, second);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index daa80d8ce..5eeb4513d 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -11,6 +11,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <future>
+ #include <map>
+ #include <memory>
+ #include <set>
+@@ -2303,12 +2304,14 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+ 
+ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+-    GGML_ASSERT(offset == 0);
+-    GGML_ASSERT(ggml_is_contiguous(tensor));
+-
+     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+-    GGML_ASSERT(split_state.n_segments == 1);
+-    GGML_ASSERT(split_state.nr[0]      == 1);
++    if (offset != 0 || !ggml_is_contiguous(tensor) || split_state.n_segments != 1 || split_state.nr[0] != 1 ||
++            (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
++             (split_state.axis < GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis > GGML_BACKEND_SPLIT_AXIS_2))) {
++        for (size_t j = 0; j < n_backends; ++j) ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j));
++        ggml_backend_tensor_get(tensor, data, offset, size);
++        return;
++    }
+ 
+     switch (split_state.axis) {
+         case GGML_BACKEND_SPLIT_AXIS_0:
+@@ -2827,14 +2830,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     };
+ 
+ 
++    const auto dev0 = ggml_backend_get_device(backend_ctx->backend_configs[0].backend);
++    const auto reg0 = ggml_backend_dev_backend_reg(dev0);
++    const bool parallel_cuda = n_backends == 2 && reg0 && std::strcmp(ggml_backend_reg_name(reg0), "CUDA") == 0 &&
++        ggml_backend_get_device(backend_ctx->backend_configs[1].backend) != dev0 &&
++        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ctx->backend_configs[1].backend)) == reg0;
++
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+-        for (size_t j = 0; j < n_backends; j++) {
++        std::future<ggml_status> pending;
++        if (parallel_cuda) {
++            pending = std::async(std::launch::async, [&, i] {
++                auto & bc = backend_ctx->backend_configs[1];
++                return ggml_backend_graph_compute_async(bc.backend, bc.cgraphs[i].cgraph_main);
++            });
++        }
++        ggml_status result = GGML_STATUS_SUCCESS;
++        for (size_t j = 0; j < (parallel_cuda ? 1 : n_backends); j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+-            if (status != GGML_STATUS_SUCCESS) {
+-                return status;
+-            }
++            if (status != GGML_STATUS_SUCCESS) result = status;
++        }
++        if (parallel_cuda) {
++            const ggml_status status = pending.get();
++            if (status != GGML_STATUS_SUCCESS) result = status;
+         }
++        if (result != GGML_STATUS_SUCCESS) return result;
+ 
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+             bool backend_allreduce_success = false;
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 2b552ec64..9eff5cfcf 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1952,6 +1952,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++        if (ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_META &&
++                input_backend->iface.get_tensor_async && ggml_backend_buffer_is_host(input_cpy->buffer)) {
++            ggml_backend_synchronize(split_backend);
++            // Queue all shards before waiting, so one GPU does not wait for the other's host copy.
++            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
++            ggml_backend_synchronize(input_backend);
++            return;
++        }
+         ggml_backend_synchronize(input_backend);
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+diff --git a/ggml/src/ggml-cuda/acc.cu b/ggml/src/ggml-cuda/acc.cu
+index e084607c0..c2738697e 100644
+--- a/ggml/src/ggml-cuda/acc.cu
++++ b/ggml/src/ggml-cuda/acc.cu
+@@ -27,6 +27,21 @@ static __global__ void acc_f32(const float * x, const float * y, float * dst, co
+     dst[i] = val;
+ }
+ 
++static __global__ void acc_f32_slice(const float * y, float * dst, const int64_t ne,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t s11, const int64_t s12, const int64_t s13, const int64_t offset) {
++    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++    if (i >= ne) return;
++    int64_t tmp = i;
++    const int64_t i10 = tmp % ne10;
++    tmp /= ne10;
++    const int64_t i11 = tmp % ne11;
++    tmp /= ne11;
++    const int64_t i12 = tmp % ne12;
++    const int64_t i13 = tmp / ne12;
++    dst[offset + i10 + i11*s11 + i12*s12 + i13*s13] += y[i];
++}
++
+ static void acc_f32_cuda(const float * x, const float * y, float * dst, const int64_t n_elements,
+         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+         const int64_t s1, const int64_t s2, const int64_t s3, const int64_t offset, cudaStream_t stream) {
+@@ -57,5 +72,21 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t s3     = dst->op_params[2] / sizeof(float);
+     const int64_t offset = dst->op_params[3] / sizeof(float);
+ 
++    const int64_t n = ggml_nelements(src1);
++    const bool ordered = s1 >= src1->ne[0] && s2 >= s1*src1->ne[1] && s3 >= s2*src1->ne[2];
++    const bool disjoint = uintptr_t(src1_d) + ggml_nbytes(src1) <= uintptr_t(dst_d) ||
++        uintptr_t(dst_d) + ggml_nbytes(dst) <= uintptr_t(src1_d);
++    const int64_t end = offset + src1->ne[0] + (src1->ne[1] - 1)*s1 +
++        (src1->ne[2] - 1)*s2 + (src1->ne[3] - 1)*s3;
++    if (ordered && disjoint && offset >= 0 && end <= ggml_nelements(dst) &&
++            (src0_d == dst_d || n <= ggml_nelements(dst)/4)) {
++        // Keep untouched elements in place when the allocator reuses the gradient buffer.
++        if (src0_d != dst_d) CUDA_CHECK(cudaMemcpyAsync(dst_d, src0_d, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
++        const int blocks = (n + CUDA_ACC_BLOCK_SIZE - 1) / CUDA_ACC_BLOCK_SIZE;
++        acc_f32_slice<<<blocks, CUDA_ACC_BLOCK_SIZE, 0, stream>>>(src1_d, dst_d, n,
++                src1->ne[0], src1->ne[1], src1->ne[2], s1, s2, s3, offset);
++        return;
++    }
++
+     acc_f32_cuda(src0_d, src1_d, dst_d, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset, stream);
+ }
+diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
+index 39b23bed7..341c2be1d 100644
+--- a/ggml/src/ggml-cuda/allreduce.cu
++++ b/ggml/src/ggml-cuda/allreduce.cu
+@@ -225,12 +225,7 @@ static __global__ void ggml_cuda_ar_add_kernel(
+ // Pipeline structure
+ // ---------------------------------------------------------------------------
+ 
+-// Number of slots in the event / arrival ring.  Two slots is sufficient:
+-// lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
+-// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
+-// from AR N-2 by the time we get to AR N.  acquire_slot's
+-// cudaEventSynchronize on ev.ker for both devices makes that consumption
+-// explicit before we overwrite host_buf[slot] for the new AR.
++// Wait for both devices to release a slot before either device reuses it.
+ static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
+ 
+ // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
+@@ -361,7 +356,7 @@ struct ggml_cuda_ar_slot_info {
+     int token;
+ };
+ 
+-static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
++static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends) {
+     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
+     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
+     p->call_count++;
+@@ -369,7 +364,11 @@ static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline *
+     if (pool_lapped) {
+         for (int i = 0; i < p->n_devices; ++i) {
+             ggml_cuda_set_device(p->devices[i]);
+-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
++            auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
++            for (int peer = 0; peer < p->n_devices; ++peer) {
++                CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), p->ev_pool[peer][slot].ker, 0));
++                CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].ker, 0));
++            }
+         }
+     }
+ 
+@@ -611,7 +610,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
+     const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
+     GGML_ASSERT(chunk_bytes > 0);
+ 
+-    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
++    const int slot = ggml_cuda_ar_acquire_slot(p, backends).slot;
+     const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
+     GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
+ 
+@@ -701,7 +700,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
+ 
+         // Record dev_tmp-released on the compute stream so the next copy_impl
+         // can wait for the kernel to finish before overwriting dev_tmp.  Also
+-        // record AR-done as ev.ker for acquire_slot's pool-wraparound sync.
++        // record AR-done as ev.ker for slot reuse on either stream.
+         CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
+         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
+     }
+@@ -896,14 +895,13 @@ bool ggml_cuda_ar_allreduce(
+         // cross-stream event handshake that the copy-engine path needs, and
+         // skips the cross-stream scheduling overhead that was hurting the
+         // small-tensor (tg) latency on the AR-stream variant.  Only ev.ker is
+-        // still recorded at end-of-AR for acquire_slot's pool-wraparound check.
++        // recorded after each chunk to protect ring-slot reuse.
+         for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
+             const size_t remaining_elems = (size_t) (ne - chunk_start);
+             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
+             const size_t chunk_dst_bytes  = chunk_elems * input_type_size;
+ 
+-            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+-            const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
++            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p, backends);
+ 
+             for (int i = 0; i < n; ++i) {
+                 const int peer = 1 - i;  // valid for n == 2 only
+@@ -947,9 +945,7 @@ bool ggml_cuda_ar_allreduce(
+ #undef LAUNCH_AR_KERNEL
+                 CUDA_CHECK(cudaGetLastError());
+ 
+-                if (last_chunk) {
+-                    CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+-                }
++                CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/fattn-back.cu b/ggml/src/ggml-cuda/fattn-back.cu
+index 09b00575b..26821b6b6 100644
+--- a/ggml/src/ggml-cuda/fattn-back.cu
++++ b/ggml/src/ggml-cuda/fattn-back.cu
+@@ -601,6 +601,17 @@ static void launch_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor
+     const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+     const size_t offs_s = offs_v + GGML_PAD(ggml_nelements(v)*sizeof(float), GGML_MEM_ALIGN);
+     cudaStream_t stream = ctx.stream();
++    const bool gemm_f16 = use_volta_f16_fattn_back(ctx, dst);
++    const bool gemm_f32 = use_pascal_f32_fattn_back(ctx, dst);
++    if (gemm_f16 || gemm_f32) {
++        // GEMMs overwrite Q/K/V; only the sink gradient uses atomic accumulation.
++        if (sinks && (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID) || (grad_flags & GGML_FLASH_ATTN_BACK_GRAD_SINKS))) {
++            CUDA_CHECK(cudaMemsetAsync((char *) dst->data + offs_s, 0, ggml_nbytes(dst) - offs_s, stream));
++        }
++        if (gemm_f16) launch_gemm_fattn_back<half>(ctx, dst);
++        else launch_gemm_fattn_back<float>(ctx, dst);
++        return;
++    }
+     if (!(grad_flags & GGML_FLASH_ATTN_BACK_GRAD_VALID)) {
+         CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+     } else {
+@@ -618,16 +629,6 @@ static void launch_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor
+         }
+     }
+ 
+-    if (use_volta_f16_fattn_back(ctx, dst)) {
+-        launch_gemm_fattn_back<half>(ctx, dst);
+-        return;
+-    }
+-
+-    if (use_pascal_f32_fattn_back(ctx, dst)) {
+-        launch_gemm_fattn_back<float>(ctx, dst);
+-        return;
+-    }
+-
+     const int threads = 128;
+     const int blocks = q->ne[1]*q->ne[2]*q->ne[3];
+     flash_attn_back_kernel<type_K, type_V><<<blocks, threads, threads*sizeof(float), stream>>>(
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 2b6bc328a..4442b2ba9 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -195,8 +195,9 @@ void ggml_cuda_mul_mat_q(
+             ncols_opt = ne12;
+ 
+             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
++            // Use the per-expert token count when wide tiles waste most columns.
++            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
++                    (cc == GGML_CUDA_CC_VOLTA && src0->type == GGML_TYPE_Q4_0)) {
+                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+             }
+         }
+diff --git a/ggml/src/ggml-cuda/out-prod.cu b/ggml/src/ggml-cuda/out-prod.cu
+index 0f8a371ba..cb3bf20a7 100644
+--- a/ggml/src/ggml-cuda/out-prod.cu
++++ b/ggml/src/ggml-cuda/out-prod.cu
+@@ -523,7 +523,7 @@ static __device__ __forceinline__ float mxfp4_get(const block_mxfp4 & block, int
+ #include <mma.h>
+ 
+ static constexpr int MUL_MAT_ID_BACK_FUSED_M = 128;
+-static constexpr int MUL_MAT_ID_BACK_FUSED_N = 64;
++static constexpr int MUL_MAT_ID_BACK_FUSED_N = 32;
+ static constexpr int MUL_MAT_ID_BACK_FUSED_K = 64;
+ static constexpr int MUL_MAT_ID_BACK_FUSED_WARPS = 8;
+ static constexpr int MUL_MAT_ID_BACK_SCALE_WARPS = 4;
+@@ -559,7 +559,10 @@ static __global__ void mul_mat_id_back_q4_0_fused(
+     __shared__ int weight_exp;
+     __shared__ float weight_scale;
+     // The MMA input tiles and output fragments use this storage at different times.
+-    __shared__ __align__(32) unsigned char workspace[tile_m*tile_n*sizeof(float)];
++    constexpr int input_bytes = (tile_m + tile_n)*tile_k*sizeof(half);
++    constexpr int output_bytes = tile_m*tile_n*sizeof(float);
++    constexpr int workspace_bytes = input_bytes > output_bytes ? input_bytes : output_bytes;
++    __shared__ __align__(32) unsigned char workspace[workspace_bytes];
+     half * a = reinterpret_cast<half *>(workspace);
+     half * b = a + tile_m*tile_k;
+     float * c = reinterpret_cast<float *>(workspace);
+@@ -593,11 +596,9 @@ static __global__ void mul_mat_id_back_q4_0_fused(
+     }
+     __syncthreads();
+ 
+-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1, acc2, acc3;
+-    wmma::fill_fragment(acc0, 0.0f);
+-    wmma::fill_fragment(acc1, 0.0f);
+-    wmma::fill_fragment(acc2, 0.0f);
+-    wmma::fill_fragment(acc3, 0.0f);
++    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[tile_n/16];
++    #pragma unroll
++    for (int j = 0; j < tile_n/16; ++j) wmma::fill_fragment(acc[j], 0.0f);
+     const int m = warp*16;
+     const int n = 0;
+     for (int64_t row_begin = 0; row_begin < rows; row_begin += tile_k) {
+@@ -627,23 +628,20 @@ static __global__ void mul_mat_id_back_q4_0_fused(
+         __syncthreads();
+         for (int k = 0; k < tile_k; k += 16) {
+             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> af;
+-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf0, bf1, bf2, bf3;
+             wmma::load_matrix_sync(af, a + m + k*tile_m, tile_m);
+-            wmma::load_matrix_sync(bf0, b + k + n*tile_k, tile_k);
+-            wmma::load_matrix_sync(bf1, b + k + (n + 16)*tile_k, tile_k);
+-            wmma::load_matrix_sync(bf2, b + k + (n + 32)*tile_k, tile_k);
+-            wmma::load_matrix_sync(bf3, b + k + (n + 48)*tile_k, tile_k);
+-            wmma::mma_sync(acc0, af, bf0, acc0);
+-            wmma::mma_sync(acc1, af, bf1, acc1);
+-            wmma::mma_sync(acc2, af, bf2, acc2);
+-            wmma::mma_sync(acc3, af, bf3, acc3);
++            #pragma unroll
++            for (int j = 0; j < tile_n/16; ++j) {
++                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
++                wmma::load_matrix_sync(bf, b + k + (n + 16*j)*tile_k, tile_k);
++                wmma::mma_sync(acc[j], af, bf, acc[j]);
++            }
+         }
+         __syncthreads();
+     }
+-    wmma::store_matrix_sync(c + m + n*tile_m, acc0, tile_m, wmma::mem_col_major);
+-    wmma::store_matrix_sync(c + m + (n + 16)*tile_m, acc1, tile_m, wmma::mem_col_major);
+-    wmma::store_matrix_sync(c + m + (n + 32)*tile_m, acc2, tile_m, wmma::mem_col_major);
+-    wmma::store_matrix_sync(c + m + (n + 48)*tile_m, acc3, tile_m, wmma::mem_col_major);
++    #pragma unroll
++    for (int j = 0; j < tile_n/16; ++j) {
++        wmma::store_matrix_sync(c + m + (n + 16*j)*tile_m, acc[j], tile_m, wmma::mem_col_major);
++    }
+     __syncthreads();
+     for (int i = tid; i < tile_m*tile_n; i += warps*WARP_SIZE) {
+         const int slot = i/tile_m;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 04dba5255..822cf993f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9052,16 +9052,18 @@ struct test_acc : public test_case {
+     const std::array<int64_t, 4> ne_a;
+     const std::array<int64_t, 4> ne_b;
+     const int64_t stride_dim;
++    const bool inplace;
++    const size_t offset;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR4(type, ne_a, ne_b, stride_dim);
++        return VARS_TO_STR6(type, ne_a, ne_b, stride_dim, inplace, offset);
+     }
+ 
+     test_acc(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {256, 17, 2, 3},
+             std::array<int64_t, 4> ne_b = {256, 16, 2, 3},
+-            uint64_t stride_dim = -1)
+-        : type(type), ne_a(ne_a), ne_b(ne_b), stride_dim(stride_dim) {}
++            uint64_t stride_dim = -1, bool inplace = false, size_t offset = 0)
++        : type(type), ne_a(ne_a), ne_b(ne_b), stride_dim(stride_dim), inplace(inplace), offset(offset) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+@@ -9090,7 +9092,8 @@ struct test_acc : public test_case {
+ 
+         // When ne_b[0] < ne_a[0], a->nb[1] != b->nb[1], so the stride
+         // parameters to ggml_acc don't match b's natural stride.
+-        ggml_tensor * out = ggml_acc(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], 0);
++        ggml_tensor * out = inplace ? ggml_acc_inplace(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], offset) :
++            ggml_acc(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], offset);
+         ggml_set_name(out, "out");
+ 
+         return out;
+@@ -13151,6 +13154,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id_back(type, GGML_TYPE_F32, 37, 2, false, 35, 512, 96));
+         test_cases.emplace_back(new test_mul_mat_id_back(type, GGML_TYPE_F32, 37, 2, false, 35, 1024, 96, 1.0f, 0, true));
+     }
++    for (bool broadcast : {false, true}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 116, 8, broadcast, 64, 256, 96));
++        test_cases.emplace_back(new test_mul_mat_id_back_balanced(GGML_TYPE_Q4_0, GGML_TYPE_F32, 116, 8, broadcast, 64, 256, 96));
++    }
+     for (float scale : {0.0f, 1e-20f, 1e-10f, 1.0f, 1e10f, 1e20f}) {
+         test_cases.emplace_back(new test_mul_mat_id_back_scaled(scale));
+     }
+@@ -13564,6 +13571,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
+     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));
+     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {9, 9, 1280, 1}));
++    for (bool inplace : {false, true}) {
++        test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 16384, 1, 1}, {256, 256, 1, 1}, -1, inplace, 8192*256*sizeof(float)));
++        test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, -1, inplace, 32*sizeof(float)));
++    }
+     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
+     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
+     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
+@@ -14749,6 +14760,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 1,   1)); // Nemotron-9B generate
+ 
+     // acc
++    for (bool inplace : {false, true}) {
++        test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 16384, 1, 1}, {256, 256, 1, 1}, -1, inplace, 8192*256*sizeof(float)));
++        test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, -1, inplace, 32*sizeof(float)));
++    }
+     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
+     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
+     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));

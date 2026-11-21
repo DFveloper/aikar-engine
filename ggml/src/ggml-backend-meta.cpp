@@ -954,6 +954,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     }
                     return src_ss[0];
                 }
+                if (axis_a > 0 && axis_a < GGML_MAX_DIMS && axis_b == axis_a &&
+                        ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                        a->ne[0] >= b->ne[0] && split_states_equal(src_ss[0], src_ss[1])) {
+                    bool row_slice = size_t(tensor->op_params[3]) <= size_t(a->ne[0] - b->ne[0])*sizeof(float);
+                    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                        row_slice &= a->ne[i] == b->ne[i] && size_t(tensor->op_params[i - 1]) == a->nb[i];
+                    }
+                    if (row_slice) return src_ss[0];
+                }
                 if (axis_a == 0 && axis_b >= 0 && axis_b < GGML_MAX_DIMS && src_ss[1].n_segments == 1 && src_ss[1].nr[0] == 1) {
                     size_t segment_offset = 0;
                     for (size_t s = 0; s < src_ss[0].n_segments; ++s) {
@@ -1459,6 +1468,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             const int first_stride = ggml_backend_meta_get_split_state(tensor->src[1], true).axis;
             for (int i = first_stride; i < 4; ++i) {
                 t_ij->op_params[i] = int64_t(tensor->op_params[i])*ne[split_dim]/tensor->ne[split_dim];
+            }
+            if (first_stride == split_dim && split_dim > 0 &&
+                    size_t(tensor->op_params[3]) < tensor->src[0]->nb[split_dim]) {
+                // An offset within one head does not shrink when heads are split.
+                t_ij->op_params[3] = tensor->op_params[3];
             }
         }
         ggml_set_name(t_ij, tensor->name);

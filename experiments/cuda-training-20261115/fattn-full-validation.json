@@ -1,0 +1,28 @@
+{
+  "status": "full_fusion_candidates_rejected_for_performance",
+  "microbenchmark_ms": {
+    "fattn-full-swa": 4.568371818181817,
+    "fattn-full-qonly": 2.506473818181818,
+    "fattn-full-qonly-v2": 1.4997205454545453,
+    "fattn-full-qonly-v3": 1.487401,
+    "fattn-full-qonly-v4": 1.3855561818181819,
+    "fattn-full-qonly-v5": 1.762344727272727,
+    "fattn-partial-qonly": 1.3277913636363636
+  },
+  "gradient_regressions_passed": true,
+  "full_qkv_regression_log": "fattn-full-regressions.log",
+  "q_only_regression_logs": [
+    "fattn-full-qonly-v3-regressions.log",
+    "fattn-full-qonly-v4-regressions.log",
+    "fattn-full-qonly-v5-regressions.log"
+  ],
+  "scope": "D256 Volta SWA, 16K keys, 256 queries, 16 Q heads, 8 KV heads, bounded 1280 visible keys",
+  "findings": [
+    "Full QKV keeps P/dS in shared memory, recomputes dP twice, and atomically accumulates dK/dV. It is slower than partial fusion.",
+    "Q-only variants hold P in registers and dS in shared memory with no global P/dS matrices. Best measured time still exceeds existing Q-only path.",
+    "Two dQ accumulator tiles reuse dS loads and improve Q-only speed from about 1.49 to 1.39 ms.",
+    "Staging Q/dO in shared memory regresses performance; no deployment."
+  ],
+  "actual_model_full_fusion_tested": false,
+  "production_source": "accepted-fattn-fusion-partial.cu"
+}

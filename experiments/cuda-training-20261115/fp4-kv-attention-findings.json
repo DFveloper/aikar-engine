@@ -1,0 +1,27 @@
+{
+  "global_kv": {
+    "type": "FP4_KV",
+    "format": "E2M1, one E4M3 scale per 16 values",
+    "training": "F32 master -> FP4_KV -> F32 restore -> STE -> F16 attention inputs",
+    "source": "src/models/gemma4.cpp:304; src/llama-graph.cpp:3579",
+    "benchmark": "CPU reference FP4 roundtrip and STE arithmetic, converted to F16; full-model validation still required"
+  },
+  "swa_kv": {
+    "training": "F32 cache -> F16 full-sequence attention inputs",
+    "head_dim": 256,
+    "kv_heads": 8,
+    "query_heads": 16
+  },
+  "existing_sparse_dispatch": {
+    "d256": "Selecting sparse also selects Q8 KV; cannot enable unchanged while preserving precision",
+    "d512": "Global causal attention has limited sparse work to skip; FP4 packed direct training attention is not implemented by this change"
+  },
+  "volta_d256_resources": {
+    "baseline_registers": 255,
+    "baseline_stack_bytes": 480,
+    "tuned_registers": 255,
+    "tuned_stack_bytes": 64
+  },
+  "q4_unpack_reuse": "Rejected: no significant gain across six full/sharded/fused shapes; source restored",
+  "production_args_changed": false
+}

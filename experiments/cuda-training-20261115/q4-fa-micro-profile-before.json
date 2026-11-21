@@ -1,0 +1,26 @@
+{
+  "fa": [
+    {
+      "calls": 1,
+      "gpu_ms": 6.732476,
+      "kernel": "void flash_attn_ext_f16<(int)256, (int)256, (int)32, (int)2, (bool)0, (bool)0, (bool)0, (bool)0>(const char *, const char *, const char *, const char *, const char *, const int *, float *, float2 *, float, float, float, float, unsigned int, float, int, uint3, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)"
+    }
+  ],
+  "q4": [
+    {
+      "calls": 1,
+      "gpu_ms": 0.750277,
+      "kernel": "void mul_mat_q<(ggml_type)2, (int)32, (bool)1, (ggml_prec)30>(const char *, const int *, const int *, const int *, float *, float *, const float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)"
+    },
+    {
+      "calls": 1,
+      "gpu_ms": 0.03232,
+      "kernel": "void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)1>(const float *, const int *, void *, long, long, long, long, long, int, int, int)"
+    },
+    {
+      "calls": 1,
+      "gpu_ms": 0.018016,
+      "kernel": "void mm_ids_helper<(int)8>(const int *, int *, int *, int *, int, int, int, int, int, bool)"
+    }
+  ]
+}

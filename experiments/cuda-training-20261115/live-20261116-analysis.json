@@ -1,0 +1,47 @@
+{
+  "status": "monitoring_fixed_training_acceleration_not_yet_verified",
+  "trainer_pid": 2418380,
+  "power_limit_watts": [
+    150,
+    150
+  ],
+  "training_restarted": false,
+  "training_arguments_changed": false,
+  "training_code_changed": false,
+  "gpu_sample": {
+    "0": {
+      "samples": 34,
+      "mean_utilization_percent": 74.6470588235294,
+      "sm_clock_mhz": [
+        795
+      ]
+    },
+    "1": {
+      "samples": 34,
+      "mean_utilization_percent": 68.02941176470588,
+      "sm_clock_mhz": [
+        795
+      ]
+    }
+  },
+  "sample_start": "2026/11/16 13:40:43.054",
+  "sample_end": "2026/11/16 13:41:16.270",
+  "sample_limitations": "34 seconds, nvidia-smi utilization sampling; cannot attribute individual CUDA kernels or establish steady-state throughput",
+  "confirmed_issue": "Three orphan/current telemetry processes shared the same truncated CSV; 1332052 NUL bytes observed in a 1954563-byte snapshot",
+  "applied": [
+    "Stopped only stale telemetry PIDs 2258051 and 2374005; retained 2418377",
+    "Restart helper now removes matching same-output telemetry processes before opening the CSV"
+  ],
+  "verification": [
+    "Trainer PID unchanged and progressed from window 2 to window 4",
+    "Both GPU power limits remain 150 W",
+    "Python syntax and selective telemetry termination checks passed"
+  ],
+  "remaining_bottleneck_hypotheses": [
+    "Repeated CUDA graph submissions and synchronization",
+    "Quantized MoE and attention forward/backward",
+    "Synchronous host graph preparation at window transitions"
+  ],
+  "profiling_blocker": "perf_event_paranoid=4; perf denied; sudo -n requires interactive authentication",
+  "historical_results_are_not_this_turn_speedups": true
+}

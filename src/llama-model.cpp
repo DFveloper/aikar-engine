@@ -831,7 +831,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // the V head size can differ from the K head size (e.g. MiMo d_k=192 d_v=128):
             // align V tensors to whole V heads at the same head-index scale as Q and K so all
             // three stay in lockstep per device
-            const int64_t granularity_v  = (granularity_kv / hparams.n_embd_head_k(il)) * hparams.n_embd_head_v(il);
+            const int64_t granularity_v  = (granularity_kv / hparams.n_embd_head_k(il)) * (tensor_name.find("cache_v") != std::string::npos ? hparams.n_embd_head_v_cache(il) : hparams.n_embd_head_v(il));
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_v_exps_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
@@ -3261,10 +3261,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         reuse = [&](uint32_t il) { return hparams.has_kv(il) ? -1 : hparams.kv_source(il); };
                     } else if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
+                            if (hparams.kvsharer_map[il]) { return hparams.kvsharer_map[il] - 1; }
                             GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
 
                             if (il >= (uint32_t)hparams.n_layer_kv_from_start) {
-                                return hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+                                const int source = hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+                                return hparams.kvsharer_map[source] ? hparams.kvsharer_map[source] - 1 : source;
                             }
 
                             return -1;

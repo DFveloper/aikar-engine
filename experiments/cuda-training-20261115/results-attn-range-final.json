@@ -1,0 +1,12 @@
+{
+  "state_tensors": 24,
+  "changed": [],
+  "state_bytes_equal": true,
+  "train_seconds_before": 298.7,
+  "train_seconds_after": 184.02,
+  "speedup": 1.6231931311813932,
+  "training_losses_equal": true,
+  "validation_losses_equal": true,
+  "production_args_changed": false,
+  "required_seconds_per_window": 35.661218424962854
+}

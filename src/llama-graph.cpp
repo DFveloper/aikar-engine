@@ -61,19 +61,28 @@ bool llm_graph_input_moe_mask::can_reuse(const llm_graph_params & params) {
 
 // dedup helpers
 
+static bool is_host_tensor(const ggml_tensor * tensor) {
+    while (tensor->view_src) tensor = tensor->view_src;
+    if (!tensor->buffer) return false;
+    auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+    return (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META) && ggml_backend_buffer_is_host(tensor->buffer);
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        bool packed = false) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    const auto type = packed ? GGML_TYPE_I32 : cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    GGML_ASSERT(!packed || n_kv % 32 == 0);
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, packed ? n_kv/32 : n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -91,7 +100,7 @@ static bool can_reuse_kq_mask(
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    res &= (kq_mask->ne[0] == (kq_mask->type == GGML_TYPE_I32 ? n_kv/32 : n_kv));
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
@@ -1776,6 +1785,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * weight = replace_weight ? replace_weight(ctx0, w) : w;
     ggml_tensor * res = ggml_mul_mat(ctx0, weight, cur_mm);
+    if (hparams.kv_global_only && !training && is_host_tensor(res->src[0])) {
+        ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
+    }
     if ((training || full_sequence) && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
     }
@@ -1913,6 +1925,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, weight, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+    if (hparams.kv_global_only && !training && is_host_tensor(res->src[0])) {
+        ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
+    }
     if (priority) { ggml_mul_mat_id_set_expert_priority(res, priority); }
     if ((training || full_sequence) && w->type == GGML_TYPE_Q4_0 && !(w->flags & GGML_TENSOR_FLAG_PARAM)) {
         GGML_ASSERT(ggml_prec_set_src(res, GGML_PREC_Q4, 0));
@@ -2433,10 +2448,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * lookahead_input) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
-    if (full_sequence && n_tokens > LLM_TRAINING_TILE_SIZE) {
+    const bool tile_inference = hparams.kv_global_only && !training;
+    const int64_t tile_size = LLM_TRAINING_TILE_SIZE;
+    if ((full_sequence || tile_inference) && n_tokens > tile_size) {
         std::vector<ggml_tensor *> tiles;
-        for (int64_t start = 0; start < n_tokens; start += LLM_TRAINING_TILE_SIZE) {
-            const int64_t count = std::min<int64_t>(LLM_TRAINING_TILE_SIZE, n_tokens - start);
+        for (int64_t start = 0; start < n_tokens; start += tile_size) {
+            const int64_t count = std::min<int64_t>(tile_size, n_tokens - start);
             const auto slice = [&](ggml_tensor * tensor) -> ggml_tensor * {
                 if (!tensor) return nullptr;
                 GGML_ASSERT(ggml_is_matrix(tensor) && tensor->ne[1] == n_tokens);
@@ -2765,6 +2782,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             } break;
         default:
             GGML_ABORT("fatal error");
+    }
+
+    if (hparams.kv_global_only && !training && !weight_before_ffn && down_exps_s &&
+            !down_exps_b && !post_exp_norm && !slots && !priority && !replace_weight &&
+            loras->empty() && (!prec_policy || (prec_policy->prec_src1.count(down_exps) == 0 &&
+            prec_policy->prec_acc.count(down_exps) == 0)) && down_exps->type == GGML_TYPE_Q4_0 &&
+            down_exps_s->type == GGML_TYPE_F32 && ggml_is_contiguous(down_exps_s)) {
+        auto * input = build_hadamard_input(down_exps, cur);
+        auto * reduced = ggml_mul_mat_id_weighted_sum(ctx0, down_exps, input, selected_experts, weights, down_exps_s);
+        ggml_backend_t owner = is_host_tensor(down_exps) ? backend_cpu : nullptr;
+        if (!owner) {
+            const ggml_tensor * storage = down_exps;
+            while (storage->view_src) storage = storage->view_src;
+            auto * device = storage->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(storage->buffer)) : nullptr;
+            for (int i = 0; device && i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                auto * backend = ggml_backend_sched_get_backend(sched, i);
+                auto * reg = ggml_backend_dev_backend_reg(device);
+                if (ggml_backend_get_device(backend) == device && reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+                    owner = backend;
+                    break;
+                }
+            }
+        }
+        if (owner && (owner != backend_cpu || n_tokens <= 4) && ggml_backend_supports_op(owner, reduced)) {
+            ggml_backend_sched_set_tensor_backend(sched, reduced, owner);
+            auto * output = ggml_reshape_2d(ctx0, reduced, n_embd, n_tokens);
+            cb(output, "ffn_moe_out", il);
+            return output;
+        }
     }
 
     {
@@ -3226,6 +3272,52 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * turboquant_parameters) const {
+    if (hparams.kv_global_only && !hparams.is_swa(il) && v->ne[0] == hparams.n_rot(il)) {
+        const int source = hparams.kv_source(il);
+        auto * scale = kv_reconstruction_scales.at(source);
+        if (scale->type != GGML_TYPE_F32) scale = ggml_cast(ctx0, scale, GGML_TYPE_F32);
+        if (!training && cparams.flash_attn && !kq_b && !v_mla &&
+                k->type == GGML_TYPE_FP4_KV && v->type == k->type) {
+            const auto n_stream = k->ne[3];
+            auto * query = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                    q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+            auto * fused = ggml_flash_attn_ext_v_from_k(ctx0,
+                    ggml_permute(ctx0, query, 0, 2, 1, 3), ggml_permute(ctx0, k, 0, 2, 1, 3),
+                    ggml_permute(ctx0, v, 0, 2, 1, 3), kq_mask, scale,
+                    kq_scale, hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            const ggml_tensor * storage = k;
+            while (storage->view_src) storage = storage->view_src;
+            auto * device = storage->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(storage->buffer)) : nullptr;
+            ggml_backend_t owner = backend_cpu;
+            for (int i = 0; device && i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                auto * backend = ggml_backend_sched_get_backend(sched, i);
+                if (ggml_backend_get_device(backend) == device) { owner = backend; break; }
+            }
+            if (kq_mask && kq_mask->type == GGML_TYPE_I32 && !ggml_backend_supports_op(owner, fused)) {
+                owner = backend_cpu;
+            }
+            if (ggml_backend_supports_op(owner, fused)) {
+                ggml_flash_attn_ext_add_sinks(fused, sinks);
+                GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+                ggml_flash_attn_ext_set_n_kv_max(fused, static_cast<int32_t>(n_kv_max));
+                ggml_flash_attn_ext_set_causal(fused, cparams.causal_attn);
+                ggml_prec_set_acc(fused, GGML_PREC_F32);
+                ggml_backend_sched_set_tensor_backend(sched, fused, owner);
+                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fused, il});
+                cb(fused, "lumen4exp_fused_v_from_k", il);
+                return ggml_reshape_2d(ctx0, fused, fused->ne[0]*fused->ne[1], fused->ne[2]*fused->ne[3]);
+            }
+        }
+        if (k->type != GGML_TYPE_F32) k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+        if (v->type != GGML_TYPE_F32) v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+        const int64_t rotary = hparams.n_rot(il);
+        const int64_t tail_size = k->ne[0] - rotary;
+        auto * tail = ggml_view_4d(ctx0, k, tail_size, k->ne[1], k->ne[2], k->ne[3],
+                k->nb[1], k->nb[2], k->nb[3], rotary * k->nb[0]);
+        auto * tail_scale = ggml_view_1d(ctx0, scale, tail_size, rotary * scale->nb[0]);
+        v = ggml_concat(ctx0, v, ggml_div(ctx0, tail, tail_scale), 0);
+        ggml_set_name(v, "lumen4exp_v_from_k");
+    }
     const uint32_t tile = LLM_TRAINING_TILE_SIZE;
     if (full_sequence && cparams.flash_attn) {
         // Share the F16 K/V conversion instead of reserving full-window copies in every query tile.
@@ -3268,20 +3360,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         return concat_tiles(ctx0, std::move(tiles), 1);
     }
     const bool v_trans = v->nb[1] > v->nb[2];
-    const auto host_cache = [](const ggml_tensor * tensor) {
-        while (tensor->view_src) {
-            tensor = tensor->view_src;
-        }
-        if (!tensor->buffer) {
-            return false;
-        }
-        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
-        return (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META) &&
-            ggml_backend_buffer_is_host(tensor->buffer);
-    };
     const bool fp4_host = cparams.flash_attn && kq_b == nullptr &&
-        is_fp4_cache_type(k->type) && k->type == v->type && host_cache(k) && host_cache(v);
-    const bool host_attention = fp4_host || (!cparams.op_offload && host_cache(k) && host_cache(v));
+        is_fp4_cache_type(k->type) && k->type == v->type && is_host_tensor(k) && is_host_tensor(v);
+    const bool host_attention = fp4_host ||
+        ((!cparams.op_offload || (hparams.kv_global_only && !training)) && is_host_tensor(k) && is_host_tensor(v));
     const bool fp4_cpu = fp4_host &&
         ((k->ne[2] >= 512 && q->ne[2] == 1 && q->ne[3] == 1) || k->ne[2] >= 65536);
     if (is_fp4_cache_type(k->type) && !fp4_cpu) {
@@ -4268,7 +4350,9 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
+        const bool packed = hparams.kv_global_only && !training && cparams.flash_attn &&
+                !hparams.use_alibi && !cparams.kv_turboquant_bits;
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams, packed);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 

@@ -4130,7 +4130,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                     train_fwd_nodes = (uint32_t)ggml_graph_n_nodes(gf_train);
                     uint32_t nvfp4_kv_nodes = 0;
                     for (uint32_t i = 0; i < train_fwd_nodes; ++i) {
-                        nvfp4_kv_nodes += strcmp(ggml_graph_node(gf_train, i)->name, "kv_nvfp4_ste") == 0;
+                        nvfp4_kv_nodes += strcmp(ggml_graph_node(gf_train, i)->name, "kv_fp4_ste") == 0;
                     }
                     if (nvfp4_kv_nodes) {
                         LLAMA_LOG_INFO("%s: kv_nvfp4_ste nodes = %u\n", __func__, nvfp4_kv_nodes);

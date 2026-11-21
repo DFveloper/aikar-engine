@@ -1,0 +1,8 @@
+Generating SQLite file experiments/cuda-training-20261115/q4-register-after-back.sqlite from experiments/cuda-training-20261115/q4-register-after-back.nsys-rep
+Processing [experiments/cuda-training-20261115/q4-register-after-back.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+97.4,1913216,1,1913216.0,1913216.0,1913216,1913216,0.0,"mul_mat_id_back_q4_0_fused(const block_q4_0 *, const float *, const int *, const int *, const int *, const int *, const int *, float *, long, long, long, long, long, long)"
+1.4,27552,1,27552.0,27552.0,27552,27552,0.0,"mul_mat_id_back_prefix_tiles(const int *, int *, int *, int *, long, long, long)"
+0.7,13600,1,13600.0,13600.0,13600,13600,0.0,"ggml_cuda_moe_route_scatter(const int *, const int *, int *, int *, long, long, long, long)"
+0.5,9472,1,9472.0,9472.0,9472,9472,0.0,"mul_mat_id_back_count_scale(const float *, const int *, int *, int *, long, long, long, long, long, long, long, long, long)"
+

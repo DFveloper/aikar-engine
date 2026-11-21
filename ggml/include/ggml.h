@@ -1554,6 +1554,15 @@ extern "C" {
             struct ggml_tensor * result,
             struct ggml_tensor * priority);
 
+    // Apply expert scales and router weights, then sum expert outputs without storing them separately.
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor * as,
+            struct ggml_tensor * b,
+            struct ggml_tensor * ids,
+            struct ggml_tensor * weights,
+            struct ggml_tensor * scales);
+
     GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -2585,6 +2594,19 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // V stores a prefix; the remaining values are K divided by v_scale.
+    // An I32 mask stores 32 blocked-token bits per element instead of F16 biases.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_v_from_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor * q,
+            struct ggml_tensor * k,
+            struct ggml_tensor * v,
+            struct ggml_tensor * mask,
+            struct ggml_tensor * v_scale,
+            float scale,
+            float max_bias,
+            float logit_softcap);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

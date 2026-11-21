@@ -1,0 +1,38 @@
+{
+  "back-up": {
+    "before_ms": 2.9742499999999996,
+    "after_ms": 1.9658799999999998,
+    "speedup": 1.5129356827476752,
+    "bytes_equal": true
+  },
+  "back-down": {
+    "before_ms": 4.54345,
+    "after_ms": 2.72612,
+    "speedup": 1.6666360981908355,
+    "bytes_equal": true
+  },
+  "fwd-up": {
+    "before_ms": 0.795635,
+    "after_ms": 0.81839,
+    "speedup": 0.9721954080572832,
+    "bytes_equal": true
+  },
+  "fwd-down": {
+    "before_ms": 1.002265,
+    "after_ms": 1.02019,
+    "speedup": 0.9824297434791559,
+    "bytes_equal": true
+  },
+  "fwd-fused-shard": {
+    "before_ms": 1.559965,
+    "after_ms": 1.58806,
+    "speedup": 0.9823086029495107,
+    "bytes_equal": true
+  },
+  "fwd-shard": {
+    "before_ms": 0.7162999999999999,
+    "after_ms": 0.725455,
+    "speedup": 0.9873803337215954,
+    "bytes_equal": true
+  }
+}

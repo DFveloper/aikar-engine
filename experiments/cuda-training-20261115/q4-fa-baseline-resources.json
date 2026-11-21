@@ -1,0 +1,17 @@
+[
+  {
+    "kernel": "_Z18flash_attn_ext_f16ILi256ELi256ELi32ELi2ELb0ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP6float2ffffjfi5uint3iiiiiiiiiiiliiliiiiil",
+    "arch": "sm_70",
+    "resources": "REG:255 STACK:480 SHARED:0 LOCAL:0 CONSTANT[0]:560 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  },
+  {
+    "kernel": "_Z18flash_attn_ext_f16ILi512ELi512ELi8ELi8ELb0ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP6float2ffffjfi5uint3iiiiiiiiiiiliiliiiiil",
+    "arch": "sm_70",
+    "resources": "REG:255 STACK:568 SHARED:0 LOCAL:0 CONSTANT[0]:560 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  },
+  {
+    "kernel": "_Z9mul_mat_qIL9ggml_type2ELi24ELb0EL9ggml_prec30EEvPKcPKiS5_S5_PfS6_PKf5uint3iiiiiS9_S9_iiiS9_S9_iiiS9_",
+    "arch": "sm_70",
+    "resources": "REG:112 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:524 TEXTURE:0 SURFACE:0 SAMPLER:0"
+  }
+]

@@ -1,0 +1,14 @@
+{
+  "dense": {
+    "state_and_adapter_tensors": 85,
+    "changed": [],
+    "losses_equal": true,
+    "loss_count": 16
+  },
+  "moe": {
+    "state_and_adapter_tensors": 85,
+    "changed": [],
+    "losses_equal": true,
+    "loss_count": 16
+  }
+}

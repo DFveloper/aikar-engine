@@ -1,0 +1,45 @@
+{
+  "checked_utc": "2026-11-16T05:50:11.238186+00:00",
+  "active_trainer_pid": 2703254,
+  "active_trainer_restarted": false,
+  "power_limit_watts": [
+    150,
+    150
+  ],
+  "windows_completed": 28,
+  "steady_mean_seconds": 82.96296296296296,
+  "training_only_projection_hours": 139.5851851851852,
+  "target_seconds_per_window": 35.661218424962854,
+  "device_accumulator_deployed": false,
+  "actual_model_device_comparison_completed": false,
+  "device_comparison_deferred_reason": "The active binary floors context/microbatch in checkpoint callbacks, so step 4 did not save. Avoid discarding live progress for the experiment.",
+  "checkpoint_fix": {
+    "source": "examples/qlora_training/finetune_qat.cpp:1265",
+    "compiled": true,
+    "next_launch_executable": "/home/user/aikar-engine/build/bin/llama-finetune-qlion",
+    "active_process_uses_old_inode": true,
+    "regression": {
+      "checkpoint_windows": [
+        [
+          "1",
+          "6"
+        ],
+        [
+          "2",
+          "12"
+        ]
+      ],
+      "resume_final_tensors": 69,
+      "different": [],
+      "exact_resume": true
+    },
+    "active_binary_first_expected_save": {
+      "step": 7,
+      "actual_completed_windows": 42,
+      "incorrect_reported_window": 44
+    },
+    "executable_sha256": "d1aa1125e8b36175cabc2035688d5e3655294a0f9e223c18634816249edb171d"
+  },
+  "small_model_numerical_validation": "/mnt/data/AIKAR/Lumen-3.8-Pulsar-training-20261116/optimization-60h/long-accumulation-probe.json",
+  "background_stop_or_restart_scheduled": false
+}

@@ -1596,8 +1596,6 @@ UseGgmlGemm2:;
 
 // ggml_compute_forward_mul_mat_id
 
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
-
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
@@ -1636,7 +1634,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
                 const int64_t _i12 = ir1; // logical row index for this expert
 
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+                struct mmid_row_mapping row_mapping = matrix_rows[_i12];
                 const int id       = row_mapping.i1; // selected expert index
 
                 const int64_t  i11 = id % ne11;
@@ -1674,9 +1672,101 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+#define MMID_REDUCE_ROWS 8
+
+static size_t ggml_mul_mat_id_reduce_work_size(const struct ggml_tensor * dst, int n_threads) {
+    const struct ggml_tensor * as = dst->src[0];
+    const struct ggml_tensor * b = dst->src[1];
+    const struct ggml_tensor * ids = dst->src[2];
+    const enum ggml_type dot_type = type_traits_cpu[as->type].vec_dot_type;
+    const size_t n_routes = ggml_nelements(ids);
+    size_t size = GGML_PAD(ggml_row_size(dot_type, b->ne[0])*n_routes, sizeof(int64_t));
+    size += (2*as->ne[2] + 1)*sizeof(int64_t) + n_routes*sizeof(struct mmid_row_mapping);
+    return GGML_PAD(size, CACHE_LINE_SIZE) + n_threads*GGML_PAD(n_routes*MMID_REDUCE_ROWS*sizeof(float), CACHE_LINE_SIZE);
+}
+
+static void ggml_compute_forward_mul_mat_id_reduce(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * as = dst->src[0];
+    const struct ggml_tensor * b = dst->src[1];
+    const struct ggml_tensor * ids = dst->src[2];
+    const float * weights = (const float *) dst->src[4]->data;
+    const float * scales = (const float *) dst->src[5]->data;
+    const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1], n_experts = as->ne[2];
+    const int64_t n_routes = n_used*n_tokens;
+    const enum ggml_type dot_type = type_traits_cpu[as->type].vec_dot_type;
+    const ggml_from_float_t quantize = type_traits_cpu[dot_type].from_float;
+    const ggml_vec_dot_t dot = type_traits_cpu[as->type].vec_dot;
+    const size_t row_size = ggml_row_size(dot_type, b->ne[0]);
+    GGML_ASSERT(params->wsize >= ggml_mul_mat_id_reduce_work_size(dst, params->nth));
+    void * work = params->wdata;
+    char * quantized = incr_ptr_aligned(&work, row_size*n_routes, sizeof(int64_t));
+    int64_t * offsets = incr_ptr_aligned(&work, (n_experts + 1)*sizeof(int64_t), sizeof(int64_t));
+    int64_t * counts = incr_ptr_aligned(&work, n_experts*sizeof(int64_t), sizeof(int64_t));
+    struct mmid_row_mapping * rows = incr_ptr_aligned(&work, n_routes*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+    const size_t partial_bytes = GGML_PAD(n_routes*MMID_REDUCE_ROWS*sizeof(float), CACHE_LINE_SIZE);
+    float * partials = (float *) ((char *) incr_ptr_aligned(&work, params->nth*partial_bytes, CACHE_LINE_SIZE) + params->ith*partial_bytes);
+
+    for (int64_t route = params->ith; route < n_routes; route += params->nth) {
+        const int64_t token = route/n_used, slot = route % n_used;
+        quantize((const float *) ((const char *) b->data + slot*b->nb[1] + token*b->nb[2]), quantized + route*row_size, b->ne[0]);
+    }
+    if (params->ith == 0) {
+        memset(counts, 0, n_experts*sizeof(int64_t));
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t slot = 0; slot < n_used; ++slot) {
+                const int32_t expert = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + slot*ids->nb[0]);
+                GGML_ASSERT(expert >= 0 && expert < n_experts);
+                counts[expert]++;
+            }
+        }
+        offsets[0] = 0;
+        for (int64_t expert = 0; expert < n_experts; ++expert) {
+            offsets[expert + 1] = offsets[expert] + counts[expert];
+            counts[expert] = offsets[expert];
+        }
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t slot = 0; slot < n_used; ++slot) {
+                const int32_t expert = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + slot*ids->nb[0]);
+                rows[counts[expert]++] = (struct mmid_row_mapping) { (int32_t) slot, (int32_t) token };
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+    for (int64_t first = params->ith*MMID_REDUCE_ROWS; first < as->ne[1]; first += params->nth*MMID_REDUCE_ROWS) {
+        const int64_t n_rows = MIN(MMID_REDUCE_ROWS, as->ne[1] - first);
+        for (int64_t expert = 0; expert < n_experts; ++expert) {
+            const char * matrix = (const char *) as->data + expert*as->nb[2] + first*as->nb[1];
+            for (int64_t index = offsets[expert]; index < offsets[expert + 1]; ++index) {
+                const struct mmid_row_mapping route = rows[index];
+                const int64_t flat = route.i2*n_used + route.i1;
+                for (int64_t row = 0; row < n_rows; ++row) {
+                    float value;
+                    dot(as->ne[0], &value, 0, matrix + row*as->nb[1], 0, quantized + flat*row_size, 0, 1);
+                    value *= scales[expert];
+                    partials[flat*MMID_REDUCE_ROWS + row] = value*weights[flat];
+                }
+            }
+        }
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            float * output = (float *) ((char *) dst->data + token*dst->nb[2]) + first;
+            for (int64_t row = 0; row < n_rows; ++row) {
+                float sum = partials[token*n_used*MMID_REDUCE_ROWS + row];
+                for (int64_t slot = 1; slot < n_used; ++slot) sum += partials[(token*n_used + slot)*MMID_REDUCE_ROWS + row];
+                output[row] = sum;
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+
+    if (dst->src[4]) {
+        ggml_compute_forward_mul_mat_id_reduce(params, dst);
+        return;
+    }
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1717,8 +1807,11 @@ static void ggml_compute_forward_mul_mat_id(
     int64_t * matrix_row_counts = // [n_as]
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
 
-    struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
-        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+    int64_t * matrix_row_offsets =
+        incr_ptr_aligned(&wdata_cur, (n_as + 1)*sizeof(int64_t), sizeof(int64_t));
+
+    struct mmid_row_mapping * matrix_rows = // [ids->ne[0]*ids->ne[1]]
+        incr_ptr_aligned(&wdata_cur, ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
@@ -1775,10 +1868,20 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+        matrix_row_offsets[0] = 0;
+        for (int expert = 0; expert < n_as; ++expert) {
+            matrix_row_offsets[expert + 1] = matrix_row_offsets[expert] + matrix_row_counts[expert];
+            matrix_row_counts[expert] = 0;
+        }
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            for (int slot = 0; slot < n_ids; ++slot) {
+                const int32_t expert = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + slot*ids->nb[0]);
+                matrix_rows[matrix_row_offsets[expert] + matrix_row_counts[expert]++] = (struct mmid_row_mapping) {slot, token};
             }
         }
     }
@@ -1802,7 +1905,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) (matrix_rows + matrix_row_offsets[cur_a]), tiled_scratch)) {
             continue;
         }
 
@@ -1849,7 +1952,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows + matrix_row_offsets[cur_a], row_size, src1_cont, wdata
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -3122,6 +3225,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
+                        if (node->src[4]) {
+                            cur = ggml_mul_mat_id_reduce_work_size(node, n_tasks);
+                            break;
+                        }
                         cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
@@ -3134,8 +3241,10 @@ struct ggml_cplan ggml_graph_plan(
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
+                        // matrix_row_offsets
+                        cur += (n_as + 1)*sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
-                        cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
+                        cur += ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
                         // Workspace for tiled (see tiled.h)
@@ -3222,7 +3331,7 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
                         const int64_t DK = node->src[1]->ne[0];
-                        const int64_t DV = node->src[2]->ne[0];
+                        const int64_t DV = node->ne[0];
 
                         // Tiled flash attention scratch (tile sizes defined in common.h)
                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding

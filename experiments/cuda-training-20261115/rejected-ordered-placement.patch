@@ -1,0 +1,37 @@
+diff --git a/ggml/src/ggml-opt.cpp b/ggml/src/ggml-opt.cpp
+index e49f19829..0578868d4 100644
+--- a/ggml/src/ggml-opt.cpp
++++ b/ggml/src/ggml-opt.cpp
+@@ -3,6 +3,7 @@
+ #include "ggml.h"
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
++#include "ggml-backend-impl.h"
+ #include "ggml-impl.h"
+ 
+ #include <algorithm>
+@@ -3673,6 +3674,24 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+         if (cpu_backend) {
+             for (int i = 0; i < ggml_graph_n_nodes(opt_ctx->allocated_graph_copy); ++i) {
+                 ggml_tensor * node = ggml_graph_node(opt_ctx->allocated_graph_copy, i);
++                if (opt_ctx->qat_grad_accumulator_cpu && node->op == GGML_OP_OUT_PROD && !node->buffer &&
++                        node->src[0]->type == GGML_TYPE_F32 && ggml_is_matrix(node) &&
++                        node->src[0]->nb[0] == sizeof(float) && !(node->flags & GGML_TENSOR_FLAG_HOST)) {
++                    for (int b = 0; b < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++b) {
++                        auto * backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, b);
++                        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU &&
++                                ggml_backend_supports_op(backend, node)) {
++                            // Keep the CPU gradient's sequential FMA order on CUDA.
++                            auto * simple = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_META ?
++                                ggml_backend_meta_simple_backend(backend, 0) : backend;
++                            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple));
++                            if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) continue;
++                            ggml_set_op_params_i32(node, 1, 1);
++                            ggml_backend_sched_set_tensor_backend(opt_ctx->backend_sched, node, backend);
++                            break;
++                        }
++                    }
++                }
+                 const bool q8_microgradient = node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q8_0 &&
+                     node->src[0] && node->src[0]->type == GGML_TYPE_F32;
+                 if (opt_ctx->qat_grad_accumulator_cpu && q8_microgradient && !node->buffer &&

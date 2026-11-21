@@ -1,0 +1,43 @@
+{
+  "state_tensors": 24,
+  "changed": [],
+  "state_bytes_equal": true,
+  "train_seconds_before": 298.7,
+  "train_seconds_after": 191.805,
+  "speedup": 1.5573108104585385,
+  "training_losses_equal": true,
+  "validation_losses_equal": true,
+  "production_args_changed": false,
+  "required_seconds_per_window": 35.661218424962854,
+  "previous_accepted_train_seconds": 204.765,
+  "incremental_time_reduction_fraction": 0.06329206651527353,
+  "incremental_speedup": 1.06756862438414,
+  "mask_regression_cases": 6,
+  "existing_attention_cases": 19,
+  "async_cuda_passed": true,
+  "fp4_semantics_preserved": true,
+  "q4_unpack_experiment_accepted": false,
+  "benchmark": {
+    "fa-final-256": {
+      "median_ms": 1.2966525
+    },
+    "fa-final-fp4": {
+      "median_ms": 10.6222445
+    },
+    "fa-final-fp4-ste": {
+      "median_ms": 16.7361855
+    },
+    "swa_bytes_equal": true,
+    "fp4_bytes_equal": true,
+    "cpu_ref_fp4_vs_cuda_ste_bytes_equal": true
+  },
+  "trainer_pid": 1785741,
+  "production_args_match": true,
+  "target_60_hours_met": false,
+  "sha256": {
+    "ggml/src/ggml-cuda/fattn-mma-f16.cuh": "f406e8af4e9fb1c4ebb9358d6293c7bb45dd0c145850e40e50bb31f943c57aa0",
+    "ggml/src/ggml-cuda/mmq-vec-dot.cuh": "c038cf45ca87552e8c7c81f71f8c908c7d07460a55a571522abd562640c692b3",
+    "tests/test-backend-ops.cpp": "fe5615b3f22fe1340c4f29a3659e1964d8e4ef48c5d229d86df8d033fbc82bbd",
+    "build/bin/libggml-cuda.so.0.27.0": "f77398743f3388da46959df55ad189f31831081aeee584244c3a95af7ca103e4"
+  }
+}

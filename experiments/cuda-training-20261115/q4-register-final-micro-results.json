@@ -1,0 +1,26 @@
+{
+  "back-up": {
+    "reference": 2.96768,
+    "final": 1.96553,
+    "speedup": 1.5098624798400433,
+    "bytes_equal": true
+  },
+  "back-down": {
+    "reference": 4.52787,
+    "final": 2.721515,
+    "speedup": 1.663731414304165,
+    "bytes_equal": true
+  },
+  "fwd-up": {
+    "reference": 0.79695,
+    "final": 0.796485,
+    "speedup": 1.0005838151377615,
+    "bytes_equal": true
+  },
+  "fwd-down": {
+    "reference": 1.0053899999999998,
+    "final": 0.943365,
+    "speedup": 1.0657486762811847,
+    "bytes_equal": true
+  }
+}

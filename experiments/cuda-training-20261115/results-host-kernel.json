@@ -1,0 +1,8 @@
+{
+  "state_tensors": 24,
+  "changed": [],
+  "finite": true,
+  "train_seconds_before": 298.7,
+  "train_seconds_after": 257.981,
+  "production_args_changed": false
+}

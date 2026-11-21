@@ -1,0 +1,40 @@
+{
+  "control": {
+    "changed": [],
+    "relative_l2": {},
+    "losses_equal": true
+  },
+  "host-async": {
+    "changed": [
+      ".qat-state.ggufqat.m.000000",
+      ".qat-state.ggufqat.m.000001",
+      ".qat-state.ggufqat.m.000002",
+      ".qat-state.ggufqat.r.000002",
+      ".qat-state.ggufqat.m.000004",
+      ".qat-state.ggufqat.r.000004",
+      ".qat-state.ggufqat.m.000008",
+      ".qat-state.ggufqat.r.000008",
+      ".qat-state.ggufqat.m.000012",
+      ".qat-state.ggufqat.r.000012",
+      ".qat-state.ggufqat.m.000016",
+      ".qat-state.ggufqat.r.000016",
+      ".qat-state.ggufqat.m.000020"
+    ],
+    "relative_l2": {
+      ".qat-state.ggufqat.m.000000": 0.0007068338080178983,
+      ".qat-state.ggufqat.m.000001": 0.0008895350965642665,
+      ".qat-state.ggufqat.m.000002": 0.0005759475472661749,
+      ".qat-state.ggufqat.r.000002": 0.0012924891576374326,
+      ".qat-state.ggufqat.m.000004": 0.0007580750382067672,
+      ".qat-state.ggufqat.r.000004": 0.003998097797650397,
+      ".qat-state.ggufqat.m.000008": 0.0008906030694496793,
+      ".qat-state.ggufqat.r.000008": 0.0017958579988454015,
+      ".qat-state.ggufqat.m.000012": 0.0006799270869352594,
+      ".qat-state.ggufqat.r.000012": 0.0015020282179179873,
+      ".qat-state.ggufqat.m.000016": 0.000778302243925342,
+      ".qat-state.ggufqat.r.000016": 0.0021896769602156104,
+      ".qat-state.ggufqat.m.000020": 0.0002195468069536969
+    },
+    "losses_equal": true
+  }
+}

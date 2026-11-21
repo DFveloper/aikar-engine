@@ -1,0 +1,26 @@
+[
+  {
+    "k": 1,
+    "bytes_equal": true
+  },
+  {
+    "k": 7,
+    "bytes_equal": true
+  },
+  {
+    "k": 31,
+    "bytes_equal": true
+  },
+  {
+    "k": 33,
+    "bytes_equal": true
+  },
+  {
+    "k": 127,
+    "bytes_equal": true
+  },
+  {
+    "k": 512,
+    "bytes_equal": true
+  }
+]

@@ -3555,6 +3555,35 @@ void ggml_mul_mat_id_set_expert_priority(struct ggml_tensor * result, struct ggm
     result->src[3] = priority;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor * as,
+        struct ggml_tensor * b,
+        struct ggml_tensor * ids,
+        struct ggml_tensor * weights,
+        struct ggml_tensor * scales) {
+    GGML_ASSERT(as->type == GGML_TYPE_Q4_0 && !ggml_is_transposed(as) && as->ne[3] == 1);
+    GGML_ASSERT(as->ne[0] <= INT32_MAX && as->ne[1] <= INT32_MAX);
+    GGML_ASSERT(as->ne[2] > 0 && as->ne[2] <= INT32_MAX);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[3] == 1 && b->ne[0] == as->ne[0]);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->ne[0] == b->ne[1] && ids->ne[1] == b->ne[2]);
+    GGML_ASSERT(ids->ne[0] > 0 && ids->ne[0] <= as->ne[2] && ids->ne[1] <= INT32_MAX);
+    GGML_ASSERT(ggml_nelements(ids) <= INT32_MAX);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nelements(ids));
+    GGML_ASSERT(scales->type == GGML_TYPE_F32 && ggml_is_contiguous(scales));
+    GGML_ASSERT(ggml_nelements(scales) == as->ne[2]);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, as->ne[1], 1, b->ne[2]);
+    result->op = GGML_OP_MUL_MAT_ID;
+    result->src[0] = as;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[4] = weights;
+    result->src[5] = scales;
+    return result;
+}
+
 struct ggml_tensor * ggml_mul_mat_id_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,
@@ -5803,6 +5832,37 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+
+struct ggml_tensor * ggml_flash_attn_ext_v_from_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q,
+        struct ggml_tensor * k,
+        struct ggml_tensor * v,
+        struct ggml_tensor * mask,
+        struct ggml_tensor * v_scale,
+        float scale,
+        float max_bias,
+        float logit_softcap) {
+    GGML_ASSERT(k->type == GGML_TYPE_FP4_KV && v->type == k->type);
+    GGML_ASSERT(v->ne[0] > 0 && v->ne[0] < k->ne[0]);
+    GGML_ASSERT(v_scale->type == GGML_TYPE_F32 && ggml_is_vector(v_scale));
+    GGML_ASSERT(ggml_is_contiguous(v_scale) && ggml_nelements(v_scale) == k->ne[0]);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        GGML_ASSERT(k->ne[i] == v->ne[i]);
+    }
+    const bool packed_mask = mask && mask->type == GGML_TYPE_I32;
+    if (packed_mask) {
+        GGML_ASSERT(max_bias == 0.0f && ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == (k->ne[1] + 31)/32 && mask->ne[1] == q->ne[1]);
+        GGML_ASSERT(mask->ne[2] > 0 && mask->ne[3] > 0);
+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0 && q->ne[3] % mask->ne[3] == 0);
+    }
+    struct ggml_tensor * result = ggml_flash_attn_ext(ctx, q, k, k, packed_mask ? NULL : mask, scale, max_bias, logit_softcap);
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[5] = v_scale;
+    return result;
+}
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
@@ -8073,6 +8133,7 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_MUL_MAT_ID: {
+            GGML_ASSERT(!tensor->src[4] && "weighted expert sum is inference-only");
             // Backward pass for indirect matrix multiplication (MoE).
             //
             // Forward:  dst[rows, n_exp_used, n_tokens] = as[:,:,ids[i,t]] @ b[:,i,t]

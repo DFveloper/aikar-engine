@@ -1,0 +1,18 @@
+{
+  "shape": {
+    "D": 256,
+    "KV": 16384,
+    "queries": 256,
+    "query_heads": 16,
+    "KV_heads": 8,
+    "sliding_window": 1024
+  },
+  "reference_ms": 13.508,
+  "bounded_backward_ms": 5.2206529090909095,
+  "output_floats": 68157440,
+  "gradients_byte_identical": true,
+  "forward_unchanged": true,
+  "original_dQ_reduction_length_preserved": true,
+  "sha256": "3042b350f7a3195924a71679285a7fe0ec7a50089abacaf999239166e4463334",
+  "kernel_speedup": 2.587415833846766
+}

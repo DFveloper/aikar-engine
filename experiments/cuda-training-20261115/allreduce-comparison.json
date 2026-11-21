@@ -1,0 +1,216 @@
+{
+  "before": [
+    {
+      "type": "f32",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 2.224,
+      "total_ms": 2.269
+    },
+    {
+      "type": "f32",
+      "elements": 1048576,
+      "rounds": 32,
+      "submit_ms": 26.107,
+      "total_ms": 27.594
+    },
+    {
+      "type": "f32",
+      "elements": 1032,
+      "rounds": 32,
+      "submit_ms": 0.925,
+      "total_ms": 0.969
+    },
+    {
+      "type": "f32",
+      "elements": 20971520,
+      "rounds": 8,
+      "submit_ms": 101.51,
+      "total_ms": 116.088
+    },
+    {
+      "type": "f32",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 1.005,
+      "total_ms": 1.048
+    },
+    {
+      "type": "f16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 2.838,
+      "total_ms": 2.893
+    },
+    {
+      "type": "f16",
+      "elements": 1048576,
+      "rounds": 32,
+      "submit_ms": 25.336,
+      "total_ms": 27.028
+    },
+    {
+      "type": "f16",
+      "elements": 1032,
+      "rounds": 32,
+      "submit_ms": 1.059,
+      "total_ms": 1.123
+    },
+    {
+      "type": "f16",
+      "elements": 20971520,
+      "rounds": 8,
+      "submit_ms": 109.708,
+      "total_ms": 127.465
+    },
+    {
+      "type": "f16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 1.111,
+      "total_ms": 1.165
+    },
+    {
+      "type": "bf16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 1.136,
+      "total_ms": 1.191
+    },
+    {
+      "type": "bf16",
+      "elements": 1048576,
+      "rounds": 32,
+      "submit_ms": 25.125,
+      "total_ms": 26.81
+    },
+    {
+      "type": "bf16",
+      "elements": 1032,
+      "rounds": 32,
+      "submit_ms": 0.99,
+      "total_ms": 1.049
+    },
+    {
+      "type": "bf16",
+      "elements": 20971520,
+      "rounds": 8,
+      "submit_ms": 109.716,
+      "total_ms": 127.728
+    },
+    {
+      "type": "bf16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 1.009,
+      "total_ms": 1.065
+    }
+  ],
+  "async": [
+    {
+      "type": "f32",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 2.025,
+      "total_ms": 2.402
+    },
+    {
+      "type": "f32",
+      "elements": 1048576,
+      "rounds": 32,
+      "submit_ms": 5.382,
+      "total_ms": 27.138
+    },
+    {
+      "type": "f32",
+      "elements": 1032,
+      "rounds": 32,
+      "submit_ms": 0.796,
+      "total_ms": 1.042
+    },
+    {
+      "type": "f32",
+      "elements": 20971520,
+      "rounds": 8,
+      "submit_ms": 6.586,
+      "total_ms": 117.92
+    },
+    {
+      "type": "f32",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 0.915,
+      "total_ms": 1.103
+    },
+    {
+      "type": "f16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 2.468,
+      "total_ms": 2.804
+    },
+    {
+      "type": "f16",
+      "elements": 1048576,
+      "rounds": 32,
+      "submit_ms": 2.758,
+      "total_ms": 26.721
+    },
+    {
+      "type": "f16",
+      "elements": 1032,
+      "rounds": 32,
+      "submit_ms": 0.857,
+      "total_ms": 1.195
+    },
+    {
+      "type": "f16",
+      "elements": 20971520,
+      "rounds": 8,
+      "submit_ms": 3.149,
+      "total_ms": 126.31
+    },
+    {
+      "type": "f16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 0.978,
+      "total_ms": 1.266
+    },
+    {
+      "type": "bf16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 0.923,
+      "total_ms": 1.265
+    },
+    {
+      "type": "bf16",
+      "elements": 1048576,
+      "rounds": 32,
+      "submit_ms": 2.694,
+      "total_ms": 26.565
+    },
+    {
+      "type": "bf16",
+      "elements": 1032,
+      "rounds": 32,
+      "submit_ms": 0.789,
+      "total_ms": 1.134
+    },
+    {
+      "type": "bf16",
+      "elements": 20971520,
+      "rounds": 8,
+      "submit_ms": 2.778,
+      "total_ms": 126.946
+    },
+    {
+      "type": "bf16",
+      "elements": 1024,
+      "rounds": 32,
+      "submit_ms": 0.936,
+      "total_ms": 1.223
+    }
+  ]
+}

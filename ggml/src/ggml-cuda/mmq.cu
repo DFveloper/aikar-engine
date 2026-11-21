@@ -283,7 +283,8 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
-    GGML_ASSERT(ne1 == n_expert_used);
+    const bool reduce_experts = dst->op == GGML_OP_MUL_MAT_ID && dst->src[4];
+    GGML_ASSERT(ne1 == (reduce_experts ? 1 : n_expert_used));
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
@@ -345,13 +346,19 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, J_best};
+
+    if (reduce_experts) {
+        args.reduction = { (const float *) dst->src[4]->data, (const float *) dst->src[5]->data,
+                (const int32_t *) ids->data, int(n_expert_used), int(ids->nb[1]/sizeof(int32_t)) };
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+    }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

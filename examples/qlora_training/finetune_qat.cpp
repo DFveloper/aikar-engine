@@ -399,11 +399,44 @@ static bool qat_load_state(
     const int64_t count_key = gguf_find_key(gctx, "training.qat.state_count");
     const int64_t type_key = gguf_find_key(gctx, "training.qat.quant_type");
     const int64_t count = count_key >= 0 ? gguf_get_val_i64(gctx, count_key) : -1;
-    if (type_key < 0 || quant_type != gguf_get_val_str(gctx, type_key) || count != llama_opt_qat_state_count(lctx)) {
+    const int64_t current_count = llama_opt_qat_state_count(lctx);
+    const char * added_targets = std::getenv("GGML_QAT_RESUME_NEW_TARGETS");
+    const auto allowed_new = added_targets ? string_split(added_targets, ",") : std::vector<std::string>{};
+    if (type_key < 0 || quant_type != gguf_get_val_str(gctx, type_key) || count < 1 ||
+            count > current_count || (count != current_count && allowed_new.empty())) {
         LOG_ERR("checkpoint state does not match the current model\n");
         gguf_free(gctx);
         ggml_free(data_ctx);
         return false;
+    }
+    std::vector<int64_t> saved_indices(current_count, -1);
+    std::vector<bool> consumed(count, false);
+    for (int64_t i = 0; i < current_count; ++i) {
+        const auto * param = llama_opt_qat_state_param(lctx, i);
+        for (int64_t j = 0; j < count; ++j) {
+            const std::string key_name = "training.qat.param." + std::to_string(j);
+            const int key = gguf_find_key(gctx, key_name.c_str());
+            if (key < 0 || gguf_get_kv_type(gctx, key) != GGUF_TYPE_STRING) {
+                LOG_ERR("checkpoint parameter names are incomplete\n");
+                gguf_free(gctx); ggml_free(data_ctx); return false;
+            }
+            if (strcmp(gguf_get_val_str(gctx, key), param->name) == 0) {
+                if (consumed[j] || saved_indices[i] >= 0) {
+                    LOG_ERR("duplicate checkpoint parameter name\n");
+                    gguf_free(gctx); ggml_free(data_ctx); return false;
+                }
+                saved_indices[i] = j;
+                consumed[j] = true;
+            }
+        }
+        if (saved_indices[i] < 0 && std::find(allowed_new.begin(), allowed_new.end(), param->name) == allowed_new.end()) {
+            LOG_ERR("checkpoint has no state for unapproved new parameter %s\n", param->name);
+            gguf_free(gctx); ggml_free(data_ctx); return false;
+        }
+    }
+    if (std::find(consumed.begin(), consumed.end(), false) != consumed.end()) {
+        LOG_ERR("checkpoint contains a parameter missing from the new target set\n");
+        gguf_free(gctx); ggml_free(data_ctx); return false;
     }
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
@@ -415,19 +448,32 @@ static bool qat_load_state(
     const size_t chunk_max = 16 * 1024 * 1024;
     std::vector<uint8_t> data(chunk_max);
     std::vector<uint8_t> check_data(chunk_max);
-    for (int64_t i = 0; i < count; ++i) {
-        const std::string param_key = "training.qat.param." + std::to_string(i);
+    for (int64_t i = 0; i < current_count; ++i) {
+        const int64_t saved_index = saved_indices[i];
+        if (saved_index < 0) {
+            auto * momentum = llama_opt_qat_state_momentum(lctx, i);
+            auto * residual = llama_opt_qat_state_residual(lctx, i);
+            auto * lr = llama_opt_qat_state_lr_scale(lctx, i);
+            ggml_backend_tensor_memset(momentum, 0, 0, ggml_nbytes(momentum));
+            ggml_backend_tensor_memset(residual, 0, 0, ggml_nbytes(residual));
+            if (lr) ggml_backend_tensor_memset(lr, 0, 0, ggml_nbytes(lr));
+            LOG_INF("resume: initialized new target %s with zero optimizer state\n", llama_opt_qat_state_param(lctx, i)->name);
+            continue;
+        }
+        const std::string param_key = "training.qat.param." + std::to_string(saved_index);
         const int64_t key = gguf_find_key(gctx, param_key.c_str());
         struct ggml_tensor * param = llama_opt_qat_state_param(lctx, i);
         struct ggml_tensor * momentum = llama_opt_qat_state_momentum(lctx, i);
         struct ggml_tensor * residual = llama_opt_qat_state_residual(lctx, i);
         char momentum_name[32];
         char residual_name[32];
-        snprintf(momentum_name, sizeof(momentum_name), "qat.m.%06ld", (long) i);
-        snprintf(residual_name, sizeof(residual_name), "qat.r.%06ld", (long) i);
+        snprintf(momentum_name, sizeof(momentum_name), "qat.m.%06ld", (long) saved_index);
+        snprintf(residual_name, sizeof(residual_name), "qat.r.%06ld", (long) saved_index);
         struct ggml_tensor * momentum_saved = ggml_get_tensor(data_ctx, momentum_name);
         struct ggml_tensor * residual_saved = ggml_get_tensor(data_ctx, residual_name);
         if (key < 0 || strcmp(gguf_get_val_str(gctx, key), param->name) != 0 || !momentum_saved || !residual_saved ||
+            momentum_saved->type != momentum->type || residual_saved->type != residual->type ||
+            !ggml_are_same_shape(momentum_saved, momentum) || !ggml_are_same_shape(residual_saved, residual) ||
             ggml_nbytes(momentum_saved) != ggml_nbytes(momentum) || ggml_nbytes(residual_saved) != ggml_nbytes(residual)) {
             LOG_ERR("state %ld does not match parameter %s\n", (long) i, param->name);
             gguf_free(gctx);
@@ -438,7 +484,7 @@ static bool qat_load_state(
         const size_t residual_bytes = ggml_nbytes(residual);
         struct ggml_tensor * lr_state = llama_opt_qat_state_lr_scale(lctx, i);
         char lr_name[32];
-        snprintf(lr_name, sizeof(lr_name), "qat.lr.%06ld", (long) i);
+        snprintf(lr_name, sizeof(lr_name), "qat.lr.%06ld", (long) saved_index);
         struct ggml_tensor * lr_saved = ggml_get_tensor(data_ctx, lr_name);
         if (lr_state && (!lr_saved || lr_saved->type != GGML_TYPE_F32 || ggml_nelements(lr_saved) != 2)) {
             LOG_ERR("checkpoint lacks adaptive LR state for %s\n", param->name);
@@ -485,6 +531,7 @@ static bool qat_load_state(
             }
         }
     }
+    LOG_INF("resume: restored %ld existing target states by name; initialized %ld added targets\n", (long) count, (long) (current_count - count));
     const int64_t step_key = gguf_find_key(gctx, "training.optimizer.step");
     const int64_t schedule_key = gguf_find_key(gctx, "training.scheduler.step");
     const int64_t epoch_key = gguf_find_key(gctx, "training.dataset.epoch");

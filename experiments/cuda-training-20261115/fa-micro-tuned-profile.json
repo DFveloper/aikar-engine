@@ -1,0 +1,9 @@
+{
+  "kernels": [
+    {
+      "calls": 1,
+      "gpu_ms": 1.327395,
+      "kernel": "void flash_attn_ext_f16<(int)256, (int)256, (int)32, (int)2, (bool)0, (bool)0, (bool)0, (bool)0>(const char *, const char *, const char *, const char *, const char *, const int *, float *, float2 *, float, float, float, float, unsigned int, float, int, uint3, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)"
+    }
+  ]
+}

@@ -85,6 +85,7 @@ struct llama_hparams {
     uint32_t n_value_expert_used = 0;
 
     // TODO: this needs to be reworked
+    std::array<int32_t, LLAMA_MAX_LAYERS> kvsharer_map{}; // source + 1, zero means unchanged
     bool kv_global_only = false;
     int32_t  n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
 
@@ -465,6 +466,8 @@ struct llama_hparams {
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;
     uint32_t n_embd_head_v(uint32_t il = 0) const;
+    uint32_t n_embd_head_v_cache(uint32_t il = 0) const;
+    uint32_t n_embd_v_gqa_cache(uint32_t il = 0) const;
 
     // dimension of key embeddings across all k-v heads
     uint32_t n_embd_k_gqa(uint32_t il = 0) const;

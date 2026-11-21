@@ -1,0 +1,101 @@
+{
+  "candidate-deployment-profile": {
+    "status": {
+      "exit_code": 0,
+      "wall_seconds": 218.1529869629885
+    },
+    "losses": [
+      "1.62849301"
+    ],
+    "window_losses": [
+      "2.60183626",
+      "1.62849301"
+    ],
+    "train_elapsed_seconds": 118,
+    "train_seconds_per_window": 59.0,
+    "phase_ms": [
+      {
+        "build": 27,
+        "alloc": 6744,
+        "inputs": 313,
+        "eval": 60720,
+        "total": 67804
+      },
+      {
+        "build": 25,
+        "alloc": 4008,
+        "inputs": 151,
+        "eval": 39485,
+        "total": 43669
+      }
+    ],
+    "phase_mean_seconds": {
+      "build": 0.026,
+      "alloc": 5.376,
+      "inputs": 0.232,
+      "eval": 50.1025,
+      "total": 55.7365
+    },
+    "peak_device_mib": {
+      "0": 14698,
+      "1": 15306
+    },
+    "workspace_bytes": 12604047360
+  },
+  "candidate-moe-1024": {
+    "status": {
+      "exit_code": 0,
+      "wall_seconds": 206.07031656900654
+    },
+    "losses": [
+      "1.62568724"
+    ],
+    "window_losses": [
+      "2.59544474",
+      "1.62568724"
+    ],
+    "train_elapsed_seconds": 107,
+    "train_seconds_per_window": 53.5,
+    "phase_ms": [
+      {
+        "build": 15,
+        "alloc": 4763,
+        "inputs": 495,
+        "eval": 56118,
+        "total": 61391
+      },
+      {
+        "build": 15,
+        "alloc": 1987,
+        "inputs": 156,
+        "eval": 37111,
+        "total": 39269
+      }
+    ],
+    "phase_mean_seconds": {
+      "build": 0.015,
+      "alloc": 3.375,
+      "inputs": 0.3255,
+      "eval": 46.6145,
+      "total": 50.33
+    },
+    "peak_device_mib": {
+      "0": 15192,
+      "1": 15822
+    },
+    "workspace_bytes": 12859449344
+  },
+  "losses_equal": false,
+  "window_losses_equal": false,
+  "state_tensors_compared": 24,
+  "changed_tensors": [
+    ".qat-state.gguf:qat.m.000000",
+    ".qat-state.gguf:qat.m.000001",
+    ".qat-state.gguf:qat.m.000002",
+    ".qat-state.gguf:qat.m.000003",
+    ".qat-state.gguf:qat.m.000004",
+    ".qat-state.gguf:qat.m.000005",
+    ".qat-state.gguf:qat.m.000006",
+    ".qat-state.gguf:qat.m.000007"
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "trainable_weight_count": 8,
+  "trainable_weight_layers": [
+    11,
+    17,
+    23,
+    29
+  ],
+  "trainable_weight_names": [
+    "attn_q.weight",
+    "attn_output.weight"
+  ],
+  "parameter_filter": "examples/qlora_training/finetune_qat.cpp:qat_param_filter; src/llama-context.cpp:llama_set_param",
+  "gradient_pruning": "ggml/src/ggml.c:ggml_build_backward_expand and ggml_compute_backward",
+  "frozen_expert_weight_gradient": false,
+  "frozen_expert_activation_gradient": "Required downstream of trainable targets to propagate loss to earlier trainable weights",
+  "attention_gradient_flags": "Q/K/V/SINKS selected per source dependency and checked in CUDA GEMM backward",
+  "evidence_scope": "Source audit plus existing target registration and optimizer-state logs; no new full-model per-node graph census"
+}

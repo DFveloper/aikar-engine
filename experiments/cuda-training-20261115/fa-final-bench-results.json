@@ -1,0 +1,14 @@
+{
+  "fa-final-256": {
+    "median_ms": 1.2966525
+  },
+  "fa-final-fp4": {
+    "median_ms": 10.6222445
+  },
+  "fa-final-fp4-ste": {
+    "median_ms": 16.7361855
+  },
+  "swa_bytes_equal": true,
+  "fp4_bytes_equal": true,
+  "cpu_ref_fp4_vs_cuda_ste_bytes_equal": true
+}

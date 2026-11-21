@@ -2138,6 +2138,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
+    if (dst->src[4]) return false;
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -2172,6 +2173,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    if (dst->src[4]) {
+        if (ids->ne[0] == 8 && src1->ne[2] <= 4 && ggml_is_contiguous(src1)) {
+            ggml_tensor output = *dst;
+            output.ne[1] = dst->ne[2];
+            output.ne[2] = 1;
+            output.nb[2] = output.nb[1]*output.ne[1];
+            ggml_cuda_mul_mat_vec_q4_0_moe_reduce(ctx, src0, src1, ids, dst->src[5], dst->src[4], &output, false);
+        } else {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        }
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -6103,6 +6117,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         nvfp4 |= src && src->type == GGML_TYPE_NVFP4;
     }
     if (nvfp4 || fp4_kv) {
+        if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+            return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        }
         if (op->op == GGML_OP_CPY || op->op == GGML_OP_CONT || op->op == GGML_OP_DUP) {
             const auto source_type = op->src[0]->type;
             const auto target_type = op->type;
@@ -6178,6 +6195,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (op->op == GGML_OP_MUL_MAT_ID && op->src[4]) {
+                    return a->type == GGML_TYPE_Q4_0 && b->type == GGML_TYPE_F32 &&
+                        a->nb[0] == ggml_type_size(a->type) && b->nb[0] == sizeof(float) &&
+                        ggml_cuda_can_use_mmq(a->type, ggml_cuda_info().devices[dev_ctx->device].cc);
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }

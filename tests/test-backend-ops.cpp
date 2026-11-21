@@ -1713,6 +1713,11 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
+        // A graph test must repeat its dependencies on every run.
+        if (run_whole_graph()) {
+            n_runs = 1;
+        }
+
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
@@ -6043,6 +6048,62 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+struct test_mul_mat_id_weighted_sum : public test_mul_mat_id {
+    const bool reference_only;
+    test_mul_mat_id_weighted_sum(int64_t tokens, int64_t rows = 257, int experts = 16, int used = 8,
+            bool reference_only = false) :
+        test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, experts, used, false, rows, tokens, 704),
+        reference_only(reference_only) {}
+
+    std::string op_desc(ggml_tensor *) override { return reference_only ? "MOE_DOWN_REFERENCE" : "MUL_MAT_ID_WEIGHTED_SUM"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * original = test_mul_mat_id::build_graph(ctx);
+        auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        auto * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(weights, "router_weights");
+        ggml_set_name(scales, "expert_scales");
+        auto * fused = ggml_mul_mat_id_weighted_sum(ctx, original->src[0], original->src[1], original->src[2], weights, scales);
+        auto * selected_scales = ggml_get_rows(ctx, ggml_repeat_4d(ctx,
+                ggml_reshape_3d(ctx, scales, 1, n_mats, 1), 1, n_mats, n, 1), original->src[2]);
+        auto * weighted = ggml_mul(ctx, ggml_mul(ctx, original, selected_scales), weights);
+        auto * reference = ggml_view_2d(ctx, weighted, m, n, weighted->nb[2], 0);
+        for (int slot = 1; slot < n_used; ++slot) {
+            auto * value = ggml_view_2d(ctx, weighted, m, n, weighted->nb[2], slot*weighted->nb[1]);
+            reference = ggml_add(ctx, reference, value);
+        }
+        reference = ggml_cont(ctx, reference);
+        auto * output = ggml_reshape_2d(ctx, fused, m, n);
+        if (mode == MODE_PERF) return reference_only ? reference : output;
+        return ggml_concat(ctx, output, reference, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "router_weights"), 0.01f, 1.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "expert_scales"), 0.25f, 2.0f);
+    }
+
+    double err(const float * a, const float * b, size_t count) override {
+        auto reference_error = [&](const float * values) {
+            std::vector<float> fused(count/2), reference(count/2);
+            for (size_t token = 0; token < size_t(n); ++token) {
+                std::copy_n(values + token*2*m, m, fused.data() + token*m);
+                std::copy_n(values + token*2*m + m, m, reference.data() + token*m);
+            }
+            return nmse(fused.data(), reference.data(), count/2);
+        };
+        const double local_error = std::max(reference_error(a), reference_error(b));
+        if (local_error > 2e-5) {
+            fprintf(stderr, "weighted expert sum differs from its backend reference: NMSE=%g\n", local_error);
+            return INFINITY;
+        }
+        return nmse(a, b, count);
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -9732,6 +9793,97 @@ struct test_flash_attn_mask_tiles : public test_flash_attn_ext {
     }
 };
 
+struct test_flash_attn_v_from_k : public test_flash_attn_ext {
+    const bool all_masked;
+    const bool packed_mask;
+    test_flash_attn_v_from_k(int nb, bool sinks, bool all_masked, bool packed_mask = false) :
+        test_flash_attn_ext(512, 512, 2, {8, 1}, 768, nb, true, sinks, 0.0f, 30.0f,
+                GGML_PREC_F32, GGML_TYPE_FP4_KV, GGML_TYPE_FP4_KV), all_masked(all_masked), packed_mask(packed_mask) {}
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_V_FROM_K"; }
+    std::string vars() override { return test_flash_attn_ext::vars() + ",v_prefix=128,all_masked=" + std::to_string(all_masked) + ",packed_mask=" + std::to_string(packed_mask); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 2e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * original = test_flash_attn_ext::build_graph(ctx);
+        auto * q = original->src[0];
+        auto * k = original->src[1];
+        auto * stored_v = original->src[2];
+        auto * v = ggml_view_4d(ctx, stored_v, 128, kv, nh, 1,
+                stored_v->nb[1], stored_v->nb[2], stored_v->nb[3], 0);
+        auto * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+        ggml_set_name(scale, "v_scale");
+        auto * mask = original->src[3];
+        if (packed_mask) {
+            mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, (kv + 31)/32, nb, 1, 1);
+            ggml_set_name(mask, "packed_mask");
+        }
+        auto * fused = ggml_flash_attn_ext_v_from_k(ctx, q, k, v, mask, scale,
+                1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(fused, original->src[4]);
+        auto decode = [&](ggml_tensor * packed) {
+            return ggml_cpy(ctx, packed, ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    packed->ne[0], packed->ne[1], packed->ne[2], packed->ne[3]));
+        };
+        auto * key = decode(k);
+        auto * tail = ggml_view_4d(ctx, key, 384, kv, nh, 1, key->nb[1], key->nb[2], key->nb[3], 128*sizeof(float));
+        auto * tail_scale = ggml_view_1d(ctx, scale, 384, 128*sizeof(float));
+        auto * value = ggml_concat(ctx, decode(v), ggml_div(ctx, tail, tail_scale), 0);
+        auto * rounded_value = ggml_cast(ctx, ggml_cast(ctx, value, GGML_TYPE_F16), GGML_TYPE_F32);
+        auto * reference = original;
+        reference->src[1] = ggml_cast(ctx, key, GGML_TYPE_F16);
+        reference->src[2] = rounded_value;
+        ggml_prec_set_acc(reference, GGML_PREC_F32);
+        return all_masked ? fused : ggml_concat(ctx, fused, reference, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "v_scale"), 0.25f, 2.0f);
+        if (all_masked) {
+            auto * mask = ggml_get_tensor(ctx, "m");
+            std::vector<float> values(ggml_nelements(mask), -INFINITY);
+            std::vector<ggml_fp16_t> packed(values.size());
+            ggml_fp32_to_fp16_row(values.data(), packed.data(), values.size());
+            ggml_backend_tensor_set(mask, packed.data(), 0, ggml_nbytes(mask));
+        }
+        if (packed_mask) {
+            auto * dense = ggml_get_tensor(ctx, "m");
+            auto * packed = ggml_get_tensor(ctx, "packed_mask");
+            std::vector<ggml_fp16_t> values(ggml_nelements(dense));
+            std::vector<uint32_t> words(ggml_nelements(packed), UINT32_MAX);
+            for (int64_t row = 0; row < nb; ++row) {
+                for (int64_t token = 0; token < kv; ++token) {
+                    const bool keep = !all_masked && token <= kv/2 + row*3 && (token + row) % 5 != 0;
+                    values[row*kv + token] = ggml_fp32_to_fp16(keep ? 0.0f : -INFINITY);
+                    if (keep) words[row*packed->ne[0] + token/32] &= ~(uint32_t(1) << (token % 32));
+                }
+            }
+            ggml_backend_tensor_set(dense, values.data(), 0, ggml_nbytes(dense));
+            ggml_backend_tensor_set(packed, words.data(), 0, ggml_nbytes(packed));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (all_masked) {
+            for (size_t i = 0; i < n; ++i) {
+                if (a[i] != 0 || b[i] != 0) return INFINITY;
+            }
+            return 0;
+        }
+        auto compare_reference = [&](const float * values) {
+            std::vector<float> fused(n/2), reference(n/2);
+            for (size_t row = 0; row < n/1024; ++row) {
+                std::copy_n(values + row*1024, 512, fused.data() + row*512);
+                std::copy_n(values + row*1024 + 512, 512, reference.data() + row*512);
+            }
+            return nmse(fused.data(), reference.data(), n/2);
+        };
+        return std::max({nmse(a, b, n), compare_reference(a), compare_reference(b)});
+    }
+};
+
 struct test_flash_attn_nvfp4_broadcast : public test_flash_attn_ext {
     test_flash_attn_nvfp4_broadcast(int nb, ggml_type type = GGML_TYPE_NVFP4) : test_flash_attn_ext(512, 512, 2, {8, 2}, 513, nb,
             true, true, 8.0f, 30.0f, GGML_PREC_F32, type, type) {}
@@ -11492,6 +11644,11 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int tokens : {1, 4, 8, 64, 256}) {
+        for (int used : {2, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id_weighted_sum(tokens, 257, 16, used));
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -13842,6 +13999,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     }
 
+    for (int nb : {1, 5, 16, 64}) {
+        test_cases.emplace_back(new test_flash_attn_v_from_k(nb, false, false));
+        test_cases.emplace_back(new test_flash_attn_v_from_k(nb, true, false));
+        test_cases.emplace_back(new test_flash_attn_v_from_k(nb, false, false, true));
+        test_cases.emplace_back(new test_flash_attn_v_from_k(nb, true, false, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_v_from_k(1, false, true));
+    test_cases.emplace_back(new test_flash_attn_v_from_k(5, true, true));
+    test_cases.emplace_back(new test_flash_attn_v_from_k(1, false, true, true));
+    test_cases.emplace_back(new test_flash_attn_v_from_k(5, true, true, true));
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     for (int hs : {128, 256}) {
@@ -14300,6 +14468,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int tokens : {1, 256}) {
+        test_cases.emplace_back(new test_mul_mat_id_weighted_sum(tokens, 2816, 128));
+        test_cases.emplace_back(new test_mul_mat_id_weighted_sum(tokens, 2816, 128, 8, true));
+    }
     for (int tokens : {512, 1024}) {
         test_cases.emplace_back(new test_mul_mat_id_back_balanced(GGML_TYPE_Q4_0, GGML_TYPE_F32, 116, 8, false, 1408, tokens, 2816));
         test_cases.emplace_back(new test_mul_mat_id_back_balanced(GGML_TYPE_Q4_0, GGML_TYPE_F32, 116, 8, false, 2816, tokens, 704));

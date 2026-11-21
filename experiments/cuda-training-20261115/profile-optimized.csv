@@ -1,0 +1,148 @@
+Generating SQLite file /tmp/aikar-training-optimized.sqlite from /tmp/aikar-training-optimized.nsys-rep
+Processing [/tmp/aikar-training-optimized.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+33.1,53242547054,50688,1050397.5,622940.0,203460,18714060,1727609.0,"void mul_mat_q<(ggml_type)2, (int)128, (bool)0, (ggml_prec)30>(const char *, const int *, const int *, const int *, float *, float *, const float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)"
+19.6,31514754638,47204,667628.9,136739.0,15456,4270066,860746.7,"acc_f32(const float *, const float *, float *, long, long, long, long, long, long, long, long, long)"
+15.1,24268105728,4864,4989330.9,4362244.5,2161706,8817034,1592321.4,"mul_mat_id_back_q4_0_fused(const block_q4_0 *, const float *, const int *, const int *, const int *, const int *, const int *, float *, long, long, long, long, long, long)"
+4.6,7475042837,57480,130046.0,68513.0,6400,2083752,198074.8,"void concat_cont<unsigned int, (int)1>(const T1 *, const T1 *, T1 *, long, long, long, long, long, long)"
+3.8,6036778709,2436,2478152.2,124867.0,120675,1433452331,58035730.4,"void k_get_rows_back_float<float, float>(const T1 *, const int *, T2 *, long, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)"
+3.1,5028899235,1792,2806305.4,2795270.5,262821,5469674,1509961.9,"void flash_attn_ext_f16<(int)512, (int)512, (int)8, (int)8, (bool)0, (bool)0, (bool)0, (bool)0>(const char *, const char *, const char *, const char *, const char *, const int *, float *, float2 *, float, float, float, float, unsigned int, float, int, uint3, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)"
+2.9,4665567749,10366,450083.7,131746.0,12192,1226583,491175.0,"out_prod_q4_0_prepare_tile(const char *, __half *, long, const char *, __half *, long, long, long, unsigned long, unsigned long, unsigned long)"
+1.8,2875886228,40342,71287.6,72513.0,2784,1159222,86451.0,"void k_bin_bcast<&op_mul, float, float, float, const float *>(const T2 *, const T3 *, T4 *, unsigned int, unsigned int, unsigned int, uint3, uint3, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, T5...)"
+1.5,2488740999,8320,299127.5,305894.0,125379,311750,28321.1,"void flash_attn_ext_f16<(int)256, (int)256, (int)32, (int)2, (bool)0, (bool)0, (bool)0, (bool)0>(const char *, const char *, const char *, const char *, const char *, const int *, float *, float2 *, float, float, float, float, unsigned int, float, int, uint3, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)"
+1.2,1859840605,30592,60795.0,26561.0,23649,102978,36555.5,"void ggml_cuda_ar_add_kernel<float, __nv_bfloat16>(T1 *, const T2 *, int)"
+0.8,1225104100,3712,330038.8,349639.0,145250,379816,58897.6,void cutlass::Kernel2<cutlass_70_tensorop_s884gemm_f16_128x128_nt_align8>(T1::Params)
+0.7,1182075948,7296,162017.0,83362.0,4160,409096,170290.6,"void k_repeat_back<float>(const T1 *, T1 *, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long, long, long, long, long)"
+0.7,1161963476,14008,82950.0,11808.0,2432,973907,217398.1,"void scale_f32<float>(const T1 *, T1 *, float, float, long)"
+0.7,1103063314,5056,218169.2,217700.0,216740,234053,1861.8,"void mul_mat_q<(ggml_type)2, (int)128, (bool)1, (ggml_prec)30>(const char *, const int *, const int *, const int *, float *, float *, const float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)"
+0.7,1076691556,73732,14602.8,12576.0,2592,794415,35778.9,"void k_bin_bcast<&op_add, float, float, float, const float *>(const T2 *, const T3 *, T4 *, unsigned int, unsigned int, unsigned int, uint3, uint3, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, T5...)"
+0.6,1002746015,30592,32778.0,14624.0,12256,55425,19568.4,"void convert_unary_cont_vec4<float, __nv_bfloat16>(const void *, T2 *, long)"
+0.5,877694934,3456,253962.7,199652.0,195748,392232,72152.7,void cutlass::Kernel2<cutlass_70_tensorop_s884gemm_f16_128x128_tn_align8>(T1::Params)
+0.5,793934445,512,1550653.2,1548926.0,1536670,1570655,6330.4,volta_sgemm_128x32_nt
+0.5,731336544,5920,123536.6,108002.0,106146,197764,32084.8,volta_s884gemm_fp16_256x128_ldg8_nt
+0.4,672955519,16000,42059.7,45409.0,16160,65217,13633.5,"void cpy_scalar<&cpy_1_scalar<float, float>>(const char *, char *, long, long, long, long, long, long, long, long, long, long, long, long, long, long, long)"
+0.4,655189522,800,818986.9,818704.0,796880,838736,9227.6,"void rms_norm_f32<(int)1024, (int)1, (bool)1, (bool)1, (bool)0, (bool)0>(const float *, float *, int, int, int, long, long, long, float, float, const float *, long, long, long, uint3, uint3, uint3, uint3, const float *, long, long, long, uint3, uint3, uint3, uint3, float)"
+0.4,600073592,1856,323315.5,62401.0,60257,830704,360617.3,volta_sgemm_128x32_nn
+0.4,588946495,43200,13633.0,15968.0,8960,24417,3106.3,"void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)0>(const float *, const int *, void *, long, long, long, long, long, int, int, int)"
+0.4,566593605,15904,35625.9,14593.0,11840,683053,93434.6,volta_s884gemm_fp16_64x64_ldg8_nn
+0.3,526524020,1792,293819.2,292358.0,56353,522442,129584.2,volta_s884gemm_fp16_64x128_ldg8_tn
+0.3,463571323,430,1078072.8,1077381.0,1072437,1085653,2629.5,"void rms_norm_f32<(int)1024, (int)1, (bool)1, (bool)1, (bool)1, (bool)0>(const float *, float *, int, int, int, long, long, long, float, float, const float *, long, long, long, uint3, uint3, uint3, uint3, const float *, long, long, long, uint3, uint3, uint3, uint3, float)"
+0.3,459391039,28960,15863.0,15776.0,14464,51681,1802.8,volta_s884gemm_fp16_64x64_ldg8_tn
+0.3,455555150,29886,15243.1,15136.0,11616,19873,989.6,volta_s884gemm_fp16_64x64_ldg8_nt
+0.3,453579652,25088,18079.5,19457.0,14944,23680,2346.3,"void mm_ids_helper<(int)8>(const int *, int *, int *, int *, int, int, int, int, int, bool)"
+0.3,423447024,20224,20937.8,21152.0,19617,22817,469.4,"void k_get_rows_float<float, float>(const T1 *, const int *, T2 *, long, long, uint3, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)"
+0.2,362418898,256,1415698.8,1415451.0,1395803,1436988,7249.1,"void distillation_f32<(bool)0, (bool)1>(const float *, const int *, const float *, const float *, const float *, float *, int, int, int, float)"
+0.2,358995897,5056,71003.9,70945.0,67713,75810,1348.2,volta_sgemm_32x128_tn
+0.2,335603564,128,2621902.8,2622162.5,2593235,2640339,9875.1,"void distillation_f32<(bool)1, (bool)1>(const float *, const int *, const float *, const float *, const float *, float *, int, int, int, float)"
+0.2,310695126,512,606826.4,601436.0,387335,859408,131671.0,"void flash_attn_back_softmax<__half, (bool)0>(const float *, T1 *, const __half *, const float *, float *, long, long, long, unsigned long, int, float)"
+0.2,302099609,8320,36310.0,36289.0,35009,38208,391.4,"void flash_attn_stream_k_fixup_general<(int)256, (int)32, (int)2>(float *, const float2 *, int, int, int, int, uint3, uint3, uint3, uint3)"
+0.2,298819383,304,982958.5,986131.0,924786,1018132,20355.3,"void rms_norm_back_f32<(int)1024>(const float *, const float *, const float *, float *, int, float)"
+0.2,279330272,12544,22268.0,22112.0,20672,25152,663.6,"void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)1>(const float *, const int *, void *, long, long, long, long, long, int, int, int)"
+0.2,257005636,260,988483.2,988962.5,659213,1325498,327773.2,"void rms_norm_mul_rope_f32<(int)256, (bool)0, float>(const float *, T3 *, int, int, int, long, long, long, long, long, long, float, const float *, long, long, long, uint3, uint3, uint3, uint3, int, const int *, float, float, float, rope_corr_dims, float, const float *, const long *, int, bool)"
+0.2,250302926,15872,15770.1,12224.0,5568,354439,26084.5,"void flash_attn_back_softmax<__half, (bool)1>(const float *, T1 *, const __half *, const float *, float *, long, long, long, unsigned long, int, float)"
+0.1,239257870,12702,18836.2,18080.0,11329,320551,31929.0,"void unary_gated_op_kernel<&op_gelu, float>(const T2 *, const T2 *, T2 *, long, long, long, long)"
+0.1,234117714,10112,23152.5,23168.0,22625,24289,233.4,"void k_argsort_f32_i32<(ggml_sort_order)1>(const float *, int *, int, int)"
+0.1,205760678,256,803752.6,804143.5,776495,806255,3425.0,"softcap_f32(const float *, float *, float, float, int)"
+0.1,205310871,768,267331.9,265141.0,104546,442985,97722.5,"void flash_attn_back_softmax_grad<__half, (int)0>(const float *, T1 *, const float *, float *, long, long, long, float, float *)"
+0.1,198986206,300,663287.4,710254.0,356647,711534,120324.4,"void cpy_scalar_contiguous<float, __half>(const char *, char *, long)"
+0.1,192757901,128,1505921.1,1505725.0,1500957,1512766,2471.6,volta_sgemm_128x128_nn
+0.1,188858354,1152,163939.5,163779.0,162531,166051,655.2,"void dequantize_block_q4_0<__half>(const void *, T1 *, int)"
+0.1,184039385,15616,11785.3,11073.0,10336,80002,5248.5,"void flash_attn_back_softmax_grad<__half, (int)16>(const float *, T1 *, const float *, float *, long, long, long, float, float *)"
+0.1,134740527,4864,27701.6,29153.0,9440,45569,14960.0,"mul_mat_id_back_count_scale(const float *, const int *, int *, int *, long, long, long, long, long, long, long, long, long)"
+0.1,126297104,4864,25965.7,25825.0,22752,28896,1417.5,"mul_mat_id_back_prefix_tiles(const int *, int *, int *, int *, long, long, long)"
+0.1,124820157,1792,69654.1,69601.0,68353,71393,507.4,"void flash_attn_stream_k_fixup_general<(int)512, (int)8, (int)8>(float *, const float2 *, int, int, int, int, uint3, uint3, uint3, uint3)"
+0.1,124734082,19936,6256.7,5984.0,5056,9825,606.3,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T5 *, T5 *, const T6 *, const T6 *, const T7 *, const T4 *, T7 *, void *, long, T6 *, int *)"
+0.1,113571163,256,443637.4,443449.0,434761,454281,3685.6,"argmax_f32(const float *, int *, long)"
+0.1,111336207,300,371120.7,396647.5,199619,401224,66879.7,"pad_f32(const float *, unsigned long, unsigned long, unsigned long, unsigned long, float *, int, int, int, int, int, int, int, int, int, int, int, int, bool)"
+0.1,103079688,128,805310.1,805760.0,779023,808176,3423.0,"void unary_op_kernel<&op_tanh, float>(const T2 *, T2 *, int)"
+0.1,102135158,128,797930.9,798271.5,771599,800463,3359.9,"void unary_op_kernel<&op_sqr, float>(const T2 *, T2 *, int)"
+0.0,79272038,338,234532.7,253637.0,6081,369159,55512.8,"void cub::CUB_200500_610_700_NS::DeviceReduceKernel<cub::CUB_200500_610_700_NS::DeviceReducePolicy<float, unsigned long long, cuda::std::__4::plus<void>>::Policy600, const float *, unsigned long long, cuda::std::__4::plus<void>, float, cuda::std::__4::__identity>(T2, T5 *, T3, cub::CUB_200500_610_700_NS::GridEvenShare<T3>, T4, T6)"
+0.0,77752650,2304,33746.8,29409.0,28001,58625,9736.6,"void dequantize_block_q8_0_f16<(bool)0>(const void *, __half *, long)"
+0.0,77634151,2470,31430.8,30112.5,15968,511209,58366.8,"glu_back_f32(const float *, const float *, const float *, float *, long, long, int)"
+0.0,72278131,5888,12275.5,12833.0,4736,23297,5231.9,"void convert_unary_cont_vec4<float, __half>(const void *, T2 *, long)"
+0.0,68218306,768,88825.9,76962.0,75457,150211,26796.7,"void dequantize_block<(int)32, (int)1, &dequantize_q8_0, float>(const void *, T4 *, long, long, long, uint3, long, long, long)"
+0.0,60714937,10112,6004.2,6080.0,5408,8352,393.0,"void soft_max_f32<(bool)1, (int)0, (int)0, float>(const float *, const T4 *, const float *, float *, soft_max_params)"
+0.0,60379794,4864,12413.6,12544.0,11328,14465,434.0,"ggml_cuda_moe_route_scatter(const int *, const int *, int *, int *, long, long, long, long)"
+0.0,56646544,608,93168.7,92994.0,91394,99362,982.7,volta_s884gemm_fp16_128x64_ldg8_nt
+0.0,56182853,98,573294.4,351191.0,340294,1910438,414999.0,"void rms_norm_back_f32<(int)32>(const float *, const float *, const float *, float *, int, float)"
+0.0,49182507,14976,3284.1,2976.0,2880,7776,538.9,"void k_bin_bcast<&op_div, float, float, float, const float *>(const T2 *, const T3 *, T4 *, unsigned int, unsigned int, unsigned int, uint3, uint3, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, T5...)"
+0.0,48263490,32,1508234.1,1691089.0,217700,1704993,495403.2,"void rms_norm_mul_rope_f32<(int)256, (bool)1, float>(const float *, T3 *, int, int, int, long, long, long, long, long, long, float, const float *, long, long, long, uint3, uint3, uint3, uint3, int, const int *, float, float, float, rope_corr_dims, float, const float *, const long *, int, bool)"
+0.0,44601458,10240,4355.6,4800.0,2624,10272,896.2,"void k_bin_bcast<&op_repeat, float, float, float, >(const T2 *, const T3 *, T4 *, unsigned int, unsigned int, unsigned int, uint3, uint3, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, T5...)"
+0.0,42587516,60,709791.9,709805.5,709198,710382,269.7,"void cpy_scalar_contiguous<__half, float>(const char *, char *, long)"
+0.0,39094749,10112,3866.2,3808.0,3712,8736,280.9,"void reduce_rows_f32<(bool)0>(const float *, float *, int)"
+0.0,28922471,2432,11892.5,10592.0,9824,18049,2777.4,"void convert_unary<float, __half>(const void *, T2 *, long, long, long, uint3, long, long, long)"
+0.0,26072353,1920,13579.4,14464.5,8672,20896,3410.8,void cutlass::Kernel2<cutlass_70_wmma_tensorop_s161616gemm_f16_32x32_64x2_tn_align8>(T1::Params)
+0.0,26066255,134,194524.3,197299.5,97793,199971,16973.2,"void rms_norm_f32<(int)128, (int)1, (bool)1, (bool)0, (bool)0, (bool)0>(const float *, float *, int, int, int, long, long, long, float, float, const float *, long, long, long, uint3, uint3, uint3, uint3, const float *, long, long, long, uint3, uint3, uint3, uint3, float)"
+0.0,25982245,10112,2569.4,2560.0,2368,7648,311.2,"void op_clamp_kernel<float>(const T1 *, T1 *, T1, T1, unsigned int, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)"
+0.0,20351660,2432,8368.3,8384.0,7200,13441,293.8,"soft_max_back_f32(const float *, const float *, float *, int, float)"
+0.0,19660476,60,327674.6,327638.5,217765,437320,108863.7,"void rope_neox<(bool)0, (bool)0, float, float>(const T3 *, T4 *, int, int, int, int, int, int, int, int, int, int, int, const int *, float, float, float, rope_corr_dims, float, const float *, const long *, int, bool)"
+0.0,14308753,40,357718.8,357702.5,346599,370567,6669.1,"void nvfp4_quantize_rows<float, long, (bool)0, (bool)1>(const char *, const char *, char *, nvfp4_layout, nvfp4_layout, nvfp4_layout)"
+0.0,12172989,4868,2500.6,2400.0,2144,6272,315.2,"void unary_op_kernel<&op_step, float>(const T2 *, T2 *, int)"
+0.0,11037841,960,11497.8,11537.0,9152,15808,2130.1,void cutlass::Kernel2<cutlass_70_wmma_tensorop_s161616gemm_f16_32x32_64x2_nt_align8>(T1::Params)
+0.0,9467472,1024,9245.6,9184.0,8832,10560,171.6,"fattn_back_rescale_q(float *, const float *, long, long)"
+0.0,7881271,12,656772.6,656268.0,652877,661516,3255.5,"void opt_step_qlion_qat<(ggml_type)2, (bool)0>(void *, const void *, block_q8_0 *, block_q4_0 *, const float *, long, long, bool)"
+0.0,6784835,12,565402.9,564891.0,560554,568427,2461.0,"void k_get_rows_float_vec<float>(const T1 *, const int *, T1 *, long, long, uint3, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)"
+0.0,6443707,8,805463.4,805407.5,804431,806735,901.7,"void rope_neox<(bool)0, (bool)1, float, float>(const T3 *, T4 *, int, int, int, int, int, int, int, int, int, int, int, const int *, float, float, float, rope_corr_dims, float, const float *, const long *, int, bool)"
+0.0,5852623,40,146315.6,146482.5,144547,148514,957.8,"void k_bin_bcast<&op_sub, float, float, float, const float *>(const T2 *, const T3 *, T4 *, unsigned int, unsigned int, unsigned int, uint3, uint3, uint3, uint3, uint3, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, T5...)"
+0.0,5760532,2432,2368.6,2368.0,2208,7840,335.5,"void unary_op_kernel<&op_neg, float>(const T2 *, T2 *, int)"
+0.0,5577709,40,139442.7,139410.5,136899,143171,2067.5,"void nvfp4_dequantize_rows<float, (bool)1>(const char *, char *, nvfp4_layout, nvfp4_layout)"
+0.0,5575529,480,11615.7,11376.5,9280,19168,2603.0,void cutlass::Kernel2<cutlass_70_wmma_tensorop_s161616gemm_f16_32x32_64x2_nn_align8>(T1::Params)
+0.0,4203822,64,65684.7,64673.0,63169,74497,2852.2,volta_s884gemm_fp16_128x128_ldg8_tn
+0.0,2441744,4,610436.0,610460.0,610220,610604,183.6,"void opt_step_qlion_qat<(ggml_type)8, (bool)0>(void *, const void *, block_q8_0 *, block_q4_0 *, const float *, long, long, bool)"
+0.0,2284972,4,571243.0,571515.0,569515,572427,1341.2,"void k_get_rows<(int)32, (int)2, &dequantize_q4_0, float>(const void *, const int *, T4 *, long, long, uint3, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)"
+0.0,2230190,32,69693.4,67441.5,66561,77505,4321.0,volta_s884gemm_fp16_128x256_ldg8_tn
+0.0,2110501,338,6244.1,5696.0,3776,8161,990.9,"void cub::CUB_200500_610_700_NS::DeviceReduceSingleTileKernel<cub::CUB_200500_610_700_NS::DeviceReducePolicy<float, unsigned long long, cuda::std::__4::plus<void>>::Policy600, float *, float *, int, cuda::std::__4::plus<void>, float, float, cuda::std::__4::__identity>(T2, T3, T4, T5, T6, T8)"
+0.0,993944,256,3882.6,3808.0,3552,10368,615.0,"void cub::CUB_200500_610_700_NS::DeviceReduceSingleTileKernel<cub::CUB_200500_610_700_NS::DeviceReducePolicy<float, unsigned long long, cuda::std::__4::plus<void>>::Policy600, const float *, float *, unsigned long long, cuda::std::__4::plus<void>, float, float, cuda::std::__4::__identity>(T2, T3, T4, T5, T6, T8)"
+0.0,868012,252,3444.5,3360.0,3136,6944,373.9,"void concat_cont<unsigned int, (int)0>(const T1 *, const T1 *, T1 *, long, long, long, long, long, long)"
+0.0,22849,4,5712.3,5728.5,5312,6080,392.1,"void count_equal<int>(const T1 *, const T1 *, long *, long, long)"
+
+Processing [/tmp/aikar-training-optimized.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+Time (%),Total Time (ns),Count,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Operation
+55.4,45264146880,155286,291488.9,177763.0,1792,68905647,1191573.2,[CUDA memcpy Host-to-Device]
+43.6,35628898892,220168,161826.0,110370.0,2048,29194710,486009.2,[CUDA memcpy Device-to-Host]
+0.9,758325366,28080,27005.9,14816.0,2976,384231,39346.8,[CUDA memcpy Device-to-Device]
+0.0,23082353,10413,2216.7,1856.0,1760,483145,11575.8,[CUDA memset]
+
+Processing [/tmp/aikar-training-optimized.sqlite] with [/tmp/lumen-nsys-2025/extracted/opt/nvidia/nsight-systems/2025.5.2/host-linux-x64/reports/cuda_api_sum.py]... 
+Time (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+63.6,101036591739,30588,3303144.8,1398060.0,1711,265134528,8003529.8,cudaEventSynchronize
+15.7,24842831195,779364,31875.8,3975.0,2720,2992884976,5255113.9,cudaLaunchKernel
+8.2,13088268156,74330,176083.3,1642.0,1056,1362666512,6131944.7,cudaStreamSynchronize
+4.7,7411281754,4,1852820438.5,742750988.0,20160,5925759618,2801069500.0,cudaMallocHost
+1.8,2845846215,402414,7071.9,2946.0,2078,68826138,219700.8,cudaMemcpyAsync
+1.6,2491425082,9,276825009.1,4697031.0,29053,2009330555,667509859.6,cudaFreeHost
+1.4,2262349907,10412,217282.9,4033.0,1480,2906167,487232.1,cudaMemsetAsync
+1.4,2206436390,984,2242313.4,6896.5,4769,16857331,4759900.6,cudaMemcpy2DAsync
+0.9,1418376018,10528,134724.2,5817.0,3876,1234237,358694.6,cuLaunchKernel
+0.3,502019125,274752,1827.2,1771.0,532,517774,2276.8,cudaStreamWaitEvent
+0.2,265061826,328420,807.1,679.0,448,29734,671.7,cudaEventRecord
+0.1,125098731,16,7818670.7,11443.5,10098,124866402,31212729.7,cudaMemGetInfo
+0.1,100277515,10528,9524.8,443.0,267,45335475,624867.9,cuKernelGetFunction
+0.0,39114201,133376,293.3,200.0,170,18658,398.6,cudaStreamGetCaptureInfo_v2_v11030
+0.0,29739606,5,5947921.2,1238777.0,1022703,13429953,6635442.1,cudaHostAlloc
+0.0,28203881,42,671521.0,128759.0,8036,3876230,1143401.2,cudaFree
+0.0,13612243,40,340306.1,158674.0,3070,3653822,653509.2,cudaMalloc
+0.0,13339506,20,666975.3,42270.0,22861,12250178,2726671.2,cuMemCreate
+0.0,5919739,59,100334.6,93916.0,88920,150086,14029.3,cudaGetDeviceProperties_v2_v12000
+0.0,4924164,20,246208.2,93664.5,62005,3018099,653072.9,cuMemSetAccess
+0.0,4690433,2,2345216.5,2345216.5,2192174,2498259,216434.8,cuLibraryLoadData
+0.0,1650744,2,825372.0,825372.0,805593,845151,27971.7,cuMemUnmap
+0.0,1216208,68,17885.4,18475.5,11364,34797,5195.5,cudaMemcpyPeerAsync
+0.0,264455,566,467.2,390.0,321,11666,689.0,cudaEventCreateWithFlags
+0.0,228119,566,403.0,344.0,257,3700,242.8,cudaEventDestroy
+0.0,125966,810,155.5,129.0,79,1037,81.3,cuGetProcAddress_v2
+0.0,100724,8,12590.5,4454.5,1657,73223,24534.7,cudaDeviceSynchronize
+0.0,97759,20,4887.9,4284.0,2274,8450,2043.5,cuMemMap
+0.0,51331,4,12832.8,10456.5,8704,21714,5983.3,cudaStreamDestroy
+0.0,42284,4,10571.0,8182.5,4077,21842,8259.9,cudaStreamCreateWithFlags
+0.0,39192,2,19596.0,19596.0,13967,25225,7960.6,cuMemAddressReserve
+0.0,30472,2,15236.0,15236.0,8308,22164,9797.7,cuMemAddressFree
+0.0,25231,1,25231.0,25231.0,25231,25231,0.0,cudaMemset
+0.0,18114,4,4528.5,4425.0,3450,5814,1019.0,cudaEventQuery
+0.0,6631,7,947.3,817.0,602,1620,375.4,cuLibraryGetKernel
+0.0,6404,3,2134.7,2041.0,1839,2524,352.0,cuInit
+0.0,4858,20,242.9,229.5,154,501,86.9,cuMemRelease
+0.0,4547,3,1515.7,143.0,111,4293,2405.3,cuMemGetAllocationGranularity
+0.0,3184,4,796.0,736.0,309,1403,458.3,cudaGetDriverEntryPoint_v11030
+0.0,1142,3,380.7,119.0,110,913,461.0,cuModuleGetLoadingMode
+

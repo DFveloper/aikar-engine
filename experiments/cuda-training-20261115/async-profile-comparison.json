@@ -1,0 +1,137 @@
+{
+  "async-before": {
+    "compute_interval_start_s": 114.317225155,
+    "compute_interval_end_s": 282.382432517,
+    "compute_interval_s": 168.065207362,
+    "devices": {
+      "0": {
+        "gpu_active_fraction": 0.7693250482326442,
+        "largest_idle_gaps_s": [
+          4.898768752,
+          3.175712793,
+          2.599931678,
+          0.345187156,
+          0.345011088,
+          0.344936695,
+          0.344647991,
+          0.344526632
+        ],
+        "idle_over_100ms_s": 18.988175154
+      },
+      "1": {
+        "gpu_active_fraction": 0.7836581062272798,
+        "largest_idle_gaps_s": [
+          4.909347478,
+          3.328380833,
+          2.600153947,
+          0.494804145,
+          0.494099412,
+          0.460912783,
+          0.454331924,
+          0.453802799
+        ],
+        "idle_over_100ms_s": 19.001001583
+      }
+    },
+    "cpu_cuda_waits": {
+      "cudaEventSynchronize": {
+        "calls": 30588,
+        "seconds": 108.600453596
+      },
+      "cudaStreamSynchronize": {
+        "calls": 74330,
+        "seconds": 12.936654988
+      }
+    }
+  },
+  "async-after": {
+    "compute_interval_start_s": 116.125984664,
+    "compute_interval_end_s": 273.261698097,
+    "compute_interval_s": 157.135713433,
+    "devices": {
+      "0": {
+        "gpu_active_fraction": 0.777034626072203,
+        "largest_idle_gaps_s": [
+          4.89188198,
+          3.175578376,
+          2.651843203,
+          0.344811138,
+          0.344798415,
+          0.344349533,
+          0.343931678,
+          0.343790238
+        ],
+        "idle_over_100ms_s": 19.023752836
+      },
+      "1": {
+        "gpu_active_fraction": 0.7816480983577958,
+        "largest_idle_gaps_s": [
+          4.938678886,
+          3.357575611,
+          2.652008596,
+          0.497941717,
+          0.497394306,
+          0.463262265,
+          0.455691969,
+          0.455666221
+        ],
+        "idle_over_100ms_s": 19.148376987
+      }
+    },
+    "cpu_cuda_waits": {
+      "cudaEventSynchronize": {
+        "calls": 0,
+        "seconds": 0.0
+      },
+      "cudaStreamSynchronize": {
+        "calls": 74254,
+        "seconds": 29.787819618
+      }
+    }
+  },
+  "async-parallel": {
+    "compute_interval_start_s": 114.389137139,
+    "compute_interval_end_s": 263.659738121,
+    "compute_interval_s": 149.270600982,
+    "devices": {
+      "0": {
+        "gpu_active_fraction": 0.8193554884377293,
+        "largest_idle_gaps_s": [
+          2.618869199,
+          0.34070467,
+          0.301101343,
+          0.232273714,
+          0.215866876,
+          0.189126358,
+          0.137133215,
+          0.133263368
+        ],
+        "idle_over_100ms_s": 5.71895378
+      },
+      "1": {
+        "gpu_active_fraction": 0.8243683384167431,
+        "largest_idle_gaps_s": [
+          2.619249212,
+          0.338733437,
+          0.2500559,
+          0.149851016,
+          0.14319352,
+          0.135126572,
+          0.133006067,
+          0.121904413
+        ],
+        "idle_over_100ms_s": 4.119303676
+      }
+    },
+    "cpu_cuda_waits": {
+      "cudaEventSynchronize": {
+        "calls": 0,
+        "seconds": 0.0
+      },
+      "cudaStreamSynchronize": {
+        "calls": 74254,
+        "seconds": 23.027387297
+      }
+    }
+  }
+}

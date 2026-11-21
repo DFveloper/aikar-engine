@@ -1,0 +1,15 @@
+{
+  "active_sampler_preserved": 2418377,
+  "stopped": [
+    {
+      "pid": 2258051,
+      "action": "SIGTERM",
+      "stdout": "/home/user/aikar-engine/experiments/cuda-training-20261115/production-host-kernel-gpu.csv"
+    },
+    {
+      "pid": 2374005,
+      "action": "SIGTERM",
+      "stdout": "/home/user/aikar-engine/experiments/cuda-training-20261115/production-host-kernel-gpu.csv"
+    }
+  ]
+}

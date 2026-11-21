@@ -1,0 +1,18 @@
+{
+  "profiling_valid": false,
+  "exit_code": 139,
+  "cuda_kernel_events": 0,
+  "diagnostics": [
+    "Profiling has started.",
+    "Process was launched by the profiler, see /tmp/nvidia/nsight_systems/quadd_session_101559179/streams/pid_1559199_stdout.log and stderr.log for program output",
+    "No CUDA events collected. Does the process use CUDA?",
+    "Common injection library initialized successfully.",
+    "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+    "Loaded CUPTI library: /tmp/lumen-cupti-12/libcupti.so.12.9",
+    "Installed CUDA driver version (13.0) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+    "Enabling trace for device graph launch",
+    "CUDA injection initialized successfully.",
+    "Profiling has stopped."
+  ],
+  "fallback": "Use earlier valid CUDA trace for ranking, isolated V100 benchmarks and unprofiled actual-model diagnostics for validation."
+}

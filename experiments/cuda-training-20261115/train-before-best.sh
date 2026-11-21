@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+
+printf '{"run":"%s","launcher_pid":%s,"launcher_name":"train.sh","status":"running","microbatch":768,"context":16384,"grad_accum":6,"total_data_windows":6057}\n' "$PWD" "$$" > webui/manual-run.json
+python3 webui/server.py > webui.log 2>&1 &
+webui_pid=$!
+trap 'kill "$webui_pid" 2>/dev/null || true' EXIT
+
+/home/user/aikar-engine/build/bin/llama-finetune-qlion \
+    -m Lumen-3.8-Pulsar-base.gguf \
+    --train-file logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json \
+    --distill-cache logit-distillation/interleaved/runs/20261112T001619Z-476684/mixed.json \
+    -dev CUDA0,CUDA1 -sm tensor -ts 1,1 -ngl 999 \
+    --fit off -fa on \
+    -c 16384 -b 16384 -ub 768 --grad-accum 6 \
+    -t 18 -tb 18 -dthr 18 \
+    --optimizer qlion2 --quant-type q4_0,q8_0 \
+    --qat-targets blk.11.attn_q.weight,blk.11.attn_output.weight,blk.17.attn_q.weight,blk.17.attn_output.weight,blk.23.attn_q.weight,blk.23.attn_output.weight,blk.29.attn_q.weight,blk.29.attn_output.weight \
+    --activation-recompute on --qat-grad-accumulator cpu \
+    --epochs 1 \
+    -lr 1e-5 -lr-min 1e-6 --lr-scheduler cosine --warmup-steps 50 \
+    --qat-adapter-only --qat-adapter-out interleaved.adapter.gguf \
+    --save-every 4 \
+    --verbose-loss "$@" 2>&1 | tee train.log

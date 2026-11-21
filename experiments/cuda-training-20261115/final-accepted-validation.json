@@ -1,0 +1,25 @@
+{
+  "source_sha256": {
+    "ggml/src/ggml-backend-meta.cpp": "017acefafe739da3fd7afd4d510fd8b5745503fc5af366eb2c314b7add51079a",
+    "ggml/src/ggml-backend.cpp": "e4084863961890ba33b3875abdb1c89827a09087b38bc9fb24a1d7f22b5dbb14",
+    "ggml/src/ggml-cuda/acc.cu": "32a0f9d8bf4c2a933f1e67aef485ff0bbf0e31c12a289d020115469fe2693704",
+    "ggml/src/ggml-cuda/allreduce.cu": "9a4ac348d875e351c5cb60bba3e72b27cb7ad93feb58b607cc5281520a7f6087",
+    "ggml/src/ggml-cuda/fattn-back.cu": "a2fc942e20fbeb4e1849db087660425be0a6c3649e8128228524534d76d0853f",
+    "ggml/src/ggml-cuda/mmq.cu": "c832e47babd6871380e5d65407798866586a641e08b8d7d3e7ed59eed74764ad",
+    "ggml/src/ggml-cuda/out-prod.cu": "580804dbb444802bb40fd6a8f50ec0e8e81f7d60b66bc132859ce6a2bca87d0e",
+    "examples/qlora_training/test-logit-distillation.cpp": "9c964531fbb8b08d4ab09b65678993eebeaaac9b67526fa844430a96a9a22815",
+    "tests/test-backend-ops.cpp": "06f2064ac551bf733345208bb8d3488e85ea335aa15a5baaec71c1a767866fbf"
+  },
+  "build_exit_code": 0,
+  "cuda_unit_exit_code": 0,
+  "full_context_integration_exit_code": 0,
+  "full_context_integration_runs": 32,
+  "production_args_changed": false,
+  "cpu_gradient_bottleneck_resolved": false,
+  "target_60_hours_met": false,
+  "rejected_last_experiment": {
+    "two_window_seconds": 250.14,
+    "state_tensors_equal": 20,
+    "state_tensors_total": 24
+  }
+}

@@ -153,6 +153,14 @@ uint32_t llama_hparams::n_embd_head_v(uint32_t il) const {
     GGML_ABORT("fatal error");
 }
 
+uint32_t llama_hparams::n_embd_head_v_cache(uint32_t il) const {
+    return kv_global_only && !is_swa(il) ? n_rot(il) : n_embd_head_v(il);
+}
+
+uint32_t llama_hparams::n_embd_v_gqa_cache(uint32_t il) const {
+    return n_embd_head_v_cache(il) * n_head_kv(il);
+}
+
 uint32_t llama_hparams::n_embd_k_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
 
@@ -319,6 +327,7 @@ uint32_t llama_hparams::n_embd_head_v_mla() const {
 }
 
 bool llama_hparams::has_kv(uint32_t il) const {
+    if (kvsharer_map[il]) { return false; }
     if (kv_global_only && is_swa(il)) {
         return true;
     }
@@ -335,6 +344,7 @@ bool llama_hparams::has_kv(uint32_t il) const {
 }
 
 int32_t llama_hparams::kv_source(uint32_t il) const {
+    if (kvsharer_map[il]) { return kvsharer_map[il] - 1; }
     if (has_kv(il)) {
         return il;
     }

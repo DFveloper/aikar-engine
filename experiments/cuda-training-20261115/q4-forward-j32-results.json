@@ -1,0 +1,14 @@
+{
+  "fwd-up": {
+    "before_ms": 0.795635,
+    "after_ms": 0.794985,
+    "speedup": 1.000817625489789,
+    "bytes_equal": true
+  },
+  "fwd-down": {
+    "before_ms": 1.002265,
+    "after_ms": 0.9421999999999999,
+    "speedup": 1.0637497346635534,
+    "bytes_equal": true
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "state_tensors": 24,
+  "changed": [],
+  "state_bytes_equal": true,
+  "train_seconds_before": 298.7,
+  "train_seconds_after": 252.688,
+  "speedup": 1.1820901665294752,
+  "training_losses_equal": true,
+  "validation_losses_equal": true,
+  "production_args_changed": false,
+  "required_seconds_per_window": 35.661218424962854,
+  "cuda_async_unit_exit_code": 0,
+  "build_targets": [
+    "llama-finetune-qlion",
+    "test-logit-distillation",
+    "test-backend-ops"
+  ],
+  "build_exit_code": 0,
+  "whitespace_check_exit_code": 0,
+  "standalone_accumulated_matrix_bytes": 92274688,
+  "standalone_accumulated_matrix_bytes_equal": true,
+  "standalone_accumulated_matrix_finite": true,
+  "cpu_reference_seconds_per_window": 149.35,
+  "optimized_diagnostic_seconds_per_window": 126.344,
+  "diagnostic_training_only_projection_hours": 212.57378,
+  "target_60_hours_met": false,
+  "remaining_bottlenecks": [
+    "forward/backward activation recompute",
+    "CPU graph construction and allocation",
+    "CPU Q8 gradient conversion and host/device transfer"
+  ],
+  "source_sha256": {
+    "ggml/src/ggml-backend.cpp": "e4084863961890ba33b3875abdb1c89827a09087b38bc9fb24a1d7f22b5dbb14",
+    "ggml/src/ggml-backend-meta.cpp": "017acefafe739da3fd7afd4d510fd8b5745503fc5af366eb2c314b7add51079a",
+    "ggml/src/ggml-cpu/ops.cpp": "ac45d36ec2e903f2aaac13c6fa2f06d2be5790b1475b516a893e69c8ed9e726b",
+    "ggml/src/ggml-cuda/out-prod.cu": "1f988123098311b37ffb75c5e4232c531559bb8985adb79add4e58e6ef478b0e",
+    "ggml/src/ggml-cuda/out-prod.cuh": "51903581c8e928005159835e3513bc562f17066c00b9066060b0451491dbfa7a",
+    "ggml/src/ggml-cuda/ggml-cuda.cu": "a37225c8edfa937a72f71e3e6830f01ff320294531f953ea9ed2a14ee05ce5e7",
+    "ggml/src/ggml-cuda/allreduce.cu": "9a4ac348d875e351c5cb60bba3e72b27cb7ad93feb58b607cc5281520a7f6087",
+    "ggml/src/ggml-cuda/acc.cu": "32a0f9d8bf4c2a933f1e67aef485ff0bbf0e31c12a289d020115469fe2693704",
+    "ggml/src/ggml-cuda/fattn-back.cu": "a2fc942e20fbeb4e1849db087660425be0a6c3649e8128228524534d76d0853f",
+    "ggml/src/ggml-cuda/mmq.cu": "c832e47babd6871380e5d65407798866586a641e08b8d7d3e7ed59eed74764ad"
+  },
+  "binary_sha256": {
+    "build/bin/llama-finetune-qlion": "0e931fd65938fe16f4f4f4e33a6e20062ef1ffe07407e2460c4d3924a0d5904f",
+    "build/bin/libggml-cuda.so.0.27.0": "0bd040c48cbab8076961eaf84f17e47ff71057dfa1af81773737b598c104df00",
+    "build/bin/libggml-cpu.so.0.27.0": "e797e1900963baf767a20a47072f37bffaf2d94d2125cc864f8fd5e29240dcff",
+    "build/bin/libggml-base.so.0.27.0": "da86d981ead005303cf828f121d32cfdf6771d392ef84c45ea8b35b156126688"
+  }
+}

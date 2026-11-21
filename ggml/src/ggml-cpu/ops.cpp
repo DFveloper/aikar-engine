@@ -10191,10 +10191,9 @@ static void ggml_flash_attn_ext_reduce_partials(
 
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
-    const ggml_tensor * v = dst->src[2];
 
     const int64_t DK        = k->ne[0];
-    const int64_t DV        = v->ne[0];
+    const int64_t DV        = dst->ne[0];
     const int64_t nek1      = k->ne[1];
     const int64_t n_q_heads = q->ne[2];
 
@@ -10253,6 +10252,15 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+static float fp4_attention_mask_value(const ggml_tensor * mask, int64_t query, int64_t head, int64_t stream, int64_t token) {
+    if (!mask) return 0;
+    const char * row = (const char *) mask->data + query*mask->nb[1] + (head % mask->ne[2])*mask->nb[2] + (stream % mask->ne[3])*mask->nb[3];
+    if (mask->type == GGML_TYPE_I32) {
+        return (((const uint32_t *) row)[token/32] >> (token % 32)) & 1 ? -INFINITY : 0;
+    }
+    return GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[token]);
+}
+
 static void ggml_compute_forward_flash_attn_ext_fp4_decode(
         const ggml_compute_params * params, ggml_tensor * dst,
         int64_t begin, int64_t end, float * partials,
@@ -10262,7 +10270,8 @@ static void ggml_compute_forward_flash_attn_ext_fp4_decode(
     const auto * v = dst->src[2];
     const auto * mask = dst->src[3];
     const auto * sinks = dst->src[4];
-    const int64_t dk = k->ne[0], dv = v->ne[0];
+    const auto * v_scale = dst->src[5];
+    const int64_t dk = k->ne[0], dv = dst->ne[0];
     const int64_t heads = q->ne[2], group = heads/k->ne[2];
     const int64_t tile_heads = 8;
     const int64_t stride = params->nth*(dv + 2);
@@ -10275,7 +10284,8 @@ static void ggml_compute_forward_flash_attn_ext_fp4_decode(
     const float m0 = powf(2.0f, -max_bias/heads_log2);
     const float m1 = powf(2.0f, -(max_bias/2)/heads_log2);
     std::vector<float> row(std::max(dk, dv));
-    std::vector<ggml_fp16_t> key(dk), value(dv), queries(tile_heads*dk), accum(tile_heads*dv);
+    std::vector<ggml_fp16_t> key(dk), value(dv), queries(tile_heads*dk), accum(v_scale ? 0 : tile_heads*dv);
+    std::vector<float> accum_f32(v_scale ? tile_heads*dv : 0);
     for (int64_t kh = head_begin; kh < head_end; ++kh) {
         for (int64_t h0 = kh*group; h0 < (kh + 1)*group; h0 += tile_heads) {
             const int64_t count = std::min(tile_heads, (kh + 1)*group - h0);
@@ -10287,18 +10297,30 @@ static void ggml_compute_forward_flash_attn_ext_fp4_decode(
                 ggml_fp32_to_fp16_row(query, queries.data() + h*dk, dk);
             }
             std::fill(accum.begin(), accum.end(), 0);
+            std::fill(accum_f32.begin(), accum_f32.end(), 0);
             for (int64_t token = begin; token < end; ++token) {
                 bool visible = false;
                 for (int64_t h = 0; h < count; ++h) {
-                    const auto * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + query_token*mask->nb[1] + ((h0 + h)%mask->ne[2])*mask->nb[2] + (stream%mask->ne[3])*mask->nb[3]) : nullptr;
-                    visible |= !mp || GGML_CPU_FP16_TO_FP32(mp[token]) != -INFINITY;
+                    visible |= fp4_attention_mask_value(mask, query_token, h0 + h, stream, token) != -INFINITY;
                 }
                 if (!visible) { continue; }
-                dequantize_fp4_attention_row((const char *) k->data + token*k->nb[1] + kh*k->nb[2] + (stream/(q->ne[3]/k->ne[3]))*k->nb[3], key.data(), dk, row.data(), k->type);
-                dequantize_fp4_attention_row((const char *) v->data + token*v->nb[1] + kh*v->nb[2] + (stream/(q->ne[3]/v->ne[3]))*v->nb[3], value.data(), dv, row.data(), v->type);
+                const char * key_data = (const char *) k->data + token*k->nb[1] + kh*k->nb[2] + (stream/(q->ne[3]/k->ne[3]))*k->nb[3];
+                const char * value_data = (const char *) v->data + token*v->nb[1] + kh*v->nb[2] + (stream/(q->ne[3]/v->ne[3]))*v->nb[3];
+                if (v_scale) {
+                    ggml_get_type_traits(k->type)->to_float(key_data, row.data(), dk);
+                    ggml_fp32_to_fp16_row(row.data(), key.data(), dk);
+                    const auto * scales = (const float *) v_scale->data;
+                    for (int64_t d = v->ne[0]; d < dv; ++d) {
+                        value[d] = GGML_CPU_FP32_TO_FP16(row[d]/scales[d]);
+                    }
+                    dequantize_fp4_attention_row(value_data, value.data(), v->ne[0], row.data(), v->type);
+                    ggml_cpu_fp16_to_fp32(value.data(), row.data(), dv);
+                } else {
+                    dequantize_fp4_attention_row(key_data, key.data(), dk, row.data(), k->type);
+                    dequantize_fp4_attention_row(value_data, value.data(), dv, row.data(), v->type);
+                }
                 for (int64_t h = 0; h < count; ++h) {
-                    const auto * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + query_token*mask->nb[1] + ((h0 + h)%mask->ne[2])*mask->nb[2] + (stream%mask->ne[3])*mask->nb[3]) : nullptr;
-                    const float bias = mp ? slopes[h]*GGML_CPU_FP16_TO_FP32(mp[token]) : 0;
+                    const float bias = slopes[h]*fp4_attention_mask_value(mask, query_token, h0 + h, stream, token);
                     if (bias == -INFINITY) { continue; }
                     float score;
                     ggml_vec_dot_f16(dk, &score, 0, key.data(), 0, queries.data() + h*dk, 0, 1);
@@ -10306,19 +10328,22 @@ static void ggml_compute_forward_flash_attn_ext_fp4_decode(
                     if (softcap != 0) { score = softcap*tanhf(score); }
                     score += bias;
                     float rescale = 1, weight = 1;
-                    auto * output = accum.data() + h*dv;
+                    auto * output = v_scale ? nullptr : accum.data() + h*dv;
                     if (score > maxima[h]) {
                         rescale = expf(maxima[h] - score); maxima[h] = score;
-                        ggml_vec_scale_f16(dv, output, rescale);
+                        if (v_scale) ggml_vec_scale_f32(dv, accum_f32.data() + h*dv, rescale);
+                        else         ggml_vec_scale_f16(dv, output, rescale);
                     } else {
                         weight = expf(score - maxima[h]);
                     }
-                    ggml_vec_mad_f16(dv, output, value.data(), weight);
+                    if (v_scale) ggml_vec_mad_f32(dv, accum_f32.data() + h*dv, row.data(), weight);
+                    else         ggml_vec_mad_f16(dv, output, value.data(), weight);
                     sums[h] = sums[h]*rescale + weight;
                 }
             }
             for (int64_t h = 0; h < count; ++h) {
-                ggml_cpu_fp16_to_fp32(accum.data() + h*dv, row.data(), dv);
+                if (v_scale) memcpy(row.data(), accum_f32.data() + h*dv, dv*sizeof(float));
+                else         ggml_cpu_fp16_to_fp32(accum.data() + h*dv, row.data(), dv);
                 if (sinks && begin == 0) {
                     const float score = ((const float *) sinks->data)[h0 + h];
                     float rescale = 1, weight = 1;
@@ -10361,7 +10386,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
 
     const int64_t DK = nek0;
-    const int64_t DV = nev0;
+    const int64_t DV = dst->ne[0];
     const int64_t N  = neq1;
 
 
@@ -10375,7 +10400,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     GGML_ASSERT(neq0 == DK);
     GGML_ASSERT(nek0 == DK);
-    GGML_ASSERT(nev0 == DV);
+    GGML_ASSERT(nev0 == DV || (dst->src[5] && nev0 < DV));
 
     GGML_ASSERT(neq1 == N);
 
@@ -10394,7 +10419,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool kv_supports_tiling = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || is_fp4_attention_type(k->type));
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_supports_tiling && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
-    if (!use_ref && !use_split_kv_path && neq1 < GGML_FA_TILE_Q &&
+    if (!use_split_kv_path && (dst->src[5] || (!use_ref && neq1 < GGML_FA_TILE_Q)) &&
             is_fp4_attention_type(k->type) && v->type == k->type && k->ne[2] == v->ne[2]) {
         const int64_t tasks = neq1*neq3*k->ne[2];
         for (int64_t task = ith; task < tasks; task += nth) {

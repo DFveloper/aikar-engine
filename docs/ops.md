@@ -4,6 +4,8 @@ List of GGML operations and backend support status.
 
 CPU `PAGED_ATTN` uses cache-sized tiles and SIMD helpers, with a scalar reference selectable through `GGML_CPU_PAGED_ATTN_REFERENCE=1`. CPU `MUL_MAT_ID` accepts optional expert-priority scheduling metadata. See [CPU LES and paged attention](pulsar-cpu-les-implementation.md) for supported configurations and numerical limits.
 
+`ggml_mul_mat_id_weighted_sum` is an inference-only Q4_0 `MUL_MAT_ID` variant on CPU and CUDA. It applies F32 expert scales and router weights and returns the sum directly, without an output tensor per selected expert. CPU uses compact routing metadata and cache-sized partials with the original expert-slot sum order; the Lumen4Exp graph selects it for up to four tokens and keeps the existing prefill path. CUDA reuses the eight-expert register reduction for up to four tokens and uses weighted MMQ writeback for larger batches. MMQ uses atomic F32 sums, so its reduction order can differ from the separate graph. Other model features, including training, LoRA, expert caches and precision overrides, retain the existing path. Standard CPU routed matmuls also store each route once instead of reserving every route for every expert.
+
 CPU `FLASH_ATTN_EXT` accepts paired NVFP4 K/V with FP32 row master scales. It decodes rows within the existing attention tiles and preserves the F16 rounding of the previous full-cache conversion. AVX2/F16C decodes directly to F16; other CPUs use the scalar codec with row-sized scratch. The model graph selects direct attention for CPU-resident NVFP4 caches with at least 512 cells during single-token, single-stream decode. Below 65,536 cache cells, prefill, batched decode and shorter caches retain the previous conversion path because direct attention did not consistently improve their measured throughput. Longer caches use direct attention to bound temporary storage. Mixed NVFP4 cache types are unsupported.
 
 CPU routed QLion accumulation variants are listed as `ACC_QLION_QAT_ID` and `ACC_QLION_QAT_EXPERTS`. They reuse the `ACC_QLION_QAT` and `ACC_QLION_QAT_ROWS` operation codes with variant parameters; the compact expert updater reuses `OPT_STEP_QLION_QAT_SPARSE_ROWS`. CUDA supports compact expert accumulation and its updater; the direct dense fused accumulation variant remains CPU-only. Vulkan rejects these expert variants. See [native QLion training](../examples/qlora_training/README.md) for selection policy and dense fallback.
@@ -106,6 +108,7 @@ Legend:
 |                          MUL_MAT | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 |                 MUL_MAT_HADAMARD | ❌ | ❌ | ✅ | ❌ | ✅ | 🟡 | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | 🟡 |
 |                       MUL_MAT_ID | ❌ | 🟡 | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | ❌ |
+|          MUL_MAT_ID_WEIGHTED_SUM | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 |                  MUL_MAT_ID_W4A4 | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
 |                  MUL_MAT_ID_W4A8 | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
 |                     MUL_MAT_W4A4 | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -163,4 +166,10 @@ Legend:
 |                          UPSCALE | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                            XIELU | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 
-CPU `fp4_kv` is a runtime-only E2M1 cache format with one E4M3 scale per 16 channels and no FP32 master scale. CPU CPY, SET_ROWS and paired FLASH_ATTN_EXT support it. Lumen4Exp selects it for global KV by default. CUDA supports F32/F16 conversion through CPY for training fake quantization; persistent cache writes and direct attention remain CPU operations. Vulkan declines this cache format.
+CPU `fp4_kv` is a runtime-only E2M1 cache format with one E4M3 scale per 16 channels and no FP32 master scale. CPU and CUDA support CPY and SET_ROWS. Lumen4Exp selects it for global KV by default. Vulkan declines this cache format.
+
+`FLASH_ATTN_EXT` can take an F32 scale vector in source 5 to reconstruct the V suffix as K divided by that scale. The stored V prefix is unchanged and the output head size equals the K head size. CPU uses row-sized scratch and CUDA uses per-lane registers with bounded split-KV partials for 512-dimensional heads. Both paths round decoded K and reconstructed V to F16, accumulate in F32, and avoid full-cache conversion tensors. Training retains the differentiable graph implementation.
+
+The V reconstruction path also accepts a contiguous I32 mask with 32 blocked-token bits per word. Each bit replaces an F16 zero or negative infinity; finite mask biases and ALiBi still use F16. Lumen4Exp inference writes the global mask directly in this format and reuses the MoE graph tiling code with 256 tokens per tile to bound expert output buffers. Training and other architectures retain their existing masks and tile sizes.
+
+Lumen4Exp inference keeps projections with host-resident weights and attention with host-resident KV on CPU. GPU-resident weights and KV retain GPU execution. This avoids temporary GPU copies of host experts during partial offload.

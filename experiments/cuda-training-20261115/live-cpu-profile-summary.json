@@ -1,0 +1,175 @@
+{
+  "self_cycles_percent_by_library": {
+    "[kernel.kallsyms]": 40.14000000000005,
+    "libcuda.so.580.178.04": 39.850000000000115,
+    "libggml-base.so.0.27.0": 6.3999999999999995,
+    "libc.so.6": 6.1899999999999995,
+    "libgomp.so.1.0.0": 2.17,
+    "libggml-cpu.so.0.27.0": 1.5799999999999998,
+    "libllama.so.0.7.0": 1.08,
+    "[vdso]": 0.6300000000000001,
+    "libggml-cuda.so.0.27.0": 0.5800000000000002,
+    "libm.so.6": 0.52,
+    "libcudart.so.12.4.127": 0.41000000000000014,
+    "ld-linux-x86-64.so.2": 0.15,
+    "libstdc++.so.6.0.35": 0.12,
+    "libcublasLt.so.12.4.5.8": 0.11,
+    "libcublas.so.12.4.5.8": 0.05,
+    "llama-finetune-qlion": 0.03,
+    "[unknown]": 0.0,
+    "libllama-common.so.0.7.0": 0.0
+  },
+  "top_self_symbols": [
+    {
+      "children_percent": 14.23,
+      "self_percent": 14.04,
+      "library": "[kernel.kallsyms]",
+      "symbol": "entry_SYSRETQ_unsafe_stack"
+    },
+    {
+      "children_percent": 4.27,
+      "self_percent": 4.22,
+      "library": "[kernel.kallsyms]",
+      "symbol": "entry_SYSCALL_64"
+    },
+    {
+      "children_percent": 4.1,
+      "self_percent": 4.08,
+      "library": "libc.so.6",
+      "symbol": "__memmove_avx_unaligned_erms"
+    },
+    {
+      "children_percent": 3.87,
+      "self_percent": 3.87,
+      "library": "[kernel.kallsyms]",
+      "symbol": "syscall_return_via_sysret"
+    },
+    {
+      "children_percent": 3.14,
+      "self_percent": 2.16,
+      "library": "libggml-base.so.0.27.0",
+      "symbol": "ggml_backend_meta_get_split_state(ggml_backend_meta_simple_tensor_container&, ggml_tensor const*, bool, ggml_backend_buffer*)::{lambda()#1}::operator()() const"
+    },
+    {
+      "children_percent": 2.03,
+      "self_percent": 2.03,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x000000000046090c"
+    },
+    {
+      "children_percent": 4.75,
+      "self_percent": 1.91,
+      "library": "[kernel.kallsyms]",
+      "symbol": "update_curr"
+    },
+    {
+      "children_percent": 1.87,
+      "self_percent": 1.87,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x00000000004609db"
+    },
+    {
+      "children_percent": 3.91,
+      "self_percent": 1.56,
+      "library": "libggml-base.so.0.27.0",
+      "symbol": "ggml_backend_meta_get_split_state(ggml_backend_meta_simple_tensor_container&, ggml_tensor const*, bool, ggml_backend_buffer*)"
+    },
+    {
+      "children_percent": 12.21,
+      "self_percent": 1.36,
+      "library": "[kernel.kallsyms]",
+      "symbol": "__schedule"
+    },
+    {
+      "children_percent": 1.33,
+      "self_percent": 1.27,
+      "library": "[kernel.kallsyms]",
+      "symbol": "__calc_delta.constprop.0"
+    },
+    {
+      "children_percent": 2.06,
+      "self_percent": 1.26,
+      "library": "[kernel.kallsyms]",
+      "symbol": "update_se"
+    },
+    {
+      "children_percent": 1.23,
+      "self_percent": 1.23,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x000000000021f6ae"
+    },
+    {
+      "children_percent": 1.21,
+      "self_percent": 1.21,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x000000000021f6a0"
+    },
+    {
+      "children_percent": 1.19,
+      "self_percent": 1.19,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x0000000000460908"
+    },
+    {
+      "children_percent": 1.18,
+      "self_percent": 1.15,
+      "library": "libggml-cpu.so.0.27.0",
+      "symbol": "ggml_qlion_qat_add_q8_block(block_q8_0*, block_q8_0 const*, bool) [clone .part.0]"
+    },
+    {
+      "children_percent": 1.13,
+      "self_percent": 1.13,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x00000000004608b4"
+    },
+    {
+      "children_percent": 1.08,
+      "self_percent": 1.08,
+      "library": "libllama.so.0.7.0",
+      "symbol": "llm_graph_input_attn_no_cache::set_input(llama_ubatch const*)"
+    },
+    {
+      "children_percent": 1.07,
+      "self_percent": 1.07,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x000000000021f6bd"
+    },
+    {
+      "children_percent": 1.03,
+      "self_percent": 1.03,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x00000000004608c4"
+    },
+    {
+      "children_percent": 1.01,
+      "self_percent": 1.01,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x00000000004609d4"
+    },
+    {
+      "children_percent": 1.0,
+      "self_percent": 1.0,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x000000000021f6c3"
+    },
+    {
+      "children_percent": 0.99,
+      "self_percent": 0.99,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x00000000004608d4"
+    },
+    {
+      "children_percent": 0.86,
+      "self_percent": 0.86,
+      "library": "libcuda.so.580.178.04",
+      "symbol": "0x000000000021f6ba"
+    },
+    {
+      "children_percent": 17.04,
+      "self_percent": 0.85,
+      "library": "[kernel.kallsyms]",
+      "symbol": "entry_SYSCALL_64_after_hwframe"
+    }
+  ],
+  "interpretation": "CPU cycle samples, including CUDA driver spin/yield waits; these are not wall-time speedup estimates."
+}

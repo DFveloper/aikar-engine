@@ -2,6 +2,14 @@
 
 This report records the earlier LES tuning. The current default KV format is documented in [Lumen4Exp](lumen4exp.md#default-fp4-kv-cache).
 
+## Weight loading update, 2026-11-21
+
+Runtime repacking remains enabled by default. The loader now releases unused interior mmap ranges as well as the file ends. Copied weights use a reusable file-read buffer instead of faulting their original mapping into RAM. Linux prefetch uses the existing memory advice without `MAP_POPULATE`, which previously made the complete source mapping resident before repacking.
+
+On the Xeon E5-2696 v3 with 18 threads, Scoria Alpha Q4_0, a 262144-token context and one slot, default repacking reduced idle and sampled load-peak RSS from 27.26 GiB to 14.13 GiB. A 250-token prompt ran at 55.63 tokens/s with repacking versus 24.19 with `--no-repack`. Median generation across three 16-token requests was 8.81 versus 7.66 tokens/s. Existing GPU training remained active during measurement. Load time increased from 11.03 to 14.24 seconds in this comparison; this change targets inference throughput and resident memory, not minimum startup latency.
+
+All three repacked requests and all three direct requests preserved their respective pre-change text and token probabilities. Loader regression coverage checks mapped/copied mixtures, entirely copied models, ordinary file reads, tensor validation and release of copied source pages. Real-model checks also cover CPU loading without mmap and partial V100 offload with tensor validation. No `--no-repack` flag is needed to avoid the former duplicate source mapping.
+
 CPU Flash Attention works with the CPU-resident KV cache. The existing build already enables AVX2, F16C, FMA, OpenMP and CPU weight repacking. Lumen4Exp stores global KV in NVFP4 and decodes it through F32 to F16 for Flash Attention. These LES measurements predate the direct NVFP4 attention optimization; see [the attention report](lumen4exp-nvfp4-cpu-attention.md) for the subsequent change. Cache precision is unchanged.
 
 The existing Gemma4 LES integration now accepts Lumen4Exp, which uses the same router and expert graph. CPU residency, single-sequence, budget, LoRA and training restrictions are retained. LES changes expert preparation and traversal order, not router selections or output slots. It remains opt-in because all measured LES configurations were slower.

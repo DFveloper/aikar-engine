@@ -1132,6 +1132,7 @@ struct llm_graph_context {
     const bool training;
     const bool activation_recompute;
     const bool full_sequence;
+    std::vector<ggml_tensor *> kv_reconstruction_scales;
     mutable std::map<std::pair<const ggml_tensor *, std::pair<int64_t, int64_t>>, ggml_tensor *> training_mask_tiles;
     const std::function<ggml_tensor * (ggml_context *, ggml_tensor *)> replace_weight;
     const bool smooth_gelu;

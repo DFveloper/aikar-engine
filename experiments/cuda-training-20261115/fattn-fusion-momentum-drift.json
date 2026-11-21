@@ -1,0 +1,62 @@
+[
+  {
+    "name": "qat.m.000000",
+    "qtype": "8",
+    "elements": 23068672,
+    "changed_bytes": 11750504,
+    "relative_l2": 0.027154165771441946,
+    "max_abs": 9.822845458984375e-05,
+    "sign_flips": 141647,
+    "finite": true
+  },
+  {
+    "name": "qat.m.000001",
+    "qtype": "8",
+    "elements": 23068672,
+    "changed_bytes": 9211839,
+    "relative_l2": 0.01568553959727398,
+    "max_abs": 0.00024437904357910156,
+    "sign_flips": 94857,
+    "finite": true
+  },
+  {
+    "name": "qat.m.000002",
+    "qtype": "8",
+    "elements": 23068672,
+    "changed_bytes": 7952281,
+    "relative_l2": 0.017505394839912588,
+    "max_abs": 8.571147918701172e-05,
+    "sign_flips": 87167,
+    "finite": true
+  },
+  {
+    "name": "qat.m.000003",
+    "qtype": "8",
+    "elements": 23068672,
+    "changed_bytes": 4743354,
+    "relative_l2": 0.00832267574975203,
+    "max_abs": 0.0004534721374511719,
+    "sign_flips": 41463,
+    "finite": true
+  },
+  {
+    "name": "qat.m.000004",
+    "qtype": "8",
+    "elements": 23068672,
+    "changed_bytes": 5439586,
+    "relative_l2": 0.013628295750108679,
+    "max_abs": 0.00010073184967041016,
+    "sign_flips": 57414,
+    "finite": true
+  },
+  {
+    "name": "qat.m.000005",
+    "qtype": "8",
+    "elements": 23068672,
+    "changed_bytes": 2519079,
+    "relative_l2": 0.005041978120494605,
+    "max_abs": 0.0005161762237548828,
+    "sign_flips": 20567,
+    "finite": true
+  }
+]

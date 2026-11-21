@@ -1,0 +1,14 @@
+{
+  "q": {
+    "different": 234089,
+    "relative_l2": 8.864897154126083e-07,
+    "finite": true,
+    "max_abs": 3.91155481338501e-08
+  },
+  "kv": {
+    "different": 0,
+    "relative_l2": 0.0,
+    "finite": true,
+    "max_abs": 0.0
+  }
+}
