@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-paired-forward.h"
 #include "llama-graph.h"
+#include "llama-model.h"
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -30,8 +31,8 @@ static void no_cache_mask_checks() {
                     cparams.causal_attn = causal;
                     llm_graph_input_attn_no_cache input(hparams, cparams);
                     ggml_context_ptr ctx(ggml_init({4*ggml_tensor_overhead(), nullptr, true}));
-                    input.self_kq_mask = ggml_new_tensor_2d(ctx.get(), type, columns, rows);
-                    input.self_kq_mask_swa = ggml_new_tensor_2d(ctx.get(), type, columns, rows);
+                    input.self_attn_mask.raw = ggml_new_tensor_2d(ctx.get(), type, columns, rows);
+                    input.self_attn_mask_swa.raw = ggml_new_tensor_2d(ctx.get(), type, columns, rows);
                     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
                     std::vector<llama_pos> positions(rows);
                     std::vector<llama_seq_id> sequences(rows);
@@ -47,7 +48,7 @@ static void no_cache_mask_checks() {
                     batch.seq_id = ids.data();
                     input.set_input(&batch);
                     for (bool sliding : {false, true}) {
-                        auto * tensor = sliding && swa != LLAMA_SWA_TYPE_NONE ? input.self_kq_mask_swa : input.self_kq_mask;
+                        auto * tensor = sliding && swa != LLAMA_SWA_TYPE_NONE ? input.self_attn_mask_swa.raw : input.self_attn_mask.raw;
                         std::vector<float> values(rows*columns);
                         if (type == GGML_TYPE_F16) {
                             std::vector<ggml_fp16_t> packed(values.size());
@@ -76,13 +77,15 @@ struct paired_result { std::vector<float> train, validation, gradient; };
 
 static std::vector<float> fake_quant_gradient(ggml_backend_t backend, bool reference) {
     llm_graph_result result(1024);
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
     llm_graph_params params = {};
-    params.hparams.n_layer_all = 1;
-    params.hparams.n_embd = 64;
-    params.hparams.n_head_arr[0] = 2;
-    params.hparams.n_head_kv_arr[0] = 1;
-    params.hparams.n_embd_head_k_full = 32;
-    params.hparams.n_embd_head_v_full = 32;
+    params.model = model.get();
+    model->hparams.n_layer_all = 1;
+    model->hparams.n_embd = 64;
+    model->hparams.n_head_arr[0] = 2;
+    model->hparams.n_head_kv_arr[0] = 1;
+    model->hparams.n_embd_head_k_full = 32;
+    model->hparams.n_embd_head_v_full = 32;
     params.res = &result;
     llm_graph_context builder(params);
     auto * ctx = result.get_ctx();
@@ -1242,13 +1245,15 @@ static std::vector<float> attention_backward(bool parallel, bool q_only = false)
 static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool last_only, ggml_backend_t backend, bool q_only = false, bool host = false, bool swa = false, bool crop = false) {
     llm_graph_result result(8192);
     llama_adapter_loras loras;
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
     llm_graph_params params = {};
-    params.hparams.n_layer_all = 2;
-    params.hparams.n_embd = 64;
-    params.hparams.n_head_arr[0] = 2;
-    params.hparams.n_head_kv_arr[0] = 1;
-    params.hparams.n_embd_head_k_full = 32;
-    params.hparams.n_embd_head_v_full = 32;
+    params.model = model.get();
+    model->hparams.n_layer_all = 2;
+    model->hparams.n_embd = 64;
+    model->hparams.n_head_arr[0] = 2;
+    model->hparams.n_head_kv_arr[0] = 1;
+    model->hparams.n_embd_head_k_full = 32;
+    model->hparams.n_embd_head_v_full = 32;
     params.cparams.n_ctx = 1024;
     params.cparams.n_ubatch = tile;
     params.cparams.flash_attn = flash;
@@ -1259,9 +1264,9 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool 
     std::vector<llama_pos> positions(1024);
     for (int i = 0; i < 1024; ++i) positions[i] = i;
     if (swa) {
-        params.hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-        params.hparams.n_swa = 128;
-        params.hparams.is_swa_impl[0] = 1;
+        model->hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        model->hparams.n_swa = 128;
+        model->hparams.is_swa_impl[0] = 1;
         if (crop) params.ubatch.pos = positions.data();
     }
     params.training = true;
@@ -1284,9 +1289,9 @@ static std::vector<float> full_context_backward(uint32_t tile, bool flash, bool 
         ggml_set_param(inputs[1]);
         ggml_set_param(inputs[2]);
     }
-    auto * output = builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 0);
+    auto * output = builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, nullptr, 0, .1767767f, 0);
     if (tile == 1024 && flash && !last_only && !q_only && !host && !swa) {
-        builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, 0, .1767767f, 1);
+        builder.build_attn_mha(inputs[0], inputs[1], inputs[2], nullptr, inputs[3], nullptr, nullptr, nullptr, 0, .1767767f, 1);
         std::set<const ggml_tensor *> masks;
         int attention_nodes = 0;
         for (int i = 0; i < ggml_graph_n_nodes(result.get_gf()); ++i) {

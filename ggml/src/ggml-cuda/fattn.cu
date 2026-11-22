@@ -5,25 +5,6 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-static ggml_tensor fattn_dense_mask_layout(const ggml_tensor * mask, int64_t tokens) {
-    ggml_tensor dense = *mask;
-    dense.type = GGML_TYPE_F16;
-    dense.ne[0] = tokens;
-    dense.nb[0] = sizeof(half);
-    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
-        dense.nb[dim] = dense.nb[dim - 1]*dense.ne[dim - 1];
-    }
-    return dense;
-}
-
-static __global__ void fattn_unpack_mask(const uint32_t * packed, half * dense, int64_t tokens, int64_t words, int64_t count) {
-    const int64_t index = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (index >= count) return;
-    const int64_t token = index % tokens;
-    const uint32_t word = packed[index/tokens*words + token/32];
-    dense[index] = __float2half_rn((word >> (token % 32)) & 1 ? -INFINITY : 0.0f);
-}
-
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 struct fattn_v_from_k_layout {
     int64_t nbq[4], nbk[4], nbv[4], nbm[4];
@@ -316,7 +297,7 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_should_use_sparse(const int device,
     const int64_t sparse_min_kv = volta_q8_single_token ? 16384 : 4096;
     const bool sparse_kv_length = K->ne[1] >= std::max<int64_t>(sparse_min_kv, 2LL*n_kv_max);
     return GGML_CUDA_CC_IS_NVIDIA(cc) && mma_sparse_available &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask != nullptr && mask->type == GGML_TYPE_F16 && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         sparse_kv_length;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -355,7 +336,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
     return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && dst->src[5] == nullptr &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask != nullptr && mask->type == GGML_TYPE_F16 && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, GGML_CUDA_CC_IS_NVIDIA(cc) ? 2*n_gather : 2LL*n_kv_max);
 #endif // !defined(GGML_USE_MUSA)
@@ -813,12 +794,6 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
-    if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
-        auto mask = fattn_dense_mask_layout(dst->src[3], dst->src[1]->ne[1]);
-        ggml_tensor dense = *dst;
-        dense.src[3] = &mask;
-        return ggml_cuda_get_best_fattn_kernel(device, &dense);
-    }
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -1105,20 +1080,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (dst->src[6]) { ggml_cuda_flash_attn_v_from_k(ctx, dst); return; }
 #endif
-    if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
-        const auto * packed = dst->src[3];
-        auto mask = fattn_dense_mask_layout(packed, dst->src[1]->ne[1]);
-        ggml_cuda_pool_alloc<half> storage(ctx.pool(), ggml_nelements(&mask));
-        mask.data = storage.get();
-        const int64_t count = ggml_nelements(&mask);
-        fattn_unpack_mask<<<(count + 255)/256, 256, 0, ctx.stream()>>>(
-            (const uint32_t *) packed->data, storage.get(), mask.ne[0], packed->ne[0], count);
-        CUDA_CHECK(cudaGetLastError());
-        ggml_tensor dense = *dst;
-        dense.src[3] = &mask;
-        ggml_cuda_flash_attn_ext(ctx, &dense);
-        return;
-    }
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
     switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:

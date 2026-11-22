@@ -242,7 +242,7 @@ llama_kv_cache::llama_kv_cache(
             if (lazy && getenv("GGML_CUDA_DISABLE_VOLTA_LAZY_KV") == nullptr) {
                 auto * reg = ggml_backend_dev_backend_reg(dev);
                 using managed_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
-                auto * get_managed_buft = (managed_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_managed_buffer_type");
+                auto * get_managed_buft = reg ? (managed_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_managed_buffer_type") : nullptr;
                 if (get_managed_buft) {
                     if (auto * managed_buft = get_managed_buft(dev)) {
                         buft = managed_buft;

@@ -5265,7 +5265,7 @@ void llm_graph_context::build_h_nextn_dev() const {
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    if (samplers.empty() || !res->t_logits || ggml_nelements(res->t_logits) == 0) {
         return;
     }
 

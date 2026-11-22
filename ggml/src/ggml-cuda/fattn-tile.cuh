@@ -680,7 +680,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
                 KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
+                    slope*fattn_mask_value(mask, stride_mask, j, k_VKQ_0 + i_KQ) : 0.0f;
 
                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
             }
@@ -911,7 +911,7 @@ static __global__ void flash_attn_tile(
 
     const int stride_K    = nb11;
     const int stride_V    = nb21;
-    const int stride_mask = nb31 / sizeof(half);
+    const int stride_mask = nb31 < 0 ? nb31 : nb31 / int(sizeof(half));
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
 

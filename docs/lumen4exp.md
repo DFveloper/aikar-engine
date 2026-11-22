@@ -33,7 +33,7 @@ The number of independent global cache layers comes from model metadata and shar
 
 The default is selected automatically for `lumen4exp`; no cache-type flags or checkpoint conversion are needed. Explicit `-ctk`/`-ctv` or `-ctgk`/`-ctgv` values override the global K/V defaults independently, including explicit `f16`. Runtime type 150 is separate from GGUF NVFP4 weight type 40. Existing NVFP4 weight codecs and conversion remain compatible. Old saved KV states are rejected by their different cache type.
 
-Global inference Flash Attention uses a packed one-bit mask for every supported KV type when ALiBi and TurboQuant are disabled. CPU attention reads the bits directly. CUDA keeps the direct packed-mask path for fused FP4 V-from-K attention and expands other masks to temporary F16 storage before invoking its existing attention kernels.
+Global inference Flash Attention uses a packed one-bit mask for every supported KV type when ALiBi and TurboQuant are disabled. CPU and CUDA attention read the bits directly. CUDA vector, tile, MMA and fused FP4 V-from-K kernels extract mask bits into registers and apply them to attention scores without an F16 mask buffer. The CUDA mask scan also reads packed bits directly; packed masks bypass F16-only sparse compaction.
 
 C API callers selecting F16 explicitly set `llama_context_params.type_k_explicit` or `type_v_explicit` to preserve that choice instead of the model default. Other explicitly selected cache types are preserved directly.
 

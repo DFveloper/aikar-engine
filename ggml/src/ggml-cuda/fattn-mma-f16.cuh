@@ -558,6 +558,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
         const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
         const int32_t * const __restrict__ indices) {
+    if (stride_mask < 0) return;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     if constexpr (use_cp_async) {
         static_assert(nbatch_fa <= 8*warp_size && nbatch_fa % 8 == 0, "bad nbatch_fa");
@@ -700,7 +701,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int j = jt*ncols1 + i/nbatch_fa;
                 const int k = i%nbatch_fa;
                 if (j < int(ne01.z) && (!oob_check || k < k_VKQ_sup)) {
-                    visible |= __half2float(mask_h[j*stride_mask + k_VKQ_0 + k]) != -INFINITY;
+                    visible |= fattn_mask_value(mask_h, stride_mask, j, k_VKQ_0 + k) != -INFINITY;
                 }
             }
             if (!__syncthreads_or(visible)) {
@@ -844,7 +845,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i = i0 + T_C_KQ::get_i(l);
                     const int j = ((threadIdx.y / np)*T_C_KQ::J + T_C_KQ::get_j(l)) / ncols2;
 
-                    KQ_C[i00/(np*T_C_KQ::I)].x[l] += slope * __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
+                    const float bias = stride_mask < 0 ? (i < k_VKQ_sup ?
+                        fattn_mask_value(mask_h, stride_mask, fastmodulo(jt*ncols1 + j, ne01), k_VKQ_0 + i) : 0.0f) :
+                        __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
+                    KQ_C[i00/(np*T_C_KQ::I)].x[l] += slope * bias;
                 }
             }
         }
@@ -910,7 +914,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i = i0 + T_C_KQ::get_j(l);
                     const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l)) / ncols2;
 
-                    KQ_C[i00/(np*T_C_KQ::J)].x[l] += __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
+                    const float bias = stride_mask < 0 ? (i < k_VKQ_sup ?
+                        fattn_mask_value(mask_h, stride_mask, fastmodulo(jt*ncols1 + j, ne01), k_VKQ_0 + i) : 0.0f) :
+                        __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
+                    KQ_C[i00/(np*T_C_KQ::J)].x[l] += bias;
                 }
 #else
 #pragma unroll
@@ -918,7 +925,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i = (i0 + T_C_KQ::get_j(l0)) / 2;
                     const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l0)) / ncols2;
 
-                    const float2 tmp = __half22float2(((const half2 *)tile_mask)[j*(nbatch_fa/2 + 4) + i]);
+                    float2 tmp;
+                    if (stride_mask < 0) {
+                        const int query = fastmodulo(jt*ncols1 + j, ne01);
+                        tmp.x = 2*i < k_VKQ_sup ? fattn_mask_value(mask_h, stride_mask, query, k_VKQ_0 + 2*i) : 0.0f;
+                        tmp.y = 2*i + 1 < k_VKQ_sup ? fattn_mask_value(mask_h, stride_mask, query, k_VKQ_0 + 2*i + 1) : 0.0f;
+                    } else {
+                        tmp = __half22float2(((const half2 *)tile_mask)[j*(nbatch_fa/2 + 4) + i]);
+                    }
                     KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] += slope*tmp.x;
                     KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1] += slope*tmp.y;
                 }
@@ -2088,7 +2102,7 @@ static __global__ void flash_attn_ext_f16(
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_K    = q8_kv ? nb11 : nb11 / sizeof(half2);
-    const int stride_mask = nb31 / sizeof(half);
+    const int stride_mask = nb31 < 0 ? nb31 : nb31 / int(sizeof(half));
 
     const int stride_V = V_is_K_view ? stride_K : (q8_kv ? nb21 : nb21 / sizeof(half2));
 
@@ -2259,7 +2273,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
     const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
     const size_t nbytes_shared_Q         = ncols                * (DKQp/2 + 4)                            * sizeof(half2);
-    const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
+    const size_t nbytes_shared_mask      = KQV->src[3] && KQV->src[3]->type == GGML_TYPE_I32 ? 0 : ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
 
     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;

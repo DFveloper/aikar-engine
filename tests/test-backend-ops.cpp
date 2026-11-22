@@ -10313,8 +10313,8 @@ struct test_flash_attn_ext : public test_case {
 
 struct test_flash_attn_packed_mask : public test_flash_attn_ext {
     const bool all_masked;
-    test_flash_attn_packed_mask(ggml_type type_k, ggml_type type_v, int nb, bool all_masked) :
-        test_flash_attn_ext(128, 128, 2, {2, 2}, 512, nb, true, true, 0, 30,
+    test_flash_attn_packed_mask(ggml_type type_k, ggml_type type_v, int nb, bool all_masked, int dim = 128) :
+        test_flash_attn_ext(dim, dim, 2, {dim == 512 ? 8 : 2, 2}, 512, nb, true, true, 0, 30,
             GGML_PREC_F32, type_k, type_v), all_masked(all_masked) {}
 
     std::string vars() override { return test_flash_attn_ext::vars() + ",packed_mask=1,all_masked=" + std::to_string(all_masked); }
@@ -15238,6 +15238,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int nb : {1, 8}) {
             test_cases.emplace_back(new test_flash_attn_packed_mask(type, type, nb, false));
             test_cases.emplace_back(new test_flash_attn_packed_mask(type, GGML_TYPE_F16, nb, true));
+        }
+    }
+
+    for (int dim : {256, 512}) {
+        for (int nb : {1, 64}) {
+            for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_KV}) {
+                test_cases.emplace_back(new test_flash_attn_packed_mask(type, type, nb, false, dim));
+            }
         }
     }
 
